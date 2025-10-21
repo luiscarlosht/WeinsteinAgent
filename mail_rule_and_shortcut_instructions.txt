@@ -1,0 +1,12 @@
+== Mac Mail Rule + Shortcut (iMessage Forward) ==
+
+1) Create a Mac Shortcut named: Send Weinstein Summary
+   - Action 1: Get Details of Mail (Message content)
+   - Action 2: Get Substring of Text (first 10–12 lines)
+   - Action 3: Send Message (Recipients: you + wife via iMessage)
+
+2) In Mail.app:
+   - Rules -> Add Rule
+   - If From CONTAINS your_report_sender@example.com AND
+        Subject CONTAINS "Weinstein Report READY"
+   - Perform: Run Shortcut -> "Send Weinstein Summary"

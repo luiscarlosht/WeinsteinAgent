@@ -1,0 +1,7 @@
+✅ Stage-2: {stage2_list}
+⚠️ Tighten stops: {tighten_list}
+🔴 Exit watch: {exit_list}
+Holdings: {holdings_brief}
+Next check: {next_check}
+
+(Full PDF/CSV attached. This summary is optimized for iMessage forwarding.)

@@ -1,0 +1,4 @@
+# === CRON EXAMPLES (UTC vs CT) ===
+30 11 * * * /usr/bin/python3 /opt/weinstein/run.py --mode daily --from-sheet --send-email --summary short >> /var/log/weinstein.log 2>&1
+0 23 * * SUN /usr/bin/python3 /opt/weinstein/run.py --mode weekly --from-sheet --holdings-sheet "https://docs.google.com/..." --send-email --charts --summary short >> /var/log/weinstein.log 2>&1
+*/2 * * * * /usr/bin/python3 /opt/weinstein/run.py --mode control --from-sheet >> /var/log/weinstein_control.log 2>&1

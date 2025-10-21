@@ -1,0 +1,4 @@
+Tab: Control
+A1: Run_Now
+B1: Mode               # daily | weekly | quick
+C1: Tickers_Override   # e.g., ANET,NVDA,PANW

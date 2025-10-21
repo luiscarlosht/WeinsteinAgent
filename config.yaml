@@ -1,0 +1,35 @@
+# === Weinstein Agent - Hybrid (VM + Mac iMessage) ===
+app:
+  mode_default: weekly
+  timezone: America/Chicago
+  benchmark: SPY
+  include_charts: true
+sheets:
+  daily_intake_sheet_id: "PUT_GOOGLE_SHEET_ID_HERE"
+  holdings_sheet_id: "PUT_HOLDINGS_SHEET_ID_HERE"
+  control_sheet_id: "PUT_CONTROL_SHEET_ID_HERE"
+notifications:
+  email:
+    enabled: true
+    sender: "you@example.com"
+    recipients:
+      - "you@example.com"
+      - "wife@example.com"
+    subject_prefix: "Weinstein Report READY"
+    provider: "smtp"
+    smtp:
+      host: "smtp.mail.me.com"
+      port_ssl: 587
+      username: "you@example.com"
+      app_password: "APP_SPECIFIC_PASSWORD"
+reporting:
+  output_dir: "/opt/weinstein/output"
+  include_pdf: true
+  include_csv: true
+  summary_lines: 10
+universe:
+  tickers: ["NVDA", "ANET", "PANW", "CRWD", "RTX", "VUG", "SOXX"]
+risk:
+  max_position_pct: 10
+  tranche_plan: [30, 30, 20, 20]
+  stop_below_ma_pct: 5
