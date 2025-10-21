@@ -23,7 +23,7 @@ notifications:
       username: "luiscarlosht@gmail.com"
       app_password: "qnamoxtmakhnvlml"
 reporting:
-  output_dir: "/opt/weinstein/output"
+  output_dir: "/home/luiscarlosht/WeinsteinAgent"
   include_pdf: true
   include_csv: true
   summary_lines: 10
