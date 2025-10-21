@@ -1,10 +1,10 @@
 # === weinstein_report_weekly.py ===
 import os
 import sys
-import io
 import math
-import yaml
+import io
 import base64
+import yaml
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -12,7 +12,7 @@ from datetime import datetime
 from weinstein_mailer import send_email
 from universe_loaders import combine_universe
 
-# Headless plotting
+# Optional tiny charts for top names
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -25,12 +25,7 @@ SLOPE_WINDOW = 5       # weeks used to measure MA slope
 NEAR_MA_BAND = 0.05    # within ±5% of MA == "near/flat"
 RS_MA_WEEKS = 30
 OUTPUT_DIR_FALLBACK = "./output"
-
-# Chart settings
-MAX_CHARTS = 20        # how many tickers to chart (Stage 2 prioritized)
-FIG_W = 7.0            # inches
-FIG_H = 4.6            # inches
-DPI = 120
+TOP_N_CHARTS = 20      # tiny charts for the top N candidates
 
 # --------- Utilities ---------
 def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
@@ -40,17 +35,12 @@ def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataF
     Handles both MultiIndex (many tickers) and single-index (one ticker) cases.
     """
     if isinstance(df.columns, pd.MultiIndex):
-        out = df.get(field)
-        if out is None:
-            raise KeyError(f"Field '{field}' not found in downloaded data.")
-        # Keep only the columns we asked for (in that order if present)
+        out = df[field].copy()
         keep = [t for t in tickers if t in out.columns]
         return out[keep]
     else:
-        # Single ticker; df has columns like ['Open','High','Low','Close','Adj Close','Volume']
         if field not in df.columns:
             raise KeyError(f"Field '{field}' not found in downloaded data.")
-        # Best guess at the ticker name (first in list)
         t0 = tickers[0] if tickers else "TICKER"
         out = df[[field]].copy()
         out.columns = [t0]
@@ -88,101 +78,31 @@ def load_config(path="config.yaml"):
 
     return cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume
 
-def _batch_download(uniq):
-    return yf.download(
-        uniq, interval="1wk", period="10y",
-        auto_adjust=True, ignore_tz=True, progress=False
-    )
-
-def _single_download(symbol):
-    return yf.download(
-        symbol, interval="1wk", period="10y",
-        auto_adjust=True, ignore_tz=True, progress=False
-    )
-
 def fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
     """
-    Robust weekly fetch:
-    - tries batch download first (fastest)
-    - if any symbols fail, retries them one-by-one up to 3 times
-    - returns Close & Volume 2D frames for all successful symbols
+    Download weekly OHLCV for all tickers + benchmark. Returns (close_w, volume_w).
     """
     uniq = list(dict.fromkeys((tickers or []) + [benchmark]))  # de-dup, preserve order
     if not uniq:
         raise ValueError("No symbols to download.")
 
-    # 1) Batch attempt
-    data = _batch_download(uniq)
-    # Extract early (may miss some columns if yfinance dropped them)
-    try:
-        close_all = _extract_field(data, "Close", uniq)
-    except Exception:
-        close_all = pd.DataFrame(index=data.index)
-    try:
-        vol_all = _extract_field(data, "Volume", uniq)
-    except Exception:
-        vol_all = pd.DataFrame(index=data.index)
+    data = yf.download(
+        uniq,
+        interval="1wk",
+        period="10y",
+        auto_adjust=True,
+        ignore_tz=True,
+        progress=False,
+    )
 
-    # 2) Find missing/empty symbols
-    missing = []
-    for s in uniq:
-        have_col = (s in close_all.columns) and (s in vol_all.columns)
-        if not have_col:
-            missing.append(s)
-        else:
-            if close_all[s].dropna().empty or vol_all[s].dropna().empty:
-                missing.append(s)
+    close = _extract_field(data, "Close", uniq)
+    volume = _extract_field(data, "Volume", uniq)
 
-    recovered = []
-    skipped = []
-    # 3) Retry missing one-by-one (up to 3 tries)
-    for s in missing:
-        ok = False
-        for _ in range(3):
-            try:
-                df1 = _single_download(s)
-                if "Close" in df1 and not df1["Close"].dropna().empty:
-                    # If either frame lacks this column, add it
-                    if s not in close_all.columns:
-                        close_all[s] = df1["Close"].copy()
-                    else:
-                        close_all[s] = close_all[s].combine_first(df1["Close"])
-                    if "Volume" in df1 and not df1["Volume"].dropna().empty:
-                        if s not in vol_all.columns:
-                            vol_all[s] = df1["Volume"].copy()
-                        else:
-                            vol_all[s] = vol_all[s].combine_first(df1["Volume"])
-                    ok = True
-                    recovered.append(s)
-                    break
-            except Exception:
-                pass
-    # 4) Any still missing -> skipped
-    have_cols = set(close_all.columns)
-    for s in uniq:
-        if s not in have_cols or close_all[s].dropna().empty:
-            skipped.append(s)
-
-    # Prune skipped columns if they got partially added
-    if skipped:
-        close_all = close_all.drop(columns=[c for c in skipped if c in close_all.columns], errors="ignore")
-        vol_all = vol_all.drop(columns=[c for c in skipped if c in vol_all.columns], errors="ignore")
-
-    # 5) Keep last N weeks
     tail_n = max(weeks, MA_WEEKS + RS_MA_WEEKS + SLOPE_WINDOW + 10)
-    close_all = close_all.tail(tail_n)
-    vol_all = vol_all.tail(tail_n)
+    close = close.tail(tail_n)
+    volume = volume.tail(tail_n)
 
-    # 6) Ensure benchmark present
-    if benchmark not in close_all.columns or close_all[benchmark].dropna().empty:
-        raise RuntimeError(f"Benchmark {benchmark} missing after fetch; cannot proceed.")
-
-    if recovered:
-        print(f"Retried & recovered: {', '.join(recovered)}")
-    if skipped:
-        print(f"⚠️ Skipped (unavailable after retries): {', '.join(skipped)}")
-
-    return close_all, vol_all
+    return close, volume
 
 def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     """
@@ -258,6 +178,22 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
         "notes": "; ".join(notes),
     }
 
+def classify_buy_signal(stage: str) -> tuple[str, str]:
+    """
+    Returns (text_label, html_badge)
+      Stage 2 -> Buy
+      Stage 1 -> Watch
+      Else    -> Avoid
+    """
+    stage = stage or ""
+    if stage.startswith("Stage 2"):
+        return ("BUY", '<span class="badge buy">Buy</span>')
+    if stage.startswith("Stage 1"):
+        return ("WATCH", '<span class="badge watch">Watch</span>')
+    if stage == "Filtered":
+        return ("AVOID", '<span class="badge avoid">Avoid</span>')
+    return ("AVOID", '<span class="badge avoid">Avoid</span>')
+
 def build_report_df(close_w: pd.DataFrame,
                     volume_w: pd.DataFrame,
                     tickers: list[str],
@@ -275,14 +211,12 @@ def build_report_df(close_w: pd.DataFrame,
     last_close = close_w.ffill().iloc[-1]
     avg_vol_10w = volume_w.rolling(10).mean().ffill().iloc[-1]
 
-    # Start rows
     rows = []
     for t in tickers:
         if t not in close_w.columns:
             rows.append({"ticker": t, "stage": "N/A", "notes": "no_data"})
             continue
 
-        # Enforce hygiene filters (if provided)
         lc = float(last_close.get(t, np.nan)) if pd.notna(last_close.get(t, np.nan)) else np.nan
         av = float(avg_vol_10w.get(t, np.nan)) if pd.notna(avg_vol_10w.get(t, np.nan)) else np.nan
         if (min_price and (pd.isna(lc) or lc < min_price)) or (min_avg_volume and (pd.isna(av) or av < min_avg_volume)):
@@ -295,7 +229,7 @@ def build_report_df(close_w: pd.DataFrame,
 
     df = pd.DataFrame(rows)
 
-    # Clean ordering
+    # Ensure expected columns exist
     cols = [
         "ticker", "stage", "price", "ma30", "dist_ma_pct", "ma_slope_per_wk",
         "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"
@@ -305,7 +239,11 @@ def build_report_df(close_w: pd.DataFrame,
             df[c] = np.nan
     df = df[cols]
 
-    # Sort: Stage 2 first, then by distance above MA
+    # Buy Signal columns (plain + HTML badge)
+    df["buy_signal"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[0])
+    df["buy_signal_html"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[1])
+
+    # Sort: Stage 2 (Buy) first, then Stage 1 (Watch), then by distance above MA
     stage_rank = {
         "Stage 2 (Uptrend)": 0,
         "Stage 1 (Basing)": 1,
@@ -318,7 +256,65 @@ def build_report_df(close_w: pd.DataFrame,
     df = df.sort_values(by=["stage_rank", "dist_ma_pct"], ascending=[True, False]).reset_index(drop=True)
     return df.drop(columns=["stage_rank"])
 
-def df_to_html(df: pd.DataFrame, title: str, chart_imgs=None):
+# ---------- Tiny inline charts ----------
+def _fig_to_base64(fig) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
+    """
+    Price vs 30-wk MA + RS line (separate axis) as a small image, returned as <img src="...">
+    """
+    # Align
+    s = series_price.dropna()
+    b = benchmark.reindex_like(s).dropna()
+    idx = s.index.intersection(b.index)
+    if len(idx) < MA_WEEKS + 5:
+        return ""
+    s = s.loc[idx]
+    b = b.loc[idx]
+
+    ma = s.rolling(MA_WEEKS).mean()
+    rs = (s / b).rolling(RS_MA_WEEKS).mean()
+
+    fig, ax1 = plt.subplots(figsize=(3.0, 1.4))
+    ax1.plot(s.index, s.values, linewidth=1.2)
+    ax1.plot(ma.index, ma.values, linewidth=1.0)
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    ax1.grid(False)
+    # Secondary for RS
+    ax2 = ax1.twinx()
+    ax2.plot(rs.index, rs.values, linewidth=0.8)
+    ax2.set_xticks([])
+    ax2.set_yticks([])
+    for spine in (*ax1.spines.values(), *ax2.spines.values()):
+        spine.set_visible(False)
+
+    img_src = _fig_to_base64(fig)
+    return f'<img src="{img_src}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
+
+def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, top_n: int = TOP_N_CHARTS) -> pd.DataFrame:
+    """
+    Add an 'chart' HTML column for top N rows (others blank) to keep email light.
+    """
+    out = df.copy()
+    out["chart"] = ""
+    bench_series = close_w[benchmark].dropna()
+    for i, row in out.head(top_n).iterrows():
+        t = row["ticker"]
+        if t in close_w.columns:
+            try:
+                out.at[i, "chart"] = make_tiny_chart_html(close_w[t], bench_series)
+            except Exception:
+                out.at[i, "chart"] = ""
+    return out
+
+# ---------- HTML / Email ----------
+def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     styled = df.copy()
 
     # Pretty percentages
@@ -329,101 +325,52 @@ def df_to_html(df: pd.DataFrame, title: str, chart_imgs=None):
     if "rs_above_ma" in styled.columns:
         styled["rs_above_ma"] = styled["rs_above_ma"].map({True: "Yes", False: "No"})
 
-    # Basic HTML table
+    # Use HTML badge for buy signal
+    if "buy_signal_html" in styled.columns:
+        styled["Buy Signal"] = styled["buy_signal_html"]
+    else:
+        styled["Buy Signal"] = styled.get("buy_signal", "")
+
+    # If chart column exists, bring it up front
+    columns_order = ["ticker", "Buy Signal", "stage", "price", "ma30", "dist_ma_pct",
+                     "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
+    if "chart" in styled.columns:
+        columns_order = ["ticker", "Buy Signal", "chart", "stage", "price", "ma30", "dist_ma_pct",
+                         "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
+
+    for c in columns_order:
+        if c not in styled.columns:
+            styled[c] = ""
+    styled = styled[columns_order]
+
+    # Render HTML table
     table_html = styled.to_html(index=False, border=0, justify="center", escape=False)
     css = """
     <style>
-      body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height:1.45; padding:20px; }
-      h2 { margin: 0 0 8px 0; }
+      body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height:1.45; padding:20px; color:#111; }
+      h2 { margin: 0 0 4px 0; }
       .sub { color:#666; margin-bottom:16px; }
+      .summary { background:#f6f8fa; border:1px solid #eaecef; padding:10px 12px; border-radius:8px; margin:10px 0 16px 0; }
       table { border-collapse: collapse; width: 100%; }
-      th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; vertical-align: top; }
       th { text-align:left; background:#fafafa; }
-      .charts { display:flex; flex-wrap:wrap; gap:12px; margin-top:16px; }
-      .chartbox { border:1px solid #eee; border-radius:8px; padding:8px; width: 360px; }
-      .chartbox h4 { margin:0 0 6px 0; font-size:14px; }
-      img { max-width:100%; height:auto; display:block; }
+      .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; border:1px solid transparent; }
+      .badge.buy { background:#eaffea; color:#106b21; border-color:#b8e7b9; }
+      .badge.watch { background:#fff6d6; color:#6b5310; border-color:#f0e2a6; }
+      .badge.avoid { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
+      img { image-rendering:-webkit-optimize-contrast; }
     </style>
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     html = f"""{css}
     <h2>{title}</h2>
     <div class="sub">Generated {now}</div>
+    <div class="summary">{summary_line}</div>
     {table_html}
     """
-
-    if chart_imgs:
-        html += '<div class="charts">'
-        for tkr, b64 in chart_imgs:
-            html += f'<div class="chartbox"><h4>{tkr}</h4><img src="data:image/png;base64,{b64}" alt="{tkr} chart"></div>'
-        html += "</div>"
-
     return html
 
-def _plot_small_chart(ticker: str, s: pd.Series, bench: pd.Series, out_path: str | None = None) -> str:
-    """
-    Create a small chart with:
-      - Top: price vs 30-wk MA
-      - Bottom: RS vs its 30-wk MA
-    Returns base64-encoded PNG (and optionally writes to disk if out_path provided).
-    """
-    try:
-        s = s.dropna()
-        b = bench.reindex_like(s).dropna()
-        idx = s.index.intersection(b.index)
-        s = s.loc[idx]
-        b = b.loc[idx]
-        if len(s) < MA_WEEKS + 5:
-            return ""
-
-        ma = s.rolling(MA_WEEKS).mean()
-
-        rs = (s / b).dropna()
-        rs_ma = rs.rolling(RS_MA_WEEKS).mean()
-
-        fig = plt.figure(figsize=(FIG_W, FIG_H), dpi=DPI)
-        ax1 = fig.add_subplot(2,1,1)
-        ax1.plot(s.index, s.values, label=f"{ticker} (Price)")
-        ax1.plot(ma.index, ma.values, label=f"MA{MA_WEEKS}")
-        ax1.set_title(f"{ticker}: Price vs MA{MA_WEEKS}")
-        ax1.grid(True, alpha=0.2)
-        ax1.legend(loc="best", fontsize=8)
-
-        ax2 = fig.add_subplot(2,1,2)
-        ax2.plot(rs.index, rs.values, label="RS (Price/Benchmark)")
-        if len(rs_ma.dropna()) > 0:
-            ax2.plot(rs_ma.index, rs_ma.values, label=f"RS MA{RS_MA_WEEKS}")
-        ax2.set_title("Relative Strength vs Benchmark")
-        ax2.grid(True, alpha=0.2)
-        ax2.legend(loc="best", fontsize=8)
-
-        plt.tight_layout()
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight")
-        plt.close(fig)
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-        if out_path:
-            with open(out_path, "wb") as f:
-                f.write(buf.getvalue())
-
-        return b64
-    except Exception:
-        return ""
-
-def select_top_for_charts(df: pd.DataFrame, max_n=MAX_CHARTS):
-    """
-    Prefer Stage 2 tickers by highest dist above MA; if fewer than max_n, fill with Stage 1.
-    Returns list of tickers.
-    """
-    stage2 = df[df["stage"]=="Stage 2 (Uptrend)"].sort_values("dist_ma_pct", ascending=False)["ticker"].tolist()
-    if len(stage2) >= max_n:
-        return stage2[:max_n]
-    stage1 = df[df["stage"]=="Stage 1 (Basing)"].sort_values("dist_ma_pct", ascending=False)["ticker"].tolist()
-    chosen = stage2 + [t for t in stage1 if t not in stage2]
-    return chosen[:max_n]
-
+# ---------- Main ----------
 def main():
     cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume = load_config()
 
@@ -431,7 +378,6 @@ def main():
         print("No tickers resolved from config.yaml (check universe.mode/custom/extra).")
         sys.exit(1)
 
-    # Ensure output dir
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Universe size: {len(tickers)} tickers (benchmark: {benchmark})")
@@ -448,46 +394,38 @@ def main():
         min_avg_volume=min_avg_volume,
     )
 
-    # Build small charts for top names
-    top_tickers = select_top_for_charts(report_df, MAX_CHARTS)
-    chart_pairs = []
-    bench = close_w[benchmark].dropna()
+    # Add tiny charts for top candidates (keeps email weight down)
+    report_with_charts = attach_tiny_charts(report_df, close_w, benchmark, top_n=TOP_N_CHARTS)
 
-    charts_dir = os.path.join(output_dir, "charts")
-    os.makedirs(charts_dir, exist_ok=True)
-
-    for t in top_tickers:
-        if t not in close_w.columns:
-            continue
-        series = close_w[t].dropna()
-        if series.empty:
-            continue
-        png_path = os.path.join(charts_dir, f"{t}_weekly.png")
-        b64 = _plot_small_chart(t, series, bench, out_path=png_path)
-        if b64:
-            chart_pairs.append((t, b64))
+    # Summary counts
+    buy_count = int((report_df["buy_signal"] == "BUY").sum())
+    watch_count = int((report_df["buy_signal"] == "WATCH").sum())
+    avoid_count = int((report_df["buy_signal"] == "AVOID").sum())
+    total = int(len(report_df))
+    summary_line = f"<strong>Summary:</strong> ✅ Buy: {buy_count} &nbsp; | &nbsp; 🟡 Watch: {watch_count} &nbsp; | &nbsp; 🔴 Avoid: {avoid_count} &nbsp; (Total: {total})"
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     csv_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.csv")
     html_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.html")
 
+    # Save CSV (plain text buy_signal)
     report_df.to_csv(csv_path, index=False)
-    html = df_to_html(report_df, title=f"Weinstein Weekly — Benchmark: {benchmark}", chart_imgs=chart_pairs)
+
+    # Build HTML with badges + charts + summary
+    html = df_to_html(report_with_charts, title=f"Weinstein Weekly — Benchmark: {benchmark}", summary_line=summary_line)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
     # Email it
     subject = f"Weinstein Weekly Report — {datetime.now().strftime('%b %d, %Y')}"
-    top_lines = report_df.head(12).to_string(index=False)
+    top_lines = report_df[["ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
     body_text = (
-        f"Weinstein Weekly Report generated.\n\nFiles:\n"
-        f"- {csv_path}\n- {html_path}\n\nTop lines:\n{top_lines}\n"
+        f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total})\n\n"
+        f"Files:\n- {csv_path}\n- {html_path}\n\nTop lines:\n{top_lines}\n"
     )
     send_email(subject=subject, html_body=html, text_body=body_text, cfg_path="config.yaml")
 
     print(f"Saved:\n - {csv_path}\n - {html_path}")
-    if chart_pairs:
-        print(f"Saved {len(chart_pairs)} charts under: {charts_dir}")
     print("Done.")
 
 if __name__ == "__main__":
