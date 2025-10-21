@@ -11,17 +11,17 @@ sheets:
 notifications:
   email:
     enabled: true
-    sender: "you@example.com"
+    sender: "luiscarlosht@gmail.com"
     recipients:
-      - "you@example.com"
-      - "wife@example.com"
+      - "luiscarloshernandez@gmail.com"
+      - "luiscarlosht@gmail.com"
     subject_prefix: "Weinstein Report READY"
     provider: "smtp"
     smtp:
       host: "smtp.mail.me.com"
       port_ssl: 587
-      username: "you@example.com"
-      app_password: "APP_SPECIFIC_PASSWORD"
+      username: "luiscarlosht@gmail.com"
+      app_password: "qnamoxtmakhnvlml"
 reporting:
   output_dir: "/opt/weinstein/output"
   include_pdf: true
