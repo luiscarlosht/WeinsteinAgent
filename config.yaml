@@ -13,7 +13,7 @@ notifications:
     enabled: true
     sender: "luiscarlosht@gmail.com"
     recipients:
-      - "luiscarloshernandez@gmail.com"
+      - "luiscarloshernandez@hotmail.com"
       - "luiscarlosht@gmail.com"
     subject_prefix: "Weinstein Report READY"
     provider: "smtp"
