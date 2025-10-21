@@ -7,6 +7,13 @@ import pandas as pd
 
 WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
+# Send a desktop browser UA so Wikipedia doesn't block with 403
+WIKI_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/119.0.0.0 Safari/537.36"
+)
+
 # Some tickers need mapping for Yahoo-style symbols (e.g., BRK.B -> BRK-B)
 YF_REPLACEMENTS = {
     r"\.": "-",   # any dot -> dash (covers BRK.B, BF.B etc)
@@ -21,13 +28,19 @@ def _to_yahoo_symbol(t: str) -> str:
 def load_sp500_from_wikipedia(max_retries: int = 3, sleep_secs: float = 1.0) -> list[str]:
     """
     Scrapes the S&P 500 constituents table from Wikipedia and returns
-    Yahoo-compatible tickers.
+    Yahoo-compatible tickers. Adds a real browser User-Agent to avoid 403.
+    Retries a few times with short sleep between attempts.
     """
     last_err = None
     for _ in range(max_retries):
         try:
-            with urllib.request.urlopen(WIKI_SP500_URL, timeout=20) as resp:
+            req = urllib.request.Request(
+                WIKI_SP500_URL,
+                headers={"User-Agent": WIKI_USER_AGENT}
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 html = resp.read().decode("utf-8", errors="ignore")
+
             dfs = pd.read_html(io.StringIO(html))
             # Find the table with 'Symbol' column
             table = None
@@ -38,8 +51,11 @@ def load_sp500_from_wikipedia(max_retries: int = 3, sleep_secs: float = 1.0) -> 
                     break
             if table is None:
                 raise RuntimeError("Could not find S&P 500 table with a 'Symbol' column.")
+
+            # First column is typically Symbol
             syms = table.iloc[:, 0].astype(str).tolist()
             syms = [_to_yahoo_symbol(t) for t in syms if isinstance(t, str) and t.strip()]
+
             # Dedup while preserving order
             seen = set()
             uniq = []
@@ -48,9 +64,11 @@ def load_sp500_from_wikipedia(max_retries: int = 3, sleep_secs: float = 1.0) -> 
                     seen.add(s)
                     uniq.append(s)
             return uniq
+
         except Exception as e:
             last_err = e
             time.sleep(sleep_secs)
+
     raise RuntimeError(f"Failed to load S&P 500 from Wikipedia: {last_err}")
 
 def combine_universe(sp500: bool, extra_symbols: list[str] | None) -> list[str]:
