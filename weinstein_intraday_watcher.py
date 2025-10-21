@@ -7,7 +7,7 @@ import pandas as pd
 import yfinance as yf
 
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")  # headless for servers
 import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
@@ -21,8 +21,14 @@ INTRADAY_INTERVAL = "60m"   # '60m' or '30m'
 LOOKBACK_DAYS = 60          # intraday history window
 PIVOT_LOOKBACK_WEEKS = 10   # breakout pivot high window (weekly proxy)
 VOL_PACE_MIN = 1.30         # today's volume pace vs 50-DMA
-BUY_DIST_ABOVE_MA_MIN = 0.00  # >= 0% above 30-wk MA proxy
+BUY_DIST_ABOVE_MA_MIN = 0.00  # >= 0% above 30-wk MA proxy (SMA150)
 CONFIRM_BARS = 2            # require last N bars >= pivot & >= MA proxy
+
+# NEW: breakout quality guards
+MIN_BREAKOUT_PCT = 0.005    # +0.5% above pivot, to avoid micro fakeouts
+REQUIRE_RISING_BAR_VOL = True
+INTRADAY_AVG_VOL_WINDOW = 20  # compare last bar vs intraday 20-bar avg
+INTRADAY_LASTBAR_AVG_MULT = 1.20  # last bar volume must be >= 1.2x avg
 
 HARD_STOP_PCT = 0.08        # 8% default hard stop for tracked positions
 TRAIL_ATR_MULT = 2.0        # ATR(14d) trailing stop multiplier
@@ -150,6 +156,28 @@ def get_last_n_intraday_closes(intraday_df, ticker, n=2):
         s = intraday_df["Close"].dropna()
     return list(map(float, s.tail(n).values))
 
+def get_last_n_intraday_volumes(intraday_df, ticker, n=2):
+    if isinstance(intraday_df.columns, pd.MultiIndex):
+        try:
+            v = intraday_df[("Volume", ticker)].dropna()
+        except KeyError:
+            return []
+    else:
+        v = intraday_df["Volume"].dropna()
+    return list(map(float, v.tail(n).values))
+
+def get_intraday_avg_volume(intraday_df, ticker, window=20):
+    if isinstance(intraday_df.columns, pd.MultiIndex):
+        try:
+            v = intraday_df[("Volume", ticker)].dropna()
+        except KeyError:
+            return np.nan
+    else:
+        v = intraday_df["Volume"].dropna()
+    if len(v) < window:
+        return np.nan
+    return float(v.tail(window).mean())
+
 # -------- Charting --------
 def make_tiny_chart_png(ticker, benchmark, daily_df):
     """
@@ -164,7 +192,6 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
         except KeyError:
             return None, None
     else:
-        # single symbol case unlikely here
         return None, None
 
     close_t = close_t.tail(PRICE_WINDOW_DAYS)
@@ -193,10 +220,9 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
     ax1.set_title(f"{ticker} — Price, SMA{SMA_DAYS}, RS/{benchmark}", fontsize=9)
     ax1.grid(alpha=0.2)
 
-    # Compose small legend
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    lgd = ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left", frameon=False)
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left", frameon=False)
 
     chart_path = os.path.join(CHART_DIR, f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
     fig.tight_layout(pad=0.8)
@@ -248,22 +274,39 @@ def run():
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
 
-        # Two-bar confirmation: last N intraday closes >= pivot AND >= MA proxy
+        # Two-bar confirmation: last N intraday closes >= pivot*(1+MIN_BREAKOUT_PCT) AND >= MA proxy
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
         ma_ok = (pd.notna(ma30))
-        if ma_ok and closes_n and pd.notna(pivot):
-            confirm = all((c >= pivot) and (c >= ma30*(1 + BUY_DIST_ABOVE_MA_MIN)) for c in closes_n[-CONFIRM_BARS:])
+        pivot_ok = pd.notna(pivot)
+        if ma_ok and pivot_ok and closes_n:
+            confirm = all(
+                (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and
+                (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
+                for c in closes_n[-CONFIRM_BARS:]
+            )
         else:
             confirm = False
 
-        rs_ok = rs_above  # use weekly CSV RS flag (weekly truth)
+        # Volume confirmation on the *last bar*: rising vs previous bar AND ≥ 1.2x intraday avg(20)
+        vol_ok = True
+        if REQUIRE_RISING_BAR_VOL:
+            vols2 = get_last_n_intraday_volumes(intraday, t, n=2)
+            vavg = get_intraday_avg_volume(intraday, t, window=INTRADAY_AVG_VOL_WINDOW)
+            if len(vols2) >= 2 and pd.notna(vavg) and vavg > 0:
+                vol_ok = (vols2[-1] > vols2[-2]) and (vols2[-1] >= INTRADAY_LASTBAR_AVG_MULT * vavg)
+            else:
+                vol_ok = False  # if we can't verify, play it safe
 
-        # BUY: weekly Stage1/2, two-bar confirm above pivot & MA, RS ok, volume pace supportive (if available)
+        rs_ok = rs_above  # weekly RS condition
+
+        # BUY: weekly Stage1/2, two-bar confirm above pivot & MA (with +0.5% headroom), RS ok,
+        #      volume pace supportive AND last bar rising/strong
         if (
             stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
             and confirm
             and rs_ok
             and (pd.isna(pace) or pace >= VOL_PACE_MIN)
+            and vol_ok
         ):
             buy_signals.append({
                 "ticker": t,
@@ -309,7 +352,8 @@ def run():
             "ma30": ma30,
             "pivot10w": pivot,
             "vol_pace_vs50dma": None if pd.isna(pace) else round(float(pace), 2),
-            "two_bar_confirm": confirm
+            "two_bar_confirm": confirm,
+            "last_bar_vol_ok": vol_ok
         })
 
     # --- Build Email ---
@@ -345,7 +389,7 @@ def run():
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     html = f"""
     <h3>Weinstein Intraday Watch — {now}</h3>
-    <p><i>Rules: weekly Stage1/2 + two-bar confirm over ~10-week pivot & 30-wk MA proxy (SMA150), RS support, and volume pace ≥ {VOL_PACE_MIN}× 50-DMA.</i></p>
+    <p><i>Rules: weekly Stage1/2 + two-bar confirm over ~10-week pivot & 30-wk MA proxy (SMA150), +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×, and last bar volume rising & ≥ {INTRADAY_LASTBAR_AVG_MULT:.1f}× {INTRADAY_AVG_VOL_WINDOW}-bar intraday avg.</i></p>
     <h4>Buy Triggers</h4>
     {bullets(buy_signals, "BUY")}
     {charts_html}
@@ -364,7 +408,7 @@ def run():
         text += f"- {s['ticker']} @ {s['price']:.2f} — {s['reasons']} ({s['stage']})\n"
 
     send_email(
-        subject=f"Intraday Watch — {len(buy_signals)} BUY / {len(sell_signals)} SELL",
+        subject=f"Intraday Watch — {len(buy_signals)} BUY / {len(sell_signals)} SELL (2-bar + vol)",
         html_body=html,
         text_body=text,
         cfg_path="config.yaml"
