@@ -1,4 +1,8 @@
+# === Weinstein Agent Requirements ===
 pandas>=2.0.0
-numpy>=1.24.0
+numpy>=1.25.0
 yfinance>=0.2.40
-PyYAML>=6.0
+matplotlib>=3.9.0
+pyyaml>=6.0.0
+lxml>=4.9.0
+requests>=2.31.0
