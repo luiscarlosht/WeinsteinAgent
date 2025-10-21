@@ -254,6 +254,10 @@ def build_report_df(close_w: pd.DataFrame,
     }
     df["stage_rank"] = df["stage"].map(stage_rank).fillna(9)
     df = df.sort_values(by=["stage_rank", "dist_ma_pct"], ascending=[True, False]).reset_index(drop=True)
+
+    # Add Rank column (1 = most actionable)
+    df.insert(0, "rank", range(1, len(df) + 1))
+
     return df.drop(columns=["stage_rank"])
 
 # ---------- Tiny inline charts ----------
@@ -299,7 +303,7 @@ def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
 
 def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, top_n: int = TOP_N_CHARTS) -> pd.DataFrame:
     """
-    Add an 'chart' HTML column for top N rows (others blank) to keep email light.
+    Add a 'chart' HTML column for top N rows (others blank) to keep email light.
     """
     out = df.copy()
     out["chart"] = ""
@@ -331,12 +335,14 @@ def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     else:
         styled["Buy Signal"] = styled.get("buy_signal", "")
 
-    # If chart column exists, bring it up front
-    columns_order = ["ticker", "Buy Signal", "stage", "price", "ma30", "dist_ma_pct",
-                     "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
+    # Column order with Rank and (optional) chart up front
+    base_cols = ["rank", "ticker", "Buy Signal", "stage", "price", "ma30", "dist_ma_pct",
+                 "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
     if "chart" in styled.columns:
-        columns_order = ["ticker", "Buy Signal", "chart", "stage", "price", "ma30", "dist_ma_pct",
+        columns_order = ["rank", "ticker", "Buy Signal", "chart", "stage", "price", "ma30", "dist_ma_pct",
                          "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
+    else:
+        columns_order = base_cols
 
     for c in columns_order:
         if c not in styled.columns:
@@ -408,17 +414,21 @@ def main():
     csv_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.csv")
     html_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.html")
 
-    # Save CSV (plain text buy_signal)
+    # Save CSV (plain text buy_signal) — includes Rank column
     report_df.to_csv(csv_path, index=False)
 
-    # Build HTML with badges + charts + summary
-    html = df_to_html(report_with_charts, title=f"Weinstein Weekly — Benchmark: {benchmark}", summary_line=summary_line)
+    # Build HTML with badges + charts + summary; title clarifies recommendation order
+    html = df_to_html(
+        report_with_charts,
+        title=f"Weinstein Weekly — Recommendation Order (Benchmark: {benchmark})",
+        summary_line=summary_line
+    )
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
     # Email it
     subject = f"Weinstein Weekly Report — {datetime.now().strftime('%b %d, %Y')}"
-    top_lines = report_df[["ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
+    top_lines = report_df[["rank", "ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
     body_text = (
         f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total})\n\n"
         f"Files:\n- {csv_path}\n- {html_path}\n\nTop lines:\n{top_lines}\n"
