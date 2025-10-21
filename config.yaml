@@ -28,7 +28,10 @@ reporting:
   include_csv: true
   summary_lines: 10
 universe:
-  tickers: ["NVDA", "ANET", "PANW", "CRWD", "RTX", "VUG", "SOXX"]
+  mode: "sp500"         # options: sp500 | custom
+  extra: ["NVDA", "ANET", "PANW", "CRWD", "RTX", "VUG", "SOXX"]  # optional add-ons
+  min_price: 5          # optional hygiene filters used later
+  min_avg_volume: 1000000
 risk:
   max_position_pct: 10
   tranche_plan: [30, 30, 20, 20]
