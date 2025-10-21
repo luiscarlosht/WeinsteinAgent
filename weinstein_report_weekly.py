@@ -17,23 +17,21 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# --------- Tunables (sensible defaults, override in config.yaml) ----------
+# NEW: Google Sheets recommendations
+from sheets_bridge import load_recommendation_universe
+
+# --------- Tunables ----------
 DEFAULT_BENCHMARK = "SPY"
-WEEKS_LOOKBACK = 180   # ~3.5 years of weekly bars
+WEEKS_LOOKBACK = 180
 MA_WEEKS = 30
-SLOPE_WINDOW = 5       # weeks used to measure MA slope
-NEAR_MA_BAND = 0.05    # within ±5% of MA == "near/flat"
+SLOPE_WINDOW = 5
+NEAR_MA_BAND = 0.05
 RS_MA_WEEKS = 30
 OUTPUT_DIR_FALLBACK = "./output"
-TOP_N_CHARTS = 20      # tiny charts for the top N candidates
+TOP_N_CHARTS = 20
 
-# --------- Utilities ---------
+# --------- Utilities ----------
 def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
-    """
-    From a yfinance download DataFrame, extract a single field (e.g., 'Close'/'Volume')
-    and return a 2D DataFrame with columns = tickers found.
-    Handles both MultiIndex (many tickers) and single-index (one ticker) cases.
-    """
     if isinstance(df.columns, pd.MultiIndex):
         out = df[field].copy()
         keep = [t for t in tickers if t in out.columns]
@@ -46,6 +44,14 @@ def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataF
         out.columns = [t0]
         return out
 
+def _merge_lists_preserve_order(*lists):
+    seen, out = set(), []
+    for lst in lists:
+        for x in (lst or []):
+            if x not in seen:
+                seen.add(x); out.append(x)
+    return out
+
 def load_config(path="config.yaml"):
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
@@ -53,36 +59,55 @@ def load_config(path="config.yaml"):
     app = cfg.get("app", {}) or {}
     uni = cfg.get("universe", {}) or {}
     reporting = cfg.get("reporting", {}) or {}
+    sheets = cfg.get("sheets", {}) or {}
 
-    # Universe mode: sp500 | custom
     mode = (uni.get("mode") or "custom").lower()
     use_sp500 = (mode == "sp500")
-    extra = uni.get("extra") or []                 # optional extras when mode=sp500
-    explicit_tickers = uni.get("tickers") or []    # for mode=custom (or legacy list)
+    extra = uni.get("extra") or []
+    explicit_tickers = uni.get("tickers") or []
 
-    # Build final ticker list
+    # Google Sheets options
+    recos_sheet_id = sheets.get("recos_sheet_id")
+    recos_tab = sheets.get("recos_tab", "Recommendations")
+    recos_tabs_alt = sheets.get("recos_tabs_alt")  # e.g. ["Sarkee","SuperiorStar","Weinstein"]
+    creds_json = sheets.get("creds_json", "./creds/gsa-sheets.json")
+
+    # Build base universe (sp500 or custom list from config)
     if use_sp500:
-        tickers = combine_universe(sp500=True, extra_symbols=extra)
+        base = combine_universe(sp500=True, extra_symbols=extra)
     else:
-        tickers = combine_universe(sp500=False, extra_symbols=explicit_tickers)
+        base = combine_universe(sp500=False, extra_symbols=explicit_tickers)
+
+    # Pull tickers from Google Sheet (if configured)
+    sheet_tickers = []
+    if recos_sheet_id and os.path.exists(creds_json):
+        try:
+            sheet_tickers = load_recommendation_universe(
+                sheet_id=recos_sheet_id,
+                creds_json=creds_json,
+                recos_tab=recos_tab,
+                recos_tabs_alt=recos_tabs_alt
+            )
+        except Exception as e:
+            print(f"[WARN] Could not read Google Sheet: {e}")
+
+    # Final tickers = base + sheet
+    tickers = _merge_lists_preserve_order(base, sheet_tickers)
 
     benchmark = app.get("benchmark", DEFAULT_BENCHMARK)
     tz = app.get("timezone", "America/Chicago")
 
     output_dir = reporting.get("output_dir", OUTPUT_DIR_FALLBACK)
-    include_pdf = reporting.get("include_pdf", False)  # (HTML+CSV always saved)
+    include_pdf = reporting.get("include_pdf", False)
 
-    # Optional hygiene filters
     min_price = int(uni.get("min_price", 0))
     min_avg_volume = int(uni.get("min_avg_volume", 0))
 
-    return cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume
+    return (cfg, tickers, benchmark, tz, output_dir, include_pdf,
+            min_price, min_avg_volume, len(sheet_tickers))
 
 def fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
-    """
-    Download weekly OHLCV for all tickers + benchmark. Returns (close_w, volume_w).
-    """
-    uniq = list(dict.fromkeys((tickers or []) + [benchmark]))  # de-dup, preserve order
+    uniq = list(dict.fromkeys((tickers or []) + [benchmark]))
     if not uniq:
         raise ValueError("No symbols to download.")
 
@@ -105,30 +130,22 @@ def fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
     return close, volume
 
 def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
-    """
-    Compute Weinstein metrics for one ticker vs. benchmark series (weekly closes).
-    Returns dict with indicators + stage label.
-    """
     s = closes.dropna().copy()
     b = bench.reindex_like(s).dropna()
 
     idx = s.index.intersection(b.index)
-    s = s.loc[idx]
-    b = b.loc[idx]
+    s = s.loc[idx]; b = b.loc[idx]
 
     if len(s) < MA_WEEKS + SLOPE_WINDOW + 5 or len(b) < RS_MA_WEEKS + 5:
         return {"error": "insufficient_data"}
 
     ma = s.rolling(MA_WEEKS).mean()
-
-    # MA slope over last SLOPE_WINDOW weeks
     ma_slope = ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
     ma_slope_last = ma_slope.iloc[-1]
     ma_last = ma.iloc[-1]
     price_last = s.iloc[-1]
     dist_ma_pct = (price_last - ma_last) / ma_last if ma_last and not math.isclose(ma_last, 0.0) else np.nan
 
-    # Relative Strength line vs. benchmark (price ratio)
     rs = s / b
     rs_ma = rs.rolling(RS_MA_WEEKS).mean()
     rs_slope = rs_ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
@@ -137,7 +154,6 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     rs_above = bool(rs_last > rs_ma_last)
     rs_slope_last = rs_slope.iloc[-1]
 
-    # Flags
     price_above_ma = bool(price_last > ma_last)
     ma_up = bool(ma_slope_last > 0)
     ma_down = bool(ma_slope_last < 0)
@@ -145,12 +161,11 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     rs_up = bool(rs_above and rs_slope_last > 0)
     rs_down = bool((not rs_above) and rs_slope_last < 0)
 
-    # Stage rules (heuristic in Weinstein spirit)
     if price_above_ma and ma_up and rs_up:
         stage = "Stage 2 (Uptrend)"
     elif (not price_above_ma) and ma_down and rs_down:
         stage = "Stage 4 (Downtrend)"
-    elif near_ma and abs(ma_slope_last) < (abs(ma_last) * 0.0005):  # flat-ish MA
+    elif near_ma and abs(ma_slope_last) < (abs(ma_last) * 0.0005):
         stage = "Stage 1 (Basing)"
     else:
         stage = "Stage 3 (Topping)"
@@ -179,12 +194,6 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     }
 
 def classify_buy_signal(stage: str) -> tuple[str, str]:
-    """
-    Returns (text_label, html_badge)
-      Stage 2 -> Buy
-      Stage 1 -> Watch
-      Else    -> Avoid
-    """
     stage = stage or ""
     if stage.startswith("Stage 2"):
         return ("BUY", '<span class="badge buy">Buy</span>')
@@ -200,14 +209,10 @@ def build_report_df(close_w: pd.DataFrame,
                     benchmark: str,
                     min_price: int = 0,
                     min_avg_volume: int = 0):
-    """
-    Build final report DataFrame. Applies optional hygiene filters using last close and 10w avg volume.
-    """
     if benchmark not in close_w.columns:
         raise KeyError(f"Benchmark '{benchmark}' not found in downloaded data.")
     bench = close_w[benchmark].dropna()
 
-    # Hygiene metrics (10-week avg volume, last close)
     last_close = close_w.ffill().iloc[-1]
     avg_vol_10w = volume_w.rolling(10).mean().ffill().iloc[-1]
 
@@ -229,7 +234,6 @@ def build_report_df(close_w: pd.DataFrame,
 
     df = pd.DataFrame(rows)
 
-    # Ensure expected columns exist
     cols = [
         "ticker", "stage", "price", "ma30", "dist_ma_pct", "ma_slope_per_wk",
         "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"
@@ -239,11 +243,9 @@ def build_report_df(close_w: pd.DataFrame,
             df[c] = np.nan
     df = df[cols]
 
-    # Buy Signal columns (plain + HTML badge)
     df["buy_signal"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[0])
     df["buy_signal_html"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[1])
 
-    # Sort: Stage 2 (Buy) first, then Stage 1 (Watch), then by distance above MA
     stage_rank = {
         "Stage 2 (Uptrend)": 0,
         "Stage 1 (Basing)": 1,
@@ -254,10 +256,6 @@ def build_report_df(close_w: pd.DataFrame,
     }
     df["stage_rank"] = df["stage"].map(stage_rank).fillna(9)
     df = df.sort_values(by=["stage_rank", "dist_ma_pct"], ascending=[True, False]).reset_index(drop=True)
-
-    # Add Rank column (1 = most actionable)
-    df.insert(0, "rank", range(1, len(df) + 1))
-
     return df.drop(columns=["stage_rank"])
 
 # ---------- Tiny inline charts ----------
@@ -265,46 +263,32 @@ def _fig_to_base64(fig) -> str:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
     plt.close(fig)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    import base64 as _b
+    b64 = _b.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
 def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
-    """
-    Price vs 30-wk MA + RS line (separate axis) as a small image, returned as <img src="...">
-    """
-    # Align
     s = series_price.dropna()
     b = benchmark.reindex_like(s).dropna()
     idx = s.index.intersection(b.index)
     if len(idx) < MA_WEEKS + 5:
         return ""
-    s = s.loc[idx]
-    b = b.loc[idx]
-
+    s = s.loc[idx]; b = b.loc[idx]
     ma = s.rolling(MA_WEEKS).mean()
     rs = (s / b).rolling(RS_MA_WEEKS).mean()
 
     fig, ax1 = plt.subplots(figsize=(3.0, 1.4))
     ax1.plot(s.index, s.values, linewidth=1.2)
     ax1.plot(ma.index, ma.values, linewidth=1.0)
-    ax1.set_xticks([])
-    ax1.set_yticks([])
-    ax1.grid(False)
-    # Secondary for RS
+    ax1.set_xticks([]); ax1.set_yticks([]); ax1.grid(False)
     ax2 = ax1.twinx()
     ax2.plot(rs.index, rs.values, linewidth=0.8)
-    ax2.set_xticks([])
-    ax2.set_yticks([])
+    ax2.set_xticks([]); ax2.set_yticks([])
     for spine in (*ax1.spines.values(), *ax2.spines.values()):
         spine.set_visible(False)
-
-    img_src = _fig_to_base64(fig)
-    return f'<img src="{img_src}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
+    return f'<img src="{_fig_to_base64(fig)}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
 
 def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, top_n: int = TOP_N_CHARTS) -> pd.DataFrame:
-    """
-    Add a 'chart' HTML column for top N rows (others blank) to keep email light.
-    """
     out = df.copy()
     out["chart"] = ""
     bench_series = close_w[benchmark].dropna()
@@ -317,39 +301,29 @@ def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, 
                 out.at[i, "chart"] = ""
     return out
 
-# ---------- HTML / Email ----------
+# ---------- HTML ----------
 def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     styled = df.copy()
-
-    # Pretty percentages
     for c in ["dist_ma_pct", "ma_slope_per_wk", "rs_slope_per_wk"]:
         if c in styled.columns:
             styled[c] = styled[c].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "")
-
     if "rs_above_ma" in styled.columns:
         styled["rs_above_ma"] = styled["rs_above_ma"].map({True: "Yes", False: "No"})
-
-    # Use HTML badge for buy signal
     if "buy_signal_html" in styled.columns:
         styled["Buy Signal"] = styled["buy_signal_html"]
     else:
         styled["Buy Signal"] = styled.get("buy_signal", "")
 
-    # Column order with Rank and (optional) chart up front
-    base_cols = ["rank", "ticker", "Buy Signal", "stage", "price", "ma30", "dist_ma_pct",
-                 "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
+    columns_order = ["ticker", "Buy Signal", "stage", "price", "ma30", "dist_ma_pct",
+                     "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
     if "chart" in styled.columns:
-        columns_order = ["rank", "ticker", "Buy Signal", "chart", "stage", "price", "ma30", "dist_ma_pct",
+        columns_order = ["ticker", "Buy Signal", "chart", "stage", "price", "ma30", "dist_ma_pct",
                          "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
-    else:
-        columns_order = base_cols
-
     for c in columns_order:
         if c not in styled.columns:
             styled[c] = ""
     styled = styled[columns_order]
 
-    # Render HTML table
     table_html = styled.to_html(index=False, border=0, justify="center", escape=False)
     css = """
     <style>
@@ -368,25 +342,25 @@ def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     </style>
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html = f"""{css}
+    return f"""{css}
     <h2>{title}</h2>
     <div class="sub">Generated {now}</div>
     <div class="summary">{summary_line}</div>
     {table_html}
     """
-    return html
 
 # ---------- Main ----------
 def main():
-    cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume = load_config()
+    (cfg, tickers, benchmark, tz, output_dir, include_pdf,
+     min_price, min_avg_volume, sheet_adds) = load_config()
 
     if not tickers:
-        print("No tickers resolved from config.yaml (check universe.mode/custom/extra).")
+        print("No tickers resolved from config.yaml (check universe & sheets settings).")
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"Universe size: {len(tickers)} tickers (benchmark: {benchmark})")
+    print(f"Universe size: {len(tickers)} tickers (benchmark: {benchmark}) [+{sheet_adds} from Google Sheet]")
     print("Downloading weekly data…")
     close_w, volume_w = fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK)
 
@@ -400,37 +374,29 @@ def main():
         min_avg_volume=min_avg_volume,
     )
 
-    # Add tiny charts for top candidates (keeps email weight down)
     report_with_charts = attach_tiny_charts(report_df, close_w, benchmark, top_n=TOP_N_CHARTS)
 
-    # Summary counts
     buy_count = int((report_df["buy_signal"] == "BUY").sum())
     watch_count = int((report_df["buy_signal"] == "WATCH").sum())
     avoid_count = int((report_df["buy_signal"] == "AVOID").sum())
     total = int(len(report_df))
-    summary_line = f"<strong>Summary:</strong> ✅ Buy: {buy_count} &nbsp; | &nbsp; 🟡 Watch: {watch_count} &nbsp; | &nbsp; 🔴 Avoid: {avoid_count} &nbsp; (Total: {total})"
+    summary_line = (f"<strong>Summary:</strong> ✅ Buy: {buy_count} &nbsp; | &nbsp; "
+                    f"🟡 Watch: {watch_count} &nbsp; | &nbsp; 🔴 Avoid: {avoid_count} "
+                    f"&nbsp; (Total: {total}, +{sheet_adds} from Google Sheet)")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     csv_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.csv")
     html_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.html")
 
-    # Save CSV (plain text buy_signal) — includes Rank column
     report_df.to_csv(csv_path, index=False)
-
-    # Build HTML with badges + charts + summary; title clarifies recommendation order
-    html = df_to_html(
-        report_with_charts,
-        title=f"Weinstein Weekly — Recommendation Order (Benchmark: {benchmark})",
-        summary_line=summary_line
-    )
+    html = df_to_html(report_with_charts, title=f"Weinstein Weekly — Benchmark: {benchmark}", summary_line=summary_line)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    # Email it
     subject = f"Weinstein Weekly Report — {datetime.now().strftime('%b %d, %Y')}"
-    top_lines = report_df[["rank", "ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
+    top_lines = report_df[["ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
     body_text = (
-        f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total})\n\n"
+        f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total}, +{sheet_adds} from Sheet)\n\n"
         f"Files:\n- {csv_path}\n- {html_path}\n\nTop lines:\n{top_lines}\n"
     )
     send_email(subject=subject, html_body=html, text_body=body_text, cfg_path="config.yaml")
