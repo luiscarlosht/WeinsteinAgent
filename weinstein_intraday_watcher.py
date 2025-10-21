@@ -64,6 +64,11 @@ def newest_weekly_csv():
 def load_weekly_report():
     path = newest_weekly_csv()
     df = pd.read_csv(path)
+    # normalize column names (some pandas versions may lowercase)
+    cols = {c.lower(): c for c in df.columns}
+    # Ensure 'ticker' and 'stage' exist
+    def getcol(name):
+        return cols.get(name, name) if name in cols else name
     return df, path
 
 def load_positions():
@@ -231,13 +236,77 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
         b64 = base64.b64encode(f.read()).decode("ascii")
     return chart_path, f"data:image/png;base64,{b64}"
 
+# ---------------- Ranking helpers ----------------
+def stage_order(stage: str) -> int:
+    # Stage 2 first (0), then Stage 1 (1), others later
+    if isinstance(stage, str):
+        if stage.startswith("Stage 2"):
+            return 0
+        if stage.startswith("Stage 1"):
+            return 1
+    return 9
+
+def buy_sort_key(item):
+    """
+    Sort BUY by:
+    weekly_rank asc, stage_order asc, volume pace desc, px/pivot desc, px/ma desc
+    """
+    wr = int(item.get("weekly_rank", 999999)) if pd.notna(item.get("weekly_rank", np.nan)) else 999999
+    st = stage_order(item.get("stage", ""))
+    pace = item.get("pace", np.nan)
+    pace = pace if pd.notna(pace) else -1e9
+    px = item.get("price", np.nan)
+    pivot = item.get("pivot", np.nan)
+    ma = item.get("ma30", np.nan)
+    ratio_pivot = (px / pivot) if (pd.notna(px) and pd.notna(pivot) and pivot != 0) else -1e9
+    ratio_ma = (px / ma) if (pd.notna(px) and pd.notna(ma) and ma != 0) else -1e9
+    return (wr, st, -pace, -ratio_pivot, -ratio_ma)
+
+def near_sort_key(item):
+    """
+    Sort NEAR by:
+    weekly_rank asc, stage_order asc, |px - pivot| asc (closer better), volume pace desc
+    """
+    wr = int(item.get("weekly_rank", 999999)) if pd.notna(item.get("weekly_rank", np.nan)) else 999999
+    st = stage_order(item.get("stage", ""))
+    px = item.get("price", np.nan)
+    pivot = item.get("pivot", np.nan)
+    dist = abs(px - pivot) if (pd.notna(px) and pd.notna(pivot)) else 1e9
+    pace = item.get("pace", np.nan)
+    pace = pace if pd.notna(pace) else -1e9
+    return (wr, st, dist, -pace)
+
 # ---------------- Logic ----------------
 def run():
     cfg, benchmark = load_config()
     weekly_df, weekly_csv_path = load_weekly_report()
 
-    # Focus: Stage 1 + Stage 2 from weekly report
-    focus = weekly_df[weekly_df["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])].copy()
+    # Pull & normalize the columns we need from weekly
+    # Expect columns: ticker, stage, ma30, rs_above_ma, rank (from weekly report)
+    # Normalize in case casing differs
+    wcols = {c.lower(): c for c in weekly_df.columns}
+    col_ticker = wcols.get("ticker", "ticker")
+    col_stage  = wcols.get("stage", "stage")
+    col_ma30   = wcols.get("ma30", "ma30")
+    col_rs_abv = wcols.get("rs_above_ma", "rs_above_ma")
+    col_rank   = wcols.get("rank", "rank") if "rank" in wcols else None
+
+    focus = weekly_df[
+        weekly_df[col_stage].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])
+    ][[col_ticker, col_stage, col_ma30, col_rs_abv] + ([col_rank] if col_rank else [])].copy()
+
+    focus.rename(columns={
+        col_ticker: "ticker",
+        col_stage: "stage",
+        col_ma30: "ma30",
+        col_rs_abv: "rs_above_ma",
+        (col_rank if col_rank else "rank"): "weekly_rank"
+    }, inplace=True)
+
+    # Safety: if no weekly_rank, fill with large numbers to de-prioritize uniformly
+    if "weekly_rank" not in focus.columns:
+        focus["weekly_rank"] = 999999
+
     tickers = sorted(set(focus["ticker"].tolist() + [benchmark]))
 
     intraday, daily = get_intraday(tickers)
@@ -252,7 +321,7 @@ def run():
     held = state.get("positions", {})
 
     buy_signals = []
-    near_signals = []  # NEW
+    near_signals = []
     sell_signals = []
     info_rows = []
     chart_imgs = []
@@ -263,13 +332,14 @@ def run():
             continue
 
         # Last price
-        px = float(last_closes.get(t, np.nan)) if t in last_closes.index else np.nan
+        px = float(last_closes.get(t, np.nan)) if (hasattr(last_closes, "index") and t in last_closes.index) else (float(last_closes.values[-1]) if len(last_closes.values) else np.nan)
         if np.isnan(px):
             continue
 
-        stage = row["stage"]
+        stage = str(row["stage"])
         ma30 = float(row.get("ma30", np.nan))
         rs_above = bool(row.get("rs_above_ma", False))
+        weekly_rank = float(row.get("weekly_rank", np.nan))
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
 
@@ -306,34 +376,31 @@ def run():
             and (pd.isna(pace) or pace >= VOL_PACE_MIN)
             and vol_ok
         ):
-            buy_signals.append({
+            item = {
                 "ticker": t,
                 "price": px,
                 "pivot": pivot,
                 "pace": None if pd.isna(pace) else float(pace),
-                "stage": stage
-            })
-            if len(chart_imgs) < MAX_CHARTS_PER_EMAIL:
-                _, data_uri = make_tiny_chart_png(t, benchmark, daily)
-                if data_uri:
-                    chart_imgs.append((t, data_uri))
+                "stage": stage,
+                "ma30": ma30,
+                "weekly_rank": weekly_rank,
+            }
+            buy_signals.append(item)
+
+            # charts for top candidates only (we'll sort first, then attach)
         else:
             # ---- NEAR-TRIGGER logic (early heads-up) ----
-            # Eligible if Stage1/2 + RS ok + pivot known
-            # Case A: last close is within 0.3% below pivot (near) and above MA
-            # Case B: last close >= pivot but < pivot*(1+MIN_BREAKOUT_PCT) OR we have only 1 bar above threshold (not 2 yet)
             if stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)") and rs_ok and pivot_ok and ma_ok and pd.notna(px):
                 near = False
                 above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
                 if above_ma:
-                    # Case A
+                    # within 0.3% below pivot and not yet a full confirm
                     if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (px < pivot * (1.0 + MIN_BREAKOUT_PCT)):
                         near = True
-                    # Case B: first close above (or at) pivot*(1+MIN_BREAKOUT_PCT) but not yet 2-bar confirm
+                    # or first close above pivot*(1+headroom) but lacking 2-bar confirm
                     elif (px >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and not confirm:
                         near = True
 
-                # Volume: not weak for near-alert
                 vol_near_ok = (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN)
 
                 if near and vol_near_ok:
@@ -343,6 +410,8 @@ def run():
                         "pivot": pivot,
                         "pace": None if pd.isna(pace) else float(pace),
                         "stage": stage,
+                        "ma30": ma30,
+                        "weekly_rank": weekly_rank,
                         "reason": "near pivot/confirm"
                     })
 
@@ -350,7 +419,7 @@ def run():
         pos = held.get(t)
         if pos:
             entry = float(pos.get("entry", np.nan))
-            hard_stop = float(pos.get("stop", np.nan)) if pd.notna(pos.get("stop", np.nan)) else entry * (1 - HARD_STOP_PCT)
+            hard_stop = float(pos.get("stop", np.nan)) if pd.notna(pos.get("stop", np.nan)) else (entry * (1 - HARD_STOP_PCT) if pd.notna(entry) else np.nan)
             atr = compute_atr(daily, t, n=14)
             trail = px - TRAIL_ATR_MULT * atr if pd.notna(atr) else None
 
@@ -367,7 +436,8 @@ def run():
                     "ticker": t,
                     "price": px,
                     "reasons": ", ".join(why),
-                    "stage": stage
+                    "stage": stage,
+                    "weekly_rank": weekly_rank
                 })
 
         info_rows.append({
@@ -378,27 +448,63 @@ def run():
             "pivot10w": pivot,
             "vol_pace_vs50dma": None if pd.isna(pace) else round(float(pace), 2),
             "two_bar_confirm": confirm,
-            "last_bar_vol_ok": vol_ok if 'vol_ok' in locals() else None
+            "last_bar_vol_ok": vol_ok if 'vol_ok' in locals() else None,
+            "weekly_rank": weekly_rank
         })
 
+    # -------- Ranking & charts for top-n --------
+    buy_signals.sort(key=buy_sort_key)
+    near_signals.sort(key=near_sort_key)
+
+    # add inline charts for top-ranked buys first, then near (until limit)
+    charts_added = 0
+    chart_imgs = []
+    for item in buy_signals:
+        if charts_added >= MAX_CHARTS_PER_EMAIL:
+            break
+        t = item["ticker"]
+        path, data_uri = make_tiny_chart_png(t, benchmark, daily)
+        if data_uri:
+            chart_imgs.append((t, data_uri))
+            charts_added += 1
+    if charts_added < MAX_CHARTS_PER_EMAIL:
+        for item in near_signals:
+            if charts_added >= MAX_CHARTS_PER_EMAIL:
+                break
+            t = item["ticker"]
+            path, data_uri = make_tiny_chart_png(t, benchmark, daily)
+            if data_uri:
+                chart_imgs.append((t, data_uri))
+                charts_added += 1
+
     # -------- Build Email --------
-    info_df = pd.DataFrame(info_rows).sort_values(["stage","ticker"])
+    info_df = pd.DataFrame(info_rows)
+    # Order snapshot roughly by recommendation: weekly_rank, stage_order, ticker
+    if not info_df.empty:
+        info_df["stage_rank"] = info_df["stage"].apply(stage_order)
+        info_df["weekly_rank"] = pd.to_numeric(info_df["weekly_rank"], errors="coerce").fillna(999999).astype(int)
+        info_df = info_df.sort_values(["weekly_rank", "stage_rank", "ticker"]).drop(columns=["stage_rank"])
 
     def bullets(items, kind):
-        if not items: return f"<p>No {kind} signals.</p>"
+        if not items:
+            return f"<p>No {kind} signals.</p>"
         lis = []
-        for it in items:
-            pace_str = ("—" if it.get("pace") is None else f"{it['pace']:.2f}x")
+        for i, it in enumerate(items, start=1):
+            pace_val = it.get("pace", None)
+            pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+            wr = it.get("weekly_rank", None)
+            wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
             if kind == "SELL":
                 lis.append(
-                    f"<li><b>{it['ticker']}</b> @ {it['price']:.2f} — {it['reasons']} ({it['stage']})</li>"
+                    f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} — {it['reasons']} "
+                    f"({it['stage']}, weekly {wr_str})</li>"
                 )
             else:
                 lis.append(
-                    f"<li><b>{it['ticker']}</b> @ {it['price']:.2f} "
-                    f"(pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']})</li>"
+                    f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} "
+                    f"(pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
                 )
-        return "<ul>" + "\n".join(lis) + "</ul>"
+        return "<ol>" + "\n".join(lis) + "</ol>"
 
     charts_html = ""
     if chart_imgs:
@@ -421,30 +527,37 @@ def run():
       NEAR-TRIGGER: Stage 1/2 + RS ok, price within {NEAR_BELOW_PIVOT_PCT*100:.1f}% below pivot or first close over pivot but not fully confirmed yet,
       volume pace ≥ {NEAR_VOL_PACE_MIN}×.
     </i></p>
-    <h4>Buy Triggers</h4>
+    <h4>Buy Triggers (ranked)</h4>
     {bullets(buy_signals, "BUY")}
-    <h4>Near-Triggers (Heads-up)</h4>
+    <h4>Near-Triggers (ranked)</h4>
     {bullets(near_signals, "NEAR")}
     {charts_html}
     <h4>Sell / Risk Triggers (Tracked Positions)</h4>
     {bullets(sell_signals, "SELL")}
-    <h4>Snapshot</h4>
+    <h4>Snapshot (ordered by weekly rank & stage)</h4>
     {info_df.to_html(index=False)}
     """
 
-    text = f"Weinstein Intraday Watch — {now}\n\nBUY:\n"
-    for b in buy_signals:
-        pace_str = ("—" if b.get("pace") is None else f"{b['pace']:.2f}x")
-        text += f"- {b['ticker']} @ {b['price']:.2f} (pivot {b['pivot']:.2f}, pace {pace_str}, {b['stage']})\n"
+    # Plain-text
+    text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n"
+    for i, b in enumerate(buy_signals, start=1):
+        pace_str = "—" if (b.get("pace") is None or pd.isna(b.get("pace"))) else f"{b['pace']:.2f}x"
+        wr = b.get("weekly_rank", None)
+        wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+        text += f"{i}. {b['ticker']} @ {b['price']:.2f} (pivot {b['pivot']:.2f}, pace {pace_str}, {b['stage']}, weekly {wr_str})\n"
 
-    text += "\nNEAR-TRIGGER:\n"
-    for n in near_signals:
-        pace_str = ("—" if n.get("pace") is None else f"{n['pace']:.2f}x")
-        text += f"- {n['ticker']} @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']})\n"
+    text += "\nNEAR-TRIGGER (ranked):\n"
+    for i, n in enumerate(near_signals, start=1):
+        pace_str = "—" if (n.get("pace") is None or pd.isna(n.get("pace"))) else f"{n['pace']:.2f}x"
+        wr = n.get("weekly_rank", None)
+        wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+        text += f"{i}. {n['ticker']} @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']}, weekly {wr_str})\n"
 
     text += "\nSELL:\n"
-    for s in sell_signals:
-        text += f"- {s['ticker']} @ {s['price']:.2f} — {s['reasons']} ({s['stage']})\n"
+    for i, s in enumerate(sell_signals, start=1):
+        wr = s.get("weekly_rank", None)
+        wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+        text += f"{i}. {s['ticker']} @ {s['price']:.2f} — {s['reasons']} ({s['stage']}, weekly {wr_str})\n"
 
     send_email(
         subject=f"Intraday Watch — {len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_signals)} SELL",
