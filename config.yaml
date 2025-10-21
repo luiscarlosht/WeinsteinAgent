@@ -18,7 +18,7 @@ notifications:
     subject_prefix: "Weinstein Report READY"
     provider: "smtp"
     smtp:
-      host: "smtp.mail.me.com"
+      host: "smtp.gmail.com"
       port_ssl: 587
       username: "luiscarlosht@gmail.com"
       app_password: "qnamoxtmakhnvlml"
