@@ -18,7 +18,7 @@ SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
 SHEET_URL = "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit?usp=drive_link"
 
 # Worksheet name to test
-WORKSHEET_NAME = "Sheet9"
+WORKSHEET_NAME = "Mapping"
 
 
 # ------------------------------------------------------------
