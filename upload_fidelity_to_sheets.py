@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
+"""
+Upload Fidelity CSVs (holdings + transactions) to Google Sheets.
+
+- Sanitizes data for Sheets/JSON (handles NaN/inf/datetimes).
+- Creates tabs if missing.
+- Clears & resizes the tab.
+- Uploads in chunks to avoid large request payloads.
+"""
+
 import os
-import math
 import argparse
 import numpy as np
 import pandas as pd
@@ -56,11 +64,11 @@ def sanitize_for_sheets(df: pd.DataFrame) -> pd.DataFrame:
     # Try to parse date-like columns to datetime (non-destructive if already str)
     for c in df.columns:
         if df[c].dtype == "object":
-            # attempt parse where sensible (errors='ignore' keeps non-dates)
             try:
-                parsed = pd.to_datetime(df[c], errors="ignore")
+                parsed = pd.to_datetime(df[c])  # let it raise if truly not parseable
                 df[c] = parsed
             except Exception:
+                # leave as-is if not parseable as dates
                 pass
 
     # Replace infs
@@ -74,7 +82,7 @@ def sanitize_for_sheets(df: pd.DataFrame) -> pd.DataFrame:
     # For numeric columns, format floats; leave ints as-is
     def format_series(s: pd.Series) -> pd.Series:
         if pd.api.types.is_float_dtype(s):
-            # round to 6 decimals, drop trailing zeros
+            # round to 6 decimals, drop trailing zeros; keep empty for NaN
             return s.round(6).map(lambda x: "" if pd.isna(x) else ("{0:.6f}".format(x)).rstrip("0").rstrip("."))
         elif pd.api.types.is_integer_dtype(s):
             return s.map(lambda x: "" if pd.isna(x) else str(int(x)))
@@ -96,6 +104,7 @@ def clear_and_size(ws, n_rows: int, n_cols: int):
 def chunked_update(ws, values):
     """
     values: list of rows (list-of-lists). We send in chunks to avoid large payloads.
+    Uses the new gspread signature: update(values, range_name=...)
     """
     if not values:
         return
@@ -106,11 +115,11 @@ def chunked_update(ws, values):
         end_row = min(start_row + ROW_CHUNK - 1, total_rows)
         # Compute A1 range for this chunk
         top_left = gspread.utils.rowcol_to_a1(start_row, 1)
-        # Determine width from first row (assume all equal)
         n_cols = len(values[0]) if values else 1
         bottom_right = gspread.utils.rowcol_to_a1(end_row, n_cols)
         rng = f"{top_left}:{bottom_right}"
-        ws.update(rng, values[start_row - 1 : end_row])
+        # NEW SIGNATURE (values first, then range_name)
+        ws.update(values[start_row - 1 : end_row], range_name=rng)
         start_row = end_row + 1
 
 def upload_csv_to_sheet(csv_path: str, worksheet_name: str):
@@ -118,10 +127,10 @@ def upload_csv_to_sheet(csv_path: str, worksheet_name: str):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    # Read CSV (let pandas infer, but keep strings intact where possible)
+    # Read CSV (let pandas infer)
     df = pd.read_csv(csv_path)
 
-    # Sanitize for Sheets
+    # Sanitize for Sheets/JSON
     df_clean = sanitize_for_sheets(df)
 
     # Authorize + open tab
