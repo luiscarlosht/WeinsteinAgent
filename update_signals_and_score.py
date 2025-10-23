@@ -5,24 +5,28 @@ update_signals_and_score.py
 Appends a signal (optional) to the "Signals" tab and recomputes source stats
 by matching signals to fills in the "Transactions" tab.
 
-New:
+Features:
 - --backfill-days: if no fill is found at/after the signal timestamp, claim the
   most recent fill up to N days BEFORE the signal time.
+- Robust parsing of Transactions: tolerant to empty/odd symbol cells like
+  "Palantir Technologies Inc (PLTR)" or "PLTR - Palantir".
+- Clean gspread .update(values, range_name) usage (no deprecation warnings).
 
-Example:
+Examples:
   # Append a PLTR BUY signal and recompute, allowing backfill 5 days
   python3 update_signals_and_score.py \
     --ticker PLTR --source SuperiorStar --direction BUY --price 32.15 \
     --timeframe short --backfill-days 5
 
   # Just recompute reports (no new signal)
-  python3 update_signals_and_score.py --recompute-only
+  python3 update_signals_and_score.py --recompute-only --backfill-days 5
 """
 import argparse
+import re
+import sys
 import datetime as dt
 from datetime import timezone, timedelta
-from typing import List, Dict, Optional, Tuple
-import sys
+from typing import List, Optional
 
 import gspread
 import pandas as pd
@@ -46,7 +50,7 @@ SIGNALS_HEADER = ["TimestampUTC", "Ticker", "Source", "Direction", "Price", "Tim
 # Which transaction column names we try for each field
 CANDIDATES = {
     "timestamp": ["Date/Time", "Date Time", "Trade Date", "Date", "Execution Time", "Timestamp"],
-    "ticker":    ["Symbol", "Ticker", "Security Symbol", "Security", "Description"],
+    "ticker":    ["Symbol", "Ticker", "Security Symbol", "Security", "Description", "Symbol/Description"],
     "action":    ["Action", "Type", "Activity", "Transaction Type"],
     "quantity":  ["Quantity", "Shares", "Qty"],
     "price":     ["Price", "Price ($)", "Fill Price", "Price Per Share"],
@@ -72,12 +76,11 @@ def get_df(ws) -> pd.DataFrame:
         return pd.DataFrame()
     header = rows[0]
     data = rows[1:]
-    # drop completely empty rows
-    data = [r for r in data if any(c.strip() for c in r)]
+    data = [r for r in data if any(c.strip() for c in r)]  # drop empty rows
     return pd.DataFrame(data, columns=header) if data else pd.DataFrame(columns=header)
 
 def write_df(ws, df: pd.DataFrame, start_cell="A1"):
-    # Clear and size
+    # Clear & size
     n_rows = max(len(df) + 1, 2)
     n_cols = max(len(df.columns), 1)
     ws.clear()
@@ -99,21 +102,18 @@ def parse_any_dt(s: str) -> Optional[dt.datetime]:
     if not s or not str(s).strip():
         return None
     s = str(s).strip()
-    # Try pandas first
     try:
         d = pd.to_datetime(s, utc=True, errors="raise")
         if isinstance(d, pd.Series):
             d = d.iloc[0]
-        # if tz-naive, force UTC
         if d.tzinfo is None:
             d = d.tz_localize("UTC")
         return d.to_pydatetime()
     except Exception:
         pass
-    # Fallback manual tries
     fmts = [
-        "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y", "%Y-%m-%d"
+        "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y", "%Y-%m-%d"
     ]
     for f in fmts:
         try:
@@ -133,11 +133,40 @@ def pick_col(df: pd.DataFrame, keys: List[str]) -> Optional[str]:
         for c in cols:
             if c == k:
                 return c
-        # try case-insensitive contains
         for lc, orig in lowered.items():
             if k.lower() == lc or k.lower() in lc:
                 return orig
     return None
+
+_TICKER_TOKEN = re.compile(r"[A-Za-z][A-Za-z.\-]{0,9}$")  # up to 10 chars, letters/dot/dash
+
+def extract_ticker(sym_raw: str) -> str:
+    """
+    Robust ticker extraction:
+    - Try parenthesis first: "Company Name (PLTR)" -> PLTR
+    - Then scan tokens split on whitespace/punctuation and return first token that
+      looks like a ticker (A..Z with optional . or -), length <= 10.
+    - Return "" if nothing reasonable.
+    """
+    s = (sym_raw or "").strip()
+    if not s:
+        return ""
+    # Parentheses e.g. "Something (PLTR)"
+    m = re.search(r"\(([A-Za-z.\-]{1,10})\)", s)
+    if m:
+        return m.group(1).upper()
+
+    # Split by whitespace and common separators
+    tokens = re.split(r"[\s/,:;|]+|-{1,}|–{1,}", s)
+    for tok in tokens:
+        t = re.sub(r"[^A-Za-z.\-]", "", tok).upper()
+        if _TICKER_TOKEN.match(t):
+            return t
+    # Last resort: if the whole string looks like a ticker
+    t = re.sub(r"[^A-Za-z.\-]", "", s).upper()
+    if _TICKER_TOKEN.match(t):
+        return t
+    return ""
 
 def normalize_action(s: str) -> str:
     if not s:
@@ -188,18 +217,26 @@ def load_transactions(ws_txn) -> pd.DataFrame:
     out = []
     for _, r in tx.iterrows():
         ts = parse_any_dt(str(r.get(c_ts, "")))
-        sym_raw = str(r.get(c_sym, "")).strip()
-        # pull ticker from "ABC - Something" if needed
-        ticker = sym_raw.split()[0].split("-")[0].strip().upper()
+        sym_raw = str(r.get(c_sym, "") or "").strip()
+        ticker = extract_ticker(sym_raw)
+        if not ticker:
+            # Skip rows with no parseable ticker
+            continue
         action = normalize_action(str(r.get(c_act, "")))
-        qty_str = str(r.get(c_qty, "")).replace(",", "")
-        try:
-            qty = float(qty_str) if qty_str else None
-        except Exception:
-            qty = None
+        if action not in ("BUY", "SELL"):
+            continue
+
+        qty = None
+        if c_qty:
+            qty_str = str(r.get(c_qty, "")).replace(",", "")
+            try:
+                qty = float(qty_str) if qty_str else None
+            except Exception:
+                qty = None
+
         px = coerce_price(r, c_px, c_amt, c_qty)
 
-        if ts and ticker and action in ("BUY", "SELL"):
+        if ts:
             out.append({
                 "TimestampUTC": ts,
                 "Ticker": ticker,
@@ -216,9 +253,7 @@ def load_transactions(ws_txn) -> pd.DataFrame:
 
 # =============== SIGNALS ===============
 def append_signal(ws_signals, sig_row: List[str]):
-    # ensure header
     ensure_signals_header(ws_signals)
-    # find next row
     current = ws_signals.get_all_values()
     next_row = len(current) + 1 if current else 2
     rng = f"A{next_row}:F{next_row}"
@@ -229,11 +264,9 @@ def load_signals(ws_signals) -> pd.DataFrame:
     df = get_df(ws_signals)
     if df.empty:
         return pd.DataFrame(columns=SIGNALS_HEADER)
-    # ensure columns
     for c in SIGNALS_HEADER:
         if c not in df.columns:
             df[c] = ""
-    # parse types
     df = df[SIGNALS_HEADER].copy()
     df["TimestampUTC"] = df["TimestampUTC"].map(lambda s: parse_any_dt(s) or now_utc())
     df["Ticker"] = df["Ticker"].map(lambda s: str(s).strip().upper())
@@ -246,14 +279,8 @@ def load_signals(ws_signals) -> pd.DataFrame:
     return df
 
 # =============== MATCHING LOGIC ===============
-def find_entry_fill(
-    tx: pd.DataFrame,
-    ticker: str,
-    direction: str,
-    t_sig: dt.datetime,
-    fill_window_days: int,
-    backfill_days: int
-) -> Optional[pd.Series]:
+def find_entry_fill(tx: pd.DataFrame, ticker: str, direction: str,
+                    t_sig: dt.datetime, fill_window_days: int, backfill_days: int) -> Optional[pd.Series]:
     if tx.empty:
         return None
     want_action = "BUY" if direction == "BUY" else "SELL"
@@ -261,27 +288,22 @@ def find_entry_fill(
     t_max = t_sig + timedelta(days=fill_window_days)
     mask_sym = (tx["Ticker"] == ticker) & (tx["Action"] == want_action)
 
-    # First try: fill at/after signal time within window
+    # First try: at/after signal
     cand = tx[mask_sym & (tx["TimestampUTC"] >= t_min) & (tx["TimestampUTC"] <= t_max)]
     if not cand.empty:
         return cand.iloc[0]
 
-    # Backfill: most recent fill BEFORE the signal within backfill window
+    # Backfill: nearest prior within window
     if backfill_days > 0:
         t_back_min = t_sig - timedelta(days=backfill_days)
         cand2 = tx[mask_sym & (tx["TimestampUTC"] < t_sig) & (tx["TimestampUTC"] >= t_back_min)]
         if not cand2.empty:
-            return cand2.iloc[-1]  # the nearest prior
+            return cand2.iloc[-1]
 
     return None
 
-def find_exit_fill(
-    tx: pd.DataFrame,
-    ticker: str,
-    direction: str,
-    t_entry: dt.datetime,
-    close_window_days: int
-) -> Optional[pd.Series]:
+def find_exit_fill(tx: pd.DataFrame, ticker: str, direction: str,
+                   t_entry: dt.datetime, close_window_days: int) -> Optional[pd.Series]:
     if tx.empty or t_entry is None:
         return None
     exit_action = "SELL" if direction == "BUY" else "BUY"
@@ -324,19 +346,16 @@ def build_source_report(signals: pd.DataFrame, tx: pd.DataFrame,
             direction = s["Direction"]
             t_sig = s["TimestampUTC"]
 
-            # Find entry
             ent = find_entry_fill(tx, ticker, direction, t_sig, fill_window_days, backfill_days)
             if ent is None:
                 open_signals += 1
                 continue
 
-            # Find exit
             ext = find_exit_fill(tx, ticker, direction, ent["TimestampUTC"], close_window_days)
             if ext is None:
                 open_signals += 1
                 continue
 
-            # closed trade
             trades += 1
             r = compute_return_pct(direction, ent.get("Price"), ext.get("Price"))
             if r is not None:
@@ -373,7 +392,7 @@ def main():
     ap.add_argument("--recompute-only", action="store_true", help="Skip appending a new signal; recompute stats only.")
     ap.add_argument("--fill-window-days", type=int, default=10, help="Max days after signal to look for entry fill.")
     ap.add_argument("--close-window-days", type=int, default=120, help="Max days after entry to look for exit fill.")
-    ap.add_argument("--backfill-days", type=int, default=0, help="If no entry after signal, allow claiming most recent prior fill within N days.")
+    ap.add_argument("--backfill-days", type=int, default=0, help="If no entry after signal, allow most recent prior fill within N days.")
     args = ap.parse_args()
 
     gc = authorize()
@@ -383,7 +402,6 @@ def main():
 
     # Append signal (unless recompute-only)
     if not args.recompute_only:
-        # Validate
         for need, val in [("ticker", args.ticker), ("source", args.source), ("direction", args.direction)]:
             if not val:
                 print(f"ERROR: --{need} is required unless --recompute-only", file=sys.stderr)
