@@ -1,12 +1,42 @@
 import gspread
 from google.oauth2.service_account import Credentials
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-creds = Credentials.from_service_account_file("gcp_service_account.json", scopes=SCOPES)
-gc = gspread.authorize(creds)
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
 
-# Use the full URL of the Sheet you just shared
-sh = gc.open_by_url("https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit?usp=drive_link")
-ws = sh.worksheet("Sheet9")  # or sh.sheet1
-ws.update("A1", "Hello from service account!")  # should succeed now
-print("OK")
+# Scopes: allow full Sheets + Drive access
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# Path to your service account key file
+SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
+
+# URL of your shared Google Sheet
+SHEET_URL = "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit?usp=drive_link"
+
+# Worksheet name to test
+WORKSHEET_NAME = "Sheet9"
+
+
+# ------------------------------------------------------------
+# AUTHENTICATION & WRITE TEST
+# ------------------------------------------------------------
+def main():
+    print("🔑 Authorizing service account...")
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+
+    print("📄 Opening Google Sheet...")
+    sh = gc.open_by_url(SHEET_URL)
+    ws = sh.worksheet(WORKSHEET_NAME)
+
+    print("✏️ Writing test message...")
+    ws.update("A1", "Hello from service account!")
+    print("✅ Success: Data written to Google Sheets!")
+
+
+if __name__ == "__main__":
+    main()
