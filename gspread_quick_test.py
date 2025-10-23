@@ -2,7 +2,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-creds = Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+creds = Credentials.from_service_account_file("gcp_service_account.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 
 # Use the full URL of the Sheet you just shared
