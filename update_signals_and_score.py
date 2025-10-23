@@ -1,68 +1,34 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 update_signals_and_score.py
 
-What it does
-------------
-1) (Optional) Append one or many signals to the 'Signals_Log' sheet.
-   - Use CLI flags for a single signal, or --signals-csv to append many.
+Appends a signal (optional) to the "Signals" tab and recomputes source stats
+by matching signals to fills in the "Transactions" tab.
 
-2) Build per-source performance by cross-referencing:
-   - Signals_Log  (Timestamp, Ticker, Source, Direction, Price, Timeframe)
-   - Transactions (your Fidelity export in the 'Transactions' tab)
+New:
+- --backfill-days: if no fill is found at/after the signal timestamp, claim the
+  most recent fill up to N days BEFORE the signal time.
 
-   Matching logic (simple, robust, explainable):
-   - For a BUY signal: find the first BUY fill for that Ticker at/after the
-     signal time (within --fill-window-days). That becomes entry.
-     Then find the first SELL fill after that entry; compute return = (sell - buy)/buy.
-   - For a SELL signal: mirror logic (first SELL after signal, then first BUY
-     after that to close short). If no close yet -> "open".
+Example:
+  # Append a PLTR BUY signal and recompute, allowing backfill 5 days
+  python3 update_signals_and_score.py \
+    --ticker PLTR --source SuperiorStar --direction BUY --price 32.15 \
+    --timeframe short --backfill-days 5
 
-   The script aggregates realized trades to produce a Source_Report:
-   Columns: Source, Trades, Wins, WinRate%, AvgReturn%, MedianReturn%, OpenSignals
-
-Assumptions
------------
-- Your Google Sheet already has tabs:
-  - 'Signals_Log' (create if missing)
-  - 'Transactions' (created by your upload script)
-  - 'Source_Report' (will be created or overwritten by this script)
-- Your Transactions sheet contains at least columns for Date/Time, Action, Symbol/Ticker, Quantity, Price.
-  The script will try to auto-detect columns (case-insensitive).
-
-Usage
------
-# Append a single signal (BUY) and then compute report
-python3 update_signals_and_score.py \
-  --ticker PLTR --source SuperiorStar --direction BUY --price 32.15 --timeframe short
-
-# Append many signals from a CSV (columns: Timestamp(optional),Ticker,Source,Direction,Price,Timeframe)
-python3 update_signals_and_score.py --signals-csv daily_signals.csv
-
-# Only recompute the Source_Report (no new signals)
-python3 update_signals_and_score.py --recompute-only
-
-You can also tune matching windows:
-  --fill-window-days 5    : how long after a signal we accept the entry fill
-  --close-window-days 60  : how long after entry we look for a closing trade
-
+  # Just recompute reports (no new signal)
+  python3 update_signals_and_score.py --recompute-only
 """
-
-import os
-import sys
-import math
 import argparse
-from datetime import datetime, timedelta, timezone
+import datetime as dt
+from datetime import timezone, timedelta
+from typing import List, Dict, Optional, Tuple
+import sys
 
-import numpy as np
-import pandas as pd
 import gspread
+import pandas as pd
 from google.oauth2.service_account import Credentials
 
-# =========================
-# CONFIG (edit to your sheet / creds)
-# =========================
+# ========= CONFIG =========
 SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -70,387 +36,381 @@ SCOPES = [
 ]
 SHEET_URL = "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
 
-TAB_SIGNALS = "Signals_Log"
-TAB_TXNS = "Transactions"
-TAB_REPORT = "Source_Report"
+TAB_SIGNALS       = "Signals"
+TAB_TRANSACTIONS  = "Transactions"
+TAB_SOURCE_REPORT = "Source_Report"
 
-# Columns we create/expect in Signals_Log
-SIGNALS_COLUMNS = ["Timestamp", "Ticker", "Source", "Direction", "Price", "Timeframe"]
+# Signals header (do not change order unless you update reading logic)
+SIGNALS_HEADER = ["TimestampUTC", "Ticker", "Source", "Direction", "Price", "Timeframe"]
 
-# Default windows
-DEFAULT_FILL_WINDOW_DAYS = 5
-DEFAULT_CLOSE_WINDOW_DAYS = 60
+# Which transaction column names we try for each field
+CANDIDATES = {
+    "timestamp": ["Date/Time", "Date Time", "Trade Date", "Date", "Execution Time", "Timestamp"],
+    "ticker":    ["Symbol", "Ticker", "Security Symbol", "Security", "Description"],
+    "action":    ["Action", "Type", "Activity", "Transaction Type"],
+    "quantity":  ["Quantity", "Shares", "Qty"],
+    "price":     ["Price", "Price ($)", "Fill Price", "Price Per Share"],
+    "amount":    ["Amount", "Amount ($)", "Total", "Net Amount"],
+}
 
-# =========================
-# Google helpers
-# =========================
+# =============== GSPREAD BASICS ===============
 def authorize():
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-    return gspread.authorize(creds)
+    gc = gspread.authorize(creds)
+    return gc
 
-def open_ws(gc, title):
+def open_ws(gc, title: str):
     sh = gc.open_by_url(SHEET_URL)
     try:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows=200, cols=20)
+        return sh.add_worksheet(title=title, rows=100, cols=26)
 
-def ensure_header(ws, header):
-    # If empty, set header row
-    vals = ws.get_all_values()
-    if not vals:
-        ws.update("A1", [header])
-        return
-    # If header differs, replace it (we keep it simple)
-    existing = vals[0]
-    if [h.strip() for h in existing] != header:
-        ws.clear()
-        ws.update("A1", [header])
-
-def append_rows(ws, rows):
+def get_df(ws) -> pd.DataFrame:
+    rows = ws.get_all_values()
     if not rows:
-        return
-    ws.append_rows(rows, value_input_option="RAW")
-
-def read_sheet_as_df(ws):
-    vals = ws.get_all_values()
-    if not vals:
         return pd.DataFrame()
-    header = vals[0]
-    data = vals[1:]
-    df = pd.DataFrame(data, columns=header)
-    # strip whitespace
-    df.columns = [c.strip() for c in df.columns]
-    return df
+    header = rows[0]
+    data = rows[1:]
+    # drop completely empty rows
+    data = [r for r in data if any(c.strip() for c in r)]
+    return pd.DataFrame(data, columns=header) if data else pd.DataFrame(columns=header)
 
-def write_df(ws, df):
+def write_df(ws, df: pd.DataFrame, start_cell="A1"):
+    # Clear and size
+    n_rows = max(len(df) + 1, 2)
+    n_cols = max(len(df.columns), 1)
     ws.clear()
-    if df is None or df.empty:
-        ws.update("A1", [["(empty)"]])
-        return
-    rows = [df.columns.tolist()] + df.astype(str).fillna("").values.tolist()
-    ws.update("A1", rows)
+    ws.resize(rows=max(n_rows, 50), cols=max(n_cols, 10))
+    # Write header + data
+    values = [df.columns.tolist()] + df.astype(str).fillna("").values.tolist()
+    ws.update(values, start_cell)
 
-# =========================
-# Data normalization
-# =========================
-def parse_dt(x):
-    if pd.isna(x) or x == "":
-        return pd.NaT
+def ensure_signals_header(ws):
+    current = ws.get_all_values()
+    if not current or (current and (not current[0] or current[0] != SIGNALS_HEADER)):
+        ws.update([SIGNALS_HEADER], "A1")
+
+# =============== TIME HELPERS ===============
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(timezone.utc)
+
+def parse_any_dt(s: str) -> Optional[dt.datetime]:
+    if not s or not str(s).strip():
+        return None
+    s = str(s).strip()
+    # Try pandas first
     try:
-        return pd.to_datetime(x)
+        d = pd.to_datetime(s, utc=True, errors="raise")
+        if isinstance(d, pd.Series):
+            d = d.iloc[0]
+        # if tz-naive, force UTC
+        if d.tzinfo is None:
+            d = d.tz_localize("UTC")
+        return d.to_pydatetime()
     except Exception:
-        return pd.NaT
+        pass
+    # Fallback manual tries
+    fmts = [
+        "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y", "%Y-%m-%d"
+    ]
+    for f in fmts:
+        try:
+            d = dt.datetime.strptime(s, f)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+        except Exception:
+            continue
+    return None
 
-def as_float(x):
-    try:
-        if x in ("", None):
-            return np.nan
-        return float(str(x).replace("$","").replace(",",""))
-    except Exception:
-        return np.nan
+# =============== TRANSACTIONS PARSING ===============
+def pick_col(df: pd.DataFrame, keys: List[str]) -> Optional[str]:
+    cols = list(df.columns)
+    lowered = {c.lower(): c for c in cols}
+    for k in keys:
+        for c in cols:
+            if c == k:
+                return c
+        # try case-insensitive contains
+        for lc, orig in lowered.items():
+            if k.lower() == lc or k.lower() in lc:
+                return orig
+    return None
 
-def normalize_transactions(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Try to find common columns from Fidelity exports:
-    Date/Time, Action, Symbol, Quantity, Price (per share)
-    """
-    if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=["Date", "Action", "Ticker", "Quantity", "Price"])
+def normalize_action(s: str) -> str:
+    if not s:
+        return ""
+    t = s.strip().lower()
+    if "buy" in t or t == "b":
+        return "BUY"
+    if "sell" in t or t == "s":
+        return "SELL"
+    return t.upper()
 
-    cols = {c.lower(): c for c in df_raw.columns}
+def coerce_price(row, price_col: Optional[str], amount_col: Optional[str], qty_col: Optional[str]) -> Optional[float]:
+    # Prefer explicit price
+    if price_col and row.get(price_col, "") != "":
+        try:
+            return float(str(row[price_col]).replace(",", "").replace("$", ""))
+        except Exception:
+            pass
+    # Derive from Amount / Quantity if possible
+    if amount_col and qty_col:
+        try:
+            amt = float(str(row[amount_col]).replace(",", "").replace("$", ""))
+            qty = float(str(row[qty_col]).replace(",", ""))
+            if qty != 0:
+                return abs(amt / qty)
+        except Exception:
+            pass
+    return None
 
-    # Date/Time
-    date_col = None
-    for key in ["date", "date/time", "transaction date", "time", "trade date"]:
-        if key in cols:
-            date_col = cols[key]; break
+def load_transactions(ws_txn) -> pd.DataFrame:
+    tx = get_df(ws_txn)
+    if tx.empty:
+        return tx
 
-    # Action
-    action_col = None
-    for key in ["action", "type", "transaction type"]:
-        if key in cols:
-            action_col = cols[key]; break
+    # Identify columns
+    c_ts   = pick_col(tx, CANDIDATES["timestamp"])
+    c_sym  = pick_col(tx, CANDIDATES["ticker"])
+    c_act  = pick_col(tx, CANDIDATES["action"])
+    c_qty  = pick_col(tx, CANDIDATES["quantity"])
+    c_px   = pick_col(tx, CANDIDATES["price"])
+    c_amt  = pick_col(tx, CANDIDATES["amount"])
 
-    # Ticker
-    sym_col = None
-    for key in ["symbol", "ticker", "security", "security symbol"]:
-        if key in cols:
-            sym_col = cols[key]; break
-
-    # Quantity
-    qty_col = None
-    for key in ["quantity", "qty", "shares", "share quantity"]:
-        if key in cols:
-            qty_col = cols[key]; break
-
-    # Price
-    price_col = None
-    for key in ["price", "price ($)", "price per share", "price/share"]:
-        if key in cols:
-            price_col = cols[key]; break
+    for need, col in [("timestamp", c_ts), ("ticker", c_sym), ("action", c_act)]:
+        if not col:
+            raise RuntimeError(f"Transactions: could not find a '{need}' column (tried {CANDIDATES[need]})")
 
     # Build normalized frame
-    out = pd.DataFrame()
-    out["Date"] = df_raw[date_col].apply(parse_dt) if date_col else pd.NaT
-    out["Action"] = df_raw[action_col].astype(str).str.strip().str.title() if action_col else ""
-    out["Ticker"] = df_raw[sym_col].astype(str).str.strip().str.upper() if sym_col else ""
-    out["Quantity"] = df_raw[qty_col].apply(as_float) if qty_col else np.nan
-    out["Price"] = df_raw[price_col].apply(as_float) if price_col else np.nan
+    out = []
+    for _, r in tx.iterrows():
+        ts = parse_any_dt(str(r.get(c_ts, "")))
+        sym_raw = str(r.get(c_sym, "")).strip()
+        # pull ticker from "ABC - Something" if needed
+        ticker = sym_raw.split()[0].split("-")[0].strip().upper()
+        action = normalize_action(str(r.get(c_act, "")))
+        qty_str = str(r.get(c_qty, "")).replace(",", "")
+        try:
+            qty = float(qty_str) if qty_str else None
+        except Exception:
+            qty = None
+        px = coerce_price(r, c_px, c_amt, c_qty)
 
-    # Keep only buys/sells with a ticker and a timestamp
-    mask_basic = (~out["Ticker"].eq("")) & out["Date"].notna() & out["Action"].isin(["Buy","Bought","Sell","Sold"])
-    out = out.loc[mask_basic].copy()
+        if ts and ticker and action in ("BUY", "SELL"):
+            out.append({
+                "TimestampUTC": ts,
+                "Ticker": ticker,
+                "Action": action,
+                "Quantity": qty,
+                "Price": px
+            })
 
-    # Normalize action values
-    out["Action"] = out["Action"].replace({"Bought":"Buy", "Sold":"Sell"})
+    df = pd.DataFrame(out)
+    if not df.empty:
+        df.sort_values("TimestampUTC", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+    return df
 
-    # Sort in time
-    out = out.sort_values("Date").reset_index(drop=True)
-    return out
+# =============== SIGNALS ===============
+def append_signal(ws_signals, sig_row: List[str]):
+    # ensure header
+    ensure_signals_header(ws_signals)
+    # find next row
+    current = ws_signals.get_all_values()
+    next_row = len(current) + 1 if current else 2
+    rng = f"A{next_row}:F{next_row}"
+    ws_signals.update([sig_row], rng)
+    print(f"✅ Appended signal: {sig_row}")
 
-def normalize_signals(df_raw: pd.DataFrame) -> pd.DataFrame:
-    if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=SIGNALS_COLUMNS)
+def load_signals(ws_signals) -> pd.DataFrame:
+    df = get_df(ws_signals)
+    if df.empty:
+        return pd.DataFrame(columns=SIGNALS_HEADER)
+    # ensure columns
+    for c in SIGNALS_HEADER:
+        if c not in df.columns:
+            df[c] = ""
+    # parse types
+    df = df[SIGNALS_HEADER].copy()
+    df["TimestampUTC"] = df["TimestampUTC"].map(lambda s: parse_any_dt(s) or now_utc())
+    df["Ticker"] = df["Ticker"].map(lambda s: str(s).strip().upper())
+    df["Source"] = df["Source"].map(lambda s: str(s).strip())
+    df["Direction"] = df["Direction"].map(lambda s: str(s).strip().upper())
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df["Timeframe"] = df["Timeframe"].map(lambda s: str(s).strip().lower())
+    df.sort_values("TimestampUTC", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
-    # Relaxed mapping
-    cols = {c.lower(): c for c in df_raw.columns}
-    def get_col(*names):
-        for n in names:
-            if n in cols: return cols[n]
+# =============== MATCHING LOGIC ===============
+def find_entry_fill(
+    tx: pd.DataFrame,
+    ticker: str,
+    direction: str,
+    t_sig: dt.datetime,
+    fill_window_days: int,
+    backfill_days: int
+) -> Optional[pd.Series]:
+    if tx.empty:
+        return None
+    want_action = "BUY" if direction == "BUY" else "SELL"
+    t_min = t_sig
+    t_max = t_sig + timedelta(days=fill_window_days)
+    mask_sym = (tx["Ticker"] == ticker) & (tx["Action"] == want_action)
+
+    # First try: fill at/after signal time within window
+    cand = tx[mask_sym & (tx["TimestampUTC"] >= t_min) & (tx["TimestampUTC"] <= t_max)]
+    if not cand.empty:
+        return cand.iloc[0]
+
+    # Backfill: most recent fill BEFORE the signal within backfill window
+    if backfill_days > 0:
+        t_back_min = t_sig - timedelta(days=backfill_days)
+        cand2 = tx[mask_sym & (tx["TimestampUTC"] < t_sig) & (tx["TimestampUTC"] >= t_back_min)]
+        if not cand2.empty:
+            return cand2.iloc[-1]  # the nearest prior
+
+    return None
+
+def find_exit_fill(
+    tx: pd.DataFrame,
+    ticker: str,
+    direction: str,
+    t_entry: dt.datetime,
+    close_window_days: int
+) -> Optional[pd.Series]:
+    if tx.empty or t_entry is None:
+        return None
+    exit_action = "SELL" if direction == "BUY" else "BUY"
+    t_max = t_entry + timedelta(days=close_window_days)
+    cand = tx[(tx["Ticker"] == ticker) &
+              (tx["Action"] == exit_action) &
+              (tx["TimestampUTC"] >= t_entry) &
+              (tx["TimestampUTC"] <= t_max)]
+    if not cand.empty:
+        return cand.iloc[0]
+    return None
+
+def compute_return_pct(direction: str, entry_price: float, exit_price: float) -> Optional[float]:
+    if entry_price is None or exit_price is None:
+        return None
+    try:
+        if direction == "BUY":
+            return (exit_price - entry_price) / entry_price * 100.0
+        else:
+            return (entry_price - exit_price) / entry_price * 100.0
+    except Exception:
         return None
 
-    ts_col  = get_col("timestamp", "time", "datetime", "date")
-    tic_col = get_col("ticker", "symbol")
-    src_col = get_col("source")
-    dir_col = get_col("direction", "side")
-    prc_col = get_col("price", "signal price")
-    tf_col  = get_col("timeframe", "horizon")
-
-    out = pd.DataFrame()
-    out["Timestamp"] = df_raw[ts_col].apply(parse_dt) if ts_col else pd.NaT
-    out["Ticker"]    = df_raw[tic_col].astype(str).str.strip().str.upper() if tic_col else ""
-    out["Source"]    = df_raw[src_col].astype(str).str.strip() if src_col else ""
-    out["Direction"] = df_raw[dir_col].astype(str).str.strip().str.upper() if dir_col else ""
-    out["Price"]     = df_raw[prc_col].apply(as_float) if prc_col else np.nan
-    out["Timeframe"] = df_raw[tf_col].astype(str).str.strip().str.lower() if tf_col else ""
-
-    # Default Timestamp if missing -> now (UTC)
-    out.loc[out["Timestamp"].isna(), "Timestamp"] = pd.Timestamp.utcnow()
-
-    # Filter sane rows
-    dir_ok = out["Direction"].isin(["BUY","SELL"])
-    tick_ok = out["Ticker"].ne("")
-    out = out.loc[dir_ok & tick_ok].copy()
-    out = out.sort_values("Timestamp").reset_index(drop=True)
-    return out
-
-# =========================
-# Matching signals to fills
-# =========================
-def first_fill_after(txns_df, ticker, action, t0, within_days):
-    """
-    Find first transaction with given action for ticker at/after t0 and within window.
-    Returns row or None.
-    """
-    if txns_df.empty: return None
-    t1 = t0
-    t2 = t0 + timedelta(days=within_days)
-    m = (txns_df["Ticker"].eq(ticker)
-         & txns_df["Action"].eq(action)
-         & (txns_df["Date"] >= t1)
-         & (txns_df["Date"] <= t2))
-    hits = txns_df.loc[m].sort_values("Date")
-    return hits.iloc[0] if len(hits) else None
-
-def pair_round_trip(txns_df, entry_row, exit_action, close_window_days):
-    """
-    Given an entry (row) and desired exit action ('Sell' for long, 'Buy' for short),
-    find the first exit within the close_window.
-    Return (exit_row or None).
-    """
-    if entry_row is None: return None
-    t0 = entry_row["Date"]
-    t2 = t0 + timedelta(days=close_window_days)
-    m = (txns_df["Ticker"].eq(entry_row["Ticker"])
-         & txns_df["Action"].eq(exit_action)
-         & (txns_df["Date"] > t0)
-         & (txns_df["Date"] <= t2))
-    hits = txns_df.loc[m].sort_values("Date")
-    return hits.iloc[0] if len(hits) else None
-
-def compute_return(entry_price, exit_price, direction):
-    if any(pd.isna([entry_price, exit_price])):
-        return np.nan
-    if direction == "BUY":
-        return (exit_price - entry_price) / entry_price
-    else:  # SELL (short)
-        return (entry_price - exit_price) / entry_price
-
-def score_sources(signals_df: pd.DataFrame,
-                  txns_df: pd.DataFrame,
-                  fill_window_days: int,
-                  close_window_days: int) -> pd.DataFrame:
-    """
-    For each signal, try to match entry+exit and compute a single-trade return.
-    Aggregate by Source.
-    """
-    if signals_df.empty:
+# =============== REPORT ===============
+def build_source_report(signals: pd.DataFrame, tx: pd.DataFrame,
+                        fill_window_days: int, close_window_days: int,
+                        backfill_days: int) -> pd.DataFrame:
+    rows = []
+    if signals.empty:
         return pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenSignals"])
 
-    results = []
-    for i, s in signals_df.iterrows():
-        tkr   = s["Ticker"]
-        src   = s["Source"] or "(unknown)"
-        direc = s["Direction"]  # BUY/SELL
-        ts    = s["Timestamp"]
-        sig_p = s.get("Price", np.nan)
+    for src, sdf in signals.groupby("Source", dropna=False):
+        trades = 0
+        wins = 0
+        rets: List[float] = []
+        open_signals = 0
 
-        # Map direction to first fill action
-        want_action = "Buy" if direc == "BUY" else "Sell"
-        entry_row = first_fill_after(txns_df, tkr, want_action, ts, within_days=fill_window_days)
+        for _, s in sdf.iterrows():
+            ticker = s["Ticker"]
+            direction = s["Direction"]
+            t_sig = s["TimestampUTC"]
 
-        if entry_row is None:
-            results.append({"Source": src, "Ticker": tkr, "Open": True, "Ret": np.nan})
-            continue
+            # Find entry
+            ent = find_entry_fill(tx, ticker, direction, t_sig, fill_window_days, backfill_days)
+            if ent is None:
+                open_signals += 1
+                continue
 
-        entry_price = entry_row["Price"]
-        # Determine closing action
-        close_action = "Sell" if direc == "BUY" else "Buy"
-        exit_row = pair_round_trip(txns_df, entry_row, close_action, close_window_days)
+            # Find exit
+            ext = find_exit_fill(tx, ticker, direction, ent["TimestampUTC"], close_window_days)
+            if ext is None:
+                open_signals += 1
+                continue
 
-        if exit_row is None:
-            results.append({"Source": src, "Ticker": tkr, "Open": True, "Ret": np.nan})
-            continue
+            # closed trade
+            trades += 1
+            r = compute_return_pct(direction, ent.get("Price"), ext.get("Price"))
+            if r is not None:
+                rets.append(r)
+                if r >= 0:
+                    wins += 1
 
-        exit_price = exit_row["Price"]
-        r = compute_return(entry_price, exit_price, direc)
-        results.append({"Source": src, "Ticker": tkr, "Open": False, "Ret": r})
+        winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+        avg_ret = (sum(rets) / len(rets)) if rets else 0.0
+        med_ret = (float(pd.Series(rets).median()) if rets else 0.0)
 
-    res = pd.DataFrame(results)
-    # Aggregate
-    grouped = []
-    for src, g in res.groupby("Source"):
-        realized = g.loc[~g["Open"]].copy()
-        trades = len(realized)
-        wins = int((realized["Ret"] > 0).sum()) if trades else 0
-        win_rate = (wins / trades * 100.0) if trades else 0.0
-        avg_ret = (realized["Ret"].mean() * 100.0) if trades else 0.0
-        med_ret = (realized["Ret"].median() * 100.0) if trades else 0.0
-        open_cnt = int(g["Open"].sum())
-        grouped.append({
-            "Source": src,
+        rows.append({
+            "Source": src if src else "",
             "Trades": trades,
             "Wins": wins,
-            "WinRate%": round(win_rate, 2),
+            "WinRate%": round(winrate, 2),
             "AvgReturn%": round(avg_ret, 2),
             "MedianReturn%": round(med_ret, 2),
-            "OpenSignals": open_cnt
+            "OpenSignals": open_signals
         })
-    rep = pd.DataFrame(grouped).sort_values(["Trades","WinRate%","AvgReturn%"], ascending=[False, False, False])
+
+    rep = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
     return rep
 
-# =========================
-# Signals append
-# =========================
-def append_single_signal(ws_signals, ticker, source, direction, price, timeframe):
-    ensure_header(ws_signals, SIGNALS_COLUMNS)
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
-    row = [now_utc, ticker.upper(), source, direction.upper(), str(price) if price is not None else "", timeframe.lower()]
-    append_rows(ws_signals, [row])
-    print(f"✅ Appended signal: {row}")
-
-def append_signals_from_csv(ws_signals, csv_path):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(csv_path)
-    df_raw = pd.read_csv(csv_path)
-    df = normalize_signals(df_raw)
-    ensure_header(ws_signals, SIGNALS_COLUMNS)
-
-    # Convert to strings for upload
-    out = []
-    for _, r in df.iterrows():
-        ts = r["Timestamp"]
-        ts_str = pd.to_datetime(ts).tz_localize(None).strftime("%Y-%m-%d %H:%M:%S")
-        out.append([
-            ts_str,
-            r["Ticker"],
-            r["Source"] or "",
-            r["Direction"].upper(),
-            "" if pd.isna(r["Price"]) else str(r["Price"]),
-            r["Timeframe"] or ""
-        ])
-    append_rows(ws_signals, out)
-    print(f"✅ Appended {len(out)} signals from {csv_path}")
-
-# =========================
-# Main
-# =========================
+# =============== MAIN ===============
 def main():
-    ap = argparse.ArgumentParser(description="Append signals and compute per-source performance report.")
-    ap.add_argument("--ticker", help="Ticker for a single signal")
-    ap.add_argument("--source", help="Source name (Sarkee, SuperiorStar, Weinstein, Bo, etc.)")
-    ap.add_argument("--direction", choices=["BUY","SELL"], help="Signal direction")
-    ap.add_argument("--price", type=float, help="Signal price (optional)")
-    ap.add_argument("--timeframe", default="", help="Signal timeframe (e.g., short, medium, long)")
-
-    ap.add_argument("--signals-csv", help="CSV with columns: Timestamp(optional),Ticker,Source,Direction,Price,Timeframe")
-    ap.add_argument("--recompute-only", action="store_true", help="Only recompute Source_Report; do not append new signals")
-
-    ap.add_argument("--fill-window-days", type=int, default=DEFAULT_FILL_WINDOW_DAYS, help="Days after a signal to accept first fill")
-    ap.add_argument("--close-window-days", type=int, default=DEFAULT_CLOSE_WINDOW_DAYS, help="Days after entry to search for exit")
-
+    ap = argparse.ArgumentParser(description="Append signals and recompute source report.")
+    ap.add_argument("--ticker", type=str, help="Ticker (e.g., PLTR)")
+    ap.add_argument("--source", type=str, help="Source (Sarkee, SuperiorStar, Weinstein, Bo, etc.)")
+    ap.add_argument("--direction", type=str, choices=["BUY","SELL"], help="BUY or SELL")
+    ap.add_argument("--price", type=float, help="Signal ref price (optional)")
+    ap.add_argument("--timeframe", type=str, default="", help="short/mid/long or custom")
+    ap.add_argument("--timestamp", type=str, default="", help="Explicit signal timestamp (UTC). If omitted, uses now.")
+    ap.add_argument("--recompute-only", action="store_true", help="Skip appending a new signal; recompute stats only.")
+    ap.add_argument("--fill-window-days", type=int, default=10, help="Max days after signal to look for entry fill.")
+    ap.add_argument("--close-window-days", type=int, default=120, help="Max days after entry to look for exit fill.")
+    ap.add_argument("--backfill-days", type=int, default=0, help="If no entry after signal, allow claiming most recent prior fill within N days.")
     args = ap.parse_args()
 
-    # Auth & open sheets
     gc = authorize()
-    ws_signals = open_ws(gc, TAB_SIGNALS)
-    ws_txns    = open_ws(gc, TAB_TXNS)
-    ws_report  = open_ws(gc, TAB_REPORT)
+    ws_sig = open_ws(gc, TAB_SIGNALS)
+    ws_txn = open_ws(gc, TAB_TRANSACTIONS)
+    ws_rep = open_ws(gc, TAB_SOURCE_REPORT)
 
-    # Maybe append new signals
+    # Append signal (unless recompute-only)
     if not args.recompute_only:
-        if args.signals_csv:
-            append_signals_from_csv(ws_signals, args.signals_csv)
-        elif args.ticker and args.source and args.direction:
-            append_single_signal(ws_signals,
-                                 ticker=args.ticker,
-                                 source=args.source,
-                                 direction=args.direction,
-                                 price=args.price,
-                                 timeframe=args.timeframe)
-        else:
-            print("ℹ️ No new signals appended (pass --signals-csv OR --ticker/--source/--direction).")
+        # Validate
+        for need, val in [("ticker", args.ticker), ("source", args.source), ("direction", args.direction)]:
+            if not val:
+                print(f"ERROR: --{need} is required unless --recompute-only", file=sys.stderr)
+                sys.exit(1)
 
-    # Read data back for scoring
-    df_signals_raw = read_sheet_as_df(ws_signals)
-    if df_signals_raw.empty:
-        print("⚠️ Signals_Log is empty. Nothing to score.")
-        write_df(ws_report, pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenSignals"]))
-        return
+        t_sig = parse_any_dt(args.timestamp) if args.timestamp else now_utc()
+        t_str = t_sig.strftime("%Y-%m-%d %H:%M:%S%z")
+        ensure_signals_header(ws_sig)
+        sig_row = [
+            t_str,
+            args.ticker.strip().upper(),
+            args.source.strip(),
+            args.direction.strip().upper(),
+            "" if args.price is None else f"{args.price}",
+            args.timeframe.strip().lower()
+        ]
+        append_signal(ws_sig, sig_row)
 
-    # Ensure proper columns / normalization
-    # If the sheet already has our schema, use it; otherwise normalize flexibly
-    if set(SIGNALS_COLUMNS).issubset(df_signals_raw.columns):
-        df_signals = df_signals_raw.copy()
-        df_signals["Timestamp"] = df_signals["Timestamp"].apply(parse_dt)
-        df_signals["Ticker"] = df_signals["Ticker"].astype(str).str.upper()
-        df_signals["Source"] = df_signals["Source"].astype(str)
-        df_signals["Direction"] = df_signals["Direction"].astype(str).str.upper()
-        df_signals["Price"] = df_signals["Price"].apply(as_float)
-        df_signals["Timeframe"] = df_signals["Timeframe"].astype(str)
-        df_signals = df_signals.sort_values("Timestamp")
-    else:
-        df_signals = normalize_signals(df_signals_raw)
+    # Load data
+    signals = load_signals(ws_sig)
+    tx = load_transactions(ws_txn)
 
-    df_txns_raw = read_sheet_as_df(ws_txns)
-    df_txns = normalize_transactions(df_txns_raw)
-
-    # Score per source
-    rep = score_sources(df_signals, df_txns, args.fill_window_days, args.close_window_days)
-
-    # Write Source_Report
-    write_df(ws_report, rep)
+    # Build and write report
+    rep = build_source_report(signals, tx, args.fill_window_days, args.close_window_days, args.backfill_days)
+    if rep.empty:
+        rep = pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenSignals"])
+    write_df(ws_rep, rep)
     print("📈 Source_Report updated.")
     if not rep.empty:
         print(rep.to_string(index=False))
