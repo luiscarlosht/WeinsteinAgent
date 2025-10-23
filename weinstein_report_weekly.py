@@ -12,25 +12,29 @@ from datetime import datetime
 from weinstein_mailer import send_email
 from universe_loaders import combine_universe
 
+# Sheets logger (make sure gsheet_helpers.py is in your project)
+try:
+    from gsheet_helpers import log_signal
+except Exception:
+    log_signal = None  # fail-safe if helper not available
+
 # Optional tiny charts for top names
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# NEW: Google Sheets recommendations
-from sheets_bridge import load_recommendation_universe
-
-# --------- Tunables ----------
+# --------- Tunables (sensible defaults, override in config.yaml) ----------
 DEFAULT_BENCHMARK = "SPY"
-WEEKS_LOOKBACK = 180
+WEEKS_LOOKBACK = 180   # ~3.5 years of weekly bars
 MA_WEEKS = 30
+MA10_WEEKS = 10        # NEW: short-term weekly MA
 SLOPE_WINDOW = 5
 NEAR_MA_BAND = 0.05
 RS_MA_WEEKS = 30
 OUTPUT_DIR_FALLBACK = "./output"
 TOP_N_CHARTS = 20
 
-# --------- Utilities ----------
+# --------- Utilities ---------
 def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         out = df[field].copy()
@@ -44,14 +48,6 @@ def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataF
         out.columns = [t0]
         return out
 
-def _merge_lists_preserve_order(*lists):
-    seen, out = set(), []
-    for lst in lists:
-        for x in (lst or []):
-            if x not in seen:
-                seen.add(x); out.append(x)
-    return out
-
 def load_config(path="config.yaml"):
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
@@ -59,40 +55,16 @@ def load_config(path="config.yaml"):
     app = cfg.get("app", {}) or {}
     uni = cfg.get("universe", {}) or {}
     reporting = cfg.get("reporting", {}) or {}
-    sheets = cfg.get("sheets", {}) or {}
 
     mode = (uni.get("mode") or "custom").lower()
     use_sp500 = (mode == "sp500")
     extra = uni.get("extra") or []
     explicit_tickers = uni.get("tickers") or []
 
-    # Google Sheets options
-    recos_sheet_id = sheets.get("recos_sheet_id")
-    recos_tab = sheets.get("recos_tab", "Recommendations")
-    recos_tabs_alt = sheets.get("recos_tabs_alt")  # e.g. ["Sarkee","SuperiorStar","Weinstein"]
-    creds_json = sheets.get("creds_json", "./creds/gsa-sheets.json")
-
-    # Build base universe (sp500 or custom list from config)
     if use_sp500:
-        base = combine_universe(sp500=True, extra_symbols=extra)
+        tickers = combine_universe(sp500=True, extra_symbols=extra)
     else:
-        base = combine_universe(sp500=False, extra_symbols=explicit_tickers)
-
-    # Pull tickers from Google Sheet (if configured)
-    sheet_tickers = []
-    if recos_sheet_id and os.path.exists(creds_json):
-        try:
-            sheet_tickers = load_recommendation_universe(
-                sheet_id=recos_sheet_id,
-                creds_json=creds_json,
-                recos_tab=recos_tab,
-                recos_tabs_alt=recos_tabs_alt
-            )
-        except Exception as e:
-            print(f"[WARN] Could not read Google Sheet: {e}")
-
-    # Final tickers = base + sheet
-    tickers = _merge_lists_preserve_order(base, sheet_tickers)
+        tickers = combine_universe(sp500=False, extra_symbols=explicit_tickers)
 
     benchmark = app.get("benchmark", DEFAULT_BENCHMARK)
     tz = app.get("timezone", "America/Chicago")
@@ -103,11 +75,10 @@ def load_config(path="config.yaml"):
     min_price = int(uni.get("min_price", 0))
     min_avg_volume = int(uni.get("min_avg_volume", 0))
 
-    return (cfg, tickers, benchmark, tz, output_dir, include_pdf,
-            min_price, min_avg_volume, len(sheet_tickers))
+    return cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume
 
 def fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
-    uniq = list(dict.fromkeys((tickers or []) + [benchmark]))
+    uniq = list(dict.fromkeys((tickers or []) + [benchmark]))  # de-dup, preserve order
     if not uniq:
         raise ValueError("No symbols to download.")
 
@@ -129,23 +100,57 @@ def fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
 
     return close, volume
 
+def _weekly_short_term_state(series_price: pd.Series) -> tuple[str, float, float]:
+    """
+    Weekly view of short vs long using 10-wk vs 30-wk MAs.
+      - ShortTermUptrend: Close > MA10 > MA30
+      - StageConflict   : Close > MA30 but MA10<=MA30, or MA10>MA30 but Close<=MA10
+      - Weak            : otherwise
+    Returns (state, ma10_last, ma30_last)
+    """
+    s = series_price.dropna()
+    if len(s) < max(MA10_WEEKS, MA_WEEKS) + 5:
+        return ("Unknown", np.nan, np.nan)
+
+    ma10 = s.rolling(MA10_WEEKS).mean()
+    ma30 = s.rolling(MA_WEEKS).mean()
+    c = float(s.iloc[-1])
+    m10 = float(ma10.iloc[-1])
+    m30 = float(ma30.iloc[-1])
+
+    state = "Unknown"
+    if pd.notna(m10) and pd.notna(m30):
+        if (c > m10) and (m10 > m30):
+            state = "ShortTermUptrend"
+        elif (c > m30) and not (m10 > m30):
+            state = "StageConflict"
+        elif (m10 > m30) and not (c > m10):
+            state = "StageConflict"
+        else:
+            state = "Weak"
+    return (state, m10, m30)
+
 def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     s = closes.dropna().copy()
     b = bench.reindex_like(s).dropna()
 
     idx = s.index.intersection(b.index)
-    s = s.loc[idx]; b = b.loc[idx]
+    s = s.loc[idx]
+    b = b.loc[idx]
 
     if len(s) < MA_WEEKS + SLOPE_WINDOW + 5 or len(b) < RS_MA_WEEKS + 5:
         return {"error": "insufficient_data"}
 
     ma = s.rolling(MA_WEEKS).mean()
+
+    # MA slope over last SLOPE_WINDOW weeks
     ma_slope = ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
     ma_slope_last = ma_slope.iloc[-1]
     ma_last = ma.iloc[-1]
     price_last = s.iloc[-1]
     dist_ma_pct = (price_last - ma_last) / ma_last if ma_last and not math.isclose(ma_last, 0.0) else np.nan
 
+    # Relative Strength line vs. benchmark (price ratio)
     rs = s / b
     rs_ma = rs.rolling(RS_MA_WEEKS).mean()
     rs_slope = rs_ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
@@ -154,16 +159,17 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     rs_above = bool(rs_last > rs_ma_last)
     rs_slope_last = rs_slope.iloc[-1]
 
+    # Flags
     price_above_ma = bool(price_last > ma_last)
     ma_up = bool(ma_slope_last > 0)
-    ma_down = bool(ma_slope_last < 0)
     near_ma = bool(abs(dist_ma_pct) <= NEAR_MA_BAND)
     rs_up = bool(rs_above and rs_slope_last > 0)
     rs_down = bool((not rs_above) and rs_slope_last < 0)
 
+    # Stage rules (heuristic)
     if price_above_ma and ma_up and rs_up:
         stage = "Stage 2 (Uptrend)"
-    elif (not price_above_ma) and ma_down and rs_down:
+    elif (not price_above_ma) and (ma_slope_last < 0) and rs_down:
         stage = "Stage 4 (Downtrend)"
     elif near_ma and abs(ma_slope_last) < (abs(ma_last) * 0.0005):
         stage = "Stage 1 (Basing)"
@@ -180,8 +186,11 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     if (not rs_above) and rs_slope_last >= 0:
         notes.append("RS below MA but improving")
 
+    st_state, ma10_last, _ma30_chk = _weekly_short_term_state(s)
+
     return {
         "price": float(price_last),
+        "ma10": float(ma10_last) if pd.notna(ma10_last) else np.nan,   # NEW
         "ma30": float(ma_last),
         "dist_ma_pct": float(dist_ma_pct) if pd.notna(dist_ma_pct) else np.nan,
         "ma_slope_per_wk": float(ma_slope_last) if pd.notna(ma_slope_last) else np.nan,
@@ -190,6 +199,7 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
         "rs_above_ma": bool(rs_above),
         "rs_slope_per_wk": float(rs_slope_last) if pd.notna(rs_slope_last) else np.nan,
         "stage": stage,
+        "short_term_state_wk": st_state,   # NEW
         "notes": "; ".join(notes),
     }
 
@@ -225,7 +235,15 @@ def build_report_df(close_w: pd.DataFrame,
         lc = float(last_close.get(t, np.nan)) if pd.notna(last_close.get(t, np.nan)) else np.nan
         av = float(avg_vol_10w.get(t, np.nan)) if pd.notna(avg_vol_10w.get(t, np.nan)) else np.nan
         if (min_price and (pd.isna(lc) or lc < min_price)) or (min_avg_volume and (pd.isna(av) or av < min_avg_volume)):
-            rows.append({"ticker": t, "stage": "Filtered", "price": lc, "notes": "below min_price/volume"})
+            # Still compute short-term state for completeness
+            s = close_w[t].dropna()
+            st_state, ma10_last, _ = _weekly_short_term_state(s)
+            rows.append({
+                "ticker": t, "stage": "Filtered", "price": lc,
+                "ma10": float(ma10_last) if pd.notna(ma10_last) else np.nan,
+                "ma30": np.nan, "short_term_state_wk": st_state,
+                "notes": "below min_price/volume"
+            })
             continue
 
         res = compute_stage_for_ticker(close_w[t], bench)
@@ -234,18 +252,21 @@ def build_report_df(close_w: pd.DataFrame,
 
     df = pd.DataFrame(rows)
 
+    # Ensure expected columns exist
     cols = [
-        "ticker", "stage", "price", "ma30", "dist_ma_pct", "ma_slope_per_wk",
-        "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"
+        "ticker", "stage", "price", "ma10", "ma30", "dist_ma_pct", "ma_slope_per_wk",
+        "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "short_term_state_wk", "notes"
     ]
     for c in cols:
         if c not in df.columns:
             df[c] = np.nan
     df = df[cols]
 
+    # Buy Signal columns (plain + HTML badge)
     df["buy_signal"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[0])
     df["buy_signal_html"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[1])
 
+    # Sort: Stage 2 (Buy) first, then Stage 1 (Watch), then by distance above MA
     stage_rank = {
         "Stage 2 (Uptrend)": 0,
         "Stage 1 (Basing)": 1,
@@ -263,8 +284,7 @@ def _fig_to_base64(fig) -> str:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
     plt.close(fig)
-    import base64 as _b
-    b64 = _b.b64encode(buf.getvalue()).decode("ascii")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
 def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
@@ -273,20 +293,25 @@ def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
     idx = s.index.intersection(b.index)
     if len(idx) < MA_WEEKS + 5:
         return ""
-    s = s.loc[idx]; b = b.loc[idx]
-    ma = s.rolling(MA_WEEKS).mean()
+    s = s.loc[idx]
+    b = b.loc[idx]
+
+    ma30 = s.rolling(MA_WEEKS).mean()
+    ma10 = s.rolling(MA10_WEEKS).mean()  # NEW
     rs = (s / b).rolling(RS_MA_WEEKS).mean()
 
     fig, ax1 = plt.subplots(figsize=(3.0, 1.4))
     ax1.plot(s.index, s.values, linewidth=1.2)
-    ax1.plot(ma.index, ma.values, linewidth=1.0)
+    ax1.plot(ma10.index, ma10.values, linewidth=1.0)
+    ax1.plot(ma30.index, ma30.values, linewidth=1.0)
     ax1.set_xticks([]); ax1.set_yticks([]); ax1.grid(False)
     ax2 = ax1.twinx()
     ax2.plot(rs.index, rs.values, linewidth=0.8)
     ax2.set_xticks([]); ax2.set_yticks([])
     for spine in (*ax1.spines.values(), *ax2.spines.values()):
         spine.set_visible(False)
-    return f'<img src="{_fig_to_base64(fig)}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
+    img_src = _fig_to_base64(fig)
+    return f'<img src="{img_src}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
 
 def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, top_n: int = TOP_N_CHARTS) -> pd.DataFrame:
     out = df.copy()
@@ -301,24 +326,31 @@ def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, 
                 out.at[i, "chart"] = ""
     return out
 
-# ---------- HTML ----------
+# ---------- HTML / Email ----------
 def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     styled = df.copy()
+
+    # Pretty percentages
     for c in ["dist_ma_pct", "ma_slope_per_wk", "rs_slope_per_wk"]:
         if c in styled.columns:
             styled[c] = styled[c].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "")
+
     if "rs_above_ma" in styled.columns:
         styled["rs_above_ma"] = styled["rs_above_ma"].map({True: "Yes", False: "No"})
+
+    # Use HTML badge for buy signal
     if "buy_signal_html" in styled.columns:
         styled["Buy Signal"] = styled["buy_signal_html"]
     else:
         styled["Buy Signal"] = styled.get("buy_signal", "")
 
-    columns_order = ["ticker", "Buy Signal", "stage", "price", "ma30", "dist_ma_pct",
-                     "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
-    if "chart" in styled.columns:
-        columns_order = ["ticker", "Buy Signal", "chart", "stage", "price", "ma30", "dist_ma_pct",
-                         "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"]
+    columns_order = [
+        "ticker", "Buy Signal", "chart",
+        "stage", "short_term_state_wk",  # NEW
+        "price", "ma10", "ma30", "dist_ma_pct",
+        "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk",
+        "notes"
+    ]
     for c in columns_order:
         if c not in styled.columns:
             styled[c] = ""
@@ -342,25 +374,25 @@ def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     </style>
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    return f"""{css}
+    html = f"""{css}
     <h2>{title}</h2>
     <div class="sub">Generated {now}</div>
     <div class="summary">{summary_line}</div>
     {table_html}
     """
+    return html
 
 # ---------- Main ----------
 def main():
-    (cfg, tickers, benchmark, tz, output_dir, include_pdf,
-     min_price, min_avg_volume, sheet_adds) = load_config()
+    cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume = load_config()
 
     if not tickers:
-        print("No tickers resolved from config.yaml (check universe & sheets settings).")
+        print("No tickers resolved from config.yaml (check universe.mode/custom/extra).")
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"Universe size: {len(tickers)} tickers (benchmark: {benchmark}) [+{sheet_adds} from Google Sheet]")
+    print(f"Universe size: {len(tickers)} tickers (benchmark: {benchmark})")
     print("Downloading weekly data…")
     close_w, volume_w = fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK)
 
@@ -374,32 +406,70 @@ def main():
         min_avg_volume=min_avg_volume,
     )
 
+    # Add tiny charts for top candidates (keeps email weight down)
     report_with_charts = attach_tiny_charts(report_df, close_w, benchmark, top_n=TOP_N_CHARTS)
 
+    # Summary counts
     buy_count = int((report_df["buy_signal"] == "BUY").sum())
     watch_count = int((report_df["buy_signal"] == "WATCH").sum())
     avoid_count = int((report_df["buy_signal"] == "AVOID").sum())
     total = int(len(report_df))
-    summary_line = (f"<strong>Summary:</strong> ✅ Buy: {buy_count} &nbsp; | &nbsp; "
-                    f"🟡 Watch: {watch_count} &nbsp; | &nbsp; 🔴 Avoid: {avoid_count} "
-                    f"&nbsp; (Total: {total}, +{sheet_adds} from Google Sheet)")
+    summary_line = f"<strong>Summary:</strong> ✅ Buy: {buy_count} &nbsp; | &nbsp; 🟡 Watch: {watch_count} &nbsp; | &nbsp; 🔴 Avoid: {avoid_count} &nbsp; (Total: {total})"
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     csv_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.csv")
     html_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.html")
 
+    # Save CSV (plain text buy_signal)
     report_df.to_csv(csv_path, index=False)
-    html = df_to_html(report_with_charts, title=f"Weinstein Weekly — Benchmark: {benchmark}", summary_line=summary_line)
+
+    # Build HTML with badges + charts + summary
+    html = df_to_html(
+        report_with_charts,
+        title=f"Weinstein Weekly — Benchmark: {benchmark}",
+        summary_line=summary_line
+    )
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
+    # Email it
     subject = f"Weinstein Weekly Report — {datetime.now().strftime('%b %d, %Y')}"
     top_lines = report_df[["ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
     body_text = (
-        f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total}, +{sheet_adds} from Sheet)\n\n"
+        f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total})\n\n"
         f"Files:\n- {csv_path}\n- {html_path}\n\nTop lines:\n{top_lines}\n"
     )
     send_email(subject=subject, html_body=html, text_body=body_text, cfg_path="config.yaml")
+
+    # ---- Google Sheets logging (one row per ticker) ----
+    if log_signal is not None:
+        print("Logging weekly signals to Google Sheets…")
+        for _, r in report_df.iterrows():
+            try:
+                # Map weekly outcome to event for the unified Signals sheet
+                event = str(r.get("buy_signal", "AVOID"))
+                stage = str(r.get("stage", ""))
+                st_state = str(r.get("short_term_state_wk", ""))
+                price = None if pd.isna(r.get("price", np.nan)) else float(r["price"])
+                # No explicit pivot in weekly run (leave blank)
+                vol_pace = None
+                notes = ""
+                log_signal(
+                    event=event,
+                    ticker=str(r["ticker"]),
+                    price=price,
+                    pivot=None,
+                    stage=stage,
+                    short_term_state=st_state,
+                    vol_pace=vol_pace,
+                    notes=notes,
+                    source="weekly"
+                )
+            except Exception as e:
+                # Don't fail the whole run if Sheets has a hiccup
+                print(f"  Sheets log failed for {r.get('ticker')}: {e}")
+    else:
+        print("gsheet_helpers.log_signal not available; skipping Sheets logging.")
 
     print(f"Saved:\n - {csv_path}\n - {html_path}")
     print("Done.")
