@@ -76,8 +76,8 @@ def base_symbol_from_string(s) -> str:
     s = str(s).strip()
     if not s:
         return ""
-    token = s.split()[0]                 # take first whitespace-delimited chunk
-    token = token.split("-")[0]          # strip option/lot suffix like "AAPL-12345"
+    token = s.split()[0]
+    token = token.split("-")[0]
     token = token.replace("(", "").replace(")", "")
     token = re.sub(r"[^A-Za-z0-9\.\-]", "", token).upper()
     if not token:
@@ -86,7 +86,6 @@ def base_symbol_from_string(s) -> str:
         return ""
     if token.isdigit():
         return ""
-    # very long numeric-like or account-number-ish -> ignore
     if len(token) > 8 and token.isalnum():
         return ""
     return token
@@ -267,7 +266,16 @@ def load_holdings(df_h: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────
 def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if tx.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        # Pre-create schema
+        realized_df = pd.DataFrame(columns=[
+            "Ticker","Qty","EntryPrice","ExitPrice","Return%","HoldDays",
+            "EntryTimeUTC","ExitTimeUTC","Source","Timeframe","SignalTimeUTC","SignalPrice"
+        ])
+        open_df = pd.DataFrame(columns=[
+            "Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen",
+            "Source","Timeframe","SignalTimeUTC","SignalPrice"
+        ])
+        return realized_df, open_df
 
     # Index signals by (Ticker, time), only BUYs
     sig_buy = sig[(sig["Direction"].str.upper()=="BUY") & sig["Ticker"].ne("")].copy()
@@ -284,7 +292,6 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame) -> Tuple[pd.Dat
 
     def last_signal_for(tkr: str, when: pd.Timestamp):
         arr = sig_by_ticker.get(tkr, [])
-        # from end to start to get most recent at/<= when
         for t, payload in reversed(arr):
             if pd.isna(t) or pd.isna(when):
                 return payload
@@ -344,7 +351,16 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame) -> Tuple[pd.Dat
                 if lot["qty_left"] <= 1e-9:
                     lots[tkr].popleft()
 
-    realized_df = pd.DataFrame(realized_rows).sort_values("ExitTimeUTC", ignore_index=True)
+    # Realized
+    realized_cols = [
+        "Ticker","Qty","EntryPrice","ExitPrice","Return%","HoldDays",
+        "EntryTimeUTC","ExitTimeUTC","Source","Timeframe","SignalTimeUTC","SignalPrice"
+    ]
+    if realized_rows:
+        realized_df = pd.DataFrame(realized_rows).reindex(columns=realized_cols)
+        realized_df = realized_df.sort_values("ExitTimeUTC", ignore_index=True)
+    else:
+        realized_df = pd.DataFrame(columns=realized_cols)
 
     # Remaining open lots
     now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
@@ -363,7 +379,12 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame) -> Tuple[pd.Dat
                 "SignalTimeUTC": lot["sig_time"],
                 "SignalPrice": lot["sig_price"],
             })
-    open_df = pd.DataFrame(open_rows).sort_values("EntryTimeUTC", ignore_index=True)
+    open_cols = [
+        "Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen",
+        "Source","Timeframe","SignalTimeUTC","SignalPrice"
+    ]
+    open_df = pd.DataFrame(open_rows).reindex(columns=open_cols)
+    open_df = open_df.sort_values("EntryTimeUTC", ignore_index=True) if not open_df.empty else open_df
     return realized_df, open_df
 
 def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str,Dict[str,str]]) -> pd.DataFrame:
