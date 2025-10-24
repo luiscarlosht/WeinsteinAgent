@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-merge_fidelity_with_signals.py  v3.0
+merge_fidelity_with_signals.py  v3.1
 
 Backfills empty fields in the Google Sheet "Signals" tab:
 - TimestampUTC, Direction, Price, Timeframe
@@ -10,9 +10,13 @@ Backfills empty fields in the Google Sheet "Signals" tab:
 Sources (in order):
 1) Transactions (latest BUY/SELL trade price & date)
 2) Holdings (any recognized "price" column)
-3) Live quote via yfinance (regular market price or last close)
+3) yfinance live quote (if available)
+4) Sheets formula =GOOGLEFINANCE() for any still-empty Price
 
-Only blank cells are filled; existing values are preserved.
+Also supports optional symbol aliases via Mapping tab:
+  Mapping!Ticker   (signal ticker)
+  Mapping!TickerYF (ticker to use for Yahoo/GOOGLEFINANCE)
+  Mapping!Timeframe (default per-ticker or per-source)
 
 Usage:
   python3 merge_fidelity_with_signals.py [--verbose]
@@ -113,7 +117,7 @@ def parse_float(val) -> Optional[float]:
     except Exception:
         return None
 
-def latest_trade_for(tdf: pd.DataFrame, ticker: str) -> Optional[Tuple[str, str, float]]:
+def latest_trade_for(tdf: pd.DataFrame, ticker: str, aliases: Dict[str, str]) -> Optional[Tuple[str, str, float]]:
     if tdf.empty or not ticker:
         return None
     cols = norm_cols(tdf)
@@ -126,7 +130,11 @@ def latest_trade_for(tdf: pd.DataFrame, ticker: str) -> Optional[Tuple[str, str,
 
     work = tdf[[c_run, c_sym, c_type, c_price]].copy()
     work[c_sym] = work[c_sym].map(clean_ticker)
-    work = work[work[c_sym] == ticker]
+    syms = {ticker}
+    if ticker in aliases and aliases[ticker]:
+        syms.add(clean_ticker(aliases[ticker]))
+
+    work = work[work[c_sym].isin(syms)]
     work = work[work[c_type].str.contains("BUY|SELL", case=False, na=False)]
     if work.empty:
         return None
@@ -143,7 +151,7 @@ def latest_trade_for(tdf: pd.DataFrame, ticker: str) -> Optional[Tuple[str, str,
         iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
     return (iso, direction, price if price is not None else float("nan"))
 
-def holdings_price(hdf: pd.DataFrame, ticker: str) -> Optional[Tuple[float, str]]:
+def holdings_price(hdf: pd.DataFrame, ticker: str, aliases: Dict[str, str]) -> Optional[Tuple[float, str]]:
     """Return (price, column_used) if found."""
     if hdf.empty or not ticker:
         return None
@@ -162,7 +170,10 @@ def holdings_price(hdf: pd.DataFrame, ticker: str) -> Optional[Tuple[float, str]
 
     work = hdf[[c_sym, c_price]].copy()
     work[c_sym] = work[c_sym].map(clean_ticker)
-    row = work[work[c_sym] == ticker]
+    syms = {ticker}
+    if ticker in aliases and aliases[ticker]:
+        syms.add(clean_ticker(aliases[ticker]))
+    row = work[work[c_sym].isin(syms)]
     if row.empty:
         return None
     p = parse_float(row.iloc[-1][c_price])
@@ -170,14 +181,18 @@ def holdings_price(hdf: pd.DataFrame, ticker: str) -> Optional[Tuple[float, str]
         return None
     return (p, c_price)
 
-def live_price(ticker: str) -> Optional[float]:
+def yf_ticker_for(ticker: str, aliases: Dict[str, str]) -> str:
+    alt = aliases.get(ticker, "").strip()
+    return alt if alt else ticker
+
+def live_price(ticker: str, aliases: Dict[str, str]) -> Optional[float]:
     if not HAVE_YF or not ticker:
         return None
+    yf_sym = yf_ticker_for(ticker, aliases)
     try:
-        t = yf.Ticker(ticker)
-        info = t.fast_info  # quicker, fewer calls
+        t = yf.Ticker(yf_sym)
+        info = t.fast_info
         p = None
-        # try regular market first; fall back to last close
         p = float(info.get("last_price")) if info.get("last_price") else None
         if p is None:
             p = float(info.get("previous_close")) if info.get("previous_close") else None
@@ -207,6 +222,23 @@ def timeframe_from_mapping(mdf: pd.DataFrame, ticker: str, source: str) -> Optio
 
     return SOURCE_DEFAULT_TIMEFRAME.get(source.lower()) if source else None
 
+def alias_map(mdf: pd.DataFrame) -> Dict[str, str]:
+    """Read Mapping!Ticker -> Mapping!TickerYF for symbol aliases."""
+    if mdf.empty:
+        return {}
+    cols = norm_cols(mdf)
+    c_tick = cols.get("ticker")
+    c_alt  = cols.get("tickeryf") or cols.get("ticker_yf") or cols.get("alias")
+    if not c_tick or not c_alt:
+        return {}
+    mp = {}
+    for _, r in mdf[[c_tick, c_alt]].iterrows():
+        k = clean_ticker(r[c_tick])
+        v = str(r[c_alt]).strip()
+        if k and v:
+            mp[k] = v
+    return mp
+
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
@@ -229,12 +261,14 @@ def main():
     print(f"• Signals rows: {len(df_sig)}")
     print(f"• Transactions rows: {len(df_txn)}")
     print(f"• Holdings rows: {len(df_hold)}")
+    if v:
+        print(f"• yfinance available: {HAVE_YF}")
 
     if df_sig.empty:
         print("⚠️ Signals tab is empty — nothing to do.")
         return
 
-    # ensure required columns exist
+    # Ensure required columns exist
     for c in [COL_SIG_TIMESTAMP, COL_SIG_TICKER, COL_SIG_SOURCE, COL_SIG_DIR, COL_SIG_PRICE, COL_SIG_TF]:
         if c not in df_sig.columns:
             df_sig[c] = ""
@@ -242,7 +276,11 @@ def main():
     df_sig["_ticker"] = df_sig[COL_SIG_TICKER].map(clean_ticker)
     df_sig["_source"] = df_sig[COL_SIG_SOURCE].astype(str).str.strip()
 
+    aliases = alias_map(df_map)
+
     filled = 0
+    price_col_index_for_formula = df_sig.columns.get_loc(COL_SIG_PRICE)  # 0-based in DataFrame
+
     for idx, row in df_sig.iterrows():
         tkr = row["_ticker"]
         src = row["_source"]
@@ -259,16 +297,16 @@ def main():
         price_val = parse_float(pr_s)
         if price_val is None:
             used = None
-            txn = latest_trade_for(df_txn, tkr)
+            txn = latest_trade_for(df_txn, tkr, aliases)
             if txn and txn[2] is not None and not pd.isna(txn[2]) and txn[2] > 0:
                 price_val = txn[2]; used = "transactions"
             else:
-                hp = holdings_price(df_hold, tkr)
+                hp = holdings_price(df_hold, tkr, aliases)
                 if hp:
                     price_val, col_used = hp
                     used = f"holdings[{col_used}]"
                 else:
-                    lp = live_price(tkr)
+                    lp = live_price(tkr, aliases)
                     if lp is not None:
                         price_val = lp; used = "yfinance"
 
@@ -276,13 +314,14 @@ def main():
                 df_sig.at[idx, COL_SIG_PRICE] = f"{price_val:.4f}".rstrip("0").rstrip(".")
                 filled += 1
                 if v: print(f"  • {tkr}: price ← {used} ({price_val})")
-            elif v:
-                print(f"  • {tkr}: no price found in transactions/holdings/yfinance")
+            else:
+                # Leave blank for now; we'll insert GOOGLEFINANCE formula later.
+                if v: print(f"  • {tkr}: no price found → will set GOOGLEFINANCE()")
 
         # TIMESTAMP
         if not ts:
             if 'txn' not in locals():
-                txn = latest_trade_for(df_txn, tkr)
+                txn = latest_trade_for(df_txn, tkr, aliases)
             if txn:
                 df_sig.at[idx, COL_SIG_TIMESTAMP] = txn[0]; filled += 1
                 if v: print(f"  • {tkr}: timestamp ← transactions ({txn[0]})")
@@ -294,7 +333,7 @@ def main():
         # DIRECTION
         if not dr:
             if 'txn' not in locals():
-                txn = latest_trade_for(df_txn, tkr)
+                txn = latest_trade_for(df_txn, tkr, aliases)
             if txn:
                 df_sig.at[idx, COL_SIG_DIR] = txn[1]; filled += 1
                 if v: print(f"  • {tkr}: direction ← transactions ({txn[1]})")
@@ -312,15 +351,36 @@ def main():
         if 'txn' in locals():
             del txn
 
+    # Insert GOOGLEFINANCE formulas for any remaining blank prices
+    # (use alias if provided for the formula as well)
+    for idx, row in df_sig.iterrows():
+        if str(row[COL_SIG_PRICE]).strip():
+            continue
+        tkr = row["_ticker"]
+        if not tkr:
+            continue
+        gf_sym = aliases.get(tkr, tkr)
+        sheet_row = idx + 2  # +1 for header, +1 to convert 0-based to 1-based
+        # If alias includes non-standard exchange codes, user can set Mapping!TickerYF accordingly
+        formula = f'=IFERROR(GOOGLEFINANCE("{gf_sym}","price"), IFERROR(GOOGLEFINANCE(B{sheet_row},"price"), ""))'
+        df_sig.at[idx, COL_SIG_PRICE] = formula
+        filled += 1
+        if v: print(f"  • {tkr}: price ← GOOGLEFINANCE({gf_sym})")
+
+    df_sig = df_sig.drop(columns=["_ticker", "_source"])
+
     if filled == 0:
         print("ℹ️ No fields needed backfilling (or no matching data). Nothing to write.")
         return
 
-    df_sig = df_sig.drop(columns=["_ticker", "_source"])
-    print(f"✏️ Backfilled {filled} empty fields in Signals. Writing back…")
+    print(f"✏️ Backfilled {filled} fields. Writing back…")
     a1_update_table(ws_sig, df_sig)
     print("✅ Done. Check the Signals tab.")
-
+    if not HAVE_YF:
+        print("ℹ️ yfinance not available in this env; prices were filled via Transactions/Holdings/GOOGLEFINANCE.")
+    else:
+        print("ℹ️ Prices used Transactions/Holdings/yfinance; any remaining blanks now use GOOGLEFINANCE formulas.")
+    
 if __name__ == "__main__":
     try:
         main()
