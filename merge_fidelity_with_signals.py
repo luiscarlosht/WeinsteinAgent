@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-merge_fidelity_with_signals.py  v2.1
+merge_fidelity_with_signals.py  v3.0
 
 Backfills empty fields in the Google Sheet "Signals" tab:
 - TimestampUTC, Direction, Price, Timeframe
 
-Sources:
-- Transactions (latest BUY/SELL price & date)
-- Holdings ("Last Price ($)" or "Price ($)")
-- Mapping (per-ticker or per-source default timeframe)
+Sources (in order):
+1) Transactions (latest BUY/SELL trade price & date)
+2) Holdings (any recognized "price" column)
+3) Live quote via yfinance (regular market price or last close)
 
-Only blank cells are filled. Existing values are preserved.
+Only blank cells are filled; existing values are preserved.
 
 Usage:
   python3 merge_fidelity_with_signals.py [--verbose]
@@ -29,6 +29,13 @@ from typing import Dict, Optional, Tuple
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+
+# Optional live quotes
+try:
+    import yfinance as yf
+    HAVE_YF = True
+except Exception:
+    HAVE_YF = False
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
@@ -57,6 +64,12 @@ COL_SIG_SOURCE    = "Source"
 COL_SIG_DIR       = "Direction"
 COL_SIG_PRICE     = "Price"
 COL_SIG_TF        = "Timeframe"
+
+# Holdings price columns we’ll try (first match wins)
+HOLDINGS_PRICE_CANDIDATES = [
+    "Last Price ($)", "Price ($)", "Last Price", "Price", "Current Price",
+    "Price/Share ($)", "Price/Share", "Market Price", "Last Trade Price"
+]
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def auth() -> gspread.Client:
@@ -87,7 +100,7 @@ def norm_cols(df: pd.DataFrame) -> Dict[str, str]:
 def clean_ticker(raw: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         return ""
-    word = raw.strip().split()[0]
+    word = raw.strip().split()[0]  # keep first token (handles "PLTR 190 Call")
     letters = re.sub(r"[^A-Za-z]", "", word)
     return letters.upper()
 
@@ -104,10 +117,10 @@ def latest_trade_for(tdf: pd.DataFrame, ticker: str) -> Optional[Tuple[str, str,
     if tdf.empty or not ticker:
         return None
     cols = norm_cols(tdf)
-    c_run   = cols.get("run date") or cols.get("date") or cols.get("trade date")
+    c_run   = cols.get("run date") or cols.get("date") or cols.get("trade date") or cols.get("time")
     c_sym   = cols.get("symbol")
     c_type  = cols.get("type") or cols.get("action")
-    c_price = cols.get("price ($)") or cols.get("price")
+    c_price = cols.get("price ($)") or cols.get("price") or cols.get("price/share ($)") or cols.get("price/share")
     if not (c_run and c_sym and c_type and c_price):
         return None
 
@@ -130,20 +143,47 @@ def latest_trade_for(tdf: pd.DataFrame, ticker: str) -> Optional[Tuple[str, str,
         iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
     return (iso, direction, price if price is not None else float("nan"))
 
-def holdings_price(hdf: pd.DataFrame, ticker: str) -> Optional[float]:
+def holdings_price(hdf: pd.DataFrame, ticker: str) -> Optional[Tuple[float, str]]:
+    """Return (price, column_used) if found."""
     if hdf.empty or not ticker:
         return None
     cols = norm_cols(hdf)
-    c_sym = cols.get("symbol") or cols.get("ticker")
-    c_lp  = cols.get("last price ($)") or cols.get("price ($)") or cols.get("last price")
-    if not (c_sym and c_lp):
+    c_sym = cols.get("symbol") or cols.get("ticker") or cols.get("symbol/cusip")
+    if not c_sym:
         return None
-    work = hdf[[c_sym, c_lp]].copy()
+    # find the first price column that exists
+    c_price = None
+    for cand in HOLDINGS_PRICE_CANDIDATES:
+        if cand.lower() in cols:
+            c_price = cols[cand.lower()]
+            break
+    if not c_price:
+        return None
+
+    work = hdf[[c_sym, c_price]].copy()
     work[c_sym] = work[c_sym].map(clean_ticker)
     row = work[work[c_sym] == ticker]
     if row.empty:
         return None
-    return parse_float(row.iloc[-1][c_lp])
+    p = parse_float(row.iloc[-1][c_price])
+    if p is None:
+        return None
+    return (p, c_price)
+
+def live_price(ticker: str) -> Optional[float]:
+    if not HAVE_YF or not ticker:
+        return None
+    try:
+        t = yf.Ticker(ticker)
+        info = t.fast_info  # quicker, fewer calls
+        p = None
+        # try regular market first; fall back to last close
+        p = float(info.get("last_price")) if info.get("last_price") else None
+        if p is None:
+            p = float(info.get("previous_close")) if info.get("previous_close") else None
+        return p
+    except Exception:
+        return None
 
 def timeframe_from_mapping(mdf: pd.DataFrame, ticker: str, source: str) -> Optional[str]:
     if mdf.empty:
@@ -210,7 +250,6 @@ def main():
             if v: print(f"  • Row {idx+2}: empty ticker → skip")
             continue
 
-        # Current values
         ts   = str(row[COL_SIG_TIMESTAMP]).strip()
         dr   = str(row[COL_SIG_DIR]).strip()
         pr_s = str(row[COL_SIG_PRICE]).strip()
@@ -219,21 +258,26 @@ def main():
         # PRICE decision
         price_val = parse_float(pr_s)
         if price_val is None:
-            txn = latest_trade_for(df_txn, tkr)
             used = None
+            txn = latest_trade_for(df_txn, tkr)
             if txn and txn[2] is not None and not pd.isna(txn[2]) and txn[2] > 0:
                 price_val = txn[2]; used = "transactions"
             else:
                 hp = holdings_price(df_hold, tkr)
-                if hp is not None and not pd.isna(hp) and hp > 0:
-                    price_val = hp; used = "holdings"
+                if hp:
+                    price_val, col_used = hp
+                    used = f"holdings[{col_used}]"
+                else:
+                    lp = live_price(tkr)
+                    if lp is not None:
+                        price_val = lp; used = "yfinance"
 
             if price_val is not None:
                 df_sig.at[idx, COL_SIG_PRICE] = f"{price_val:.4f}".rstrip("0").rstrip(".")
                 filled += 1
                 if v: print(f"  • {tkr}: price ← {used} ({price_val})")
             elif v:
-                print(f"  • {tkr}: no price found in transactions or holdings")
+                print(f"  • {tkr}: no price found in transactions/holdings/yfinance")
 
         # TIMESTAMP
         if not ts:
@@ -265,15 +309,13 @@ def main():
                 df_sig.at[idx, COL_SIG_TF] = tf_val; filled += 1
                 if v: print(f"  • {tkr}: timeframe ← mapping/default ({tf_val})")
 
-        # clean local var for next loop
         if 'txn' in locals():
             del txn
 
     if filled == 0:
-        print("ℹ️ No fields needed backfilling (or no matching data in transactions/holdings). Nothing to write.")
+        print("ℹ️ No fields needed backfilling (or no matching data). Nothing to write.")
         return
 
-    # drop helper cols & write back
     df_sig = df_sig.drop(columns=["_ticker", "_source"])
     print(f"✏️ Backfilled {filled} empty fields in Signals. Writing back…")
     a1_update_table(ws_sig, df_sig)
