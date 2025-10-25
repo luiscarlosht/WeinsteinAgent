@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Builds three tabs from your Google Sheet data:
+  - Realized_Trades   (FIFO matched from Transactions using BUY/SELL)
+  - Open_Positions    (remaining FIFO lots + live GOOGLEFINANCE price)
+  - Performance_By_Source (Trades/Wins/WinRate/Avg/Median Return + OpenSignals)
+
+Key fixes:
+- SELL rows no longer disappear: we take abs() of Quantity so they pass the Qty>0 filter.
+- Safer regex (non-capturing groups) to avoid pandas "match groups" warnings.
+- Robust ticker extraction from Symbol/Action/Description.
+- Uses gspread.update(values, range_name=...) to avoid deprecation warnings.
+"""
+
 import math, re, argparse
-from collections import deque, defaultdict
+import datetime as dt
+from collections import defaultdict, deque
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -47,11 +62,49 @@ def read_tab(ws) -> pd.DataFrame:
         return pd.DataFrame()
     header, rows = vals[0], vals[1:]
     df = pd.DataFrame(rows, columns=[h.strip() for h in header])
-    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)  # strip strings
+    # strip strings
+    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
+def write_tab(ws, df: pd.DataFrame):
+    ws.clear()
+    if df.empty:
+        # Use new signature (values first, then range_name=...) to avoid deprecation
+        ws.update([["(empty)"]], range_name="A1")
+        return
+    rows, cols = df.shape
+    ws.resize(rows=max(100, rows+5), cols=max(min(26, cols+2), 8))
+    header = [str(c) for c in df.columns]
+    data = [header] + df.astype(str).fillna("").values.tolist()
+
+    CHUNK = 500
+    start = 0
+    r = 1
+    while start < len(data):
+        end = min(start+CHUNK, len(data))
+        block = data[start:end]
+        top_left = gspread.utils.rowcol_to_a1(r, 1)
+        ncols = len(header)
+        bottom_right = gspread.utils.rowcol_to_a1(r + len(block) - 1, ncols)
+        ws.update(block, range_name=f"{top_left}:{bottom_right}")
+        r += len(block)
+        start = end
+
 def to_dt(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce", utc=True)
+    # coerce & set UTC if naive
+    s = pd.to_datetime(series, errors="coerce", utc=False)
+    # localize naive to UTC
+    if isinstance(s, pd.Series):
+        try:
+            # elements may be mixed; convert naive to UTC
+            s = s.dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
+        except Exception:
+            # if already tz-aware, convert
+            try:
+                s = s.dt.tz_convert("UTC")
+            except Exception:
+                pass
+    return s
 
 def to_float(series: pd.Series) -> pd.Series:
     def conv(x):
@@ -75,7 +128,7 @@ def base_symbol_from_string(s) -> str:
     s = str(s).strip()
     if not s:
         return ""
-    token = s.split()[0]                 # take first whitespace-delimited chunk
+    token = s.split()[0]                 # first whitespace-delimited chunk
     token = token.split("-")[0]          # strip option/lot suffix like "AAPL-12345"
     token = token.replace("(", "").replace(")", "")
     token = re.sub(r"[^A-Za-z0-9\.\-]", "", token).upper()
@@ -85,32 +138,9 @@ def base_symbol_from_string(s) -> str:
         return ""
     if token.isdigit():
         return ""
-    # very long numeric-like or account-number-ish -> ignore
     if len(token) > 8 and token.isalnum():
         return ""
     return token
-
-def write_tab(ws, df: pd.DataFrame):
-    ws.clear()
-    if df.empty:
-        ws.update(values=[["(empty)"]], range_name="A1")
-        return
-    rows, cols = df.shape
-    ws.resize(rows=max(100, rows+5), cols=max(min(26, cols+2), 8))
-    header = [str(c) for c in df.columns]
-    data = [header] + df.astype(str).fillna("").values.tolist()
-    CHUNK = 500
-    start = 0
-    r = 1
-    while start < len(data):
-        end = min(start+CHUNK, len(data))
-        block = data[start:end]
-        top_left = gspread.utils.rowcol_to_a1(r, 1)
-        ncols = len(header)
-        bottom_right = gspread.utils.rowcol_to_a1(r + len(block) - 1, ncols)
-        ws.update(range_name=f"{top_left}:{bottom_right}", values=block)
-        r += len(block)
-        start = end
 
 def read_mapping(gc) -> Dict[str, Dict[str,str]]:
     """Return {ticker: {'FormulaSym': 'EXCH: TKR', 'TickerYF': 'TKR'}} if Mapping tab exists."""
@@ -155,99 +185,111 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     df["Price"] = df.get("Price","")
     return df[["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"]]
 
-def load_transactions(df_tx: pd.DataFrame, debug=False) -> pd.DataFrame:
+def _symbol_from_text(s: str) -> str:
     """
-    Parse Fidelity 'Transactions' export to trades DataFrame with cols:
-    When, Type, Symbol, Qty, Price
+    Try to extract (TICKER) in parentheses or the last all-caps token.
+    Handles strings like:
+      'YOU SOLD NEXTRACKER INC CLASS A COM (NXT) (Cash)'
+      'VANGUARD S&P 500 ETF (VOO) (Cash)'
     """
-    if df_tx.empty:
-        return df_tx
+    if not isinstance(s, str):
+        return ""
+    # Try parentheses with capital letters/numbers/.- inside
+    m = re.search(r"\(([A-Z0-9\.\-]{1,8})\)", s.upper())
+    if m:
+        return base_symbol_from_string(m.group(1))
+    # Fallback: last capitalized token
+    toks = re.findall(r"[A-Z0-9\.\-]{1,8}", s.upper())
+    if toks:
+        return base_symbol_from_string(toks[-1])
+    return ""
 
-    # likely Fidelity column names
-    symcol   = next((c for c in df_tx.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
-    actioncol= next((c for c in df_tx.columns if c.lower() in ("action","type")), None)
-    pricecol = next((c for c in df_tx.columns if "price" in c.lower()), None)
-    qtycol   = next((c for c in df_tx.columns if "quantity" in c.lower()), None)
-    amtcol   = next((c for c in df_tx.columns if "amount" in c.lower()), None)
-    desc_col = next((c for c in df_tx.columns if "description" in c.lower()), None)
-    datecol  = next((c for c in df_tx.columns if "run date" in c.lower()), None)
-    if not actioncol or not datecol:
-        raise ValueError("Transactions tab must include Action/Type and Run Date columns.")
+def load_transactions(df_tx: pd.DataFrame, debug=False) -> pd.DataFrame:
+    if df_tx.empty:
+        return pd.DataFrame(columns=["When","Type","Symbol","Qty","Price"])
+
+    # Column discovery
+    symcol  = next((c for c in df_tx.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
+    typecol = next((c for c in df_tx.columns if c.lower() in ("type","action")), None)
+    pricecol= next((c for c in df_tx.columns if "price" in c.lower()), None)
+    amtcol  = next((c for c in df_tx.columns if "amount" in c.lower()), None)
+    qtycol  = next((c for c in df_tx.columns if "quantity" in c.lower()), None)
+    datecol = next((c for c in df_tx.columns if "run date" in c.lower()), None)
+    desccol = next((c for c in df_tx.columns if "description" in c.lower()), None)
+    if not datecol or not typecol:
+        raise ValueError("Transactions tab must include Run Date and Type/Action columns.")
+    if not symcol and not desccol and not typecol:
+        raise ValueError("Transactions tab needs at least Symbol or Description/Action to extract tickers.")
 
     df = df_tx.copy()
-    when = to_dt(df[datecol])
-    action_raw = df[actioncol].fillna("").astype(str)
-    desc_raw   = df[desc_col].fillna("").astype(str) if desc_col else pd.Series([""]*len(df))
 
-    # detect trade-like rows
+    # Base fields
+    when = to_dt(df[datecol])
+    action_raw = df[typecol].fillna("").astype(str)
+    desc_raw   = df[desccol].fillna("").astype(str) if desccol else pd.Series([""]*len(df), index=df.index)
+    symbol_raw = df[symcol].fillna("").astype(str) if symcol else pd.Series([""]*len(df), index=df.index)
+
+    # Trade-like rows: YOU BOUGHT / YOU SOLD / BUY / SELL (non-capturing groups to silence warning)
     patt = r"\b(?:YOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
     mask_action = action_raw.str.upper().str.contains(patt, regex=True, na=False)
     mask_desc   = desc_raw.str.upper().str.contains(patt,   regex=True, na=False)
-    trade_mask  = mask_action | mask_desc
+    mask_trade = (mask_action | mask_desc)
 
-    # symbol: prefer Symbol column; if blank, try to extract from Action/Description "(AAPL)"
-    if symcol:
-        sym = df[symcol].map(base_symbol_from_string)
+    df = df[mask_trade].copy()
+
+    # Ticker extraction: prefer Symbol column, then (TICKER) in Action/Description
+    sym = symbol_raw.map(base_symbol_from_string)
+    # fill blanks from Action then Description
+    sym = np.where(sym.astype(str).eq(""), action_raw.map(_symbol_from_text), sym)
+    sym = np.where(pd.Series(sym).astype(str).eq(""), desc_raw.map(_symbol_from_text), sym)
+    sym = pd.Series(sym, index=df.index).astype(str).fillna("")
+    sym = sym.map(base_symbol_from_string)
+
+    # Quantities & prices
+    if qtycol and qtycol in df.columns:
+        qty = to_float(df[qtycol]).abs()  # ← IMPORTANT: abs() so SELLs aren't dropped later
     else:
-        sym = pd.Series([""]*len(df))
-
-    def symbol_from_action(s: str) -> str:
-        m = re.search(r"\(([A-Za-z0-9\.\-]{1,8})\)", s or "")
-        return base_symbol_from_string(m.group(1)) if m else ""
-
-    # fill blanks from action/description
-    sym_filled = sym.copy()
-    need_sym = sym_filled.eq("")
-    sym_filled.loc[need_sym] = action_raw[need_sym].map(symbol_from_action)
-    need_sym = sym_filled.eq("")
-    sym_filled.loc[need_sym] = desc_raw[need_sym].map(symbol_from_action)
-
-    # qty & price
-    if qtycol:
-        qty = to_float(df[qtycol])
-    else:
-        if amtcol and pricecol:
+        # derive from Amount/Price if present
+        if amtcol and pricecol and (amtcol in df.columns) and (pricecol in df.columns):
             amt = to_float(df[amtcol])
             prc = to_float(df[pricecol])
             with np.errstate(divide='ignore', invalid='ignore'):
                 qty = np.where((prc!=0) & (~np.isnan(prc)) & (~np.isnan(amt)), np.abs(amt)/np.abs(prc), np.nan)
-            qty = pd.Series(qty, index=df.index)
+            qty = pd.Series(qty, index=df.index).abs()
         else:
             qty = pd.Series(np.nan, index=df.index)
-    price = to_float(df[pricecol]) if pricecol else pd.Series(np.nan, index=df.index)
+    price = to_float(df[pricecol]) if (pricecol and pricecol in df.columns) else pd.Series(np.nan, index=df.index)
 
     tx = pd.DataFrame({
         "When": when,
-        "Type": action_raw,
-        "Symbol": sym_filled,
-        "Qty": qty,
+        "Type": action_raw.str.upper(),
+        "Symbol": sym,
+        "Qty": pd.to_numeric(qty, errors="coerce"),
         "Price": price,
-    })
+    }).dropna(subset=["When"])
 
-    # keep only trade-like + symbol + timestamp
-    tx = tx[trade_mask & tx["Symbol"].ne("") & tx["When"].notna()].copy()
-    tx["Qty"] = pd.to_numeric(tx["Qty"], errors="coerce")
-    tx = tx[tx["Qty"] > 0].copy()
+    # Keep only rows with a symbol & positive quantity
+    tx = tx[(tx["Symbol"].ne("")) & (tx["Qty"] > 0)].copy()
+
+    # Sort
     tx.sort_values("When", inplace=True)
     tx.reset_index(drop=True, inplace=True)
 
     if debug:
-        detected = int(trade_mask.sum())
-        print(f"• load_transactions: detected {detected} trade-like rows (of {len(df_tx)})")
+        print(f"• load_transactions: detected {mask_trade.sum()} trade-like rows (of {len(df_tx)})")
         print(f"• load_transactions: after cleaning → {len(tx)} trades")
-        print(tx.head(8).to_string(index=False))
-
+        print(tx.head(8))
     return tx
 
 def load_holdings(df_h: pd.DataFrame) -> pd.DataFrame:
-    if df_h.empty: return df_h
+    if df_h.empty: return pd.DataFrame(columns=["Ticker","Qty","Price"])
     symcol  = next((c for c in df_h.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
     qtycol  = next((c for c in df_h.columns if "quantity" in c.lower()), None)
     pricecol= next((c for c in df_h.columns if "price" in c.lower()), None)
-    df = pd.DataFrame()
-    if symcol:   df["Ticker"] = df_h[symcol].map(base_symbol_from_string)
-    if qtycol:   df["Qty"]    = to_float(df_h[qtycol])
-    if pricecol: df["Price"]  = to_float(df_h[pricecol])
+    df = pd.DataFrame(index=df_h.index)
+    df["Ticker"] = df_h[symcol].map(base_symbol_from_string) if symcol else ""
+    df["Qty"]    = to_float(df_h[qtycol]) if qtycol else np.nan
+    df["Price"]  = to_float(df_h[pricecol]) if pricecol else np.nan
     return df
 
 # ─────────────────────────────
@@ -255,27 +297,26 @@ def load_holdings(df_h: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────
 def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug=False) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if tx.empty:
+        if debug: print("• build_realized_and_open: no transactions → nothing to match")
         return pd.DataFrame(), pd.DataFrame()
 
-    # Index BUY signals by (Ticker, time)
-    sig_buy = sig[(sig["Direction"].str.upper() == "BUY") & sig["Ticker"].ne("")].copy()
+    # Filter signals to BUYs with ticker
+    sig_buy = sig[(sig["Direction"].astype(str).str.upper()=="BUY") & sig["Ticker"].ne("")].copy()
     sig_buy.sort_values(["Ticker","TimestampUTC"], inplace=True)
 
+    # Index signals by ticker for "last signal at/<= time"
     sig_by_ticker: Dict[str, List[Tuple[pd.Timestamp, dict]]] = defaultdict(list)
     for _, r in sig_buy.iterrows():
-        sig_by_ticker[r["Ticker"]].append((
-            r["TimestampUTC"],
-            {
-                "Source": r.get("Source",""),
-                "Timeframe": r.get("Timeframe",""),
-                "SigTime": r.get("TimestampUTC"),
-                "SigPrice": r.get("Price",""),
-            }
-        ))
+        sig_by_ticker[r["Ticker"]].append( (r["TimestampUTC"], {
+            "Source": r.get("Source",""),
+            "Timeframe": r.get("Timeframe",""),
+            "SigTime": r.get("TimestampUTC"),
+            "SigPrice": r.get("Price",""),
+        }))
 
     def last_signal_for(tkr: str, when: pd.Timestamp):
         arr = sig_by_ticker.get(tkr, [])
-        # most recent signal at/<= when
+        # from end to start to get most recent at/<= when
         for t, payload in reversed(arr):
             if pd.isna(t) or pd.isna(when):
                 return payload
@@ -289,15 +330,14 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug=False) ->
     for _, row in tx.iterrows():
         tkr   = row["Symbol"]
         when  = row["When"]
-        ttype = str(row["Type"]).upper()
+        ttype = row["Type"]
         qty   = row["Qty"] if not math.isnan(row["Qty"]) else 0.0
         price = row["Price"] if not math.isnan(row["Price"]) else np.nan
-        if qty <= 0 or pd.isna(when) or tkr == "":
+        if qty <= 0 or pd.isna(when) or tkr=="":
             continue
 
-        # Proper action detection (covers YOU BOUGHT / YOU SOLD)
-        is_buy  = (("BUY"  in ttype) or ("BOUGHT" in ttype)) and not (("SELL" in ttype) or ("SOLD" in ttype))
-        is_sell =  ("SELL" in ttype) or ("SOLD"   in ttype)
+        is_buy  = ("BUY" in ttype) and ("SELL" not in ttype)
+        is_sell = ("SELL" in ttype) or ("SOLD" in ttype)
 
         if is_buy:
             siginfo = last_signal_for(tkr, when)
@@ -310,14 +350,12 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug=False) ->
                 "sig_time": siginfo.get("SigTime"),
                 "sig_price": siginfo.get("SigPrice"),
             })
-
         elif is_sell:
             remaining = qty
             while remaining > 0 and lots[tkr]:
                 lot = lots[tkr][0]
                 take = min(remaining, lot["qty_left"])
-                if take <= 0:
-                    break
+                if take <= 0: break
                 entry = lot["entry_price"] if not math.isnan(lot["entry_price"]) else 0.0
                 exitp = price if not math.isnan(price) else 0.0
                 ret_pct = ((exitp - entry) / entry * 100.0) if entry else np.nan
@@ -343,15 +381,14 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug=False) ->
 
     realized_df = pd.DataFrame(realized_rows)
     if not realized_df.empty:
-        realized_df.sort_values("ExitTimeUTC", inplace=True, ignore_index=True)
+        realized_df = realized_df.sort_values("ExitTimeUTC", ignore_index=True)
 
     # Remaining open lots
     now_utc = pd.Timestamp.now(tz="UTC")
     open_rows = []
     for tkr, q in lots.items():
         for lot in q:
-            if lot["qty_left"] <= 1e-9:
-                continue
+            if lot["qty_left"] <= 1e-9: continue
             open_rows.append({
                 "Ticker": tkr,
                 "OpenQty": round(lot["qty_left"], 6),
@@ -365,10 +402,10 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug=False) ->
             })
     open_df = pd.DataFrame(open_rows)
     if not open_df.empty:
-        open_df.sort_values("EntryTimeUTC", inplace=True, ignore_index=True)
+        open_df = open_df.sort_values("EntryTimeUTC", ignore_index=True)
 
     if debug:
-        print(f"• realized trades: {len(realized_df)} | open lots: {len(open_df)}")
+        print(f"• realized trades: {0 if realized_df.empty else len(realized_df)} | open lots: {0 if open_df.empty else len(open_df)}")
 
     return realized_df, open_df
 
@@ -378,10 +415,11 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str,Dict[str,st
     out = open_df.copy()
     price_now = []
     unreal = []
+    # row index in Sheets = dataframe index + 2 (header at row 1)
     for idx, r in out.iterrows():
         tkr = r["Ticker"]
         ep  = r.get("EntryPrice")
-        row_index = idx + 2  # header is row 1
+        row_index = idx + 2
         formula = googlefinance_formula_for(tkr, row_index, mapping)
         price_now.append(formula)
         try:
@@ -393,7 +431,7 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str,Dict[str,st
     out.insert(out.columns.get_loc("PriceNow")+1, "Unrealized%", unreal)
     return out
 
-def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame, signals_df: pd.DataFrame) -> pd.DataFrame:
+def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
     if realized_df.empty:
         realized_grp = pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%"])
     else:
@@ -419,11 +457,13 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame, signa
     if perf.empty:
         return pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenSignals"])
 
+    # clean types
     perf["Trades"] = pd.to_numeric(perf["Trades"], errors="coerce").fillna(0).astype(int)
-    perf["Wins"] = pd.to_numeric(perf["Wins"], errors="coerce").fillna(0).astype(int)
+    perf["Wins"]   = pd.to_numeric(perf["Wins"],   errors="coerce").fillna(0).astype(int)
     for col in ["WinRate%","AvgReturn%","MedianReturn%"]:
         perf[col] = pd.to_numeric(perf[col], errors="coerce").fillna(0.0)
     perf["OpenSignals"] = pd.to_numeric(perf["OpenSignals"], errors="coerce").fillna(0).astype(int)
+
     perf = perf.sort_values(["Source"]).reset_index(drop=True)
     return perf
 
@@ -431,10 +471,9 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame, signa
 # MAIN
 # ─────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Build performance dashboard tabs from Signals + Transactions.")
-    ap.add_argument("--debug", action="store_true", help="Print debug details")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--debug", action="store_true", help="print debug info")
     args = ap.parse_args()
-    debug = args.debug
 
     print("📊 Building performance dashboard…")
     gc = auth_gspread()
@@ -450,10 +489,10 @@ def main():
     print(f"• Loaded: Signals={len(df_sig)} rows, Transactions={len(df_tx)} rows, Holdings={len(df_h)} rows")
 
     sig = load_signals(df_sig)
-    tx  = load_transactions(df_tx, debug=debug)
-    _   = load_holdings(df_h)  # optional; currently unused in the build
+    tx  = load_transactions(df_tx, debug=args.debug)
+    _   = load_holdings(df_h)  # optional; not used further here
 
-    realized_df, open_df = build_realized_and_open(tx, sig, debug=debug)
+    realized_df, open_df = build_realized_and_open(tx, sig, debug=args.debug)
 
     # Add live price formulas for open lots
     mapping = read_mapping(gc)
@@ -471,7 +510,7 @@ def main():
             "Source","Timeframe","SignalTimeUTC","SignalPrice"
         ]]
 
-    perf_df = build_perf_by_source(realized_df.copy(), open_df.copy(), sig)
+    perf_df = build_perf_by_source(realized_df.copy(), open_df.copy(),)
 
     # Write tabs
     ws_real = open_ws(gc, TAB_REALIZED)
@@ -482,9 +521,9 @@ def main():
     write_tab(ws_open, open_df)
     write_tab(ws_perf, perf_df)
 
-    print(f"✅ Wrote {TAB_REALIZED}: {len(realized_df)} rows")
-    print(f"✅ Wrote {TAB_OPEN}: {len(open_df)} rows")
-    print(f"✅ Wrote {TAB_PERF}: {len(perf_df)} rows")
+    print(f"✅ Wrote {TAB_REALIZED}: {0 if realized_df.empty else len(realized_df)} rows")
+    print(f"✅ Wrote {TAB_OPEN}: {0 if open_df.empty else len(open_df)} rows")
+    print(f"✅ Wrote {TAB_PERF}: {0 if perf_df.empty else len(perf_df)} rows")
     print("🎯 Done.")
 
 if __name__ == "__main__":
