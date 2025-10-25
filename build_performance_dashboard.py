@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
-# build_performance_dashboard.py
-# Creates/updates three tabs in your Google Sheet:
-#   - Realized_Trades
-#   - Open_Positions
-#   - Performance_By_Source
-#
-# Sheets needed as inputs:
-#   - Signals (TimestampUTC, Ticker, Source, Direction, Price, Timeframe)
-#   - Transactions (Fidelity export with Action/Type/Symbol/Description/Run Date/Quantity/Price ($)/Amount ($))
-#   - Holdings (optional, not required for the core logic)
-#
-# Run:
-#   python3 build_performance_dashboard.py [--debug]
-
-import argparse
-import math
-import re
-from collections import defaultdict, deque
+import math, re, argparse
+from collections import deque, defaultdict
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -41,10 +25,10 @@ TAB_REALIZED     = "Realized_Trades"
 TAB_OPEN         = "Open_Positions"
 TAB_PERF         = "Performance_By_Source"
 
-DEFAULT_EXCHANGE_PREFIX = "NASDAQ: "  # used when Mapping.FormulaSym missing
+DEFAULT_EXCHANGE_PREFIX = "NASDAQ: "
 
 # ─────────────────────────────
-# AUTH / SHEETS IO
+# UTILITIES
 # ─────────────────────────────
 def auth_gspread():
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
@@ -63,62 +47,8 @@ def read_tab(ws) -> pd.DataFrame:
         return pd.DataFrame()
     header, rows = vals[0], vals[1:]
     df = pd.DataFrame(rows, columns=[h.strip() for h in header])
-    # strip strings safely
-    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
+    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)  # strip strings
     return df
-
-def write_tab(ws, df: pd.DataFrame):
-    ws.clear()
-    if df.empty:
-        ws.update(range_name="A1", values=[["(empty)"]])
-        return
-    rows, cols = df.shape
-    ws.resize(rows=max(100, rows + 5), cols=max(min(26, cols + 2), 8))
-
-    header = [str(c) for c in df.columns]
-    data = [header] + df.astype(str).fillna("").values.tolist()
-
-    CHUNK = 500
-    start = 0
-    r = 1
-    while start < len(data):
-        end = min(start + CHUNK, len(data))
-        block = data[start:end]
-        top_left = gspread.utils.rowcol_to_a1(r, 1)
-        ncols = len(header)
-        bottom_right = gspread.utils.rowcol_to_a1(r + len(block) - 1, ncols)
-        ws.update(range_name=f"{top_left}:{bottom_right}", values=block)
-        r += len(block)
-        start = end
-
-# ─────────────────────────────
-# HELPERS
-# ─────────────────────────────
-BLACKLIST_TOKENS = {
-    "CASH","USD","INTEREST","DIVIDEND","REINVESTMENT","FEE","WITHDRAWAL","DEPOSIT",
-    "TRANSFER","SWEEP"
-}
-
-def base_symbol_from_string(s) -> str:
-    """Extract a base equity/ETF symbol; return '' for cash/blank/other."""
-    if s is None or (isinstance(s, float) and math.isnan(s)):
-        return ""
-    s = str(s).strip()
-    if not s:
-        return ""
-    token = s.split()[0]                 # first whitespace-delimited chunk
-    token = token.split("-")[0]          # strip lot suffix like "AAPL-12345"
-    token = token.replace("(", "").replace(")", "")
-    token = re.sub(r"[^A-Za-z0-9\.\-]", "", token).upper()
-    if not token:
-        return ""
-    if token in BLACKLIST_TOKENS:
-        return ""
-    if token.isdigit():
-        return ""
-    if len(token) > 8 and token.isalnum():
-        return ""  # likely account number
-    return token
 
 def to_dt(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=True)
@@ -133,38 +63,85 @@ def to_float(series: pd.Series) -> pd.Series:
             return np.nan
     return series.map(conv)
 
-def read_mapping(gc) -> Dict[str, Dict[str, str]]:
+BLACKLIST_TOKENS = {
+    "CASH","USD","INTEREST","DIVIDEND","REINVESTMENT","FEE","WITHDRAWAL","DEPOSIT",
+    "TRANSFER","SWEEP"
+}
+
+def base_symbol_from_string(s) -> str:
+    """Robustly extract a base equity/ETF symbol; return '' for cash/blank/other."""
+    if s is None or (isinstance(s, float) and math.isnan(s)):
+        return ""
+    s = str(s).strip()
+    if not s:
+        return ""
+    token = s.split()[0]                 # take first whitespace-delimited chunk
+    token = token.split("-")[0]          # strip option/lot suffix like "AAPL-12345"
+    token = token.replace("(", "").replace(")", "")
+    token = re.sub(r"[^A-Za-z0-9\.\-]", "", token).upper()
+    if not token:
+        return ""
+    if token in BLACKLIST_TOKENS:
+        return ""
+    if token.isdigit():
+        return ""
+    # very long numeric-like or account-number-ish -> ignore
+    if len(token) > 8 and token.isalnum():
+        return ""
+    return token
+
+def write_tab(ws, df: pd.DataFrame):
+    ws.clear()
+    if df.empty:
+        ws.update(values=[["(empty)"]], range_name="A1")
+        return
+    rows, cols = df.shape
+    ws.resize(rows=max(100, rows+5), cols=max(min(26, cols+2), 8))
+    header = [str(c) for c in df.columns]
+    data = [header] + df.astype(str).fillna("").values.tolist()
+    CHUNK = 500
+    start = 0
+    r = 1
+    while start < len(data):
+        end = min(start+CHUNK, len(data))
+        block = data[start:end]
+        top_left = gspread.utils.rowcol_to_a1(r, 1)
+        ncols = len(header)
+        bottom_right = gspread.utils.rowcol_to_a1(r + len(block) - 1, ncols)
+        ws.update(range_name=f"{top_left}:{bottom_right}", values=block)
+        r += len(block)
+        start = end
+
+def read_mapping(gc) -> Dict[str, Dict[str,str]]:
     """Return {ticker: {'FormulaSym': 'EXCH: TKR', 'TickerYF': 'TKR'}} if Mapping tab exists."""
     try:
         mws = open_ws(gc, "Mapping")
         dfm = read_tab(mws)
-        out: Dict[str, Dict[str, str]] = {}
+        out: Dict[str, Dict[str,str]] = {}
         if not dfm.empty and "Ticker" in dfm.columns:
             for _, row in dfm.iterrows():
                 t = str(row.get("Ticker","")).strip().upper()
-                if not t:
-                    continue
+                if not t: continue
                 out[t] = {
                     "FormulaSym": str(row.get("FormulaSym","")).strip(),
-                    "TickerYF": str(row.get("TickerYF","")).strip().upper(),
+                    "TickerYF": str(row.get("TickerYF","")).strip().upper()
                 }
         return out
     except Exception:
         return {}
 
-def googlefinance_formula_for(ticker: str, row_idx: int, mapping: Dict[str, Dict[str, str]]) -> str:
+def googlefinance_formula_for(ticker:str, row_idx:int, mapping:Dict[str,Dict[str,str]]) -> str:
     base = base_symbol_from_string(ticker)
     mapped = mapping.get(ticker, {}) or mapping.get(base, {}) or {}
     sym = mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
-    # Use fallback to B{row} ticker if FormulaSym were to fail
     return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_idx},"price"), ""))'
 
 # ─────────────────────────────
-# LOADERS
+# LOAD SHEET DATA
 # ─────────────────────────────
 def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     if df_sig.empty:
-        return pd.DataFrame(columns=["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"])
+        return df_sig
     df = df_sig.copy()
     tcol = next((c for c in df.columns if c.lower() in ("ticker","symbol")), None)
     if not tcol:
@@ -176,113 +153,107 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     tscol = next((c for c in df.columns if c.lower().startswith("timestamp")), None)
     df["TimestampUTC"] = to_dt(df[tscol]) if tscol else pd.NaT
     df["Price"] = df.get("Price","")
-    out = df[["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"]].copy()
-    out.sort_values(["Ticker","TimestampUTC"], inplace=True, ignore_index=True)
-    return out
+    return df[["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"]]
 
 def load_transactions(df_tx: pd.DataFrame, debug=False) -> pd.DataFrame:
     """
-    Parses Fidelity 'Transactions' tab, extracting BUY/SELL rows with Symbol, When, Qty, Price.
-    If Symbol is blank, it tries to extract (TICKER) from Action/Description.
+    Parse Fidelity 'Transactions' export to trades DataFrame with cols:
+    When, Type, Symbol, Qty, Price
     """
     if df_tx.empty:
-        return pd.DataFrame(columns=["When","Type","Symbol","Qty","Price"])
+        return df_tx
+
+    # likely Fidelity column names
+    symcol   = next((c for c in df_tx.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
+    actioncol= next((c for c in df_tx.columns if c.lower() in ("action","type")), None)
+    pricecol = next((c for c in df_tx.columns if "price" in c.lower()), None)
+    qtycol   = next((c for c in df_tx.columns if "quantity" in c.lower()), None)
+    amtcol   = next((c for c in df_tx.columns if "amount" in c.lower()), None)
+    desc_col = next((c for c in df_tx.columns if "description" in c.lower()), None)
+    datecol  = next((c for c in df_tx.columns if "run date" in c.lower()), None)
+    if not actioncol or not datecol:
+        raise ValueError("Transactions tab must include Action/Type and Run Date columns.")
 
     df = df_tx.copy()
-
-    # Column discovery
-    datecol = next((c for c in df.columns if "run date" in c.lower()), None)
-    actioncol = next((c for c in df.columns if c.lower() in ("action","type")), None)
-    symcol  = next((c for c in df.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
-    desccol = next((c for c in df.columns if "description" in c.lower()), None)
-    qtycol  = next((c for c in df.columns if "quantity" in c.lower()), None)
-    pricecol= next((c for c in df.columns if "price" in c.lower()), None)
-    amtcol  = next((c for c in df.columns if "amount" in c.lower()), None)
-
-    if not datecol or not actioncol:
-        raise ValueError("Transactions tab must include 'Run Date' and 'Action/Type' columns.")
-
     when = to_dt(df[datecol])
-    action = df[actioncol].fillna("")
-    desc = df[desccol].fillna("") if desccol else pd.Series([""] * len(df))
+    action_raw = df[actioncol].fillna("").astype(str)
+    desc_raw   = df[desc_col].fillna("").astype(str) if desc_col else pd.Series([""]*len(df))
 
-    # find trade-like rows (case-insensitive, non-capturing groups -> no warning)
-    patt = r"(?:YOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
-    mask = action.str.contains(patt, regex=True, na=False, case=False) | \
-           desc.str.contains(patt,   regex=True, na=False, case=False)
+    # detect trade-like rows
+    patt = r"\b(?:YOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
+    mask_action = action_raw.str.upper().str.contains(patt, regex=True, na=False)
+    mask_desc   = desc_raw.str.upper().str.contains(patt,   regex=True, na=False)
+    trade_mask  = mask_action | mask_desc
 
-    df_trade = df[mask].copy()
-    if debug:
-        print(f"• load_transactions: detected {len(df_trade)} trade-like rows (of {len(df)})")
+    # symbol: prefer Symbol column; if blank, try to extract from Action/Description "(AAPL)"
+    if symcol:
+        sym = df[symcol].map(base_symbol_from_string)
+    else:
+        sym = pd.Series([""]*len(df))
 
-    # Symbol extraction
-    symbol_series = df_trade[symcol].map(base_symbol_from_string) if symcol else pd.Series([""] * len(df_trade))
-
-    # Fallback: pull ticker inside parentheses from Action/Description
-    def extract_sym_from_text(txt: str) -> str:
-        if not isinstance(txt, str):
-            return ""
-        m = re.search(r"\(([A-Za-z0-9\.\-]{1,8})\)", txt)
+    def symbol_from_action(s: str) -> str:
+        m = re.search(r"\(([A-Za-z0-9\.\-]{1,8})\)", s or "")
         return base_symbol_from_string(m.group(1)) if m else ""
 
-    sym_from_action = df_trade[actioncol].map(extract_sym_from_text)
-    sym_from_desc   = df_trade[desccol].map(extract_sym_from_text) if desccol else pd.Series([""] * len(df_trade))
+    # fill blanks from action/description
+    sym_filled = sym.copy()
+    need_sym = sym_filled.eq("")
+    sym_filled.loc[need_sym] = action_raw[need_sym].map(symbol_from_action)
+    need_sym = sym_filled.eq("")
+    sym_filled.loc[need_sym] = desc_raw[need_sym].map(symbol_from_action)
 
-    sym_final = symbol_series.fillna("")
-    sym_final = np.where(sym_final.astype(str).eq(""), sym_from_action, sym_final)
-    sym_final = np.where(pd.Series(sym_final).astype(str).eq(""), sym_from_desc, sym_final)
-    sym_final = pd.Series(sym_final, index=df_trade.index).astype(str).fillna("")
-    sym_final = sym_final.map(base_symbol_from_string)
-
-    # Quantities & price
-    qty = to_float(df_trade[qtycol]) if qtycol else pd.Series(np.nan, index=df_trade.index)
-    price = to_float(df_trade[pricecol]) if pricecol else pd.Series(np.nan, index=df_trade.index)
-
-    # If qty missing but amount+price present, derive qty = |amount|/|price|
-    if qty.isna().all() and amtcol and pricecol:
-        amt = to_float(df_trade[amtcol])
-        with np.errstate(divide='ignore', invalid='ignore'):
-            qty = np.where((price != 0) & (~np.isnan(price)) & (~np.isnan(amt)), np.abs(amt) / np.abs(price), np.nan)
-        qty = pd.Series(qty, index=df_trade.index)
+    # qty & price
+    if qtycol:
+        qty = to_float(df[qtycol])
+    else:
+        if amtcol and pricecol:
+            amt = to_float(df[amtcol])
+            prc = to_float(df[pricecol])
+            with np.errstate(divide='ignore', invalid='ignore'):
+                qty = np.where((prc!=0) & (~np.isnan(prc)) & (~np.isnan(amt)), np.abs(amt)/np.abs(prc), np.nan)
+            qty = pd.Series(qty, index=df.index)
+        else:
+            qty = pd.Series(np.nan, index=df.index)
+    price = to_float(df[pricecol]) if pricecol else pd.Series(np.nan, index=df.index)
 
     tx = pd.DataFrame({
-        "When": when.loc[df_trade.index],
-        "Type": action.loc[df_trade.index].fillna(""),
-        "Symbol": sym_final,
-        "Qty": pd.to_numeric(qty, errors="coerce"),
-        "Price": pd.to_numeric(price, errors="coerce"),
-    }).dropna(subset=["When"])
+        "When": when,
+        "Type": action_raw,
+        "Symbol": sym_filled,
+        "Qty": qty,
+        "Price": price,
+    })
 
-    # Keep only equity trades with symbol & qty > 0
-    tx = tx[(tx["Symbol"].ne("")) & (tx["Qty"] > 0)].copy()
+    # keep only trade-like + symbol + timestamp
+    tx = tx[trade_mask & tx["Symbol"].ne("") & tx["When"].notna()].copy()
+    tx["Qty"] = pd.to_numeric(tx["Qty"], errors="coerce")
+    tx = tx[tx["Qty"] > 0].copy()
     tx.sort_values("When", inplace=True)
     tx.reset_index(drop=True, inplace=True)
 
     if debug:
+        detected = int(trade_mask.sum())
+        print(f"• load_transactions: detected {detected} trade-like rows (of {len(df_tx)})")
         print(f"• load_transactions: after cleaning → {len(tx)} trades")
-        print(tx.head(8).to_string())
+        print(tx.head(8).to_string(index=False))
 
     return tx
 
 def load_holdings(df_h: pd.DataFrame) -> pd.DataFrame:
-    if df_h.empty:
-        return pd.DataFrame(columns=["Ticker","Qty","Price"])
+    if df_h.empty: return df_h
     symcol  = next((c for c in df_h.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
     qtycol  = next((c for c in df_h.columns if "quantity" in c.lower()), None)
     pricecol= next((c for c in df_h.columns if "price" in c.lower()), None)
-
-    out = pd.DataFrame(index=df_h.index)
-    if symcol:   out["Ticker"] = df_h[symcol].map(base_symbol_from_string)
-    if qtycol:   out["Qty"]    = to_float(df_h[qtycol])
-    if pricecol: out["Price"]  = to_float(df_h[pricecol])
-    out = out.fillna("")
-    return out
+    df = pd.DataFrame()
+    if symcol:   df["Ticker"] = df_h[symcol].map(base_symbol_from_string)
+    if qtycol:   df["Qty"]    = to_float(df_h[qtycol])
+    if pricecol: df["Price"]  = to_float(df_h[pricecol])
+    return df
 
 # ─────────────────────────────
-# MATCH SIGNALS → BUY LOTS, FIFO CLOSE WITH SELLS
+# MATCH SIGNALS → BUYS, THEN FIFO CLOSE WITH SELLS
 # ─────────────────────────────
-def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame,
-                            debug=False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug=False) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if tx.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -318,13 +289,17 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame,
     for _, row in tx.iterrows():
         tkr   = row["Symbol"]
         when  = row["When"]
-        ttype = row["Type"].upper()
+        ttype = str(row["Type"]).upper()
         qty   = row["Qty"] if not math.isnan(row["Qty"]) else 0.0
         price = row["Price"] if not math.isnan(row["Price"]) else np.nan
         if qty <= 0 or pd.isna(when) or tkr == "":
             continue
 
-        if ("BUY" in ttype) and ("SELL" not in ttype):
+        # Proper action detection (covers YOU BOUGHT / YOU SOLD)
+        is_buy  = (("BUY"  in ttype) or ("BOUGHT" in ttype)) and not (("SELL" in ttype) or ("SOLD" in ttype))
+        is_sell =  ("SELL" in ttype) or ("SOLD"   in ttype)
+
+        if is_buy:
             siginfo = last_signal_for(tkr, when)
             lots[tkr].append({
                 "qty_left": qty,
@@ -335,12 +310,14 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame,
                 "sig_time": siginfo.get("SigTime"),
                 "sig_price": siginfo.get("SigPrice"),
             })
-        elif ("SELL" in ttype) or ("SOLD" in ttype):
+
+        elif is_sell:
             remaining = qty
             while remaining > 0 and lots[tkr]:
                 lot = lots[tkr][0]
                 take = min(remaining, lot["qty_left"])
-                if take <= 0: break
+                if take <= 0:
+                    break
                 entry = lot["entry_price"] if not math.isnan(lot["entry_price"]) else 0.0
                 exitp = price if not math.isnan(price) else 0.0
                 ret_pct = ((exitp - entry) / entry * 100.0) if entry else np.nan
@@ -395,7 +372,7 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame,
 
     return realized_df, open_df
 
-def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
+def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str,Dict[str,str]]) -> pd.DataFrame:
     if open_df.empty:
         return open_df
     out = open_df.copy()
@@ -404,22 +381,19 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, 
     for idx, r in out.iterrows():
         tkr = r["Ticker"]
         ep  = r.get("EntryPrice")
-        row_index = idx + 2  # header row is 1
+        row_index = idx + 2  # header is row 1
         formula = googlefinance_formula_for(tkr, row_index, mapping)
-        # Wrap with IFERROR to keep the sheet clean
-        price_now.append(f'=IFERROR({formula},"")')
+        price_now.append(formula)
         try:
             epf = float(ep)
             unreal.append(f'=IFERROR(( {formula} / {epf} - 1 ) * 100,"")' if epf > 0 else "")
         except Exception:
             unreal.append("")
-    # insert after EntryPrice
-    at = out.columns.get_loc("EntryPrice")
-    out.insert(at + 1, "PriceNow", price_now)
-    out.insert(at + 2, "Unrealized%", unreal)
+    out.insert(out.columns.get_loc("EntryPrice")+1, "PriceNow", price_now)
+    out.insert(out.columns.get_loc("PriceNow")+1, "Unrealized%", unreal)
     return out
 
-def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
+def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame, signals_df: pd.DataFrame) -> pd.DataFrame:
     if realized_df.empty:
         realized_grp = pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%"])
     else:
@@ -431,7 +405,7 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
             "Source": g.size().index,
             "Trades": g.size().values,
             "Wins": g["is_win"].sum().values,
-            "WinRate%": (g["is_win"].mean().fillna(0.0).values * 100).round(2),
+            "WinRate%": (g["is_win"].mean().fillna(0.0).values*100).round(2),
             "AvgReturn%": g["ret"].mean().round(2).values,
             "MedianReturn%": g["ret"].median().round(2).values,
         })
@@ -445,13 +419,11 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
     if perf.empty:
         return pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenSignals"])
 
-    # Clean numeric types (no FutureWarning)
     perf["Trades"] = pd.to_numeric(perf["Trades"], errors="coerce").fillna(0).astype(int)
     perf["Wins"] = pd.to_numeric(perf["Wins"], errors="coerce").fillna(0).astype(int)
     for col in ["WinRate%","AvgReturn%","MedianReturn%"]:
         perf[col] = pd.to_numeric(perf[col], errors="coerce").fillna(0.0)
     perf["OpenSignals"] = pd.to_numeric(perf["OpenSignals"], errors="coerce").fillna(0).astype(int)
-
     perf = perf.sort_values(["Source"]).reset_index(drop=True)
     return perf
 
@@ -459,9 +431,10 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
 # MAIN
 # ─────────────────────────────
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Build performance dashboard tabs from Signals + Transactions.")
+    ap.add_argument("--debug", action="store_true", help="Print debug details")
+    args = ap.parse_args()
+    debug = args.debug
 
     print("📊 Building performance dashboard…")
     gc = auth_gspread()
@@ -477,10 +450,10 @@ def main():
     print(f"• Loaded: Signals={len(df_sig)} rows, Transactions={len(df_tx)} rows, Holdings={len(df_h)} rows")
 
     sig = load_signals(df_sig)
-    tx  = load_transactions(df_tx, debug=args.debug)
-    _   = load_holdings(df_h)  # optional; not needed downstream
+    tx  = load_transactions(df_tx, debug=debug)
+    _   = load_holdings(df_h)  # optional; currently unused in the build
 
-    realized_df, open_df = build_realized_and_open(tx, sig, debug=args.debug)
+    realized_df, open_df = build_realized_and_open(tx, sig, debug=debug)
 
     # Add live price formulas for open lots
     mapping = read_mapping(gc)
@@ -498,7 +471,7 @@ def main():
             "Source","Timeframe","SignalTimeUTC","SignalPrice"
         ]]
 
-    perf_df = build_perf_by_source(realized_df.copy(), open_df.copy())
+    perf_df = build_perf_by_source(realized_df.copy(), open_df.copy(), sig)
 
     # Write tabs
     ws_real = open_ws(gc, TAB_REALIZED)
