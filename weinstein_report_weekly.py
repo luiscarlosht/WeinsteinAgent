@@ -2,25 +2,53 @@
 # -*- coding: utf-8 -*-
 
 """
-weinstein_report_weekly.py
+Weinstein Weekly Report
 
-Weekly report that pulls Holdings from your Google Sheet and produces:
-- Total portfolio gain/loss ($)
-- Portfolio % gain (sum gain / sum cost basis)
-- Average % gain across positions
-- Per-position recommendation: SELL / HOLD / HOLD (Strong)
+What it does
+------------
+• Reads the Google Sheet tabs (Holdings, Transactions, Signals if needed)
+• Computes per-position and portfolio-level P&L
+• Applies simple recommendation rules (HOLD / SELL / HOLD (Strong))
+• Writes a clean Weekly_Report tab (summary block + detailed table)
+• Optionally emails a completion confirmation
 
-Usage:
-  python3 weinstein_report_weekly.py
+Email (optional)
+----------------
+Use a Gmail App Password (recommended). Either pass flags or set env vars:
+
+  Flags:
+    --email                      Send an email on success
+    --email-to you@example.com
+    --email-from you@gmail.com
+    --smtp-user you@gmail.com
+    --smtp-pass <app_password>
+
+  Environment variables (used if flags omitted):
+    GMAIL_TO, GMAIL_FROM, GMAIL_USER, GMAIL_APP_PASSWORD
+
+Recommendations
+---------------
+Default thresholds (tweak with flags):
+  • SELL if Total Gain/Loss Percent <= --sell-threshold (default -7.0)
+  • HOLD (Strong) if Total Gain/Loss Percent >= --strong-hold-threshold (default 50.0)
+  • Else HOLD
+
+CLI
+---
   python3 weinstein_report_weekly.py --write
-  python3 weinstein_report_weekly.py --sell-thresh -7 --strong-hold 12 --write
-  python3 weinstein_report_weekly.py --sheet-url "https://docs.google.com/..." --creds "creds/gcp_service_account.json"
+  python3 weinstein_report_weekly.py --write --email
+  python3 weinstein_report_weekly.py --write --email --email-to x@y.com \
+      --smtp-user you@gmail.com --smtp-pass <app_password>
+
 """
 
 from __future__ import annotations
 
+import os
 import argparse
-from typing import Tuple, List
+import smtplib
+from email.mime.text import MIMEText
+from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,356 +56,343 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────
-# DEFAULT CONFIG (matches your repo)
+# CONFIG
 # ─────────────────────────────
-SERVICE_ACCOUNT_FILE_DEFAULT = "creds/gcp_service_account.json"
-SHEET_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
+SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+SHEET_URL = "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
 
-TAB_HOLDINGS = "Holdings"
-TAB_WEEKLY   = "Weekly_Report"
-ROW_CHUNK = 500
+TAB_HOLDINGS      = "Holdings"
+TAB_WEEKLY_REPORT = "Weekly_Report"
+
+ROW_CHUNK = 500  # for chunked writes when needed
+
 
 # ─────────────────────────────
-# AUTH / IO HELPERS
+# GSHEETS HELPERS
 # ─────────────────────────────
-def auth_gspread(creds_path: str) -> gspread.Client:
+def auth_gspread():
     print("🔑 Authorizing service account…")
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     return gspread.authorize(creds)
 
-def open_ws(gc: gspread.Client, sheet_url: str, tab: str) -> gspread.Worksheet:
-    sh = gc.open_by_url(sheet_url)
+def open_ws(gc, tab: str):
+    sh = gc.open_by_url(SHEET_URL)
     try:
         return sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=tab, rows=2000, cols=26)
 
-def read_tab(ws: gspread.Worksheet) -> pd.DataFrame:
+def read_tab(ws) -> pd.DataFrame:
     vals = ws.get_all_values()
     if not vals:
         return pd.DataFrame()
     header, rows = vals[0], vals[1:]
     df = pd.DataFrame(rows, columns=[h.strip() for h in header])
+    # strip strings
     df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
-def write_tab(ws: gspread.Worksheet, df: pd.DataFrame):
-    ws.clear()
-    if df.empty:
-        ws.resize(rows=50, cols=8)
-        ws.update([["(empty)"]], range_name="A1")
-        return
-    rows, cols = df.shape
-    ws.resize(rows=max(100, rows + 5), cols=max(8, min(26, cols + 2)))
-    header = [str(c) for c in df.columns]
-    data = [header] + df.astype(str).fillna("").values.tolist()
+def safe_float(x) -> float:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
+    s = str(x).replace("$", "").replace(",", "").replace("%", "").strip()
+    if s == "" or s.upper() in ("N/A", "NA", "-"):
+        return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
 
-    start = 0
-    r = 1
-    while start < len(data):
-        end = min(start + ROW_CHUNK, len(data))
-        block = data[start:end]
-        ncols = len(header)
-        top_left = gspread.utils.rowcol_to_a1(r, 1)
-        bottom_right = gspread.utils.rowcol_to_a1(r + len(block) - 1, ncols)
-        rng = f"{top_left}:{bottom_right}"
-        ws.update(block, range_name=rng)
-        r += len(block)
-        start = end
 
 # ─────────────────────────────
-# PARSING HELPERS (robust to $ , % etc.)
+# CORE LOGIC
 # ─────────────────────────────
-_CASHY = {"FCASH", "FCASH**", "SPAXX", "SPAXX**", "PENDING", "PENDING ACTIVITY", "PENDING ACTIVITY*", "CASH"}
-
-def _to_float(series: pd.Series) -> pd.Series:
-    def conv(x):
-        if x is None:
-            return np.nan
-        if isinstance(x, (int, float, np.floating)):
-            return float(x)
-        s = str(x).strip()
-        if s == "":
-            return np.nan
-        s = s.replace("$", "").replace(",", "")
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
-    return series.map(conv)
-
-def _to_pct(series: pd.Series) -> pd.Series:
-    def conv(x):
-        if x is None:
-            return np.nan
-        if isinstance(x, (int, float, np.floating)):
-            return float(x)
-        s = str(x).strip().replace("%", "")
-        if s == "":
-            return np.nan
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
-    return series.map(conv)
-
-def _looks_like_cash(symbol: str, description: str) -> bool:
-    if not symbol:
-        return True
-    s = symbol.strip().upper()
-    if s in _CASHY:
-        return True
-    if "CASH" in s:
-        return True
-    desc = (description or "").strip().upper()
-    if "HELD IN" in desc and "CASH" in desc:
-        return True
-    return False
-
-# ─────────────────────────────
-# ANALYSIS
-# ─────────────────────────────
-def prepare_holdings_frame(df: pd.DataFrame) -> pd.DataFrame:
+def parse_holdings(df_h: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize columns from a Fidelity-style Holdings export.
-    Returns a filtered numeric dataframe for positions (no cash/pending lines).
+    Normalize the Holdings export into the columns we need:
+      Symbol, Description, Quantity, Last Price, Current Value,
+      Cost Basis Total, Average Cost Basis,
+      Total Gain/Loss Dollar, Total Gain/Loss Percent
     """
-    if df.empty:
+
+    if df_h.empty:
         return pd.DataFrame(columns=[
             "Symbol","Description","Quantity","Last Price","Current Value",
-            "Total Gain/Loss Dollar","Total Gain/Loss Percent","Cost Basis Total","Average Cost Basis","Type"
+            "Cost Basis Total","Average Cost Basis",
+            "Total Gain/Loss Dollar","Total Gain/Loss Percent"
         ])
 
-    # Column name resolution (case-insensitive, tolerate minor variations)
-    def pick(*cands):
-        for c in df.columns:
-            cl = c.lower()
-            for k in cands:
-                if cl == k.lower():
-                    return c
-        for c in df.columns:
-            cl = c.lower()
-            for k in cands:
-                if k.lower() in cl:
+    # Try to match typical Fidelity column names (case-insensitive contains)
+    def find_col(options):
+        opts = [o.lower() for o in options]
+        for c in df_h.columns:
+            lc = c.lower()
+            for o in opts:
+                if o in lc:
                     return c
         return None
 
-    c_sym  = pick("Symbol")
-    c_desc = pick("Description")
-    c_qty  = pick("Quantity")
-    c_lp   = pick("Last Price")
-    c_cv   = pick("Current Value")
-    c_tgld = pick("Total Gain/Loss Dollar", "Total Gain/Loss $")
-    c_tglp = pick("Total Gain/Loss Percent", "Total Gain/Loss %")
-    c_cb   = pick("Cost Basis Total")
-    c_acb  = pick("Average Cost Basis")
-    c_type = pick("Type")
+    c_symbol      = find_col(["symbol"])
+    c_desc        = find_col(["description"])
+    c_qty         = find_col(["quantity"])
+    c_last_price  = find_col(["last price"])
+    c_cur_val     = find_col(["current value"])
+    c_cost_total  = find_col(["cost basis total"])
+    c_cost_avg    = find_col(["average cost"])
+    c_gl_dollar   = find_col(["total gain/loss dollar"])
+    c_gl_percent  = find_col(["total gain/loss percent"])
 
-    out = pd.DataFrame({
-        "Symbol": df.get(c_sym, ""),
-        "Description": df.get(c_desc, ""),
-        "Quantity": _to_float(df.get(c_qty, np.nan)),
-        "Last Price": _to_float(df.get(c_lp, np.nan)),
-        "Current Value": _to_float(df.get(c_cv, np.nan)),
-        "Total Gain/Loss Dollar": _to_float(df.get(c_tgld, np.nan)),
-        "Total Gain/Loss Percent": _to_pct(df.get(c_tglp, np.nan)),
-        "Cost Basis Total": _to_float(df.get(c_cb, np.nan)),
-        "Average Cost Basis": _to_float(df.get(c_acb, np.nan)),
-        "Type": df.get(c_type, ""),
-    })
+    # Build a view
+    out = pd.DataFrame()
+    out["Symbol"] = df_h.get(c_symbol, "")
+    out["Description"] = df_h.get(c_desc, "")
+    out["Quantity"] = df_h.get(c_qty, "").map(safe_float)
+    out["Last Price"] = df_h.get(c_last_price, "").map(safe_float)
+    out["Current Value"] = df_h.get(c_cur_val, "").map(safe_float)
+    out["Cost Basis Total"] = df_h.get(c_cost_total, "").map(safe_float)
+    out["Average Cost Basis"] = df_h.get(c_cost_avg, "").map(safe_float)
+    # Gain/Loss — prefer existing columns; otherwise recompute
+    gl_d = df_h.get(c_gl_dollar, "").map(safe_float)
+    gl_p = df_h.get(c_gl_percent, "").map(safe_float)
 
-    # Drop obvious cash/pending rows
-    mask_cash = [
-        _looks_like_cash(str(sym), str(desc))
-        for sym, desc in zip(out["Symbol"].astype(str), out["Description"].astype(str))
-    ]
-    out = out.loc[~pd.Series(mask_cash, index=out.index)].copy()
+    # Recompute if missing
+    need_gl_d = gl_d.isna().all()
+    need_gl_p = gl_p.isna().all()
 
-    # Keep only positive-quantity or positive-value positions
-    out = out[(out["Quantity"].fillna(0) > 0) | (out["Current Value"].fillna(0) > 0)]
+    if need_gl_d:
+        gl_d = out["Current Value"] - out["Cost Basis Total"]
+
+    if need_gl_p:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gl_p = np.where(out["Cost Basis Total"] > 0,
+                            100.0 * gl_d / out["Cost Basis Total"],
+                            np.nan)
+
+    out["Total Gain/Loss Dollar"] = gl_d
+    out["Total Gain/Loss Percent"] = gl_p
+
+    # Filter out cash/money market rows (SPAXX, FCASH, Pending, etc.)
+    def is_equity_like(sym, desc):
+        s = str(sym).upper()
+        d = str(desc).upper()
+        blacklist = ("SPAXX", "FCASH", "PENDING", "MONEY MARKET")
+        return not any(tok in s or tok in d for tok in blacklist)
+
+    out = out[out.apply(lambda r: is_equity_like(r["Symbol"], r["Description"]), axis=1)].copy()
     out.reset_index(drop=True, inplace=True)
     return out
 
-def recommend_row(pct_gain: float, sell_thresh: float, strong_hold: float) -> str:
-    """
-    Simple rule:
-      pct <= sell_thresh  => SELL
-      pct >= strong_hold  => HOLD (Strong)
-      else                => HOLD
-    """
+
+def recommendation_for(pct_gain: float, sell_threshold: float, strong_hold_threshold: float) -> str:
     if pd.isna(pct_gain):
         return "HOLD"
-    if pct_gain <= sell_thresh:
+    if pct_gain <= sell_threshold:
         return "SELL"
-    if pct_gain >= strong_hold:
+    if pct_gain >= strong_hold_threshold:
         return "HOLD (Strong)"
     return "HOLD"
 
-def analyze_holdings(
-    df_pos: pd.DataFrame,
-    sell_thresh: float,
-    strong_hold: float
-) -> Tuple[pd.DataFrame, float, float, float]:
+
+def build_view_with_recos(df: pd.DataFrame,
+                          sell_threshold: float,
+                          strong_hold_threshold: float) -> pd.DataFrame:
+    view = df.copy()
+    view["Recommendation"] = view["Total Gain/Loss Percent"].map(
+        lambda v: recommendation_for(v, sell_threshold, strong_hold_threshold)
+    )
+
+    # Pretty formatting for output table
+    def money(x):
+        return "" if pd.isna(x) else f"{x:,.2f}"
+
+    def pct(x):
+        return "" if pd.isna(x) else f"{x:.2f}%"
+
+    pretty = pd.DataFrame({
+        "Symbol": view["Symbol"],
+        "Description": view["Description"],
+        "Quantity": view["Quantity"].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}".rstrip('0').rstrip('.')),
+        "Last Price": view["Last Price"].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}"),
+        "Current Value": view["Current Value"].map(money),
+        "Cost Basis Total": view["Cost Basis Total"].map(money),
+        "Average Cost Basis": view["Average Cost Basis"].map(money),
+        "Total Gain/Loss Dollar": view["Total Gain/Loss Dollar"].map(money),
+        "Total Gain/Loss Percent": view["Total Gain/Loss Percent"].map(pct),
+        "Recommendation": view["Recommendation"],
+    })
+    return pretty, view  # pretty for sheet, view for totals
+
+
+def compute_totals(df_numeric: pd.DataFrame) -> Tuple[float, float, float]:
     """
     Returns:
-      per_position_df, total_gain_dollar, portfolio_gain_pct, avg_pct
-    portfolio_gain_pct = (sum $gain) / (sum cost basis) * 100
-    avg_pct            = mean of Total Gain/Loss Percent (across positions)
+      total_gain_dollar, portfolio_pct_gain, average_pct_gain
     """
-    if df_pos.empty:
-        return df_pos, 0.0, 0.0, 0.0
+    total_gain = float(np.nansum(df_numeric["Total Gain/Loss Dollar"].values))
+    cost_total = float(np.nansum(df_numeric["Cost Basis Total"].values))
+    if cost_total > 0:
+        portfolio_pct = 100.0 * total_gain / cost_total
+    else:
+        portfolio_pct = 0.0
 
-    # Compute missing fields if needed
-    if df_pos["Total Gain/Loss Dollar"].isna().any():
-        can = df_pos["Current Value"].notna() & df_pos["Cost Basis Total"].notna()
-        df_pos.loc[can, "Total Gain/Loss Dollar"] = (
-            df_pos.loc[can, "Current Value"] - df_pos.loc[can, "Cost Basis Total"]
-        )
+    avg_pct = float(np.nanmean(df_numeric["Total Gain/Loss Percent"].values))
+    return total_gain, portfolio_pct, avg_pct
 
-    if df_pos["Total Gain/Loss Percent"].isna().any():
-        can = (
-            df_pos["Total Gain/Loss Dollar"].notna()
-            & df_pos["Cost Basis Total"].notna()
-            & (df_pos["Cost Basis Total"] != 0)
-        )
-        df_pos.loc[can, "Total Gain/Loss Percent"] = (
-            df_pos.loc[can, "Total Gain/Loss Dollar"]
-            / df_pos.loc[can, "Cost Basis Total"]
-            * 100.0
-        )
-
-    # Recommendations
-    df_pos["Recommendation"] = df_pos["Total Gain/Loss Percent"].map(
-        lambda p: recommend_row(p, sell_thresh=sell_thresh, strong_hold=strong_hold)
-    )
-
-    total_gain = float(df_pos["Total Gain/Loss Dollar"].fillna(0).sum())
-    total_cost = float(df_pos["Cost Basis Total"].fillna(0).sum())
-    portfolio_pct = (total_gain / total_cost * 100.0) if total_cost else 0.0
-    avg_pct = float(
-        df_pos["Total Gain/Loss Percent"].dropna().mean()
-    ) if not df_pos["Total Gain/Loss Percent"].dropna().empty else 0.0
-
-    # Nicely rounded presentation columns (keep numeric under the hood)
-    df_view = df_pos.copy()
-    for col in [
-        "Quantity",
-        "Last Price",
-        "Current Value",
-        "Total Gain/Loss Dollar",
-        "Cost Basis Total",
-        "Average Cost Basis",
-    ]:
-        df_view[col] = df_view[col].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}")
-    df_view["Total Gain/Loss Percent"] = df_view["Total Gain/Loss Percent"].map(
-        lambda x: "" if pd.isna(x) else f"{x:.2f}%"
-    )
-
-    return df_view, total_gain, portfolio_pct, avg_pct
 
 # ─────────────────────────────
-# SHEET OUTPUT (Weekly_Report)
+# WRITE WEEKLY TAB
 # ─────────────────────────────
-def build_weekly_sheet(df_view: pd.DataFrame, total_gain: float, portfolio_pct: float, avg_pct: float) -> pd.DataFrame:
-    """
-    Build the Weekly_Report as a single table of strings.
-    Avoids concat of DataFrames with duplicate/blank columns.
-    Layout:
-      Row1: header for metrics ("Metric","Value", …padding)
-      Row2-4: metrics
-      Row5: blank
-      Row6: positions header (present columns)
-      Row7+: position rows
-    """
-    # Positions block columns
-    pos_cols_pref = [
-        "Symbol", "Description", "Quantity", "Last Price", "Current Value",
-        "Cost Basis Total", "Average Cost Basis",
-        "Total Gain/Loss Dollar", "Total Gain/Loss Percent", "Recommendation"
+def write_weekly_tab(gc,
+                     df_pretty: pd.DataFrame,
+                     total_gain: float,
+                     portfolio_pct: float,
+                     avg_pct: float):
+    ws = open_ws(gc, TAB_WEEKLY_REPORT)
+    ws.clear()
+
+    # 1) Summary block (A1:B4)
+    summary_values = [
+        ["Metric", "Value"],
+        ["Total Gain/Loss ($)", f"${total_gain:,.2f}"],
+        ["Portfolio % Gain", f"{portfolio_pct:.2f}%"],
+        ["Average % Gain", f"{avg_pct:.2f}%"],
     ]
-    pos_cols = [c for c in pos_cols_pref if c in df_view.columns]
+    ws.update(summary_values, range_name="A1:B4")
 
-    # Determine total width
-    metrics_width = 2
-    max_cols = max(metrics_width, len(pos_cols))
-    pad = lambda row: row + [""] * (max_cols - len(row))
+    # 2) Table header + rows starting at A6
+    header = list(df_pretty.columns)
+    rows = df_pretty.fillna("").values.tolist()
+    table_values = [header] + rows
 
-    # Build rows
-    rows: List[List[str]] = []
-    # Metrics header
-    rows.append(pad(["Metric", "Value"]))
-    rows.append(pad(["Total Gain/Loss ($)", f"${total_gain:,.2f}"]))
-    rows.append(pad(["Portfolio % Gain", f"{portfolio_pct:.2f}%"]))
-    rows.append(pad(["Average % Gain", f"{avg_pct:.2f}%"]))
-    # Blank spacer
-    rows.append([""] * max_cols)
-    # Positions header
-    rows.append(pad(pos_cols))
-    # Positions rows
-    for _, r in df_view[pos_cols].iterrows():
-        rows.append(pad([str(r[c]) if c in r and pd.notna(r[c]) else "" for c in pos_cols]))
+    # Resize and write
+    total_rows = 6 + len(table_values)
+    total_cols = max(10, len(header))
+    ws.resize(rows=max(100, total_rows + 5), cols=max(26, total_cols))
 
-    # Turn into a DataFrame with a simple header row (first row is the header)
-    header = rows[0]
-    body = rows[1:]
-    return pd.DataFrame(body, columns=header)
+    # Compute bottom-right for the table range
+    top_left = gspread.utils.rowcol_to_a1(6, 1)
+    bottom_right = gspread.utils.rowcol_to_a1(6 + len(table_values) - 1, len(header))
+    ws.update(table_values, range_name=f"{top_left}:{bottom_right}")
+
+
+# ─────────────────────────────
+# EMAIL (optional)
+# ─────────────────────────────
+def send_email(subject: str,
+               body: str,
+               to_addr: str,
+               from_addr: str,
+               smtp_user: str,
+               smtp_pass: str) -> Optional[str]:
+    """
+    Send a simple text email via Gmail SMTP (SSL).
+    Returns an error string on failure, or None on success.
+    """
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = from_addr
+        msg["To"] = to_addr
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return None
+    except Exception as e:
+        return str(e)
+
 
 # ─────────────────────────────
 # MAIN
 # ─────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Weekly Weinstein report from Google Sheets Holdings.")
-    ap.add_argument("--sheet-url", default=SHEET_URL_DEFAULT, help="Google Sheet URL.")
-    ap.add_argument("--creds", default=SERVICE_ACCOUNT_FILE_DEFAULT, help="Path to service account JSON.")
-    ap.add_argument("--sell-thresh", type=float, default=-5.0, help="SELL if pct <= this (default: -5)")
-    ap.add_argument("--strong-hold", type=float, default=10.0, help="HOLD (Strong) if pct >= this (default: 10)")
-    ap.add_argument("--write", action="store_true", help=f"Write a '{TAB_WEEKLY}' tab to the sheet.")
+    ap = argparse.ArgumentParser(description="Generate the Weinstein Weekly Report from Google Sheets data.")
+    ap.add_argument("--write", action="store_true", help="Write the Weekly_Report tab in the Google Sheet.")
+    ap.add_argument("--sell-threshold", type=float, default=-7.0,
+                    help="SELL if Total Gain/Loss Percent <= this (default: -7.0).")
+    ap.add_argument("--strong-hold-threshold", type=float, default=50.0,
+                    help="HOLD (Strong) if Total Gain/Loss Percent >= this (default: 50.0).")
+
+    # Email flags (optional)
+    ap.add_argument("--email", action="store_true", help="Send an email confirmation on success.")
+    ap.add_argument("--email-to", type=str, default=os.getenv("GMAIL_TO", ""),
+                    help="Email recipient (or set env GMAIL_TO).")
+    ap.add_argument("--email-from", type=str, default=os.getenv("GMAIL_FROM", ""),
+                    help="Email 'From' address (or set env GMAIL_FROM).")
+    ap.add_argument("--smtp-user", type=str, default=os.getenv("GMAIL_USER", ""),
+                    help="SMTP username (or set env GMAIL_USER).")
+    ap.add_argument("--smtp-pass", type=str, default=os.getenv("GMAIL_APP_PASSWORD", ""),
+                    help="SMTP app password (or set env GMAIL_APP_PASSWORD).")
+
     args = ap.parse_args()
 
     print("📊 Generating weekly Weinstein report…")
-    gc = auth_gspread(args.creds)
+    gc = auth_gspread()
 
-    # Fetch holdings
-    ws_h = open_ws(gc, args.sheet_url, TAB_HOLDINGS)
-    df_hold = read_tab(ws_h)
-    if df_hold.empty:
-        print("⚠️ Holdings tab is empty. Nothing to report.")
-        return
+    # Load holdings
+    ws_h = open_ws(gc, TAB_HOLDINGS)
+    df_h = read_tab(ws_h)
 
-    # Normalize & analyze
-    pos = prepare_holdings_frame(df_hold)
-    df_view, total_gain, portfolio_pct, avg_pct = analyze_holdings(
-        pos, sell_thresh=args.sell_thresh, strong_hold=args.strong_hold
+    # Normalize + recos
+    df_norm = parse_holdings(df_h)
+    df_pretty, df_numeric = build_view_with_recos(
+        df_norm,
+        sell_threshold=args.sell_threshold,
+        strong_hold_threshold=args.strong_hold_threshold
     )
 
-    # Console summary
+    # Totals
+    total_gain, portfolio_pct, avg_pct = compute_totals(df_numeric)
+
+    # Console print
     print("\n=== Weinstein Weekly Report ===")
     print(f"Total Gain/Loss ($): {total_gain:,.2f}")
     print(f"Portfolio % Gain  : {portfolio_pct:.2f}%")
-    print(f"Average % Gain     : {avg_pct:.2f}%")
-    print("\nPer-position snapshot:")
-    if df_view.empty:
-        print("(no equity positions found)")
-    else:
-        cols = [
-            "Symbol","Description","Quantity","Current Value",
-            "Cost Basis Total","Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"
-        ]
-        cols = [c for c in cols if c in df_view.columns]
-        print(df_view[cols].to_string(index=False))
+    print(f"Average % Gain     : {avg_pct:.2f}%\n")
 
-    # Optional write to sheet
+    # Head of table preview
+    if not df_pretty.empty:
+        print("Per-position snapshot:")
+        print(df_pretty.head(30).to_string(index=False))  # preview first ~30 lines
+    else:
+        print("(No equity-like rows found in Holdings.)")
+
+    # Write tab if requested
     if args.write:
-        ws_out = open_ws(gc, args.sheet_url, TAB_WEEKLY)
-        out_df = build_weekly_sheet(df_view, total_gain, portfolio_pct, avg_pct)
-        write_tab(ws_out, out_df)
-        print(f"\n✅ Wrote '{TAB_WEEKLY}' tab with summary and per-position details.")
+        write_weekly_tab(gc, df_pretty, total_gain, portfolio_pct, avg_pct)
+        print("\n✅ Wrote 'Weekly_Report' tab with summary and per-position details.")
+
+    # Optional email
+    if args.email:
+        to_addr   = args.email_to or ""
+        from_addr = args.email_from or args.smtp_user or ""
+        user      = args.smtp_user or ""
+        pwd       = args.smtp_pass or ""
+
+        if not (to_addr and from_addr and user and pwd):
+            print("⚠️ Skipping email: missing --email-to/--email-from/--smtp-user/--smtp-pass "
+                  "or env GMAIL_TO/GMAIL_FROM/GMAIL_USER/GMAIL_APP_PASSWORD.")
+        else:
+            subject = "Weinstein Weekly Report complete"
+            body = (
+                "Your weekly report has finished.\n\n"
+                f"Total Gain/Loss ($): {total_gain:,.2f}\n"
+                f"Portfolio % Gain   : {portfolio_pct:.2f}%\n"
+                f"Average % Gain     : {avg_pct:.2f}%\n"
+                "\nSheet tab: Weekly_Report\n"
+            )
+            err = send_email(subject, body, to_addr, from_addr, user, pwd)
+            if err:
+                print(f"⚠️ Email failed: {err}")
+            else:
+                print(f"📧 Email confirmation sent to {to_addr}")
 
     print("\n🎯 Done.")
+
 
 if __name__ == "__main__":
     main()
