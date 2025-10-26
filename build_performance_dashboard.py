@@ -24,12 +24,6 @@ Key behaviors
 CLI
 ---
 python3 build_performance_dashboard.py [--debug] [--no-live]
-
-Requirements
-------------
-- creds/gcp_service_account.json  (service account with access to the sheet)
-- SCOPES must include Sheets+Drive
-- SHEET_URL points to your target spreadsheet
 """
 
 import math
@@ -82,7 +76,7 @@ def read_tab(ws) -> pd.DataFrame:
         return pd.DataFrame()
     header, rows = vals[0], vals[1:]
     df = pd.DataFrame(rows, columns=[h.strip() for h in header])
-    # strip strings (avoid deprecated applymap)
+    # strip strings
     for c in df.columns:
         if df[c].dtype == "object":
             df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
@@ -250,7 +244,7 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
     if not datecol:
         raise ValueError("Transactions: missing a Run Date / Date column.")
 
-    # Build a boolean mask for rows that look like trades (BUY/SELL in action/type/description)
+    # Series on full df
     action = df[actioncol].astype(str) if actioncol else pd.Series([""] * len(df))
     typ    = df[typecol].astype(str)   if typecol   else pd.Series([""] * len(df))
     desc   = df[desccol].astype(str)   if desccol   else pd.Series([""] * len(df))
@@ -259,38 +253,44 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
     typ_up    = typ.str.upper()
     desc_up   = desc.str.upper()
 
-    patt = r"\b(YOU\s+)?(BOUGHT|SOLD|BUY|SELL)\b"
+    # Use non-capturing groups to silence the warning
+    patt = r"\b(?:YOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
     mask_action = action_up.str.contains(patt, regex=True, na=False)
     mask_type   = typ_up.str.contains(patt,    regex=True, na=False)
-    mask_desc   = desc_up.str.contains(patt,   regex=True, na=False)
+    mask_desc   = desc_up.str_contains(patt,   regex=True, na=False) if hasattr(desc_up, "str_contains") else desc_up.str.contains(patt, regex=True, na=False)
     mask_trades = mask_action | mask_type | mask_desc
 
     df_tr = df[mask_trades].copy()
     if debug:
         print(f"• load_transactions: detected {mask_trades.sum()} trade-like rows (of {len(df)})")
 
-    # Now compute normalized columns on this filtered frame
+    # Compute normalized columns on this filtered frame ONLY
     df_tr["When"] = to_dt(df_tr[datecol])
 
     # Raw symbol, fallback to parsing from action/description if blank
     raw_symbol = df_tr[symcol].astype(str) if symcol else pd.Series([""] * len(df_tr))
-    # Extract (AAPL) style tickers from action/description when symbol missing
+    # Extract (AAPL) style tickers from action/description when symbol missing (on df_tr-aligned text)
     pattern_paren = re.compile(r"\(([A-Za-z0-9\.\-]{1,8})\)")
     def symbol_from_text(txt: str) -> str:
         m = pattern_paren.search(txt or "")
         return m.group(1).upper() if m else ""
 
-    sym_fill = raw_symbol
+    action_tr = df_tr[actioncol].astype(str) if actioncol else pd.Series([""] * len(df_tr), index=df_tr.index)
+    desc_tr   = df_tr[desccol].astype(str)   if desccol   else pd.Series([""] * len(df_tr), index=df_tr.index)
+
+    sym_fill = raw_symbol.copy()
     blank_mask = sym_fill.str.strip().eq("") | sym_fill.str.upper().isin(BLACKLIST_TOKENS)
     if blank_mask.any():
-        fallback = action_up[blank_mask].map(symbol_from_text)
-        fallback = fallback.replace("", np.nan).fillna(desc_up[blank_mask].map(symbol_from_text))
-        sym_fill.loc[blank_mask] = fallback.fillna("")
+        fb = action_tr[blank_mask].map(symbol_from_text)
+        fb = fb.replace("", np.nan).fillna(desc_tr[blank_mask].map(symbol_from_text))
+        sym_fill.loc[blank_mask] = fb.fillna("")
 
     df_tr["Symbol"] = sym_fill.map(base_symbol_from_string)
 
-    # Normalize Type to BUY/SELL using precedence: Action → Type → Description
-    def classify(a, t, d):
+    # Normalize Type to BUY/SELL using df_tr-aligned fields
+    typ_tr = df_tr[typecol].astype(str) if typecol else pd.Series([""] * len(df_tr), index=df_tr.index)
+
+    def classify_row(a: str, t: str, d: str) -> str:
         txt = f"{a} {t} {d}".upper()
         if "SOLD" in txt or re.search(r"\bSELL\b", txt):
             return "SELL"
@@ -298,9 +298,9 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
             return "BUY"
         return ""
 
-    df_tr["Type"] = [classify(a, t, d) for a, t, d in zip(action, typ, desc)]
+    df_tr["Type"] = [classify_row(a, t, d) for a, t, d in zip(action_tr, typ_tr, desc_tr)]
 
-    # Qty / Price
+    # Qty / Price from df_tr
     qty_series   = to_float(df_tr[qtycol])   if qtycol   else pd.Series(np.nan, index=df_tr.index)
     price_series = to_float(df_tr[pricecol]) if pricecol else pd.Series(np.nan, index=df_tr.index)
 
@@ -430,7 +430,7 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug: bool=Fal
         realized_df = realized_df.sort_values("ExitTimeUTC").reset_index(drop=True)
 
     # anything still in lots is open
-    now_utc = pd.Timestamp.utcnow().tz_convert("UTC")
+    now_utc = pd.Timestamp.now(tz="UTC")
     open_rows = []
     for tkr, q in lots.items():
         for lot in q:
@@ -548,7 +548,7 @@ def main():
     print(f"• Loaded: Signals={len(df_sig)} rows, Transactions={len(df_tx)} rows, Holdings={len(df_h)} rows")
 
     sig = load_signals(df_sig)
-    tx, _unmatched_placeholder = load_transactions(df_tx, debug=DEBUG)
+    tx, _ = load_transactions(df_tx, debug=DEBUG)
     _hold = load_holdings(df_h)
 
     realized_df, open_df, warnings = build_realized_and_open(tx, sig, debug=DEBUG)
