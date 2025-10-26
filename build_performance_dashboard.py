@@ -216,8 +216,8 @@ def _looks_like_trade_mask(action: pd.Series, typ: pd.Series, desc: pd.Series) -
     desc_up   = desc.fillna("").astype(str).str.upper()
     return (
         action_up.str.contains(_TRADE_PATT, regex=True, na=False)
-        | typ_up.str_contains(_TRADE_PATT, regex=True, na=False)
-        | desc_up.str_contains(_TRADE_PATT, regex=True, na=False)
+        | typ_up.str.contains(_TRADE_PATT, regex=True, na=False)
+        | desc_up.str.contains(_TRADE_PATT, regex=True, na=False)
     )
 
 def _classify_type(a: str, t: str, d: str) -> str:
@@ -502,7 +502,7 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
     Returns Performance_By_Source with columns:
     Source, Trades, Wins, WinRate%, AvgReturn%, MedianReturn%, OpenLots, OpenTickers
     """
-    # Aggregate realized without using named-agg keywords that contain '%'
+    # Aggregate realized
     if realized_df.empty:
         realized_grp = pd.DataFrame(columns=["Source", "Trades", "Wins", "WinRate%", "AvgReturn%", "MedianReturn%"])
     else:
@@ -519,7 +519,7 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
             "MedianReturn%": g["ret"].median().round(2).values,
         })
 
-    # Open lots counts (build explicitly to avoid `%` in named-agg)
+    # Open lots counts
     if open_df.empty:
         open_counts = pd.DataFrame(columns=["Source", "OpenLots", "OpenTickers"])
     else:
