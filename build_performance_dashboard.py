@@ -23,7 +23,6 @@ Features
 - Prints a summary of unmatched SELLs and any tickers with Source "(unknown)".
 - Adds totals row at top of Performance_By_Source.
 - Adds OpenLots_Detail tab with one row per open lot.
-
 """
 
 from __future__ import annotations
@@ -217,8 +216,8 @@ def _looks_like_trade_mask(action: pd.Series, typ: pd.Series, desc: pd.Series) -
     desc_up   = desc.fillna("").astype(str).str.upper()
     return (
         action_up.str.contains(_TRADE_PATT, regex=True, na=False)
-        | typ_up.str.contains(_TRADE_PATT, regex=True, na=False)
-        | desc_up.str.contains(_TRADE_PATT, regex=True, na=False)
+        | typ_up.str_contains(_TRADE_PATT, regex=True, na=False)
+        | desc_up.str_contains(_TRADE_PATT, regex=True, na=False)
     )
 
 def _classify_type(a: str, t: str, d: str) -> str:
@@ -333,7 +332,6 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
         preview_cols = [c for c in ["Run Date","Account","Account Number","Action","Symbol","Description","Type","Quantity","Price ($)","Settlement Date","When","Qty","Price"] if c in df_tr.columns]
         print(df_tr[preview_cols].head(8).to_string(index=False))
 
-    # Unmatched SELL reporting is generated during FIFO; placeholder returned here
     return df_tr[["When", "Type", "Symbol", "Qty", "Price"]], pd.DataFrame()
 
 # ─────────────────────────────
@@ -398,14 +396,13 @@ def build_realized_and_open(
                 if t <= when:
                     return payload
             return {"Source": "(unknown)", "Timeframe": "", "SigTime": pd.NaT, "SigPrice": ""}
-        # non-strict: first try at/<= when; else fallback to most recent ever
+        # non-strict: prefer at/<= when; else fallback to most recent ever
         for t, payload in reversed(arr):
             if pd.isna(t) or pd.isna(when):
                 continue
             if t <= when:
                 return payload
-        # fallback to latest any-time
-        return arr[-1][1]
+        return arr[-1][1]  # latest any-time
 
     lots: Dict[str, deque] = defaultdict(deque)
     realized_rows = []
@@ -420,7 +417,6 @@ def build_realized_and_open(
         if qty <= 0 or pd.isna(when) or tkr == "":
             continue
 
-        # Ignore very old sells if sell_cutoff is provided
         if ttype == "SELL" and sell_cutoff is not None and when < sell_cutoff:
             if debug:
                 print(f"• Ignoring SELL before cutoff: {tkr} at {when.isoformat()} qty={qty}")
@@ -465,7 +461,6 @@ def build_realized_and_open(
                 if lot["qty_left"] <= 1e-9:
                     lots[tkr].popleft()
             if remaining > 1e-9:
-                # SELL without matching BUY
                 msg = f"{tkr} SELL on {when.isoformat()} qty={qty} price={price} — No prior BUY lot in window"
                 unmatched_sells.append(msg)
                 if debug:
@@ -506,9 +501,8 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
     """
     Returns Performance_By_Source with columns:
     Source, Trades, Wins, WinRate%, AvgReturn%, MedianReturn%, OpenLots, OpenTickers
-    (WinRate%, AvgReturn%, MedianReturn% are numeric; we'll keep '%' in the headers.)
     """
-    # Aggregate realized
+    # Aggregate realized without using named-agg keywords that contain '%'
     if realized_df.empty:
         realized_grp = pd.DataFrame(columns=["Source", "Trades", "Wins", "WinRate%", "AvgReturn%", "MedianReturn%"])
     else:
@@ -525,14 +519,16 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
             "MedianReturn%": g["ret"].median().round(2).values,
         })
 
-    # Open lots counts
+    # Open lots counts (build explicitly to avoid `%` in named-agg)
     if open_df.empty:
         open_counts = pd.DataFrame(columns=["Source", "OpenLots", "OpenTickers"])
     else:
-        open_counts = (open_df.groupby("Source")
-                       .agg(OpenLots=("Ticker", "count"),
-                            OpenTickers=("Ticker", "nunique"))
-                       .reset_index())
+        g2 = open_df.groupby("Source")
+        open_counts = pd.DataFrame({
+            "Source": g2.size().index,
+            "OpenLots": g2.size().values,
+            "OpenTickers": g2["Ticker"].nunique().values,
+        })
 
     perf = pd.merge(realized_grp, open_counts, on="Source", how="outer")
     if perf.empty:
@@ -669,9 +665,7 @@ def main():
     perf_df = build_perf_by_source(realized_df.copy(), open_df.copy())
     open_detail_df = pd.DataFrame()
     if not open_df.empty:
-        # Build the detail from open_df; include numeric-friendly columns
         open_detail_df = open_df.copy()
-        # Ensure consistent ordering
         detail_cols = [c for c in ["Source","Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen","Timeframe","SignalTimeUTC","SignalPrice","PriceNow","Unrealized%"] if c in open_detail_df.columns]
         open_detail_df = open_detail_df[detail_cols].sort_values(["Source","Ticker","EntryTimeUTC"], ignore_index=True)
 
@@ -691,7 +685,6 @@ def main():
     print(f"✅ Wrote {TAB_PERF}: {len(perf_df)} rows")
     print(f"✅ Wrote {TAB_OPEN_DETAIL}: {len(open_detail_df)} rows")
 
-    # Summaries
     if unmatched_sells:
         print(f"⚠️ Summary: {len(unmatched_sells)} unmatched SELL events (use --debug to print details).")
         if DEBUG:
