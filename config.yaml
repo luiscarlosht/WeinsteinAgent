@@ -5,9 +5,9 @@ app:
   benchmark: SPY
   include_charts: true
 sheets:
-  daily_intake_sheet_id: "PUT_GOOGLE_SHEET_ID_HERE"
-  holdings_sheet_id: "PUT_HOLDINGS_SHEET_ID_HERE"
-  control_sheet_id: "PUT_CONTROL_SHEET_ID_HERE"
+  open_positions_tab: "Open_Positions"
+  signals_tab: "Signals"
+  output_dir: "./output"
 notifications:
   email:
     enabled: true
