@@ -13,13 +13,20 @@ usage() {
 Usage:
   ./run_all.sh <HOLDINGS_CSV> <TXNS_CSV> [flags]
 
-Flags:
-  --no-live           Skip GOOGLEFINANCE formulas in Open_Positions
-  --strict-signals    Disable fallback signal matching
-  --sell-cutoff DATE  Ignore unmatched SELLs on/after date
-  --debug             Verbose debug
-  --skip-upload       Skip upload step
-  --skip-merge        Skip merge step
+Flags (merge step):
+  --merge-debug        Pass --debug to merge_fidelity_with_signals.py
+  --merge-strict       Pass --strict to merge_fidelity_with_signals.py
+  --merge-no-google    Pass --no-google to merge_fidelity_with_signals.py
+
+Flags (build step):
+  --no-live            Skip GOOGLEFINANCE formulas in Open_Positions
+  --strict-signals     Disable fallback signal matching
+  --sell-cutoff DATE   Ignore unmatched SELLs on/after date (YYYY-MM-DD)
+  --debug              Verbose debug for build
+
+General:
+  --skip-upload        Skip upload step
+  --skip-merge         Skip merge step
 USAGE
 }
 
@@ -29,45 +36,61 @@ HOLDINGS_CSV="$1"; shift
 TXNS_CSV="$1"; shift
 
 BUILD_FLAGS=()
-DEBUG_FLAG=""
+MERGE_FLAGS=()
 SKIP_UPLOAD=false
 SKIP_MERGE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    # build flags
     --no-live|--strict-signals|--debug)
       BUILD_FLAGS+=("$1"); shift ;;
     --sell-cutoff)
+      [[ $# -ge 2 ]] || { red "--sell-cutoff needs a DATE"; exit 2; }
       BUILD_FLAGS+=("--sell-cutoff" "$2"); shift 2 ;;
+
+    # merge flags
+    --merge-debug)
+      MERGE_FLAGS+=("--debug"); shift ;;
+    --merge-strict)
+      MERGE_FLAGS+=("--strict"); shift ;;
+    --merge-no-google)
+      MERGE_FLAGS+=("--no-google"); shift ;;
+
+    # control
     --skip-upload)
       SKIP_UPLOAD=true; shift ;;
     --skip-merge)
       SKIP_MERGE=true; shift ;;
-    *) red "Unknown flag: $1"; exit 2 ;;
+
+    *)
+      red "Unknown flag: $1"; exit 2 ;;
   esac
 done
 
 bold "🏁 Starting pipeline…"
 yellow "• Holdings:    $HOLDINGS_CSV"
 yellow "• Transactions: $TXNS_CSV"
+yellow "• Merge flags:  ${MERGE_FLAGS[*]:-(none)}"
 yellow "• Build flags:  ${BUILD_FLAGS[*]:-(none)}"
 
-source .venv/bin/activate || true
+# Activate venv if present
+source .venv/bin/activate 2>/dev/null || true
 
 if ! $SKIP_UPLOAD; then
-  bold "🔑 Uploading CSVs to Google Sheets…"
-  python3 upload_fidelity_to_sheets.py --holdings "$HOLDINGS_CSV" --txns "$TXNS_CSV" "${DEBUG_FLAG:-}"
+  bold "🔑 Authorizing & uploading CSVs to Google Sheets…"
+  python3 upload_fidelity_to_sheets.py --holdings "$HOLDINGS_CSV" --txns "$TXNS_CSV"
 else
   yellow "⏭️ Skipping upload."
 fi
 
 if ! $SKIP_MERGE; then
   bold "🔗 Merging Signals with Transactions/Holdings…"
-  python3 merge_fidelity_with_signals.py ${DEBUG_FLAG:-}
+  python3 merge_fidelity_with_signals.py "${MERGE_FLAGS[@]}"
 else
   yellow "⏭️ Skipping merge."
 fi
 
-bold "📊 Building dashboard tabs…"
+bold "📊 Building Performance dashboard tabs…"
 python3 build_performance_dashboard.py "${BUILD_FLAGS[@]}"
-green "🎯 Done!"
+green "🎯 All done!"
