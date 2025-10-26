@@ -65,8 +65,8 @@ def open_ws(gc, tab):
 def _sanitize_df_for_read(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    return df
+    # applymap is deprecated; do per-column map instead (works on older pandas too)
+    return df.apply(lambda s: s.map(lambda x: x.strip() if isinstance(x, str) else x))
 
 def read_tab(ws) -> pd.DataFrame:
     vals = ws.get_all_values()
@@ -184,12 +184,12 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     # Timestamp column (any col that starts with 'timestamp')
     tscol = next((c for c in df.columns if c.lower().startswith("timestamp")), None)
 
-    df["Ticker"]      = df[tcol].map(base_symbol_from_string)
-    df["Source"]      = df.get("Source","")
-    df["Direction"]   = df.get("Direction","")
-    df["Timeframe"]   = df.get("Timeframe","")
-    df["TimestampUTC"]= to_dt(df[tscol]) if tscol else pd.NaT
-    df["Price"]       = df.get("Price","")
+    df["Ticker"]       = df[tcol].map(base_symbol_from_string)
+    df["Source"]       = df.get("Source","")
+    df["Direction"]    = df.get("Direction","")
+    df["Timeframe"]    = df.get("Timeframe","")
+    df["TimestampUTC"] = to_dt(df[tscol]) if tscol else pd.NaT
+    df["Price"]        = df.get("Price","")
 
     out = df[["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"]].copy()
     # Keep only non-empty tickers
@@ -208,13 +208,13 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
     df = df_tx.copy()
 
     # Guess common Fidelity columns
-    symcol   = next((c for c in df.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
-    actioncol= next((c for c in df.columns if c.lower() in ("action","type")), None)
-    desccol  = next((c for c in df.columns if "description" in c.lower()), None)
-    qtycol   = next((c for c in df.columns if "quantity" in c.lower()), None)
-    pricecol = next((c for c in df.columns if "price" in c.lower()), None)
-    amtcol   = next((c for c in df.columns if "amount" in c.lower()), None)
-    datecol  = next((c for c in df.columns if "run date" in c.lower() or "date" == c.lower()), None)
+    symcol    = next((c for c in df.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
+    actioncol = next((c for c in df.columns if c.lower() in ("action","type")), None)
+    desccol   = next((c for c in df.columns if "description" in c.lower()), None)
+    qtycol    = next((c for c in df.columns if "quantity" in c.lower()), None)
+    pricecol  = next((c for c in df.columns if "price" in c.lower()), None)
+    amtcol    = next((c for c in df.columns if "amount" in c.lower()), None)
+    datecol   = next((c for c in df.columns if "run date" in c.lower() or c.lower() == "date"), None)
 
     if not datecol:
         raise ValueError("Transactions tab must include a 'Run Date' or 'Date' column.")
@@ -280,14 +280,13 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
     # Normalize Type & sign of qty from action/desc text
     type_series = np.where(
         action_up.str.contains(r"\bSOLD|SELL\b", regex=True, na=False) |
-        desc_up.str_contains(r"\bSOLD|SELL\b", regex=True, na=False),
+        desc_up.str.contains(r"\bSOLD|SELL\b", regex=True, na=False),
         "SELL", "BUY"
     )
     df["Type"] = pd.Series(type_series, index=df.index)
 
     # Make QTY positive (we’ll use Type to decide entry/exit)
-    qty = pd.to_numeric(qty, errors="coerce")
-    qty = qty.abs()
+    qty = pd.to_numeric(qty, errors="coerce").abs()
 
     tx = pd.DataFrame({
         "When":   df["When"],
@@ -341,11 +340,9 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug: bool=Fal
         arr = sig_index.get(tkr, [])
         if not arr:
             return {"Source":"(unknown)","Timeframe":"","SigTime":pd.NaT,"SigPrice":""}
-        # find last t <= when
         best = {"Source":"(unknown)","Timeframe":"","SigTime":pd.NaT,"SigPrice":""}
         for t, payload in arr:
             if pd.isna(t) or pd.isna(when):
-                # if we lack one of the timestamps, just take the latest we have
                 best = payload
             elif t <= when:
                 best = payload
@@ -373,7 +370,6 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug: bool=Fal
             })
         else:  # SELL
             remaining = float(qty)
-            start_remaining = remaining
             while remaining > 1e-12 and lots[tkr]:
                 lot = lots[tkr][0]
                 take = min(remaining, lot["qty_left"])
