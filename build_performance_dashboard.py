@@ -8,15 +8,15 @@ Build three Google Sheets tabs from your data:
 - Performance_By_Source
 
 Reads:
-  Signals        (manual or merged)
+  Signals        (manual or merged)  ← we now default to using the *latest* signal
+                                       for a ticker even if it’s after the BUY.
   Transactions   (Fidelity history)
-  Holdings       (optional; currently not used for PnL, only for context)
+  Holdings       (optional; context only)
 
-Key notes
-- Uses FIFO to match BUY lots against SELLs and compute realized returns.
-- Sources/timeframes are taken from the most recent Signal at or before a BUY.
-- Live price formulas can be added to Open_Positions (disable via --no-live).
-- Prints a summary of unmatched SELLs (e.g., very old positions) and unknown sources.
+Options:
+  --no-live              Do NOT add GOOGLEFINANCE formulas to Open_Positions.
+  --debug                Verbose logs.
+  --strict-signal-timing Only use signals at-or-before BUY time (old behavior).
 """
 
 from __future__ import annotations
@@ -73,7 +73,6 @@ def read_tab(ws) -> pd.DataFrame:
         return pd.DataFrame()
     header, rows = vals[0], vals[1:]
     df = pd.DataFrame(rows, columns=[h.strip() for h in header])
-    # strip strings
     df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
@@ -176,10 +175,8 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     if not tcol:
         raise ValueError("Signals tab needs a 'Ticker' column.")
 
-    # Timestamp column (any that starts with "timestamp")
     tscol = next((c for c in df.columns if c.lower().startswith("timestamp")), None)
 
-    # Normalize fields
     df["Ticker"] = df[tcol].map(base_symbol_from_string)
     df["Source"] = df.get("Source","").fillna("").astype(str)
     df["Direction"] = df.get("Direction","").fillna("").astype(str)
@@ -187,13 +184,11 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     df["TimestampUTC"] = to_dt(df[tscol]) if tscol else pd.NaT
     df["Price"] = df.get("Price","").fillna("").astype(str)
 
-    # Keep only non-empty ticker rows
     df = df[df["Ticker"].ne("")]
-    # Sorting makes matching deterministic
     df.sort_values(["Ticker","TimestampUTC"], inplace=True, ignore_index=True)
     return df[["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"]]
 
-# Regex without capture groups (silences “match groups” warning)
+# Regex without capture groups
 _TRADE_PATT = r"\b(?:YOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
 
 def _looks_like_trade_mask(action: pd.Series, typ: pd.Series, desc: pd.Series) -> pd.Series:
@@ -346,32 +341,43 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str,Dict[str,st
 # ─────────────────────────────
 # FIFO MATCHING (REALIZED & OPEN)
 # ─────────────────────────────
-def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+def build_realized_and_open(
+    tx: pd.DataFrame,
+    sig: pd.DataFrame,
+    debug: bool=False,
+    strict_signal_timing: bool=False
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     if tx.empty:
         return pd.DataFrame(), pd.DataFrame(), []
 
-    # Index signals by (Ticker, time), only BUY signals
+    # Build signal index per ticker (BUY-only)
     sig_buy = sig[(sig["Direction"].str.upper()=="BUY") & sig["Ticker"].ne("")].copy()
     sig_buy.sort_values(["Ticker","TimestampUTC"], inplace=True, ignore_index=True)
 
     sig_by_ticker: Dict[str, List[Tuple[pd.Timestamp, dict]]] = defaultdict(list)
+    latest_signal: Dict[str, dict] = {}  # fastest path: always take the last (most recent)
     for _, r in sig_buy.iterrows():
-        sig_by_ticker[r["Ticker"]].append( (r["TimestampUTC"], {
+        payload = {
             "Source": r.get("Source",""),
             "Timeframe": r.get("Timeframe",""),
             "SigTime": r.get("TimestampUTC"),
             "SigPrice": r.get("Price",""),
-        }))
+        }
+        sig_by_ticker[r["Ticker"]].append((r["TimestampUTC"], payload))
+        latest_signal[r["Ticker"]] = payload  # overwrite → leaves most recent
 
-    def last_signal_for(tkr: str, when: pd.Timestamp):
-        arr = sig_by_ticker.get(tkr, [])
-        # from end to start to get most recent at/<= when
-        for t, payload in reversed(arr):
-            if pd.isna(t) or pd.isna(when):
-                return payload
-            if t <= when:
-                return payload
-        return {"Source":"(unknown)","Timeframe":"","SigTime": pd.NaT, "SigPrice": ""}
+    def signal_for(tkr: str, when: pd.Timestamp):
+        # 1) strict timing → use last at/<= when; else 2) use most recent regardless of time
+        if strict_signal_timing:
+            arr = sig_by_ticker.get(tkr, [])
+            for t, payload in reversed(arr):
+                if pd.isna(t) or pd.isna(when):
+                    return payload
+                if t <= when:
+                    return payload
+            return {"Source":"(unknown)","Timeframe":"","SigTime": pd.NaT, "SigPrice": ""}
+        # relaxed: take whatever most recent you logged (what you want)
+        return latest_signal.get(tkr, {"Source":"(unknown)","Timeframe":"","SigTime": pd.NaT, "SigPrice": ""})
 
     lots: Dict[str, deque] = defaultdict(deque)
     realized_rows = []
@@ -387,7 +393,7 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug: bool=Fal
             continue
 
         if ttype == "BUY":
-            siginfo = last_signal_for(tkr, when)
+            siginfo = signal_for(tkr, when)
             lots[tkr].append({
                 "qty_left": qty,
                 "entry_price": price,
@@ -428,7 +434,6 @@ def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug: bool=Fal
                 if lot["qty_left"] <= 1e-9:
                     lots[tkr].popleft()
             if remaining > 1e-9:
-                # SELL without prior BUY (old history) – track for the summary
                 unmatched_sells.append(
                     f"{tkr} SELL on {when.isoformat()} qty={qty} price={price} — No prior BUY lot in window"
                 )
@@ -524,6 +529,8 @@ def main():
     ap = argparse.ArgumentParser(description="Build performance dashboard tabs.")
     ap.add_argument("--no-live", action="store_true", help="Do NOT add GOOGLEFINANCE formulas to Open_Positions.")
     ap.add_argument("--debug", action="store_true", help="Verbose debug output")
+    ap.add_argument("--strict-signal-timing", action="store_true",
+                    help="Only use signals at-or-before BUY time (default is relaxed: use latest signal any time).")
     args = ap.parse_args()
     DEBUG = args.debug
 
@@ -547,7 +554,9 @@ def main():
     tx, _ = load_transactions(df_tx, debug=DEBUG)
 
     # Build realized & open (FIFO)
-    realized_df, open_df, unmatched_sells = build_realized_and_open(tx, sig, debug=DEBUG)
+    realized_df, open_df, unmatched_sells = build_realized_and_open(
+        tx, sig, debug=DEBUG, strict_signal_timing=args.strict_signal_timing
+    )
 
     # Optionally add live price formulas (Open_Positions)
     if not args.no_live and not open_df.empty:
@@ -561,7 +570,6 @@ def main():
             "EntryTimeUTC","ExitTimeUTC","Source","Timeframe","SignalTimeUTC","SignalPrice"
         ]]
     if not open_df.empty:
-        # If live disabled there may be no PriceNow/Unrealized%; include only what exists
         cols = ["Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen","Source","Timeframe","SignalTimeUTC","SignalPrice"]
         if "PriceNow" in open_df.columns and "Unrealized%" in open_df.columns:
             cols = ["Ticker","OpenQty","EntryPrice","PriceNow","Unrealized%","EntryTimeUTC","DaysOpen","Source","Timeframe","SignalTimeUTC","SignalPrice"]
