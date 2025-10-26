@@ -8,15 +8,15 @@ Build three Google Sheets tabs from your data:
 - Performance_By_Source
 
 Reads:
-  Signals        (manual or merged)  ← we now default to using the *latest* signal
-                                       for a ticker even if it’s after the BUY.
+  Signals        (manual or merged)
   Transactions   (Fidelity history)
-  Holdings       (optional; context only)
+  Holdings       (optional; currently not used for PnL, only for context)
 
-Options:
-  --no-live              Do NOT add GOOGLEFINANCE formulas to Open_Positions.
-  --debug                Verbose logs.
-  --strict-signal-timing Only use signals at-or-before BUY time (old behavior).
+Key notes
+- Uses FIFO to match BUY lots against SELLs and compute realized returns.
+- Sources/timeframes are taken from the most recent Signal at or before a BUY.
+- Live price formulas can be added to Open_Positions (disable via --no-live).
+- Prints a summary of unmatched SELLs (e.g., very old positions) and unknown sources.
 """
 
 from __future__ import annotations
@@ -73,6 +73,7 @@ def read_tab(ws) -> pd.DataFrame:
         return pd.DataFrame()
     header, rows = vals[0], vals[1:]
     df = pd.DataFrame(rows, columns=[h.strip() for h in header])
+    # strip strings
     df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
@@ -175,8 +176,10 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     if not tcol:
         raise ValueError("Signals tab needs a 'Ticker' column.")
 
+    # Timestamp column (any that starts with "timestamp")
     tscol = next((c for c in df.columns if c.lower().startswith("timestamp")), None)
 
+    # Normalize fields
     df["Ticker"] = df[tcol].map(base_symbol_from_string)
     df["Source"] = df.get("Source","").fillna("").astype(str)
     df["Direction"] = df.get("Direction","").fillna("").astype(str)
@@ -184,11 +187,13 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
     df["TimestampUTC"] = to_dt(df[tscol]) if tscol else pd.NaT
     df["Price"] = df.get("Price","").fillna("").astype(str)
 
+    # Keep only non-empty ticker rows
     df = df[df["Ticker"].ne("")]
+    # Sorting makes matching deterministic
     df.sort_values(["Ticker","TimestampUTC"], inplace=True, ignore_index=True)
     return df[["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"]]
 
-# Regex without capture groups
+# Regex without capture groups (silences “match groups” warning)
 _TRADE_PATT = r"\b(?:YOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
 
 def _looks_like_trade_mask(action: pd.Series, typ: pd.Series, desc: pd.Series) -> pd.Series:
@@ -341,43 +346,32 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str,Dict[str,st
 # ─────────────────────────────
 # FIFO MATCHING (REALIZED & OPEN)
 # ─────────────────────────────
-def build_realized_and_open(
-    tx: pd.DataFrame,
-    sig: pd.DataFrame,
-    debug: bool=False,
-    strict_signal_timing: bool=False
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+def build_realized_and_open(tx: pd.DataFrame, sig: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     if tx.empty:
         return pd.DataFrame(), pd.DataFrame(), []
 
-    # Build signal index per ticker (BUY-only)
+    # Index signals by (Ticker, time), only BUY signals
     sig_buy = sig[(sig["Direction"].str.upper()=="BUY") & sig["Ticker"].ne("")].copy()
     sig_buy.sort_values(["Ticker","TimestampUTC"], inplace=True, ignore_index=True)
 
     sig_by_ticker: Dict[str, List[Tuple[pd.Timestamp, dict]]] = defaultdict(list)
-    latest_signal: Dict[str, dict] = {}  # fastest path: always take the last (most recent)
     for _, r in sig_buy.iterrows():
-        payload = {
+        sig_by_ticker[r["Ticker"]].append( (r["TimestampUTC"], {
             "Source": r.get("Source",""),
             "Timeframe": r.get("Timeframe",""),
             "SigTime": r.get("TimestampUTC"),
             "SigPrice": r.get("Price",""),
-        }
-        sig_by_ticker[r["Ticker"]].append((r["TimestampUTC"], payload))
-        latest_signal[r["Ticker"]] = payload  # overwrite → leaves most recent
+        }))
 
-    def signal_for(tkr: str, when: pd.Timestamp):
-        # 1) strict timing → use last at/<= when; else 2) use most recent regardless of time
-        if strict_signal_timing:
-            arr = sig_by_ticker.get(tkr, [])
-            for t, payload in reversed(arr):
-                if pd.isna(t) or pd.isna(when):
-                    return payload
-                if t <= when:
-                    return payload
-            return {"Source":"(unknown)","Timeframe":"","SigTime": pd.NaT, "SigPrice": ""}
-        # relaxed: take whatever most recent you logged (what you want)
-        return latest_signal.get(tkr, {"Source":"(unknown)","Timeframe":"","SigTime": pd.NaT, "SigPrice": ""})
+    def last_signal_for(tkr: str, when: pd.Timestamp):
+        arr = sig_by_ticker.get(tkr, [])
+        # from end to start to get most recent at/<= when
+        for t, payload in reversed(arr):
+            if pd.isna(t) or pd.isna(when):
+                return payload
+            if t <= when:
+                return payload
+        return {"Source":"(unknown)","Timeframe":"","SigTime": pd.NaT, "SigPrice": ""}
 
     lots: Dict[str, deque] = defaultdict(deque)
     realized_rows = []
@@ -393,7 +387,7 @@ def build_realized_and_open(
             continue
 
         if ttype == "BUY":
-            siginfo = signal_for(tkr, when)
+            siginfo = last_signal_for(tkr, when)
             lots[tkr].append({
                 "qty_left": qty,
                 "entry_price": price,
@@ -434,6 +428,7 @@ def build_realized_and_open(
                 if lot["qty_left"] <= 1e-9:
                     lots[tkr].popleft()
             if remaining > 1e-9:
+                # SELL without prior BUY (old history) – track for the summary
                 unmatched_sells.append(
                     f"{tkr} SELL on {when.isoformat()} qty={qty} price={price} — No prior BUY lot in window"
                 )
@@ -470,37 +465,60 @@ def build_realized_and_open(
 # ─────────────────────────────
 # PERFORMANCE TABLE
 # ─────────────────────────────
-def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
+def build_perf_by_source(realized_df: pd.DataFrame,
+                         open_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize realized performance by Source and include open-position counts.
+    Adds two open metrics:
+      - OpenLots:    number of open FIFO lots for that source (previous behavior)
+      - OpenTickers: number of unique tickers with at least one open lot for that source
+    """
+    # ---- Realized aggregates ----
     if realized_df.empty:
-        realized_grp = pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%"])
+        realized_grp = pd.DataFrame(
+            columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%"]
+        )
     else:
         tmp = realized_df.copy()
         tmp["ret"] = pd.to_numeric(tmp["Return%"], errors="coerce")
         tmp["is_win"] = tmp["ret"] > 0
         g = tmp.groupby("Source", dropna=False)
+
         realized_grp = pd.DataFrame({
             "Source": g.size().index,
             "Trades": g.size().values,
             "Wins": g["is_win"].sum().values,
-            "WinRate%": (g["is_win"].mean().fillna(0.0).values*100).round(2),
+            "WinRate%": (g["is_win"].mean().fillna(0.0).values * 100).round(2),
             "AvgReturn%": g["ret"].mean().round(2).values,
             "MedianReturn%": g["ret"].median().round(2).values,
         })
 
+    # ---- Open aggregates ----
     if open_df.empty:
-        open_counts = pd.DataFrame(columns=["Source","OpenSignals"])
+        open_agg = pd.DataFrame(columns=["Source","OpenLots","OpenTickers"])
     else:
-        open_counts = open_df.groupby("Source").size().rename("OpenSignals").reset_index()
+        open_by_src = open_df.groupby("Source", dropna=False)
+        open_agg = pd.DataFrame({
+            "Source": open_by_src.size().index,
+            "OpenLots": open_by_src.size().values,
+            "OpenTickers": open_by_src["Ticker"].nunique().values,
+        })
 
-    perf = pd.merge(realized_grp, open_counts, on="Source", how="outer")
+    # ---- Merge ----
+    perf = pd.merge(realized_grp, open_agg, on="Source", how="outer")
     if perf.empty:
-        return pd.DataFrame(columns=["Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenSignals"])
+        return pd.DataFrame(columns=[
+            "Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenLots","OpenTickers"
+        ])
 
-    perf["Trades"] = perf["Trades"].fillna(0).astype(int)
-    perf["Wins"] = perf["Wins"].fillna(0).astype(int)
+    # Clean types
+    perf["Trades"] = pd.to_numeric(perf["Trades"], errors="coerce").fillna(0).astype(int)
+    perf["Wins"] = pd.to_numeric(perf["Wins"], errors="coerce").fillna(0).astype(int)
     for col in ["WinRate%","AvgReturn%","MedianReturn%"]:
         perf[col] = pd.to_numeric(perf[col], errors="coerce").fillna(0.0)
-    perf["OpenSignals"] = perf["OpenSignals"].fillna(0).astype(int)
+    perf["OpenLots"] = pd.to_numeric(perf.get("OpenLots", 0), errors="coerce").fillna(0).astype(int)
+    perf["OpenTickers"] = pd.to_numeric(perf.get("OpenTickers", 0), errors="coerce").fillna(0).astype(int)
+
     perf = perf.sort_values(["Source"]).reset_index(drop=True)
     return perf
 
@@ -522,6 +540,24 @@ def print_unknown_sources(realized_df: pd.DataFrame, open_df: pd.DataFrame):
         if unk_open:
             print("  • Open    :", ", ".join(unk_open))
 
+def debug_open_breakdown(open_df: pd.DataFrame, source_name: str = None):
+    """Print lots per (Source, Ticker) to see why 'open' counts are what they are."""
+    if open_df.empty:
+        print("• No open lots.")
+        return
+    df = open_df if source_name is None else open_df[open_df["Source"] == source_name]
+    if df.empty:
+        print(f"• No open lots for Source='{source_name}'.")
+        return
+    print("🔍 Open breakdown:")
+    out = (df.groupby(["Source","Ticker"])
+             .size()
+             .rename("Lots")
+             .reset_index()
+             .sort_values(["Source","Ticker"]))
+    for _, r in out.iterrows():
+        print(f"  - {r['Source']}: {r['Ticker']} → {int(r['Lots'])} lot(s)")
+
 # ─────────────────────────────
 # MAIN
 # ─────────────────────────────
@@ -529,8 +565,6 @@ def main():
     ap = argparse.ArgumentParser(description="Build performance dashboard tabs.")
     ap.add_argument("--no-live", action="store_true", help="Do NOT add GOOGLEFINANCE formulas to Open_Positions.")
     ap.add_argument("--debug", action="store_true", help="Verbose debug output")
-    ap.add_argument("--strict-signal-timing", action="store_true",
-                    help="Only use signals at-or-before BUY time (default is relaxed: use latest signal any time).")
     args = ap.parse_args()
     DEBUG = args.debug
 
@@ -554,9 +588,7 @@ def main():
     tx, _ = load_transactions(df_tx, debug=DEBUG)
 
     # Build realized & open (FIFO)
-    realized_df, open_df, unmatched_sells = build_realized_and_open(
-        tx, sig, debug=DEBUG, strict_signal_timing=args.strict_signal_timing
-    )
+    realized_df, open_df, unmatched_sells = build_realized_and_open(tx, sig, debug=DEBUG)
 
     # Optionally add live price formulas (Open_Positions)
     if not args.no_live and not open_df.empty:
@@ -570,12 +602,13 @@ def main():
             "EntryTimeUTC","ExitTimeUTC","Source","Timeframe","SignalTimeUTC","SignalPrice"
         ]]
     if not open_df.empty:
+        # If live disabled there may be no PriceNow/Unrealized%; include only what exists
         cols = ["Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen","Source","Timeframe","SignalTimeUTC","SignalPrice"]
         if "PriceNow" in open_df.columns and "Unrealized%" in open_df.columns:
             cols = ["Ticker","OpenQty","EntryPrice","PriceNow","Unrealized%","EntryTimeUTC","DaysOpen","Source","Timeframe","SignalTimeUTC","SignalPrice"]
         open_df = open_df[cols]
 
-    # Performance by source
+    # Performance by source (with OpenLots & OpenTickers)
     perf_df = build_perf_by_source(realized_df.copy(), open_df.copy())
 
     # Write tabs
@@ -599,6 +632,12 @@ def main():
                 print("  •", line)
 
     print_unknown_sources(realized_df, open_df)
+
+    if DEBUG:
+        # Helpful visibility: lots per ticker per source (and specifically Bo Xu)
+        debug_open_breakdown(open_df)
+        debug_open_breakdown(open_df, "Bo Xu")
+
     print("🎯 Done.")
 
 if __name__ == "__main__":
