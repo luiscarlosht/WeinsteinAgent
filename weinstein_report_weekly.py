@@ -30,7 +30,6 @@ Notes:
 from __future__ import annotations
 
 import argparse
-import re
 from typing import Tuple
 
 import numpy as np
@@ -86,7 +85,6 @@ def write_tab(ws: gspread.Worksheet, df: pd.DataFrame):
         ws.update([["(empty)"]], range_name="A1")
         return
 
-    # resize conservatively
     rows, cols = df.shape
     ws.resize(rows=max(100, rows + 5), cols=max(8, min(26, cols + 2)))
 
@@ -178,7 +176,6 @@ def prepare_holdings_frame(df: pd.DataFrame) -> pd.DataFrame:
             for k in cands:
                 if cl == k.lower():
                     return c
-        # fallback partial contains
         for c in df.columns:
             cl = c.lower()
             for k in cands:
@@ -197,7 +194,6 @@ def prepare_holdings_frame(df: pd.DataFrame) -> pd.DataFrame:
     c_acb  = pick("Average Cost Basis")
     c_type = pick("Type")
 
-    # Build a working frame with safe defaults
     out = pd.DataFrame({
         "Symbol": df.get(c_sym, ""),
         "Description": df.get(c_desc, ""),
@@ -254,16 +250,21 @@ def analyze_holdings(
 
     # Compute missing fields if needed
     if df_pos["Total Gain/Loss Dollar"].isna().any():
-        # if we have CV and CB, infer
         can = df_pos["Current Value"].notna() & df_pos["Cost Basis Total"].notna()
         df_pos.loc[can, "Total Gain/Loss Dollar"] = (
             df_pos.loc[can, "Current Value"] - df_pos.loc[can, "Cost Basis Total"]
         )
 
     if df_pos["Total Gain/Loss Percent"].isna().any():
-        can = df_pos["Total Gain/Loss Dollar"].notna() & df_pos["Cost Basis Total"].notna() & (df_pos["Cost Basis Total"] != 0)
+        can = (
+            df_pos["Total Gain/Loss Dollar"].notna()
+            & df_pos["Cost Basis Total"].notna()
+            & (df_pos["Cost Basis Total"] != 0)
+        )
         df_pos.loc[can, "Total Gain/Loss Percent"] = (
-            df_pos.loc[can, "Total Gain/Loss Dollar"] / df_pos.loc[can, "Cost Basis Total"] * 100.0
+            df_pos.loc[can, "Total Gain/Loss Dollar"]
+            / df_pos.loc[can, "Cost Basis Total"]
+            * 100.0
         )
 
     # Recommendations
@@ -274,13 +275,24 @@ def analyze_holdings(
     total_gain = float(df_pos["Total Gain/Loss Dollar"].fillna(0).sum())
     total_cost = float(df_pos["Cost Basis Total"].fillna(0).sum())
     portfolio_pct = (total_gain / total_cost * 100.0) if total_cost else 0.0
-    avg_pct = float(df_pos["Total Gain/Loss Percent"].dropna().mean()) if not df_pos["Total Gain/Loss Percent"].dropna().empty else 0.0
+    avg_pct = float(
+        df_pos["Total Gain/Loss Percent"].dropna().mean()
+    ) if not df_pos["Total Gain/Loss Percent"].dropna().empty else 0.0
 
     # Nicely rounded presentation columns (keep numeric under the hood)
     df_view = df_pos.copy()
-    for col in ["Quantity", "Last Price", "Current Value", "Total Gain/Loss Dollar", "Cost Basis Total", "Average Cost Basis"]:
+    for col in [
+        "Quantity",
+        "Last Price",
+        "Current Value",
+        "Total Gain/Loss Dollar",
+        "Cost Basis Total",
+        "Average Cost Basis",
+    ]:
         df_view[col] = df_view[col].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}")
-    df_view["Total Gain/Loss Percent"] = df_view["Total Gain/Loss Percent"].map(lambda x: "" if pd.isna(x) else f"{x:.2f}%")
+    df_view["Total Gain/Loss Percent"] = df_view["Total Gain/Loss Percent"].map(
+        lambda x: "" if pd.isna(x) else f"{x:.2f}%"
+    )
 
     return df_view, total_gain, portfolio_pct, avg_pct
 
@@ -288,6 +300,22 @@ def analyze_holdings(
 # ─────────────────────────────
 # SHEET OUTPUT (Weekly_Report)
 # ─────────────────────────────
+def pad_to_ncols(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """
+    Safely expand df to n columns by ADDING blank columns, then renaming
+    those added columns to "" so headers appear blank in the sheet.
+    """
+    out = df.copy()
+    cur = len(out.columns)
+    if cur < n:
+        # add real columns (unique names), then rename to blanks
+        for i in range(n - cur):
+            out[f"__pad{i+1}"] = ""
+        # rename last added columns to blank header cells (duplicates allowed in pandas)
+        new_cols = list(out.columns[:cur]) + [""] * (n - cur)
+        out.columns = new_cols
+    return out
+
 def build_weekly_sheet(df_view: pd.DataFrame, total_gain: float, portfolio_pct: float, avg_pct: float) -> pd.DataFrame:
     """
     Assemble a nice table with a metrics header + per-position rows for "Weekly_Report".
@@ -307,27 +335,15 @@ def build_weekly_sheet(df_view: pd.DataFrame, total_gain: float, portfolio_pct: 
     present = [c for c in cols if c in df_view.columns]
     positions = df_view[present].copy()
 
-    # Compose into one sheet-like frame
-    # We’ll return it as one DataFrame with an empty row separating sections;
-    # write_tab() handles the actual upload.
-    top = summary
-    bot = positions
+    # Determine target column width for the combined sheet
+    max_cols = max(len(summary.columns), len(spacer.columns), len(positions.columns))
 
-    # Convert to a common schema by padding columns
-    max_cols = max(len(top.columns), len(bot.columns), len(spacer.columns))
-    def pad(df, n):
-        if len(df.columns) < n:
-            extra = [f"" for _ in range(n - len(df.columns))]
-            newcols = list(df.columns) + [f""] * (n - len(df.columns))
-            df = df.copy()
-            df.columns = newcols
-        return df
+    # Pad each block to the same width
+    top = pad_to_ncols(summary, max_cols)
+    spc = pad_to_ncols(spacer, max_cols)
+    bot = pad_to_ncols(positions, max_cols)
 
-    top = pad(top, max_cols)
-    spacer = pad(spacer, max_cols)
-    bot = pad(bot, max_cols)
-
-    combined = pd.concat([top, spacer, bot], ignore_index=True)
+    combined = pd.concat([top, spc, bot], ignore_index=True)
     return combined
 
 
@@ -368,7 +384,10 @@ def main():
     if df_view.empty:
         print("(no equity positions found)")
     else:
-        cols = ["Symbol","Description","Quantity","Current Value","Cost Basis Total","Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"]
+        cols = [
+            "Symbol","Description","Quantity","Current Value",
+            "Cost Basis Total","Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"
+        ]
         cols = [c for c in cols if c in df_view.columns]
         print(df_view[cols].to_string(index=False))
 
