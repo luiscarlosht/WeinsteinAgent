@@ -8,35 +8,24 @@ Weekly report that pulls Holdings from your Google Sheet and produces:
 - Total portfolio gain/loss ($)
 - Portfolio % gain (sum gain / sum cost basis)
 - Average % gain across positions
-- Per-position recommendation: SELL / HOLD (configurable thresholds)
+- Per-position recommendation: SELL / HOLD / HOLD (Strong)
 
-Optional: write a "Weekly_Report" tab back to the sheet.
-
-Usage examples:
+Usage:
   python3 weinstein_report_weekly.py
   python3 weinstein_report_weekly.py --write
   python3 weinstein_report_weekly.py --sell-thresh -7 --strong-hold 12 --write
   python3 weinstein_report_weekly.py --sheet-url "https://docs.google.com/..." --creds "creds/gcp_service_account.json"
-
-Notes:
-- Reuses the same service account method as your other scripts (gspread).
-- Designed for your Fidelity-style Holdings tab columns, e.g.:
-    "Symbol", "Description", "Quantity", "Last Price",
-    "Current Value", "Total Gain/Loss Dollar", "Total Gain/Loss Percent",
-    "Cost Basis Total", "Average Cost Basis", "Type"
-- Cash rows like FCASH** / SPAXX** / "Pending activity" are ignored automatically.
 """
 
 from __future__ import annotations
 
 import argparse
-from typing import Tuple
+from typing import Tuple, List
 
 import numpy as np
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-
 
 # ─────────────────────────────
 # DEFAULT CONFIG (matches your repo)
@@ -46,9 +35,7 @@ SHEET_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy7
 
 TAB_HOLDINGS = "Holdings"
 TAB_WEEKLY   = "Weekly_Report"
-
 ROW_CHUNK = 500
-
 
 # ─────────────────────────────
 # AUTH / IO HELPERS
@@ -84,10 +71,8 @@ def write_tab(ws: gspread.Worksheet, df: pd.DataFrame):
         ws.resize(rows=50, cols=8)
         ws.update([["(empty)"]], range_name="A1")
         return
-
     rows, cols = df.shape
     ws.resize(rows=max(100, rows + 5), cols=max(8, min(26, cols + 2)))
-
     header = [str(c) for c in df.columns]
     data = [header] + df.astype(str).fillna("").values.tolist()
 
@@ -103,7 +88,6 @@ def write_tab(ws: gspread.Worksheet, df: pd.DataFrame):
         ws.update(block, range_name=rng)
         r += len(block)
         start = end
-
 
 # ─────────────────────────────
 # PARSING HELPERS (robust to $ , % etc.)
@@ -153,7 +137,6 @@ def _looks_like_cash(symbol: str, description: str) -> bool:
     if "HELD IN" in desc and "CASH" in desc:
         return True
     return False
-
 
 # ─────────────────────────────
 # ANALYSIS
@@ -296,56 +279,52 @@ def analyze_holdings(
 
     return df_view, total_gain, portfolio_pct, avg_pct
 
-
 # ─────────────────────────────
 # SHEET OUTPUT (Weekly_Report)
 # ─────────────────────────────
-def pad_to_ncols(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    """
-    Safely expand df to n columns by ADDING blank columns, then renaming
-    those added columns to "" so headers appear blank in the sheet.
-    """
-    out = df.copy()
-    cur = len(out.columns)
-    if cur < n:
-        # add real columns (unique names), then rename to blanks
-        for i in range(n - cur):
-            out[f"__pad{i+1}"] = ""
-        # rename last added columns to blank header cells (duplicates allowed in pandas)
-        new_cols = list(out.columns[:cur]) + [""] * (n - cur)
-        out.columns = new_cols
-    return out
-
 def build_weekly_sheet(df_view: pd.DataFrame, total_gain: float, portfolio_pct: float, avg_pct: float) -> pd.DataFrame:
     """
-    Assemble a nice table with a metrics header + per-position rows for "Weekly_Report".
+    Build the Weekly_Report as a single table of strings.
+    Avoids concat of DataFrames with duplicate/blank columns.
+    Layout:
+      Row1: header for metrics ("Metric","Value", …padding)
+      Row2-4: metrics
+      Row5: blank
+      Row6: positions header (present columns)
+      Row7+: position rows
     """
-    summary = pd.DataFrame({
-        "Metric": ["Total Gain/Loss ($)", "Portfolio % Gain", "Average % Gain"],
-        "Value":  [f"${total_gain:,.2f}", f"{portfolio_pct:.2f}%", f"{avg_pct:.2f}%"]
-    })
-    spacer = pd.DataFrame({"Metric": [""], "Value": [""]})
-
-    # Reorder a sensible set of columns for the per-position section
-    cols = [
+    # Positions block columns
+    pos_cols_pref = [
         "Symbol", "Description", "Quantity", "Last Price", "Current Value",
         "Cost Basis Total", "Average Cost Basis",
         "Total Gain/Loss Dollar", "Total Gain/Loss Percent", "Recommendation"
     ]
-    present = [c for c in cols if c in df_view.columns]
-    positions = df_view[present].copy()
+    pos_cols = [c for c in pos_cols_pref if c in df_view.columns]
 
-    # Determine target column width for the combined sheet
-    max_cols = max(len(summary.columns), len(spacer.columns), len(positions.columns))
+    # Determine total width
+    metrics_width = 2
+    max_cols = max(metrics_width, len(pos_cols))
+    pad = lambda row: row + [""] * (max_cols - len(row))
 
-    # Pad each block to the same width
-    top = pad_to_ncols(summary, max_cols)
-    spc = pad_to_ncols(spacer, max_cols)
-    bot = pad_to_ncols(positions, max_cols)
+    # Build rows
+    rows: List[List[str]] = []
+    # Metrics header
+    rows.append(pad(["Metric", "Value"]))
+    rows.append(pad(["Total Gain/Loss ($)", f"${total_gain:,.2f}"]))
+    rows.append(pad(["Portfolio % Gain", f"{portfolio_pct:.2f}%"]))
+    rows.append(pad(["Average % Gain", f"{avg_pct:.2f}%"]))
+    # Blank spacer
+    rows.append([""] * max_cols)
+    # Positions header
+    rows.append(pad(pos_cols))
+    # Positions rows
+    for _, r in df_view[pos_cols].iterrows():
+        rows.append(pad([str(r[c]) if c in r and pd.notna(r[c]) else "" for c in pos_cols]))
 
-    combined = pd.concat([top, spc, bot], ignore_index=True)
-    return combined
-
+    # Turn into a DataFrame with a simple header row (first row is the header)
+    header = rows[0]
+    body = rows[1:]
+    return pd.DataFrame(body, columns=header)
 
 # ─────────────────────────────
 # MAIN
@@ -399,7 +378,6 @@ def main():
         print(f"\n✅ Wrote '{TAB_WEEKLY}' tab with summary and per-position details.")
 
     print("\n🎯 Done.")
-
 
 if __name__ == "__main__":
     main()
