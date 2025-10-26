@@ -65,7 +65,7 @@ def open_ws(gc, tab):
 def _sanitize_df_for_read(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    # applymap is deprecated; do per-column map instead (works on older pandas too)
+    # applymap is deprecated; do per-column map instead
     return df.apply(lambda s: s.map(lambda x: x.strip() if isinstance(x, str) else x))
 
 def read_tab(ws) -> pd.DataFrame:
@@ -205,36 +205,40 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
     if df_tx.empty:
         return pd.DataFrame(columns=["When","Type","Symbol","Qty","Price"]), pd.DataFrame()
 
-    df = df_tx.copy()
+    df_all = df_tx.copy()
 
     # Guess common Fidelity columns
-    symcol    = next((c for c in df.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
-    actioncol = next((c for c in df.columns if c.lower() in ("action","type")), None)
-    desccol   = next((c for c in df.columns if "description" in c.lower()), None)
-    qtycol    = next((c for c in df.columns if "quantity" in c.lower()), None)
-    pricecol  = next((c for c in df.columns if "price" in c.lower()), None)
-    amtcol    = next((c for c in df.columns if "amount" in c.lower()), None)
-    datecol   = next((c for c in df.columns if "run date" in c.lower() or c.lower() == "date"), None)
+    symcol    = next((c for c in df_all.columns if c.lower() in ("symbol","security","symbol/cusip")), None)
+    actioncol = next((c for c in df_all.columns if c.lower() in ("action","type")), None)
+    desccol   = next((c for c in df_all.columns if "description" in c.lower()), None)
+    qtycol    = next((c for c in df_all.columns if "quantity" in c.lower()), None)
+    pricecol  = next((c for c in df_all.columns if "price" in c.lower()), None)
+    amtcol    = next((c for c in df_all.columns if "amount" in c.lower()), None)
+    datecol   = next((c for c in df_all.columns if "run date" in c.lower() or c.lower() == "date"), None)
 
     if not datecol:
         raise ValueError("Transactions tab must include a 'Run Date' or 'Date' column.")
     if not actioncol and not desccol:
         raise ValueError("Transactions need an Action/Type or Description column to identify BUY/SELL.")
 
-    # Build “trade-like” mask from Action/Description
+    # Build “trade-like” mask from Action/Description on the FULL frame
     patt = r"(?:\bYOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
-    action_up = df[actioncol].str.upper() if actioncol in df.columns else pd.Series("", index=df.index)
-    desc_up   = df[desccol].str.upper()   if desccol   in df.columns else pd.Series("", index=df.index)
-    mask_action = action_up.str.contains(patt, regex=True, na=False)
-    mask_desc   = desc_up.str.contains(patt,   regex=True, na=False)
-    mask_trade  = mask_action | mask_desc
+    action_up_all = df_all[actioncol].str.upper() if actioncol in df_all.columns else pd.Series("", index=df_all.index)
+    desc_up_all   = df_all[desccol].str.upper()   if desccol   in df_all.columns else pd.Series("", index=df_all.index)
+    mask_action   = action_up_all.str.contains(patt, regex=True, na=False)
+    mask_desc     = desc_up_all.str.contains(patt,   regex=True, na=False)
+    mask_trade    = mask_action | mask_desc
 
     if debug:
-        print(f"• load_transactions: detected {int(mask_trade.sum())} trade-like rows (of {len(df)})")
+        print(f"• load_transactions: detected {int(mask_trade.sum())} trade-like rows (of {len(df_all)})")
 
-    df = df[mask_trade].copy()
+    # Now filter down to the trade-like rows AND slice all helper series accordingly
+    df = df_all[mask_trade].copy()
     if df.empty:
         return pd.DataFrame(columns=["When","Type","Symbol","Qty","Price"]), pd.DataFrame()
+
+    action_up = action_up_all[mask_trade]
+    desc_up   = desc_up_all[mask_trade]
 
     # Parse When
     df["When"] = to_dt(df[datecol])
@@ -253,6 +257,7 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
         m2 = re.search(r"\b([A-Z][A-Z0-9\.\-]{0,7})\b", text.upper())
         return base_symbol_from_string(m2.group(1)) if m2 else ""
 
+    # Fill symbol from text only for blank ones (on the FILTERED index)
     fill_from_action = ~sym.astype(bool)
     if fill_from_action.any():
         sym.where(~fill_from_action, other=action_up.map(symbol_from_text), inplace=True)
@@ -262,10 +267,10 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
 
     df["Symbol"] = sym
 
-    # Price
+    # Price (on filtered df)
     price = to_float(df[pricecol]) if pricecol else pd.Series(np.nan, index=df.index)
 
-    # Quantity (prefer explicit quantity; else derive from amount/price)
+    # Quantity (prefer explicit quantity; else derive from amount/price) — all on filtered df
     if qtycol:
         qty = to_float(df[qtycol])
     else:
@@ -277,7 +282,7 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool=False) -> Tuple[pd.DataFr
         else:
             qty = pd.Series(np.nan, index=df.index)
 
-    # Normalize Type & sign of qty from action/desc text
+    # Normalize Type & sign of qty FROM the FILTERED action/desc text (fix for length mismatch)
     type_series = np.where(
         action_up.str.contains(r"\bSOLD|SELL\b", regex=True, na=False) |
         desc_up.str.contains(r"\bSOLD|SELL\b", regex=True, na=False),
