@@ -1,273 +1,236 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# WeinsteinMinimalEmailSender.py
+# Lightweight email helper used by weekly/intraday scripts.
 
-"""
-WeinsteinMinimalEmailSender.py
-
-Minimal email helper that reads config.yaml and sends an email with optional
-HTML body and attachments. Supports two config layouts:
-
-A) Legacy:
-email:
-  from: "you@example.com"
-  to: ["a@x.com", "b@y.com"]
-  subject_prefix: "Weinstein Report"
-  use_tls: true
-  smtp_host: "smtp.gmail.com"
-  smtp_port: 587
-  smtp_user: "you@example.com"
-  smtp_pass: "app_password"
-
-B) Notifications style (your current file):
-notifications:
-  email:
-    enabled: true
-    sender: "you@example.com"
-    recipients:
-      - "a@x.com"
-      - "b@y.com"
-    subject_prefix: "Weinstein Report READY"
-    provider: "smtp"
-    smtp:
-      host: "smtp.gmail.com"
-      port_ssl: 587
-      username: "you@example.com"
-      app_password: "app_password"
-
-Usage example (from another script):
-    from WeinsteinMinimalEmailSender import send_email
-    send_email(
-        subject="Weekly report",
-        text_body="See attached.",
-        html_body="<h1>Weekly</h1><p>See attached.</p>",
-        attachments=["/path/to/file.html", "/path/to/file.csv"]
-    )
-"""
+from __future__ import annotations
 
 import os
 import smtplib
+import ssl
 import mimetypes
-from typing import Iterable, List, Optional, Tuple
-
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
+from typing import List, Optional, Tuple
 
-import yaml
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config helpers
+# Config
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_config(path: str = "config.yaml") -> dict:
+def _load_config(path: str = "config.yaml") -> dict:
+    cfg = {}
+    if yaml is None:
+        return cfg
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Config file not found: {path}")
+        return cfg
     with open(path, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+        cfg = yaml.safe_load(fh) or {}
+    return cfg
 
 
-def _resolve_email_cfg(cfg: dict) -> dict:
-    """
-    Normalize email configuration from either:
-      - cfg['email'] {...}
-      - or cfg['notifications']['email'] {...} with nested smtp settings.
-    Returns a flat dict with keys:
-        from, to, smtp_host, smtp_port, smtp_user, smtp_pass, use_tls, subject_prefix, enabled
-    """
-    e = (cfg or {}).get("email") or {}
-    n = ((cfg or {}).get("notifications") or {}).get("email") or {}
-    smtp_n = n.get("smtp") or {}
-
-    # Prefer top-level `email` if present
-    if e:
-        # Allow either lists or comma-separated strings for recipients
-        to_val = e.get("to") or e.get("recipients") or []
-        if isinstance(to_val, str):
-            to_val = [t.strip() for t in to_val.split(",") if t.strip()]
-
-        return {
-            "enabled": True if e != {} else bool(n.get("enabled", True)),
-            "from": e.get("from") or e.get("smtp_user") or e.get("sender"),
-            "to": to_val,
-            "smtp_host": e.get("smtp_host") or (e.get("smtp") or {}).get("host") or "smtp.gmail.com",
-            "smtp_port": int(
-                e.get("smtp_port")
-                or (e.get("smtp") or {}).get("port")
-                or (e.get("smtp") or {}).get("port_ssl")
-                or 587
-            ),
-            "smtp_user": e.get("smtp_user") or (e.get("smtp") or {}).get("username"),
-            "smtp_pass": e.get("smtp_pass") or (e.get("smtp") or {}).get("app_password"),
-            "use_tls": bool(e.get("use_tls", True)),
-            "subject_prefix": e.get("subject_prefix", ""),
-        }
-
-    # Fallback → notifications.email + notifications.email.smtp
-    to_val = n.get("recipients") or []
-    if isinstance(to_val, str):
-        to_val = [t.strip() for t in to_val.split(",") if t.strip()]
-
-    return {
-        "enabled": bool(n.get("enabled", True)),
-        "from": n.get("sender") or smtp_n.get("username"),
-        "to": to_val,
-        "smtp_host": smtp_n.get("host", "smtp.gmail.com"),
-        "smtp_port": int(smtp_n.get("port_ssl", 587)),
-        "smtp_user": smtp_n.get("username"),
-        "smtp_pass": smtp_n.get("app_password"),
-        "use_tls": True,
-        "subject_prefix": n.get("subject_prefix", ""),
-    }
+def _email_cfg() -> dict:
+    cfg = _load_config()
+    return ((cfg.get("notifications") or {}).get("email") or {})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core mail send
+# Message building
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _ensure_list(x) -> List[str]:
-    if x is None:
-        return []
-    if isinstance(x, str):
-        return [x]
-    return list(x)
+def _guess_mime_type(path: str) -> Tuple[str, str]:
+    mtype, _ = mimetypes.guess_type(path)
+    if not mtype:
+        return "application", "octet-stream"
+    maintype, subtype = mtype.split("/", 1)
+    return maintype, subtype
 
 
 def _make_multipart_message(
+    sender: str,
+    to: List[str],
     subject: str,
-    from_addr: str,
-    to_addrs: Iterable[str],
     text_body: Optional[str] = None,
     html_body: Optional[str] = None,
-    attachments: Optional[Iterable[str]] = None,
-    cc_addrs: Optional[Iterable[str]] = None,
-    bcc_addrs: Optional[Iterable[str]] = None,
-) -> Tuple[MIMEMultipart, List[str]]:
+    attachments: Optional[List[str]] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+) -> Tuple[EmailMessage, List[str]]:
     """
-    Build a MIME email with alternative (text/html) and attachments.
-    Returns (message, all_recipients).
+    Build an EmailMessage and return it plus the full list of recipients (to+cc+bcc).
     """
-    to_addrs = _ensure_list(to_addrs)
-    cc_addrs = _ensure_list(cc_addrs)
-    bcc_addrs = _ensure_list(bcc_addrs)
-    all_rcpts = list(dict.fromkeys(to_addrs + cc_addrs + bcc_addrs))  # dedupe
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to) if to else ""
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg["Subject"] = subject or ""
 
-    msg_root = MIMEMultipart("mixed")
-    msg_root["From"] = from_addr
-    msg_root["To"] = ", ".join(to_addrs) if to_addrs else ""
-    if cc_addrs:
-        msg_root["Cc"] = ", ".join(cc_addrs)
-    msg_root["Subject"] = subject
-    msg_root["Date"] = formatdate(localtime=True)
-    msg_root["Message-ID"] = make_msgid()
-
-    # Create alternative part for text/html bodies
-    alt = MIMEMultipart("alternative")
-    if text_body:
-        alt.attach(MIMEText(text_body, "plain", "utf-8"))
+    # Text/HTML alternative
     if html_body:
-        alt.attach(MIMEText(html_body, "html", "utf-8"))
+        if text_body:
+            msg.set_content(text_body)
+        else:
+            # Provide a plaintext fallback if only HTML is provided
+            msg.set_content("This message contains HTML content. Please view in an HTML-capable client.")
+        msg.add_alternative(html_body, subtype="html")
+    else:
+        msg.set_content(text_body or "")
 
-    msg_root.attach(alt)
-
-    # Attach files
-    for path in (attachments or []):
-        if not path:
+    # Attachments
+    attachments = attachments or []
+    for path in attachments:
+        if not path or not os.path.exists(path):
             continue
-        if not os.path.exists(path):
-            # Attach a small note as text if missing file; don't fail the whole email.
-            note = MIMEText(f"(Attachment missing: {path})\n", "plain", "utf-8")
-            note.add_header("Content-Disposition", "attachment", filename=os.path.basename(path) or "missing.txt")
-            msg_root.attach(note)
+        maintype, subtype = _guess_mime_type(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        filename = os.path.basename(path)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
+
+    all_recipients = list(to or [])
+    if cc:
+        all_recipients.extend(cc)
+    if bcc:
+        all_recipients.extend(bcc)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for r in all_recipients:
+        if not r:
             continue
+        if r not in seen:
+            unique.append(r)
+            seen.add(r)
 
-        ctype, encoding = mimetypes.guess_type(path)
-        if ctype is None or encoding is not None:
-            ctype = "application/octet-stream"
-        maintype, subtype = ctype.split("/", 1)
+    return msg, unique
 
-        with open(path, "rb") as f:
-            part = MIMEApplication(f.read(), _subtype=subtype)
-        part.add_header("Content-Disposition", "attachment", filename=os.path.basename(path))
-        msg_root.attach(part)
 
-    return msg_root, all_rcpts
+# ──────────────────────────────────────────────────────────────────────────────
+# Sender backends
+# ──────────────────────────────────────────────────────────────────────────────
 
+def _send_via_smtp(
+    msg: EmailMessage,
+    recipients: List[str],
+    host: str,
+    port: int,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    use_starttls: bool = True,
+) -> None:
+    if use_starttls:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(host, port) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            if username and password:
+                server.login(username, password)
+            server.send_message(msg, to_addrs=recipients)
+    else:
+        with smtplib.SMTP(host, port) as server:
+            if username and password:
+                server.login(username, password)
+            server.send_message(msg, to_addrs=recipients)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────────────────
 
 def send_email(
     subject: str,
     text_body: Optional[str] = None,
     html_body: Optional[str] = None,
-    attachments: Optional[Iterable[str]] = None,
-    cc: Optional[Iterable[str]] = None,
-    bcc: Optional[Iterable[str]] = None,
-    cfg_path: str = "config.yaml",
-) -> bool:
+    attachments: Optional[List[str]] = None,
+    to: Optional[List[str]] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    sender: Optional[str] = None,
+) -> None:
     """
-    Send an email based on config.yaml (supports both layouts).
-    Returns True on success, False on failure (also raises on certain config errors).
+    Send an email using settings from config.yaml (notifications.email).
+    Parameters can override config values if provided.
+    Expected config structure (Option B example):
+
+    notifications:
+      email:
+        enabled: true
+        sender: "you@example.com"
+        recipients: ["you@example.com", "other@example.com"]
+        subject_prefix: "Weinstein Report READY"
+        provider: "smtp"
+        smtp:
+          host: "smtp.gmail.com"
+          port_ssl: 587
+          username: "you@example.com"
+          app_password: "abcd app password here"
     """
-    cfg = load_config(cfg_path)
-    em = _resolve_email_cfg(cfg)
+    ecfg = _email_cfg()
 
-    if not em.get("enabled", True):
-        print("✉️  Email is disabled by config (notifications.email.enabled = false). Skipping send.")
-        return True
+    enabled = bool(ecfg.get("enabled", True))
+    if not enabled:
+        # Quietly no-op if disabled
+        return
 
-    from_addr = em.get("from")
-    to_addrs = em.get("to") or []
-    host = em.get("smtp_host")
-    port = int(em.get("smtp_port") or 587)
-    user = em.get("smtp_user")
-    pwd = em.get("smtp_pass")
-    use_tls = bool(em.get("use_tls", True))
-    prefix = em.get("subject_prefix", "")
+    # Sender & recipients
+    sender_final = sender or ecfg.get("sender") or ecfg.get("from") or ecfg.get("smtp_user")
+    if not sender_final:
+        raise ValueError("Email FROM is not configured. Set notifications.email.sender or notifications.email.smtp.username in config.yaml")
 
-    if not from_addr or not user:
-        raise ValueError("Email FROM is not configured. "
-                         "Set either email.from/smtp_user or notifications.email.sender/smtp.username in config.yaml")
+    to_final: List[str] = to if to is not None else list(ecfg.get("recipients") or [])
+    # Optional CC/BCC from config (merged with parameters if both)
+    cc_final: List[str] = list(ecfg.get("cc") or [])
+    bcc_final: List[str] = list(ecfg.get("bcc") or [])
+    if cc:
+        cc_final.extend(cc)
+    if bcc:
+        bcc_final.extend(bcc)
 
-    final_subject = f"{prefix} {subject}".strip()
+    if not to_final and not cc_final and not bcc_final:
+        raise ValueError("No recipients configured. Provide notifications.email.recipients in config.yaml or pass 'to='.")
 
+    # Subject prefix (optional)
+    prefix = ecfg.get("subject_prefix", "")
+    if prefix and not subject.startswith(prefix):
+        subject = f"{prefix} {subject}"
+
+    # Build message
     msg, all_rcpts = _make_multipart_message(
-        subject=final_subject,
-        from_addr=from_addr,
-        to_addrs=to_addrs,
+        sender=sender_final,
+        to=to_final,
+        subject=subject,
         text_body=text_body,
         html_body=html_body,
         attachments=attachments,
-        cc=cc,
-        bcc=bcc,
+        cc=cc_final or None,
+        bcc=bcc_final or None,
     )
 
-    if not all_rcpts:
-        raise ValueError("Email recipient list is empty. "
-                         "Add recipients under email.to / email.recipients or notifications.email.recipients.")
+    # Provider route (only SMTP supported here)
+    provider = (ecfg.get("provider") or "smtp").lower()
+    if provider != "smtp":
+        raise ValueError(f"Unsupported email provider '{provider}'. Only 'smtp' is supported in this minimal sender.")
 
-    try:
-        with smtplib.SMTP(host, port, timeout=30) as s:
-            if use_tls:
-                s.starttls()
-            s.login(user, pwd)
-            s.sendmail(from_addr, all_rcpts, msg.as_string())
-        print(f"📧 Email sent to {', '.join(all_rcpts)}")
-        return True
-    except Exception as e:
-        print(f"❌ Email send failed: {e}")
-        return False
+    smtp_cfg = ecfg.get("smtp") or {}
+    host = smtp_cfg.get("host") or "smtp.gmail.com"
+    port = int(smtp_cfg.get("port_ssl") or smtp_cfg.get("port") or 587)
+    username = smtp_cfg.get("username") or sender_final
+    password = smtp_cfg.get("app_password") or smtp_cfg.get("password")
 
+    if not password:
+        raise ValueError("SMTP password/app_password missing. Set notifications.email.smtp.app_password in config.yaml.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI helper (optional)
-# ──────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # Simple manual test:
-    ok = send_email(
-        subject="Weinstein Agent - Test",
-        text_body="Plain text body.\nIf you see this, SMTP works.",
-        html_body="<h2>Weinstein Agent - Test</h2><p>If you see this, SMTP works.</p>",
-        attachments=[],
+    _send_via_smtp(
+        msg=msg,
+        recipients=all_rcpts,
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        use_starttls=True,
     )
-    raise SystemExit(0 if ok else 2)
