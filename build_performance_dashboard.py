@@ -23,12 +23,18 @@ Features
 - Prints a summary of unmatched SELLs and any tickers with Source "(unknown)".
 - Adds totals row at top of Performance_By_Source.
 - Adds OpenLots_Detail tab with one row per open lot.
+
+This version loads configuration from config.yaml:
+  sheets.url or sheets.sheet_url
+  google.service_account_json
+  sheets.open_positions_tab, sheets.signals_tab (optional)
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
@@ -37,17 +43,18 @@ import numpy as np
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+import yaml
 
 # ─────────────────────────────
-# CONFIG
+# DEFAULTS (can be overridden by YAML or CLI)
 # ─────────────────────────────
-SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
-SCOPES = [
+DEFAULT_SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
+DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-SHEET_URL = "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
 
+# Tab names (can be overridden in YAML via sheets.* if you want)
 TAB_SIGNALS      = "Signals"
 TAB_TRANSACTIONS = "Transactions"
 TAB_HOLDINGS     = "Holdings"           # optional
@@ -60,15 +67,44 @@ DEFAULT_EXCHANGE_PREFIX = "NYSE: "
 ROW_CHUNK = 500
 
 # ─────────────────────────────
+# CONFIG LOADING
+# ─────────────────────────────
+def load_cfg(path: str) -> dict:
+    """Load YAML; tolerate missing file by returning {}."""
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        return yaml.safe_load(f) or {}
+
+def resolve_sheet_url(cfg: dict) -> Optional[str]:
+    sheets = cfg.get("sheets", {}) or {}
+    # support both keys
+    return sheets.get("url") or sheets.get("sheet_url") or os.getenv("SHEET_URL")
+
+def resolve_service_account_file(cfg: dict) -> str:
+    google = cfg.get("google", {}) or {}
+    # env var GOOGLE_APPLICATION_CREDENTIALS also allowed
+    return (
+        google.get("service_account_json")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        or DEFAULT_SERVICE_ACCOUNT_FILE
+    )
+
+def resolve_tab_name(cfg: dict, key: str, default_name: str) -> str:
+    """Allow optional overrides of tab names in YAML under sheets.*"""
+    sheets = cfg.get("sheets", {}) or {}
+    return sheets.get(key, default_name)
+
+# ─────────────────────────────
 # UTILITIES
 # ─────────────────────────────
-def auth_gspread():
+def auth_gspread(service_account_file: str):
     print("🔑 Authorizing service account…")
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    creds = Credentials.from_service_account_file(service_account_file, scopes=DEFAULT_SCOPES)
     return gspread.authorize(creds)
 
-def open_ws(gc, tab):
-    sh = gc.open_by_url(SHEET_URL)
+def open_ws(gc, sheet_url: str, tab: str):
+    sh = gc.open_by_url(sheet_url)
     try:
         return sh.worksheet(tab)
     except gspread.WorksheetNotFound:
@@ -155,10 +191,10 @@ def base_symbol_from_string(s) -> str:
         return ""
     return token
 
-def read_mapping(gc) -> Dict[str, Dict[str, str]]:
+def read_mapping(gc, sheet_url: str) -> Dict[str, Dict[str, str]]:
     """Return {ticker: {'FormulaSym': 'EXCH: TKR', 'TickerYF': 'TKR'}} if Mapping tab exists."""
     try:
-        mws = open_ws(gc, "Mapping")
+        mws = open_ws(gc, sheet_url, "Mapping")
         dfm = read_tab(mws)
         out: Dict[str, Dict[str, str]] = {}
         if not dfm.empty and "Ticker" in dfm.columns:
@@ -360,6 +396,7 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, 
 
 # ─────────────────────────────
 # FIFO MATCHING
+# (unchanged)
 # ─────────────────────────────
 def build_realized_and_open(
     tx: pd.DataFrame,
@@ -371,7 +408,6 @@ def build_realized_and_open(
     if tx.empty:
         return pd.DataFrame(), pd.DataFrame(), []
 
-    # Index signals by (Ticker, time), only BUY signals
     sig_buy = sig[(sig["Direction"].str.upper() == "BUY") & sig["Ticker"].ne("")].copy()
     sig_buy.sort_values(["Ticker", "TimestampUTC"], inplace=True, ignore_index=True)
 
@@ -388,7 +424,6 @@ def build_realized_and_open(
         arr = sig_by_ticker.get(tkr, [])
         if not arr:
             return {"Source": "(unknown)", "Timeframe": "", "SigTime": pd.NaT, "SigPrice": ""}
-        # strict: only at/<= when
         if strict_signals:
             for t, payload in reversed(arr):
                 if pd.isna(t) or pd.isna(when):
@@ -396,13 +431,12 @@ def build_realized_and_open(
                 if t <= when:
                     return payload
             return {"Source": "(unknown)", "Timeframe": "", "SigTime": pd.NaT, "SigPrice": ""}
-        # non-strict: prefer at/<= when; else fallback to most recent ever
         for t, payload in reversed(arr):
             if pd.isna(t) or pd.isna(when):
                 continue
             if t <= when:
                 return payload
-        return arr[-1][1]  # latest any-time
+        return arr[-1][1]
 
     lots: Dict[str, deque] = defaultdict(deque)
     realized_rows = []
@@ -495,14 +529,9 @@ def build_realized_and_open(
     return realized_df, open_df, unmatched_sells
 
 # ─────────────────────────────
-# PERFORMANCE TABLE
+# PERFORMANCE TABLE (unchanged)
 # ─────────────────────────────
 def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Returns Performance_By_Source with columns:
-    Source, Trades, Wins, WinRate%, AvgReturn%, MedianReturn%, OpenLots, OpenTickers
-    """
-    # Aggregate realized
     if realized_df.empty:
         realized_grp = pd.DataFrame(columns=["Source", "Trades", "Wins", "WinRate%", "AvgReturn%", "MedianReturn%"])
     else:
@@ -519,7 +548,6 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
             "MedianReturn%": g["ret"].median().round(2).values,
         })
 
-    # Open lots counts
     if open_df.empty:
         open_counts = pd.DataFrame(columns=["Source", "OpenLots", "OpenTickers"])
     else:
@@ -536,7 +564,6 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
             "Source","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","OpenLots","OpenTickers"
         ])
 
-    # Clean types
     for c in ["Trades", "Wins", "OpenLots", "OpenTickers"]:
         if c in perf.columns:
             perf[c] = pd.to_numeric(perf[c], errors="coerce").fillna(0).astype(int)
@@ -544,7 +571,6 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
         if c in perf.columns:
             perf[c] = pd.to_numeric(perf[c], errors="coerce").fillna(0.0)
 
-    # Totals row
     tot_trades = int(perf["Trades"].sum()) if "Trades" in perf else 0
     tot_wins = int(perf["Wins"].sum()) if "Wins" in perf else 0
     overall_ret_mean = 0.0
@@ -572,7 +598,7 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
     return perf
 
 # ─────────────────────────────
-# REPORT HELPERS
+# REPORT HELPERS (unchanged)
 # ─────────────────────────────
 def print_unknown_sources(realized_df: pd.DataFrame, open_df: pd.DataFrame):
     unk_real = []
@@ -602,6 +628,7 @@ def print_open_breakdown(open_df: pd.DataFrame):
 # ─────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="Build performance dashboard tabs.")
+    ap.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
     ap.add_argument("--no-live", action="store_true", help="Do NOT add GOOGLEFINANCE formulas to Open_Positions.")
     ap.add_argument("--strict-signals", action="store_true", help="Only use signals at/before BUY; no fallback.")
     ap.add_argument("--sell-cutoff", type=str, default=None, help="Ignore SELLs before this date (YYYY-MM-DD).")
@@ -609,13 +636,31 @@ def main():
     args = ap.parse_args()
     DEBUG = args.debug
 
+    cfg = load_cfg(args.config)
+    sheet_url = resolve_sheet_url(cfg)
+    service_account_file = resolve_service_account_file(cfg)
+
+    # Allow tab overrides from YAML (optional)
+    tab_signals = resolve_tab_name(cfg, "signals_tab", TAB_SIGNALS)
+    tab_openpos = resolve_tab_name(cfg, "open_positions_tab", TAB_OPEN)
+    tab_perf    = TAB_PERF
+    tab_real    = TAB_REALIZED
+    tab_open_det= TAB_OPEN_DETAIL
+    tab_tx      = TAB_TRANSACTIONS
+    tab_hold    = TAB_HOLDINGS
+
     print("📊 Building performance dashboard…")
-    gc = auth_gspread()
+    if not sheet_url:
+        print("SHEET_URL not found in YAML. Set sheets.url OR sheets.sheet_url.")
+        return
+
+    print(f"• Google Sheet: {sheet_url}")
+    gc = auth_gspread(service_account_file)
 
     # Read tabs
-    ws_sig = open_ws(gc, TAB_SIGNALS)
-    ws_tx  = open_ws(gc, TAB_TRANSACTIONS)
-    ws_h   = open_ws(gc, TAB_HOLDINGS)
+    ws_sig = open_ws(gc, sheet_url, tab_signals)
+    ws_tx  = open_ws(gc, sheet_url, tab_tx)
+    ws_h   = open_ws(gc, sheet_url, tab_hold)
 
     df_sig = read_tab(ws_sig)
     df_tx  = read_tab(ws_tx)
@@ -644,7 +689,7 @@ def main():
 
     # Optionally add live price formulas to Open_Positions
     if not args.no_live and not open_df.empty:
-        mapping = read_mapping(gc)
+        mapping = read_mapping(gc, sheet_url)
         open_df = add_live_price_formulas(open_df, mapping)
 
     # Pretty column order
@@ -654,7 +699,6 @@ def main():
             "EntryTimeUTC","ExitTimeUTC","Source","Timeframe","SignalTimeUTC","SignalPrice"
         ]]
 
-    # Open tab columns (depend on live formula choice)
     if not open_df.empty:
         cols = ["Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen","Source","Timeframe","SignalTimeUTC","SignalPrice"]
         if "PriceNow" in open_df.columns and "Unrealized%" in open_df.columns:
@@ -670,20 +714,20 @@ def main():
         open_detail_df = open_detail_df[detail_cols].sort_values(["Source","Ticker","EntryTimeUTC"], ignore_index=True)
 
     # Write tabs
-    ws_real = open_ws(gc, TAB_REALIZED)
-    ws_open = open_ws(gc, TAB_OPEN)
-    ws_perf = open_ws(gc, TAB_PERF)
-    ws_open_detail = open_ws(gc, TAB_OPEN_DETAIL)
+    ws_real = open_ws(gc, sheet_url, tab_real)
+    ws_open = open_ws(gc, sheet_url, tab_openpos)
+    ws_perf = open_ws(gc, sheet_url, tab_perf)
+    ws_open_detail = open_ws(gc, sheet_url, tab_open_det)
 
     write_tab(ws_real, realized_df)
     write_tab(ws_open, open_df)
     write_tab(ws_perf, perf_df)
     write_tab(ws_open_detail, open_detail_df)
 
-    print(f"✅ Wrote {TAB_REALIZED}: {len(realized_df)} rows")
-    print(f"✅ Wrote {TAB_OPEN}: {len(open_df)} rows")
-    print(f"✅ Wrote {TAB_PERF}: {len(perf_df)} rows")
-    print(f"✅ Wrote {TAB_OPEN_DETAIL}: {len(open_detail_df)} rows")
+    print(f"✅ Wrote {tab_real}: {len(realized_df)} rows")
+    print(f"✅ Wrote {tab_openpos}: {len(open_df)} rows")
+    print(f"✅ Wrote {tab_perf}: {len(perf_df)} rows")
+    print(f"✅ Wrote {tab_open_det}: {len(open_detail_df)} rows")
 
     if unmatched_sells:
         print(f"⚠️ Summary: {len(unmatched_sells)} unmatched SELL events (use --debug to print details).")
