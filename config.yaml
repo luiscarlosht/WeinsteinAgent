@@ -39,7 +39,7 @@ risk:
   stop_below_ma_pct: 5#
 google:
   google:
-  service_account_json: "/home/youruser/WeinsteinAgent/creds/gcp_service_account.json"
+  service_account_json: "/home/luiscarlosht/WeinsteinAgent/creds/gcp_service_account.json"
 #  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
 #sheets:
 #  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
