@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-# === weinstein_report_weekly.py (Yahoo Finance source, robust batching + flexible column extraction) ===
-
+# === weinstein_report_weekly.py ===
 import os
 import sys
 import math
@@ -11,23 +9,25 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime
+
 from weinstein_mailer import send_email
 from universe_loaders import combine_universe
 
-# Optional Sheets logging (does NOT affect report content)
+# Optional Sheets signal logger
 try:
     from gsheet_helpers import log_signal
 except Exception:
     log_signal = None
 
-# Tiny charts
+# ---- Matplotlib for tiny inline charts ----
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+
 # --------- Tunables ----------
 DEFAULT_BENCHMARK = "SPY"
-WEEKS_LOOKBACK = 180
+WEEKS_LOOKBACK = 180      # rows to keep when computing indicators
 MA_WEEKS = 30
 MA10_WEEKS = 10
 SLOPE_WINDOW = 5
@@ -35,56 +35,44 @@ NEAR_MA_BAND = 0.05
 RS_MA_WEEKS = 30
 OUTPUT_DIR_FALLBACK = "./output"
 TOP_N_CHARTS = 20
-BATCH_SIZE = 90  # yfinance is happier with <100 tickers per call
+
 
 # --------- Utilities ----------
-def _extract_field_flexible(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
+def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
     """
-    Robust extraction for yfinance outputs:
-    - MultiIndex (('AAPL','Close') layout) -> level=1 has 'Close'
-    - MultiIndex (('Close','AAPL') layout) -> level=0 has 'Close'
-    - Single-index (single ticker) -> columns include 'Close'
-    Falls back to 'Adj Close' if 'Close' is missing.
+    Robustly extract a single OHLCV field from yfinance's return (multi- or single-index).
+    Falls back to 'Adj Close' if 'Close' not present.
     """
     if df is None or df.empty:
-        raise KeyError("Downloaded data is empty.")
+        raise ValueError("Empty dataframe returned by yfinance.")
 
-    def _reindex_cols(out: pd.DataFrame) -> pd.DataFrame:
-        keep = [t for t in tickers if t in out.columns]
-        return out[keep] if keep else out
-
+    # MultiIndex (typical when requesting multiple tickers)
     if isinstance(df.columns, pd.MultiIndex):
-        lv0 = df.columns.get_level_values(0).unique()
-        lv1 = df.columns.get_level_values(1).unique()
-        if field in lv0:
-            out = df.loc[:, field].copy()
-            return _reindex_cols(out)
-        if field in lv1:
-            out = df.xs(field, axis=1, level=1).copy()
-            return _reindex_cols(out)
-        if field == "Close":
-            if "Adj Close" in lv0:
-                out = df.loc[:, "Adj Close"].copy()
-                return _reindex_cols(out)
-            if "Adj Close" in lv1:
-                out = df.xs("Adj Close", axis=1, level=1).copy()
-                return _reindex_cols(out)
-        raise KeyError(f"Field '{field}' not in downloaded data (MultiIndex).")
-    else:
-        if field in df.columns:
-            t0 = tickers[0] if tickers else "TICKER"
-            out = df[[field]].copy()
-            out.columns = [t0]
-            return out
-        if field == "Close" and "Adj Close" in df.columns:
-            t0 = tickers[0] if tickers else "TICKER"
-            out = df[["Adj Close"]].copy()
-            out.columns = [t0]
-            return out
-        raise KeyError(f"Field '{field}' not in downloaded data (single-index).")
+        avail_top = list(df.columns.get_level_values(0).unique())
+        use_field = field if field in avail_top else ("Adj Close" if "Adj Close" in avail_top else None)
+        if not use_field:
+            raise KeyError(f"Field '{field}' not found; available top-level columns: {avail_top}")
+        out = df[use_field].copy()
+        keep = [t for t in tickers if t in out.columns]
+        if not keep:
+            raise KeyError(f"No requested tickers found in downloaded data. Requested={tickers[:5]}...")
+        return out[keep]
 
-def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
-    return _extract_field_flexible(df, field, tickers)
+    # Single ticker -> single-level columns
+    cols = set(df.columns.astype(str))
+    if field in cols:
+        t0 = tickers[0] if tickers else "TICKER"
+        out = df[[field]].copy()
+        out.columns = [t0]
+        return out
+    if "Adj Close" in cols:
+        t0 = tickers[0] if tickers else "TICKER"
+        out = df[["Adj Close"]].copy()
+        out.columns = [t0]
+        return out
+
+    raise KeyError(f"Field '{field}' not in downloaded data; got columns: {list(df.columns)}")
+
 
 def load_config(path="config.yaml"):
     with open(path, "r") as f:
@@ -115,91 +103,63 @@ def load_config(path="config.yaml"):
 
     return cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume
 
-def _chunks(seq, n):
-    for i in range(0, len(seq), n):
-        yield seq[i:i+n]
 
 def fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
-    """
-    Download in batches to avoid yfinance empty/partial returns.
-    Returns wide DataFrames: close, volume (columns=tickers incl. benchmark).
-    """
-    all_syms = list(dict.fromkeys((tickers or []) + [benchmark]))
-    if not all_syms:
+    uniq = list(dict.fromkeys((tickers or []) + [benchmark]))  # de-dup preserve order
+    if not uniq:
         raise ValueError("No symbols to download.")
 
-    close_frames = []
-    volume_frames = []
+    data = yf.download(
+        uniq,
+        interval="1wk",
+        period="10y",
+        auto_adjust=True,
+        ignore_tz=True,
+        progress=False,
+        group_by="column",
+    )
 
-    for batch in _chunks(all_syms, BATCH_SIZE):
-        if benchmark not in batch:
-            batch = batch + [benchmark]
-        data = yf.download(
-            batch,
-            interval="1wk",
-            period="10y",
-            auto_adjust=True,
-            ignore_tz=True,
-            progress=False,
-        )
-        if data is None or data.empty:
-            continue
-
-        try:
-            close_b = _extract_field(data, "Close", batch)
-        except KeyError:
-            close_b = _extract_field(data, "Adj Close", batch)
-
-        volume_b = _extract_field(data, "Volume", batch)
-
-        close_frames.append(close_b)
-        volume_frames.append(volume_b)
-
-    if not close_frames or not volume_frames:
-        raise KeyError("No data fetched from Yahoo Finance (all batches empty).")
-
-    close = pd.concat(close_frames, axis=1)
-    volume = pd.concat(volume_frames, axis=1)
-
-    close = close.loc[:, ~close.columns.duplicated()]
-    volume = volume.loc[:, ~volume.columns.duplicated()]
-
-    ordered = [t for t in all_syms if t in close.columns]
-    close = close[ordered]
-    volume = volume[ordered]
+    close = _extract_field(data, "Close", uniq)
+    volume = _extract_field(data, "Volume", uniq)
 
     tail_n = max(weeks, MA_WEEKS + RS_MA_WEEKS + SLOPE_WINDOW + 10)
     close = close.tail(tail_n)
     volume = volume.tail(tail_n)
 
-    if close.empty or volume.empty:
-        raise KeyError("Downloaded data became empty after trimming.")
-
     return close, volume
 
+
 def _weekly_short_term_state(series_price: pd.Series) -> tuple[str, float, float]:
+    """
+    Weekly short-term vs long-term using 10-wk vs 30-wk MAs.
+    Returns (state, ma10_last, ma30_last)
+    """
     s = series_price.dropna()
     if len(s) < max(MA10_WEEKS, MA_WEEKS) + 5:
         return ("Unknown", np.nan, np.nan)
+
     ma10 = s.rolling(MA10_WEEKS).mean()
     ma30 = s.rolling(MA_WEEKS).mean()
     c = float(s.iloc[-1])
     m10 = float(ma10.iloc[-1])
     m30 = float(ma30.iloc[-1])
-    if (c > m10) and (m10 > m30):
-        state = "ShortTermUptrend"
-    elif (c > m30) and not (m10 > m30):
-        state = "StageConflict"
-    elif (m10 > m30) and not (c > m10):
-        state = "StageConflict"
-    else:
-        state = "Weak"
+
+    state = "Unknown"
+    if pd.notna(m10) and pd.notna(m30):
+        if (c > m10) and (m10 > m30):
+            state = "ShortTermUptrend"
+        elif (c > m30) and not (m10 > m30):
+            state = "StageConflict"
+        elif (m10 > m30) and not (c > m10):
+            state = "StageConflict"
+        else:
+            state = "Weak"
     return (state, m10, m30)
+
 
 def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     s = closes.dropna().copy()
     b = bench.reindex_like(s).dropna()
-
     idx = s.index.intersection(b.index)
     s = s.loc[idx]
     b = b.loc[idx]
@@ -209,12 +169,14 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
 
     ma = s.rolling(MA_WEEKS).mean()
 
+    # MA slope over last SLOPE_WINDOW weeks
     ma_slope = ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
     ma_slope_last = ma_slope.iloc[-1]
     ma_last = ma.iloc[-1]
     price_last = s.iloc[-1]
     dist_ma_pct = (price_last - ma_last) / ma_last if ma_last and not math.isclose(ma_last, 0.0) else np.nan
 
+    # Relative Strength line vs benchmark
     rs = s / b
     rs_ma = rs.rolling(RS_MA_WEEKS).mean()
     rs_slope = rs_ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
@@ -223,12 +185,14 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     rs_above = bool(rs_last > rs_ma_last)
     rs_slope_last = rs_slope.iloc[-1]
 
+    # Flags
     price_above_ma = bool(price_last > ma_last)
     ma_up = bool(ma_slope_last > 0)
     near_ma = bool(abs(dist_ma_pct) <= NEAR_MA_BAND)
     rs_up = bool(rs_above and rs_slope_last > 0)
     rs_down = bool((not rs_above) and rs_slope_last < 0)
 
+    # Stage rules (heuristic)
     if price_above_ma and ma_up and rs_up:
         stage = "Stage 2 (Uptrend)"
     elif (not price_above_ma) and (ma_slope_last < 0) and rs_down:
@@ -248,7 +212,7 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
     if (not rs_above) and rs_slope_last >= 0:
         notes.append("RS below MA but improving")
 
-    st_state, ma10_last, _ = _weekly_short_term_state(s)
+    st_state, ma10_last, _ma30_chk = _weekly_short_term_state(s)
 
     return {
         "price": float(price_last),
@@ -265,6 +229,7 @@ def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
         "notes": "; ".join(notes),
     }
 
+
 def classify_buy_signal(stage: str) -> tuple[str, str]:
     stage = stage or ""
     if stage.startswith("Stage 2"):
@@ -274,6 +239,7 @@ def classify_buy_signal(stage: str) -> tuple[str, str]:
     if stage == "Filtered":
         return ("AVOID", '<span class="badge avoid">Avoid</span>')
     return ("AVOID", '<span class="badge avoid">Avoid</span>')
+
 
 def build_report_df(close_w: pd.DataFrame,
                     volume_w: pd.DataFrame,
@@ -297,6 +263,7 @@ def build_report_df(close_w: pd.DataFrame,
         lc = float(last_close.get(t, np.nan)) if pd.notna(last_close.get(t, np.nan)) else np.nan
         av = float(avg_vol_10w.get(t, np.nan)) if pd.notna(avg_vol_10w.get(t, np.nan)) else np.nan
         if (min_price and (pd.isna(lc) or lc < min_price)) or (min_avg_volume and (pd.isna(av) or av < min_avg_volume)):
+            # Still compute short-term state for completeness
             s = close_w[t].dropna()
             st_state, ma10_last, _ = _weekly_short_term_state(s)
             rows.append({
@@ -313,6 +280,7 @@ def build_report_df(close_w: pd.DataFrame,
 
     df = pd.DataFrame(rows)
 
+    # Ensure expected columns exist
     cols = [
         "ticker", "stage", "price", "ma10", "ma30", "dist_ma_pct", "ma_slope_per_wk",
         "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "short_term_state_wk", "notes"
@@ -322,9 +290,11 @@ def build_report_df(close_w: pd.DataFrame,
             df[c] = np.nan
     df = df[cols]
 
+    # Buy signal
     df["buy_signal"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[0])
     df["buy_signal_html"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[1])
 
+    # Sort
     stage_rank = {
         "Stage 2 (Uptrend)": 0,
         "Stage 1 (Basing)": 1,
@@ -337,6 +307,7 @@ def build_report_df(close_w: pd.DataFrame,
     df = df.sort_values(by=["stage_rank", "dist_ma_pct"], ascending=[True, False]).reset_index(drop=True)
     return df.drop(columns=["stage_rank"])
 
+
 # ---------- Tiny inline charts ----------
 def _fig_to_base64(fig) -> str:
     buf = io.BytesIO()
@@ -344,6 +315,7 @@ def _fig_to_base64(fig) -> str:
     plt.close(fig)
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/png;base64,{b64}"
+
 
 def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
     s = series_price.dropna()
@@ -371,6 +343,7 @@ def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
     img_src = _fig_to_base64(fig)
     return f'<img src="{img_src}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
 
+
 def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, top_n: int = TOP_N_CHARTS) -> pd.DataFrame:
     out = df.copy()
     out["chart"] = ""
@@ -384,10 +357,12 @@ def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, 
                 out.at[i, "chart"] = ""
     return out
 
-# ---------- HTML ----------
+
+# ---------- HTML / Email ----------
 def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     styled = df.copy()
 
+    # Pretty percentages
     for c in ["dist_ma_pct", "ma_slope_per_wk", "rs_slope_per_wk"]:
         if c in styled.columns:
             styled[c] = styled[c].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "")
@@ -395,6 +370,7 @@ def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     if "rs_above_ma" in styled.columns:
         styled["rs_above_ma"] = styled["rs_above_ma"].map({True: "Yes", False: "No"})
 
+    # Use HTML badge for buy signal
     if "buy_signal_html" in styled.columns:
         styled["Buy Signal"] = styled["buy_signal_html"]
     else:
@@ -438,6 +414,200 @@ def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     """
     return html
 
+
+# --- NEW: Holdings + snapshot helpers ----------------------------------------
+def _try_read_open_positions_local(output_dir: str) -> pd.DataFrame | None:
+    for fname in ["Open_Positions.csv", "open_positions.csv"]:
+        p = os.path.join(output_dir, fname)
+        if os.path.exists(p):
+            try:
+                df = pd.read_csv(p)
+                if not df.empty:
+                    return df
+            except Exception:
+                pass
+    return None
+
+
+def _read_open_positions_gsheet(cfg: dict, tab_name: str = "Open_Positions") -> pd.DataFrame:
+    """
+    Fallback: read Open_Positions from Google Sheet via service account.
+    Expects:
+      cfg['sheets']['url'] = spreadsheet URL
+      cfg['google']['service_account_json'] = path to credentials JSON
+    """
+    import gspread  # lazy import
+    from oauth2client.service_account import ServiceAccountCredentials
+
+    sheet_url = cfg.get("sheets", {}).get("url")
+    keyfile = cfg.get("google", {}).get("service_account_json")
+    if not sheet_url or not keyfile:
+        raise RuntimeError("Missing sheets.url or google.service_account_json in config.yaml")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(keyfile, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(sheet_url)
+    # if custom tab provided in config, prefer it
+    if cfg.get("sheets", {}).get("open_positions_tab"):
+        tab_name = cfg["sheets"]["open_positions_tab"]
+    ws = sh.worksheet(tab_name)
+    data = ws.get_all_records()
+    return pd.DataFrame(data)
+
+
+def _coerce_numlike(series: pd.Series) -> pd.Series:
+    """
+    Convert strings like '$1,234.56' or '7.90%' to floats.
+    """
+    def conv(x):
+        if pd.isna(x):
+            return np.nan
+        if isinstance(x, (int, float, np.number)):
+            return float(x)
+        s = str(x)
+        s = s.replace(",", "").replace("$", "").strip()
+        if s.endswith("%"):
+            s = s[:-1]
+        try:
+            return float(s)
+        except Exception:
+            return np.nan
+    return series.apply(conv)
+
+
+def _normalize_open_positions_columns(df: pd.DataFrame) -> pd.DataFrame:
+    ren = {
+        "Ticker": "Symbol", "symbol": "Symbol", "SYMBOL": "Symbol",
+        "Qty": "Quantity", "Shares": "Quantity", "quantity": "Quantity",
+        "Last": "Last Price", "Price": "Last Price", "LastPrice": "Last Price",
+        "Current Value $": "Current Value", "Market Value": "Current Value", "MarketValue": "Current Value",
+        "Cost Basis": "Cost Basis Total", "Cost": "Cost Basis Total",
+        "Avg Cost": "Average Cost Basis", "AvgCost": "Average Cost Basis",
+        "Gain $": "Total Gain/Loss Dollar", "Gain": "Total Gain/Loss Dollar",
+        "Gain %": "Total Gain/Loss Percent", "GainPct": "Total Gain/Loss Percent",
+        "Name": "Description", "Description/Name": "Description",
+    }
+    out = df.rename(columns=ren).copy()
+
+    # Ensure required columns exist
+    required = [
+        "Symbol","Description","Quantity","Last Price","Current Value",
+        "Cost Basis Total","Average Cost Basis",
+        "Total Gain/Loss Dollar","Total Gain/Loss Percent"
+    ]
+    for c in required:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    # Coerce numerics robustly
+    num_cols = ["Quantity","Last Price","Current Value","Cost Basis Total",
+                "Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"]
+    for c in num_cols:
+        out[c] = _coerce_numlike(out[c])
+
+    # Keep only snapshot columns
+    cols = ["Symbol","Description","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis",
+            "Total Gain/Loss Dollar","Total Gain/Loss Percent"]
+    out = out[cols]
+
+    # Drop fully empty rows if any
+    out = out.dropna(how="all")
+    return out
+
+
+def _compute_portfolio_metrics(positions: pd.DataFrame) -> dict:
+    cur = float(positions["Current Value"].fillna(0).sum())
+    cost = float(positions["Cost Basis Total"].fillna(0).sum())
+    gl_dollar = cur - cost
+    port_pct = (gl_dollar / cost) if cost else 0.0
+
+    row_pct = positions["Total Gain/Loss Percent"].dropna().astype(float)
+    avg_pct = float(row_pct.mean())/100.0 if len(row_pct) else 0.0
+
+    return {
+        "total_gl_dollar": gl_dollar,
+        "portfolio_pct_gain": port_pct,
+        "average_pct_gain": avg_pct,
+        "total_current_value": cur,
+        "total_cost_basis": cost,
+    }
+
+
+def _merge_stage_and_recommend(positions: pd.DataFrame, stage_df: pd.DataFrame) -> pd.DataFrame:
+    stage_min = stage_df[["ticker","stage","rs_above_ma"]].rename(columns={"ticker":"Symbol"})
+    out = positions.merge(stage_min, on="Symbol", how="left")
+
+    def recommend(row):
+        pct = row.get("Total Gain/Loss Percent", np.nan)
+        stage = str(row.get("stage", ""))
+        rs_above = bool(row.get("rs_above_ma", False))
+
+        if stage.startswith("Stage 2") and (rs_above or (pd.notna(pct) and pct >= 20)):
+            return "HOLD (Strong)"
+        if stage.startswith("Stage 4") and pd.notna(pct) and pct < 0:
+            return "SELL"
+        if pd.notna(pct) and pct <= -8:
+            return "SELL"
+        return "HOLD"
+
+    out["Recommendation"] = out.apply(recommend, axis=1)
+    return out
+
+
+def _money(x):
+    return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
+
+
+def _pct(x):
+    return f"{x*100:.2f}%" if (x is not None and pd.notna(x)) else ""
+
+
+def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str:
+    summary = pd.DataFrame([
+        ["Total Gain/Loss ($)", _money(metrics["total_gl_dollar"])],
+        ["Portfolio % Gain",     _pct(metrics["portfolio_pct_gain"])],
+        ["Average % Gain",       _pct(metrics["average_pct_gain"])],
+    ], columns=["Metric","Value"])
+    summary_html = summary.to_html(index=False, border=0)
+
+    snap = positions_merged.copy()
+    snap["Last Price"] = snap["Last Price"].apply(_money)
+    snap["Current Value"] = snap["Current Value"].apply(_money)
+    snap["Cost Basis Total"] = snap["Cost Basis Total"].apply(_money)
+    snap["Average Cost Basis"] = snap["Average Cost Basis"].apply(_money)
+    snap["Total Gain/Loss Dollar"] = snap["Total Gain/Loss Dollar"].apply(_money)
+    snap["Total Gain/Loss Percent"] = snap["Total Gain/Loss Percent"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+
+    cols = ["Symbol","Description","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis",
+            "Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"]
+    snap = snap[cols]
+    snapshot_html = snap.to_html(index=False, border=0)
+
+    css = """
+    <style>
+      .blk { margin-top:20px; }
+      .blk h3 { margin: 0 0 6px 0; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; vertical-align: top; }
+      th { text-align:left; background:#fafafa; }
+    </style>
+    """
+    return f"""{css}
+    <div class="blk">
+      <h3>Weinstein Weekly – Summary</h3>
+      {summary_html}
+    </div>
+    <div class="blk">
+      <h3>Per-position Snapshot</h3>
+      {snapshot_html}
+    </div>
+    """
+# --- END holdings helpers -----------------------------------------------------
+
+
 # ---------- Main ----------
 def main():
     cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume = load_config()
@@ -462,8 +632,10 @@ def main():
         min_avg_volume=min_avg_volume,
     )
 
+    # Add tiny charts for top candidates
     report_with_charts = attach_tiny_charts(report_df, close_w, benchmark, top_n=TOP_N_CHARTS)
 
+    # Summary counts
     buy_count = int((report_df["buy_signal"] == "BUY").sum())
     watch_count = int((report_df["buy_signal"] == "WATCH").sum())
     avoid_count = int((report_df["buy_signal"] == "AVOID").sum())
@@ -474,41 +646,49 @@ def main():
     csv_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.csv")
     html_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.html")
 
-    # Save CSVs (timestamped + pipeline-friendly)
+    # Save CSV (plain text signals)
     report_df.to_csv(csv_path, index=False)
-    classic_csv_path = os.path.join(output_dir, "scan_sp500.csv")
-    try:
-        report_df.to_csv(classic_csv_path, index=False)
-    except Exception as e:
-        print(f"⚠️  Could not write {classic_csv_path}: {e}")
 
-    # Build + write HTML (timestamped + pipeline-friendly combined)
-    html = df_to_html(
+    # Build core HTML
+    html_core = df_to_html(
         report_with_charts,
         title=f"Weinstein Weekly — Benchmark: {benchmark}",
         summary_line=summary_line
     )
+
+    # NEW: Append holdings sections (local CSV -> Google Sheet)
+    holdings_df = _try_read_open_positions_local(output_dir)
+    if holdings_df is None:
+        try:
+            holdings_df = _read_open_positions_gsheet(cfg, tab_name=cfg.get("sheets", {}).get("open_positions_tab","Open_Positions"))
+        except Exception as e:
+            print(f"⚠️  Could not load Open_Positions (no CSV and sheet read failed): {e}")
+            holdings_df = None
+
+    extra_html = ""
+    if holdings_df is not None and not holdings_df.empty:
+        pos_norm = _normalize_open_positions_columns(holdings_df)
+        metrics = _compute_portfolio_metrics(pos_norm)
+        pos_merged = _merge_stage_and_recommend(pos_norm, report_df)
+        extra_html = holdings_sections_html(pos_merged, metrics)
+    else:
+        extra_html = "<!-- holdings not available -->"
+
+    html = html_core + extra_html
+
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    combined_html = os.path.join(output_dir, "combined_weekly_email.html")
-    try:
-        with open(combined_html, "w", encoding="utf-8") as f:
-            f.write(html)
-        print(f"✅ Combined weekly report written: {combined_html}")
-    except Exception as e:
-        print(f"⚠️  Could not write {combined_html}: {e}")
-
-    # Email
+    # Email it
     subject = f"Weinstein Weekly Report — {datetime.now().strftime('%b %d, %Y')}"
     top_lines = report_df[["ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
     body_text = (
         f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total})\n\n"
-        f"Files:\n- {csv_path}\n- {html_path}\n- {classic_csv_path}\n- {combined_html}\n\nTop lines:\n{top_lines}\n"
+        f"Files:\n- {csv_path}\n- {html_path}\n\nTop lines:\n{top_lines}\n"
     )
     send_email(subject=subject, html_body=html, text_body=body_text, cfg_path="config.yaml")
 
-    # Optional: log to Sheets
+    # Optional: log signals to Google Sheets
     if log_signal is not None:
         print("Logging weekly signals to Google Sheets…")
         for _, r in report_df.iterrows():
@@ -535,6 +715,7 @@ def main():
 
     print(f"Saved:\n - {csv_path}\n - {html_path}")
     print("Done.")
+
 
 if __name__ == "__main__":
     main()
