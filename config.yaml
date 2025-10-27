@@ -35,7 +35,10 @@ universe:
 risk:
   max_position_pct: 10
   tranche_plan: [30, 30, 20, 20]
-  stop_below_ma_pct: 5
-google:
+  stop_below_ma_pct: 5#
+#google:
+#  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
+sheets:
   sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
+
 
