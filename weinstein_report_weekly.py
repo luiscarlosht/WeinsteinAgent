@@ -2,14 +2,19 @@
 # weinstein_report_weekly.py
 #
 # Weekly report generator:
-# - Fixes credential discovery (prefers creds/gcp_service_account.json)
-# - Reads SMTP app password from config.yaml (notifications.email.smtp.app_password)
-# - Builds portfolio summary + per-position snapshot
+# - Credential discovery prefers creds/gcp_service_account.json
+# - SMTP app password read from config.yaml (notifications.email.smtp.app_password)
+# - Builds portfolio summary + per-position snapshot from your Google Sheet
 # - If ./output/scan_sp500.csv exists, merges the classic Weinstein scan and renders:
 #     "Weinstein Weekly — Benchmark: SPY", generated timestamp,
-#     Buy/Watch/Avoid counts, and the scan table (robust columns).
+#     Buy/Watch/Avoid counts, and the scan table (robust column matching).
 # - Writes output/combined_weekly_email.html
-# - Optionally emails via SMTP with --email
+# - Email sending:
+#     * --email                  -> send email (new flag)
+#     * --attach-html (legacy)   -> send email (compat with run_weekly.sh)
+#     * --write (legacy)         -> write HTML (already default; accepted & ignored)
+#
+# Exit code 0 on success; non-zero on obvious failures.
 
 import os
 import io
@@ -20,14 +25,14 @@ from typing import Tuple, Optional, Dict, List
 
 import pandas as pd
 
-# === optional helper first (keeps your repo compatibility) ===
+# Optional helper first (repo compatibility)
 try:
     from gsheets_sync import authorize_service_account as _auth_helper
     _HAVE_GSHEETS_HELPER = True
 except Exception:
     _HAVE_GSHEETS_HELPER = False
 
-# === gspread path as fallback ===
+# gspread as fallback
 try:
     import gspread
     from google.oauth2.service_account import Credentials as _Creds
@@ -54,8 +59,8 @@ def _service_account_client():
     env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     candidates = [
         env_path,
-        os.path.join(root, "creds", "gcp_service_account.json"),  # ← preferred
-        os.path.join(root, "creds", "service_account.json"),      # ← legacy fallback
+        os.path.join(root, "creds", "gcp_service_account.json"),  # preferred
+        os.path.join(root, "creds", "service_account.json"),      # legacy fallback
     ]
     sa_path = next((p for p in candidates if p and os.path.exists(p)), None)
     if not sa_path:
@@ -71,7 +76,7 @@ def _service_account_client():
 
 
 # --------------------------------------------------------------------------------------
-# Read email settings from config.yaml (and fallback env var for app password)
+# Read email settings from config.yaml (with env fallback for app password)
 # --------------------------------------------------------------------------------------
 def _read_smtp_from_yaml(cfg_path="config.yaml"):
     try:
@@ -96,7 +101,7 @@ def _read_smtp_from_yaml(cfg_path="config.yaml"):
 
 
 # --------------------------------------------------------------------------------------
-# Utility: write or replace a sheet tab with a DataFrame
+# Utility: write/replace a sheet tab with a DataFrame
 # --------------------------------------------------------------------------------------
 def _write_df(sh, name: str, df: pd.DataFrame):
     try:
@@ -114,7 +119,7 @@ def _write_df(sh, name: str, df: pd.DataFrame):
 
 
 # --------------------------------------------------------------------------------------
-# Portfolio report (unchanged behavior but resilient to missing columns)
+# Portfolio block (unchanged behavior, resilient to missing columns)
 # --------------------------------------------------------------------------------------
 def _build_portfolio_block(sh) -> Tuple[str, bytes, pd.DataFrame]:
     # Load Open_Positions (fallback to Holdings)
@@ -255,7 +260,6 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
 
     # derive counts
     if col_label is None:
-        # fabricate a neutral column so we still show something
         df["__label__"] = "Avoid"
         col_label = "__label__"
     buckets = df[col_label].fillna("").map(_label_to_bucket)
@@ -266,20 +270,19 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
 
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Prepare rendered DF with the preferred columns/order if present
+    # Prepare rendered DF with preferred columns
     out_cols = []
-    def _add(col_name: str, title: str):
+    def _add(col_name: Optional[str], title: str):
         nonlocal out_cols
         if col_name and col_name in df.columns:
             out_cols.append((col_name, title))
 
     _add(col_ticker, "ticker")
-    # 'Buy Signal' column: normalize to "Buy/Watch/Avoid"
+
     pretty_label_col = "__pretty_label__"
     df[pretty_label_col] = buckets
     _add(pretty_label_col, "Buy Signal")
 
-    # Chart hyperlink
     chart_col = "__chart__"
     def _chart_link(t):
         t = (t or "").strip().upper()
@@ -299,14 +302,12 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
     _add(col_notes, "notes")
 
     if not out_cols:
-        # if we couldn't identify anything, just show the raw CSV
         out_df = df
         headers = list(out_df.columns)
     else:
         headers = [t for _, t in out_cols]
         out_df = pd.DataFrame({t: df[c] for c, t in out_cols})
 
-    # build HTML
     hdr = f"""
 <h2>Weinstein Weekly — Benchmark: {benchmark}</h2>
 <p><em>Generated {ts}</em></p>
@@ -314,9 +315,9 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
 """
     table = "<table border='1' cellspacing='0' cellpadding='4'>\n"
     table += "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>\n"
-    # don't truncate; render everything
     for _, r in out_df.iterrows():
         table += "<tr>" + "".join(f"<td>{r[h]}</td>" for h in headers) + "</tr>\n"
+        # no truncation
     table += "</table>\n"
     return hdr + table
 
@@ -330,13 +331,9 @@ def build_weekly_summary(sheet_url: str, classic_csv: str = "./output/scan_sp500
     gc = _service_account_client()
     sh = gc.open_by_url(sheet_url)
 
-    # Portfolio block
     portfolio_html, csv_bytes, df_positions = _build_portfolio_block(sh)
-
-    # Classic block (if present)
     classic_html = _render_classic_block(classic_csv, benchmark="SPY")
 
-    # Assemble combined HTML
     parts = []
     if classic_html:
         parts.append(classic_html)
@@ -375,11 +372,10 @@ def _send_email_with_smtp(subject: str, html_body: str, csv_bytes: bytes, cfg_pa
     prefix = smtp_cfg.get("subject_prefix") or ""
     if prefix and not prefix.endswith(" "):
         prefix += " "
-    msg["Subject"] = f"{prefix}{subject}"
+    msg["Subject"] = f"{prefix}Weinstein Weekly — {dt.date.today().isoformat()}"
 
     msg.attach(MIMEText(html_body, "html"))
 
-    # attach CSV of positions
     part = MIMEBase("application", "octet-stream")
     part.set_payload(csv_bytes)
     encoders.encode_base64(part)
@@ -403,9 +399,15 @@ def _send_email_with_smtp(subject: str, html_body: str, csv_bytes: bytes, cfg_pa
 # --------------------------------------------------------------------------------------
 def main(argv=None):
     parser = argparse.ArgumentParser()
+    # New/primary flags
     parser.add_argument("--email", action="store_true", help="Send email using SMTP settings in config.yaml")
     parser.add_argument("--sheet-url", required=True, help="Google Sheet URL")
     parser.add_argument("--classic-csv", default="./output/scan_sp500.csv", help="Path to classic scan CSV")
+
+    # Legacy flags (accepted for compatibility with run_weekly.sh)
+    parser.add_argument("--write", action="store_true", help="(legacy) Write HTML (always done)")
+    parser.add_argument("--attach-html", action="store_true", help="(legacy) Also send email")
+
     args = parser.parse_args(argv)
 
     html_body, csv_bytes, _ = build_weekly_summary(args.sheet_url, classic_csv=args.classic_csv)
@@ -416,14 +418,27 @@ def main(argv=None):
         f.write(html_body)
     print(f"✅ Combined weekly report written: {out_html}")
 
-    if args.email:
-        subject = f"Weinstein Weekly — {dt.date.today().isoformat()}"
-        ok = _send_email_with_smtp(subject, html_body, csv_bytes, cfg_path=os.environ.get("CONFIG_FILE", "config.yaml"))
+    # Determine whether to email
+    send_email = bool(args.email or args.attach_html)
+    if send_email:
+        ok = _send_email_with_smtp(
+            subject=f"Weinstein Weekly — {dt.date.today().isoformat()}",
+            html_body=html_body,
+            csv_bytes=csv_bytes,
+            cfg_path=os.environ.get("CONFIG_FILE", "config.yaml"),
+        )
         if not ok:
             print("⚠️  Email step did not complete.")
     else:
-        print("ℹ️  --email not passed; skipping email.")
+        print("ℹ️  Email not requested (pass --email or legacy --attach-html to send).")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        # propagate argparse exit codes intact
+        raise
+    except Exception as ex:
+        print(f"❌ Fatal error: {ex}")
+        sys.exit(1)
