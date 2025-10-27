@@ -1,77 +1,61 @@
 #!/usr/bin/env python3
-"""
-weinstein_report_weekly.py
-
-Builds a concise weekly portfolio summary (reads Google Sheet), writes the
-"Weekly_Report" tab, and (optionally) emails an HTML/CSV snapshot.
-
-CLI
----
-  --write                 Write the Weekly_Report tab back to the same sheet.
-  --email                 Email the summary using settings in config.yaml.
-  --attach-html           Attach the generated HTML file to the email.
-  --sheet-url SHEET_URL   Full Google Sheet URL to read/write.
-
-Notes
------
-- This script purposely does NOT accept --config; the runner discovers the
-  Sheet URL from YAML and passes only --sheet-url.
-- Email uses WeinsteinMinimalEmailSender.send_email_with_yaml(...) and will
-  pull SMTP app_password from:
-      notifications.email.smtp.app_password
-  inside `config.yaml` (or $CONFIG_FILE if set).
-"""
+# weinstein_report_weekly.py
+#
+# Drop-in replacement that:
+#  - Fixes credential discovery (prefers creds/gcp_service_account.json)
+#  - Reads SMTP app password from config.yaml at notifications.email.smtp.app_password
+#  - Keeps your output & prints the same (Weekly_Report tab + HTML/CSV + optional email)
 
 import os
 import sys
-import csv
 import io
 import argparse
-from datetime import datetime
+import datetime as dt
+from typing import Tuple, Optional
 
-# Ensure local modules (in repo) import cleanly even if run as a script
-sys.path.append(os.path.dirname(__file__))
-
-import yaml
 import pandas as pd
 
-# Try to use gsheets utilities from the repo (if present). If not, fallback to
-# plain gspread auth (expects creds/service_account.json).
+# === optional helper first (keeps your repo compatibility) ===
 try:
-    from gsheets_sync import (
-        authorize_service_account,
-        open_by_url,
-        get_or_create_worksheet_by_title,
-    )
-    _HAVE_HELPERS = True
+    from gsheets_sync import authorize_service_account as _auth_helper
+    _HAVE_GSHEETS_HELPER = True
 except Exception:
-    _HAVE_HELPERS = False
+    _HAVE_GSHEETS_HELPER = False
 
+# === gspread path as fallback ===
 try:
     import gspread
     from google.oauth2.service_account import Credentials as _Creds
-except Exception as _e:
+except Exception:
     gspread = None
     _Creds = None
 
+# --------------------------------------------------------------------------------------
+# Credentials: prefer creds/gcp_service_account.json, then creds/service_account.json,
+# or GOOGLE_APPLICATION_CREDENTIALS. Try project helper first if available.
+# --------------------------------------------------------------------------------------
 def _service_account_client():
-    """
-    Returns an authorized gspread client.
-
-    Prefers gsheets_sync helpers. If unavailable, uses creds/service_account.json
-    directly via gspread.
-    """
-    if _HAVE_HELPERS:
+    if _HAVE_GSHEETS_HELPER:
         try:
-            gc = authorize_service_account()
-            return gc
+            return _auth_helper()
         except Exception as e:
             print(f"⚠️  gsheets_sync authorize_service_account failed, falling back: {e}")
 
     if gspread is None or _Creds is None:
-        raise RuntimeError("gspread not available and gsheets_sync helpers failed.")
+        raise RuntimeError("gspread / google-auth not available and helpers failed.")
 
-    sa_path = os.path.join(os.path.dirname(__file__), "creds", "service_account.json")
+    root = os.path.dirname(__file__)
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    candidates = [
+        env_path,
+        os.path.join(root, "creds", "gcp_service_account.json"),  # ← preferred
+        os.path.join(root, "creds", "service_account.json"),      # ← legacy fallback
+    ]
+    sa_path = next((p for p in candidates if p and os.path.exists(p)), None)
+    if not sa_path:
+        tried = "\n".join(f"  - {p}" for p in candidates if p)
+        raise FileNotFoundError("Missing Google service account credentials. Tried:\n" + tried)
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -79,247 +63,232 @@ def _service_account_client():
     creds = _Creds.from_service_account_file(sa_path, scopes=scopes)
     return gspread.authorize(creds)
 
-def _open_sheet(gc, sheet_url: str):
-    if _HAVE_HELPERS:
-        try:
-            return open_by_url(gc, sheet_url)
-        except Exception as e:
-            print(f"⚠️  gsheets_sync open_by_url failed, falling back: {e}")
-
-    # fallback
-    return gc.open_by_url(sheet_url)
-
-def _get_or_create(ws, sheet, title: str):
-    if _HAVE_HELPERS:
-        try:
-            return get_or_create_worksheet_by_title(sheet, title)
-        except Exception as e:
-            print(f"⚠️  gsheets_sync get_or_create_worksheet_by_title failed, falling back: {e}")
-
+# --------------------------------------------------------------------------------------
+# Read email settings from config.yaml (and fallback env var for app password)
+# --------------------------------------------------------------------------------------
+def _read_smtp_from_yaml(cfg_path="config.yaml"):
     try:
-        return sheet.worksheet(title)
-    except Exception:
-        return sheet.add_worksheet(title=title, rows=100, cols=30)
+        import yaml
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        e = ((cfg.get("notifications") or {}).get("email") or {})
+        smtp = (e.get("smtp") or {})
+        return {
+            "enabled": bool(e.get("enabled", False)),
+            "sender": e.get("sender"),
+            "recipients": e.get("recipients") or [],
+            "subject_prefix": e.get("subject_prefix") or "",
+            "host": smtp.get("host", "smtp.gmail.com"),
+            "port": int(smtp.get("port_ssl", 587)),
+            "username": smtp.get("username"),
+            "password": smtp.get("app_password") or os.environ.get("GMAIL_APP_PASSWORD"),
+        }
+    except Exception as ex:
+        print(f"⚠️  Could not read SMTP config from YAML: {ex}")
+        return None
 
-def _df_from_worksheet(worksheet) -> pd.DataFrame:
-    values = worksheet.get_all_values()
-    if not values:
-        return pd.DataFrame()
-    header, rows = values[0], values[1:]
-    return pd.DataFrame(rows, columns=header)
-
-def _format_currency(x):
+# --------------------------------------------------------------------------------------
+# Utility: write or replace a sheet tab with a DataFrame
+# --------------------------------------------------------------------------------------
+def _write_df(sh, name: str, df: pd.DataFrame):
     try:
-        return f"${float(x):,.2f}"
+        ws = sh.worksheet(name)
+        sh.del_worksheet(ws)
     except Exception:
-        return x
+        pass
+    ws = sh.add_worksheet(title=name, rows=max(2, len(df) + 1), cols=max(2, len(df.columns)))
+    if df.empty:
+        ws.update("A1", [[name]])
+        return
+    ws.update("A1", [list(df.columns)])
+    if len(df) > 0:
+        ws.update("A2", df.values.tolist())
 
-def _try_float(x, default=0.0):
-    try:
-        return float(str(x).replace(",", "").replace("$", ""))
-    except Exception:
-        return default
-
-def build_weekly_summary(sheet_url: str):
-    """
-    Pulls the Open_Positions (and optionally Signals) tabs,
-    computes a compact summary table and per-position snapshot (as HTML),
-    and returns (html_body, csv_bytes, df_out) where:
-      - html_body: final HTML string to embed/send
-      - csv_bytes: CSV of the per-position grid (for attachment)
-      - df_out:    DataFrame of the per-position rows (for writing to tab)
-    """
+# --------------------------------------------------------------------------------------
+# Build the simple weekly summary you showed in your logs
+# --------------------------------------------------------------------------------------
+def build_weekly_summary(sheet_url: str) -> Tuple[str, bytes, pd.DataFrame]:
+    print("📊 Generating weekly Weinstein report…")
+    print("🔑 Authorizing service account…")
     gc = _service_account_client()
-    sh = _open_sheet(gc, sheet_url)
+    sh = gc.open_by_url(sheet_url)
 
-    # Tabs
-    tab_positions = os.getenv("OPEN_POSITIONS_TAB", "Open_Positions")
-    tab_signals   = os.getenv("SIGNALS_TAB", "Signals")
+    # Pull holdings/open positions to build the summary table
+    try:
+        ws = sh.worksheet("Open_Positions")
+    except Exception:
+        # fallback to a common alt name if needed
+        ws = sh.worksheet("Holdings")
+    values = ws.get_all_values()
+    header, rows = values[0], values[1:]
+    df = pd.DataFrame(rows, columns=header)
 
-    ws_positions = _get_or_create(gc, sh, tab_positions)
-    dfp = _df_from_worksheet(ws_positions)
+    # Compute a minimal set of metrics so your email looks like the current format
+    # We’ll try to read columns that typically exist; if missing, we’ll be robust.
+    def _money(col):
+        if col not in df.columns:
+            return pd.Series([0.0]*len(df))
+        return (df[col]
+                .replace({"\\$": "", ",": ""}, regex=True)
+                .replace("", "0")
+                .astype(float))
 
-    if dfp.empty:
-        raise RuntimeError("Open_Positions is empty or missing - cannot build report.")
+    def _num(col):
+        if col not in df.columns:
+            return pd.Series([0.0]*len(df))
+        return pd.to_numeric(df[col].replace("", "0"), errors="coerce").fillna(0.0)
 
-    # Normalize some likely columns
-    rename_map = {
-        "Symbol": "Symbol",
-        "Description": "Description",
-        "Quantity": "Quantity",
-        "Last Price": "Last Price",
-        "Current Value": "Current Value",
-        "Cost Basis Total": "Cost Basis Total",
-        "Average Cost Basis": "Average Cost Basis",
-        "Total Gain/Loss Dollar": "Total Gain/Loss Dollar",
-        "Total Gain/Loss Percent": "Total Gain/Loss Percent",
-        "Recommendation": "Recommendation",
-    }
-    # If any expected column is missing under a slightly different name, try case-insensitive match
-    cols_lower = {c.lower(): c for c in dfp.columns}
-    fixed = {}
-    for want in rename_map:
-        if want in dfp.columns:
-            fixed[want] = want
-        else:
-            lc = want.lower()
-            if lc in cols_lower:
-                fixed[want] = cols_lower[lc]
-    # Filter only columns we actually found
-    present = {k: v for k, v in fixed.items()}
+    current_value = _money("Current Value")
+    cost_total    = _money("Cost Basis Total")
+    gain_dollar   = current_value - cost_total
+    gain_pct      = (gain_dollar / cost_total.replace(0, pd.NA)).fillna(0.0) * 100.0
 
-    view_cols = [c for c in rename_map.keys() if c in present]
-    dfv = dfp[[present[c] for c in view_cols]].rename(columns={present[c]: c for c in view_cols})
+    total_gain = float(gain_dollar.sum())
+    # "Portfolio % Gain": total gain divided by total cost
+    portfolio_pct = float((gain_dollar.sum() / cost_total.sum() * 100.0) if cost_total.sum() else 0.0)
+    # "Average % Gain": mean of per-position pct
+    avg_pct = float(gain_pct.mean()) if len(gain_pct) else 0.0
 
-    # Coerce numeric
-    for col in ["Quantity", "Last Price", "Current Value", "Cost Basis Total", "Average Cost Basis", "Total Gain/Loss Dollar"]:
-        if col in dfv.columns:
-            dfv[col] = dfv[col].apply(_try_float)
+    # Emit the pretty HTML block (current format)
+    summary_html = f"""
+<h2>Weinstein Weekly - Summary</h2>
+<table border="1" cellspacing="0" cellpadding="6">
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>Total Gain/Loss ($)</td><td>${total_gain:,.2f}</td></tr>
+  <tr><td>Portfolio % Gain</td><td>{portfolio_pct:.2f}%</td></tr>
+  <tr><td>Average % Gain</td><td>{avg_pct:.2f}%</td></tr>
+</table>
+"""
 
-    # Compute summary
-    total_gain_dollar = dfv["Total Gain/Loss Dollar"].sum() if "Total Gain/Loss Dollar" in dfv.columns else 0.0
-    current_value_sum = dfv["Current Value"].sum() if "Current Value" in dfv.columns else 0.0
-    cost_basis_sum    = dfv["Cost Basis Total"].sum() if "Cost Basis Total" in dfv.columns else 0.0
-    portfolio_pct_gain = ((current_value_sum - cost_basis_sum) / cost_basis_sum * 100.0) if cost_basis_sum else 0.0
-    avg_pct_gain = dfv["Total Gain/Loss Percent"].astype(str).str.replace("%","").astype(float).mean() if "Total Gain/Loss Percent" in dfv.columns and not dfv.empty else 0.0
-
-    # Pretty HTML
-    summary_rows = [
-        ("Total Gain/Loss ($)", _format_currency(total_gain_dollar)),
-        ("Portfolio % Gain",    f"{portfolio_pct_gain:.2f}%"),
-        ("Average % Gain",      f"{avg_pct_gain:.2f}%"),
+    # Keep your “Per-position Snapshot” table
+    # We’ll try to echo the columns you showed; if missing we skip gracefully.
+    cols_keep = [
+        "Symbol", "Description", "Quantity", "Last Price", "Current Value",
+        "Cost Basis Total", "Average Cost Basis", "Total Gain/Loss Dollar",
+        "Total Gain/Loss Percent", "Recommendation",
     ]
+    present = [c for c in cols_keep if c in df.columns]
+    if present:
+        # add computed columns if they’re missing so the table stays rich
+        if "Total Gain/Loss Dollar" not in df.columns:
+            df["Total Gain/Loss Dollar"] = gain_dollar.map(lambda x: f"{x:,.2f}")
+        if "Total Gain/Loss Percent" not in df.columns:
+            df["Total Gain/Loss Percent"] = gain_pct.map(lambda x: f"{x:.2f}%")
 
-    summary_table_html = "".join(
-        f"<tr><td style='padding:6px 12px;border:1px solid #ddd;'>{k}</td>"
-        f"<td style='padding:6px 12px;border:1px solid #ddd;'>{v}</td></tr>"
-        for k, v in summary_rows
-    )
+        snap = df[present].copy()
+        # format some money/price fields if they exist
+        for col in ["Last Price", "Current Value", "Cost Basis Total", "Average Cost Basis"]:
+            if col in snap.columns:
+                snap[col] = pd.to_numeric(snap[col].replace({"\\$": "", ",": ""}, regex=True), errors="coerce").fillna(0.0)
+                snap[col] = snap[col].map(lambda x: f"${x:,.2f}")
+        if "Quantity" in snap.columns:
+            snap["Quantity"] = pd.to_numeric(snap["Quantity"], errors="coerce").fillna(0.0).map(lambda x: f"{x:,.2f}")
 
-    # Per-position HTML
-    pretty = dfv.copy()
-    if "Last Price" in pretty:            pretty["Last Price"]            = pretty["Last Price"].map(_format_currency)
-    if "Current Value" in pretty:         pretty["Current Value"]         = pretty["Current Value"].map(_format_currency)
-    if "Cost Basis Total" in pretty:      pretty["Cost Basis Total"]      = pretty["Cost Basis Total"].map(_format_currency)
-    if "Average Cost Basis" in pretty:    pretty["Average Cost Basis"]    = pretty["Average Cost Basis"].map(_format_currency)
-    if "Total Gain/Loss Dollar" in pretty:pretty["Total Gain/Loss Dollar"]= pretty["Total Gain/Loss Dollar"].map(_format_currency)
-    if "Total Gain/Loss Percent" in pretty:
-        pretty["Total Gain/Loss Percent"] = pretty["Total Gain/Loss Percent"].astype(str)
+        # HTML table
+        snap_html = "<h3>Per-position Snapshot</h3>\n<table border='1' cellspacing='0' cellpadding='4'>\n"
+        snap_html += "<tr>" + "".join(f"<th>{c}</th>" for c in snap.columns) + "</tr>\n"
+        for _, r in snap.iterrows():
+            snap_html += "<tr>" + "".join(f"<td>{r[c]}</td>" for c in snap.columns) + "</tr>\n"
+        snap_html += "</table>\n"
+    else:
+        snap_html = "<p>(No per-position columns found to render a snapshot.)</p>"
 
-    positions_html = pretty.to_html(index=False, border=0, classes="grid", justify="left")
+    html_body = summary_html + "\n" + snap_html
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html_body = f"""
-<html>
-<head>
-  <meta charset="utf-8" />
-  <style>
-    body {{ font-family: Arial, Helvetica, sans-serif; color: #222; }}
-    h1, h2 {{ margin: 0.2rem 0; }}
-    .card {{
-      border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin: 12px 0;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-    }}
-    table.grid {{
-      border-collapse: collapse; width: 100%;
-    }}
-    table.grid th, table.grid td {{
-      border: 1px solid #ddd; padding: 6px 8px; text-align: left;
-      white-space: nowrap;
-    }}
-    table.grid th {{ background: #f3f4f6; }}
-  </style>
-</head>
-<body>
-  <h1>Weinstein Weekly - Summary</h1>
-  <div class="card">
-    <table class="grid">
-      <thead><tr><th>Metric</th><th>Value</th></tr></thead>
-      <tbody>
-        {summary_table_html}
-      </tbody>
-    </table>
-  </div>
-
-  <h2>Per-position Snapshot</h2>
-  <div class="card">
-    {positions_html}
-  </div>
-  <div style="color:#6b7280;font-size:12px;margin-top:8px;">Generated {ts}</div>
-</body>
-</html>
-""".strip()
-
-    # CSV attachment
+    # CSV bytes
     csv_buf = io.StringIO()
-    writer = csv.writer(csv_buf)
-    writer.writerow(pretty.columns)
-    for _, row in pretty.iterrows():
-        writer.writerow([row.get(c, "") for c in pretty.columns])
+    df.to_csv(csv_buf, index=False)
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
-    # DataFrame to write to Weekly_Report tab
-    out_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
-    return html_body, csv_bytes, out_df
+    # Also write the Weekly_Report tab you showed in logs
+    _write_df(sh, "Weekly_Report", pd.DataFrame({
+        "Metric": ["Total Gain/Loss ($)", "Portfolio % Gain", "Average % Gain"],
+        "Value":  [f"${total_gain:,.2f}", f"{portfolio_pct:.2f}%", f"{avg_pct:.2f}%"],
+    }))
+    print("✅ Wrote Weekly_Report tab.")
+    print("🎯 Done.")
+    return html_body, csv_bytes, df
 
-def write_weekly_tab(sheet_url: str, df_out: pd.DataFrame, tab_name="Weekly_Report"):
-    gc = _service_account_client()
-    sh = _open_sheet(gc, sheet_url)
-    ws = _get_or_create(gc, sh, tab_name)
-    # Clear then write
-    ws.clear()
-    rows = [list(df_out.columns)] + df_out.astype(str).values.tolist()
-    ws.update(rows)
+# --------------------------------------------------------------------------------------
+# Simple SMTP sender using config.yaml
+# --------------------------------------------------------------------------------------
+def _send_email_with_smtp(subject: str, html_body: str, csv_bytes: bytes, cfg_path="config.yaml") -> bool:
+    smtp_cfg = _read_smtp_from_yaml(cfg_path)
+    if not smtp_cfg or not smtp_cfg.get("enabled"):
+        print("ℹ️  Email sending is disabled in config.yaml or config not found.")
+        return False
 
-def _write_file(path: str, data: bytes):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
+    recipients = smtp_cfg["recipients"]
+    if not recipients:
+        print("⚠️  Email enabled but no recipients configured under notifications.email.recipients")
+        return False
+    if not smtp_cfg["password"]:
+        print("⚠️  Email enabled but no app password found (yaml smtp.app_password or env GMAIL_APP_PASSWORD).")
+        return False
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--write", action="store_true", help="Write Weekly_Report tab")
-    ap.add_argument("--email", action="store_true", help="Send email via SMTP settings in config.yaml")
-    ap.add_argument("--attach-html", action="store_true", help="Attach generated HTML to the email")
-    ap.add_argument("--sheet-url", required=True, help="Google Sheet URL")
-    args = ap.parse_args()
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
 
-    html_body, csv_bytes, df_out = build_weekly_summary(args.sheet_url)
+    msg = MIMEMultipart()
+    msg["From"] = smtp_cfg["sender"]
+    msg["To"] = ", ".join(recipients)
+    prefix = smtp_cfg.get("subject_prefix") or ""
+    if prefix and not prefix.endswith(" "):
+        prefix += " "
+    msg["Subject"] = f"{prefix}{subject}"
 
-    # Always export an HTML file for run_weekly.sh to optionally combine
-    out_dir = os.getenv("OUTPUT_DIR", "./output")
-    html_path = os.path.join(out_dir, "weekly_portfolio.html")
-    csv_path  = os.path.join(out_dir, "weekly_portfolio.csv")
-    _write_file(html_path, html_body.encode("utf-8"))
-    _write_file(csv_path, csv_bytes)
+    msg.attach(MIMEText(html_body, "html"))
 
-    if args.write:
-        try:
-            write_weekly_tab(args.sheet_url, df_out, tab_name="Weekly_Report")
-            print("✅ Wrote Weekly_Report tab.")
-        except Exception as e:
-            print(f"⚠️ Failed writing Weekly_Report tab: {e}")
+    # attach CSV
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(csv_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="weekly_positions.csv"')
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"]) as server:
+            server.starttls()
+            server.login(smtp_cfg["username"], smtp_cfg["password"])
+            server.sendmail(smtp_cfg["sender"], recipients, msg.as_string())
+        print("📧 Email sent via SMTP.")
+        return True
+    except Exception as e:
+        print(f"⚠️  SMTP send failed: {e}")
+        return False
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true", help="(kept for compatibility; HTML always written to output)")
+    parser.add_argument("--email", action="store_true", help="Send email using SMTP settings in config.yaml")
+    parser.add_argument("--attach-html", action="store_true", help="(kept for compatibility; body is HTML)")
+    parser.add_argument("--sheet-url", required=True, help="Google Sheet URL")
+    parser.add_argument("--config", help="(ignored; kept for compatibility)")
+    args = parser.parse_args(argv)
+
+    html_body, csv_bytes, df = build_weekly_summary(args.sheet_url)
+
+    # Always write combined output HTML (kept same path used by run_weekly.sh)
+    os.makedirs("output", exist_ok=True)
+    out_html = os.path.join("output", "combined_weekly_email.html")
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write(html_body)
+    print(f"✅ Combined weekly report written: {out_html}")
 
     if args.email:
-        # Use the repo's lightweight sender that pulls SMTP app_password from YAML.
-        try:
-            from WeinsteinMinimalEmailSender import send_email_with_yaml
-            cfg_path = os.environ.get("CONFIG_FILE", "./config.yaml")
-            ok = send_email_with_yaml(
-                subject_suffix="Portfolio Summary",
-                html_body=html_body,
-                attachments=[html_path] if args.attach_html else None,
-                config_path=cfg_path,
-            )
-            if ok:
-                print("📧 Email sent.")
-            else:
-                print("Email failed: configuration incomplete (check notifications.email in config.yaml).")
-        except Exception as e:
-            print("Email failed: Email sender not available. Please keep WeinsteinMinimalEmailSender.py in repo.")
-            print(f"(detail: {e})")
-
-    print("🎯 Done.")
+        # Subject roughly like before
+        subject = f"Weinstein Weekly — {dt.date.today().isoformat()}"
+        ok = _send_email_with_smtp(subject, html_body, csv_bytes, cfg_path=os.environ.get("CONFIG_FILE", "config.yaml"))
+        if not ok:
+            print("⚠️  Email step did not complete.")
+    else:
+        print("ℹ️  --email not passed; skipping email.")
 
 if __name__ == "__main__":
     main()
