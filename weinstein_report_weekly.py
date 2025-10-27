@@ -1,481 +1,493 @@
 #!/usr/bin/env python3
-# weinstein_report_weekly.py
-#
-# Weekly report generator:
-# - Prefers creds/gcp_service_account.json (then creds/service_account.json or GOOGLE_APPLICATION_CREDENTIALS).
-# - SMTP app password read from config.yaml (notifications.email.smtp.app_password) or env GMAIL_APP_PASSWORD.
-# - Builds portfolio summary + per-position snapshot from Google Sheet.
-# - Classic section:
-#     * If ./output/scan_sp500.csv exists, render from it (original behavior).
-#     * Otherwise FALL BACK to build a classic-style table from the "Signals" tab.
-# - Writes output/combined_weekly_email.html
-# - Email sending:
-#     * --email                  -> send email via SMTP settings in config.yaml
-#     * --attach-html (legacy)   -> send email (compat with older run_weekly.sh)
-#     * --write (legacy)         -> accepted no-op (we always write HTML)
-#
-# Exit code 0 on success.
+# === weinstein_report_weekly.py (Yahoo Finance source, no Sheets data in the table) ===
 
 import os
-import io
 import sys
-import argparse
-import datetime as dt
-from typing import Tuple, Optional, Dict, List
-
+import math
+import io
+import base64
+import yaml
 import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime
+from weinstein_mailer import send_email
+from universe_loaders import combine_universe
 
-# Optional helper first (repo compatibility)
+# Sheets logger (optional; doesn't affect the report body)
 try:
-    from gsheets_sync import authorize_service_account as _auth_helper
-    _HAVE_GSHEETS_HELPER = True
+    from gsheet_helpers import log_signal
 except Exception:
-    _HAVE_GSHEETS_HELPER = False
+    log_signal = None  # fail-safe if helper not available
 
-# gspread as fallback
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials as _Creds
-except Exception:
-    gspread = None
-    _Creds = None
+# Tiny inline charts for top names
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
+# --------- Tunables ----------
+DEFAULT_BENCHMARK = "SPY"
+WEEKS_LOOKBACK = 180   # ~3.5 years of weekly bars
+MA_WEEKS = 30
+MA10_WEEKS = 10
+SLOPE_WINDOW = 5
+NEAR_MA_BAND = 0.05
+RS_MA_WEEKS = 30
+OUTPUT_DIR_FALLBACK = "./output"
+TOP_N_CHARTS = 20
 
-# --------------------------------------------------------------------------------------
-# Credentials: prefer creds/gcp_service_account.json, then creds/service_account.json,
-# or GOOGLE_APPLICATION_CREDENTIALS. Try project helper first if available.
-# --------------------------------------------------------------------------------------
-def _service_account_client():
-    if _HAVE_GSHEETS_HELPER:
-        try:
-            return _auth_helper()
-        except Exception as e:
-            print(f"⚠️  gsheets_sync authorize_service_account failed, falling back: {e}")
-
-    if gspread is None or _Creds is None:
-        raise RuntimeError("gspread / google-auth not available and helpers failed.")
-
-    root = os.path.dirname(__file__)
-    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    candidates = [
-        env_path,
-        os.path.join(root, "creds", "gcp_service_account.json"),  # preferred
-        os.path.join(root, "creds", "service_account.json"),      # legacy fallback
-    ]
-    sa_path = next((p for p in candidates if p and os.path.exists(p)), None)
-    if not sa_path:
-        tried = "\n".join(f"  - {p}" for p in candidates if p)
-        raise FileNotFoundError("Missing Google service account credentials. Tried:\n" + tried)
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = _Creds.from_service_account_file(sa_path, scopes=scopes)
-    return gspread.authorize(creds)
-
-
-# --------------------------------------------------------------------------------------
-# Read email settings from config.yaml (with env fallback for app password)
-# --------------------------------------------------------------------------------------
-def _read_smtp_from_yaml(cfg_path="config.yaml"):
-    try:
-        import yaml
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        e = ((cfg.get("notifications") or {}).get("email") or {})
-        smtp = (e.get("smtp") or {})
-        return {
-            "enabled": bool(e.get("enabled", False)),
-            "sender": e.get("sender"),
-            "recipients": e.get("recipients") or [],
-            "subject_prefix": e.get("subject_prefix") or "",
-            "host": smtp.get("host", "smtp.gmail.com"),
-            "port": int(smtp.get("port_ssl", 587)),
-            "username": smtp.get("username"),
-            "password": smtp.get("app_password") or os.environ.get("GMAIL_APP_PASSWORD"),
-        }
-    except Exception as ex:
-        print(f"⚠️  Could not read SMTP config from YAML: {ex}")
-        return None
-
-
-# --------------------------------------------------------------------------------------
-# Utility: write/replace a sheet tab with a DataFrame
-# --------------------------------------------------------------------------------------
-def _write_df(sh, name: str, df: pd.DataFrame):
-    try:
-        ws = sh.worksheet(name)
-        sh.del_worksheet(ws)
-    except Exception:
-        pass
-    ws = sh.add_worksheet(title=name, rows=max(2, len(df) + 1), cols=max(2, len(df.columns)))
-    if df.empty:
-        ws.update(values=[[name]], range_name="A1")
-        return
-    ws.update(values=[list(df.columns)], range_name="A1")
-    if len(df) > 0:
-        ws.update(values=df.values.tolist(), range_name="A2")
-
-
-# --------------------------------------------------------------------------------------
-# Portfolio block (unchanged behavior, resilient to missing columns)
-# --------------------------------------------------------------------------------------
-def _build_portfolio_block(sh) -> Tuple[str, bytes, pd.DataFrame]:
-    # Load Open_Positions (fallback to Holdings)
-    try:
-        ws = sh.worksheet("Open_Positions")
-    except Exception:
-        ws = sh.worksheet("Holdings")
-    values = ws.get_all_values()
-    header, rows = values[0], values[1:]
-    df = pd.DataFrame(rows, columns=header)
-
-    def _money(series: pd.Series) -> pd.Series:
-        return (series.replace({"\\$": "", ",": ""}, regex=True)
-                      .replace("", "0")
-                      .pipe(pd.to_numeric, errors="coerce")
-                      .fillna(0.0))
-
-    def _get_money(col: str) -> pd.Series:
-        if col not in df.columns:
-            return pd.Series([0.0]*len(df))
-        return _money(df[col])
-
-    cost_total = _get_money("Cost Basis Total")
-    current_value = _get_money("Current Value")
-    gain_dollar = current_value - cost_total
-    # avoid FutureWarning: convert to float early
-    cost_total_float = pd.to_numeric(cost_total, errors="coerce").astype(float)
-    denom = cost_total_float.replace(0, pd.NA)
-    gain_pct = (pd.to_numeric(gain_dollar, errors="coerce").astype(float) / denom).fillna(0.0) * 100.0
-
-    total_gain = float(gain_dollar.sum())
-    portfolio_pct = float((gain_dollar.sum() / cost_total_float.sum() * 100.0) if cost_total_float.sum() else 0.0)
-    avg_pct = float(gain_pct.mean() if len(gain_pct) else 0.0)
-
-    summary_html = f"""
-<h2>Weinstein Weekly - Summary</h2>
-<table border="1" cellspacing="0" cellpadding="6">
-  <tr><th>Metric</th><th>Value</th></tr>
-  <tr><td>Total Gain/Loss ($)</td><td>${total_gain:,.2f}</td></tr>
-  <tr><td>Portfolio % Gain</td><td>{portfolio_pct:.2f}%</td></tr>
-  <tr><td>Average % Gain</td><td>{avg_pct:.2f}%</td></tr>
-</table>
-"""
-
-    # Per-position snapshot table (if columns exist)
-    cols_keep = [
-        "Symbol", "Description", "Quantity", "Last Price", "Current Value",
-        "Cost Basis Total", "Average Cost Basis", "Total Gain/Loss Dollar",
-        "Total Gain/Loss Percent", "Recommendation",
-    ]
-    present = [c for c in cols_keep if c in df.columns]
-    if present:
-        # enrich if missing
-        if "Total Gain/Loss Dollar" not in df.columns:
-            df["Total Gain/Loss Dollar"] = gain_dollar.map(lambda x: f"{x:,.2f}")
-        if "Total Gain/Loss Percent" not in df.columns:
-            df["Total Gain/Loss Percent"] = gain_pct.map(lambda x: f"{x:.2f}%")
-
-        snap = df[present].copy()
-        for col in ["Last Price", "Current Value", "Cost Basis Total", "Average Cost Basis"]:
-            if col in snap.columns:
-                snap[col] = pd.to_numeric(
-                    snap[col].replace({"\\$": "", ",": ""}, regex=True),
-                    errors="coerce"
-                ).fillna(0.0).map(lambda x: f"${x:,.2f}")
-        if "Quantity" in snap.columns:
-            snap["Quantity"] = pd.to_numeric(snap["Quantity"], errors="coerce").fillna(0.0).map(lambda x: f"{x:,.2f}")
-
-        snap_html = "<h3>Per-position Snapshot</h3>\n<table border='1' cellspacing='0' cellpadding='4'>\n"
-        snap_html += "<tr>" + "".join(f"<th>{c}</th>" for c in snap.columns) + "</tr>\n"
-        for _, r in snap.iterrows():
-            snap_html += "<tr>" + "".join(f"<td>{r[c]}</td>" for c in snap.columns) + "</tr>\n"
-        snap_html += "</table>\n"
+# --------- Utilities ----------
+def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
+    """Handle yfinance returning MultiIndex columns when multiple tickers are requested."""
+    if isinstance(df.columns, pd.MultiIndex):
+        # When df has a top-level ticker and second-level 'Close'/'Volume'
+        if field not in df.columns.levels[1]:
+            raise KeyError(f"Field '{field}' not in downloaded data.")
+        out = df[field].copy()
+        # Keep only requested tickers (in order)
+        keep = [t for t in tickers if t in out.columns]
+        return out[keep]
     else:
-        snap_html = "<p>(No per-position columns found to render a snapshot.)</p>"
+        # Single ticker case; make it look like multi-ticker with one column
+        if field not in df.columns:
+            raise KeyError(f"Field '{field}' not found in downloaded data.")
+        t0 = tickers[0] if tickers else "TICKER"
+        out = df[[field]].copy()
+        out.columns = [t0]
+        return out
 
-    # CSV for attachment
-    csv_buf = io.StringIO()
-    df.to_csv(csv_buf, index=False)
-    csv_bytes = csv_buf.getvalue().encode("utf-8")
+def load_config(path="config.yaml"):
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f)
 
-    # Also write Weekly_Report tab
-    _write_df(sh, "Weekly_Report", pd.DataFrame({
-        "Metric": ["Total Gain/Loss ($)", "Portfolio % Gain", "Average % Gain"],
-        "Value":  [f"${total_gain:,.2f}", f"{portfolio_pct:.2f}%", f"{avg_pct:.2f}%"],
-    }))
-    print("✅ Wrote Weekly_Report tab.")
-    print("🎯 Done.")
+    app = cfg.get("app", {}) or {}
+    uni = cfg.get("universe", {}) or {}
+    reporting = cfg.get("reporting", {}) or {}
 
-    return summary_html + "\n" + snap_html, csv_bytes, df
+    mode = (uni.get("mode") or "custom").lower()
+    use_sp500 = (mode == "sp500")
+    extra = uni.get("extra") or []
+    explicit_tickers = uni.get("tickers") or []
 
-
-# --------------------------------------------------------------------------------------
-# Classic scan loader + renderer (robust to column naming)
-# Adds fallback: build from Signals sheet if CSV is missing.
-# --------------------------------------------------------------------------------------
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    mapping = {c: c.strip().lower().replace(" ", "_") for c in df.columns}
-    df.columns = [mapping[c] for c in df.columns]
-    return df
-
-def _pick_first(df: pd.DataFrame, names: List[str]) -> Optional[str]:
-    for n in names:
-        if n in df.columns:
-            return n
-    return None
-
-def _label_to_bucket(val: str) -> str:
-    s = (val or "").strip().lower()
-    if s.startswith("buy") or s == "long" or s == "accumulate":
-        return "Buy"
-    if s.startswith("watch") or s.startswith("hold") or "basing" in s:
-        return "Watch"
-    if s.startswith("avoid") or s.startswith("sell"):
-        return "Avoid"
-    return "Avoid"
-
-def _render_classic_from_df(df: pd.DataFrame, benchmark: str = "SPY") -> Optional[str]:
-    if df is None or df.empty:
-        return None
-
-    df = _normalize_columns(df)
-
-    # identify key columns (robust to names)
-    col_ticker = _pick_first(df, ["ticker", "symbol"])
-    col_label  = _pick_first(df, ["buy_signal", "signal", "recommendation", "verdict", "label", "rating", "rec"])
-    col_stage  = _pick_first(df, ["stage", "weinstein_stage"])
-    col_price  = _pick_first(df, ["price", "last", "close", "last_price"])
-    col_ma30   = _pick_first(df, ["ma30", "sma_30", "sma30"])
-    col_dist   = _pick_first(df, ["dist_ma_pct", "dist_from_ma_pct", "price_to_ma_pct", "dist_from_ma_30_pct"])
-    col_slope  = _pick_first(df, ["ma_slope_per_wk", "ma_slope_weekly", "ma_trend_wk"])
-    col_rs     = _pick_first(df, ["rs", "relative_strength"])
-    col_rsma   = _pick_first(df, ["rs_ma30", "rs_ma_30", "rs_sma30"])
-    col_rs_ab  = _pick_first(df, ["rs_above_ma", "rs_gt_ma", "rs_vs_ma"])
-    col_rsslp  = _pick_first(df, ["rs_slope_per_wk", "rs_slope_weekly"])
-    col_notes  = _pick_first(df, ["notes", "comment", "reason"])
-
-    # derive counts
-    buckets = df[col_label].fillna("").map(_label_to_bucket) if col_label else pd.Series(["Avoid"] * len(df))
-    buy_n = int((buckets == "Buy").sum())
-    watch_n = int((buckets == "Watch").sum())
-    avoid_n = int((buckets == "Avoid").sum())
-    total_n = int(len(df))
-
-    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    out_cols = []
-
-    def _add(col_name: Optional[str], title: str):
-        nonlocal out_cols
-        if col_name and col_name in df.columns:
-            out_cols.append((col_name, title))
-
-    # ticker
-    _add(col_ticker, "ticker")
-
-    # pretty label
-    pretty_label_col = "__pretty_label__"
-    df[pretty_label_col] = buckets
-    _add(pretty_label_col, "Buy Signal")
-
-    # chart link
-    chart_col = "__chart__"
-    def _chart_link(t):
-        t = (t or "").strip().upper()
-        return f'<a href="https://www.tradingview.com/symbols/{t}/" target="_blank">chart</a>' if t else ""
-    df[chart_col] = df[col_ticker].map(_chart_link) if col_ticker else ""
-    _add(chart_col, "chart")
-
-    # remaining
-    _add(col_stage, "stage")
-    _add(col_price, "price")
-    _add(col_ma30, "ma30")
-    _add(col_dist, "dist_ma_pct")
-    _add(col_slope, "ma_slope_per_wk")
-    _add(col_rs, "rs")
-    _add(col_rsma, "rs_ma30")
-    _add(col_rs_ab, "rs_above_ma")
-    _add(col_rsslp, "rs_slope_per_wk")
-    _add(col_notes, "notes")
-
-    if not out_cols:
-        out_df = df
-        headers = list(out_df.columns)
+    if use_sp500:
+        tickers = combine_universe(sp500=True, extra_symbols=extra)
     else:
-        headers = [t for _, t in out_cols]
-        out_df = pd.DataFrame({t: df[c] for c, t in out_cols})
+        tickers = combine_universe(sp500=False, extra_symbols=explicit_tickers)
 
-    hdr = f"""
-<h2>Weinstein Weekly — Benchmark: {benchmark}</h2>
-<p><em>Generated {ts}</em></p>
-<p><strong>Summary:</strong> ✅ Buy: {buy_n} &nbsp;&nbsp;|&nbsp;&nbsp; 🟡 Watch: {watch_n} &nbsp;&nbsp;|&nbsp;&nbsp; 🔴 Avoid: {avoid_n} &nbsp;&nbsp; (Total: {total_n})</p>
-"""
-    table = "<table border='1' cellspacing='0' cellpadding='4'>\n"
-    table += "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>\n"
-    for _, r in out_df.iterrows():
-        table += "<tr>" + "".join(f"<td>{r[h]}</td>" for h in headers) + "</tr>\n"
-    table += "</table>\n"
-    return hdr + table
+    benchmark = app.get("benchmark", DEFAULT_BENCHMARK)
+    tz = app.get("timezone", "America/Chicago")
 
+    output_dir = reporting.get("output_dir", OUTPUT_DIR_FALLBACK)
+    include_pdf = reporting.get("include_pdf", False)
 
-def _render_classic_block_from_csv(csv_path: str, benchmark: str = "SPY") -> Optional[str]:
-    if not os.path.exists(csv_path):
-        return None
+    min_price = int(uni.get("min_price", 0))
+    min_avg_volume = int(uni.get("min_avg_volume", 0))
+
+    return cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume
+
+def fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
+    uniq = list(dict.fromkeys((tickers or []) + [benchmark]))  # de-dup, preserve order
+    if not uniq:
+        raise ValueError("No symbols to download.")
+
+    data = yf.download(
+        uniq,
+        interval="1wk",
+        period="10y",
+        auto_adjust=True,
+        ignore_tz=True,
+        progress=False,
+    )
+
+    close = _extract_field(data, "Close", uniq)
+    volume = _extract_field(data, "Volume", uniq)
+
+    tail_n = max(weeks, MA_WEEKS + RS_MA_WEEKS + SLOPE_WINDOW + 10)
+    close = close.tail(tail_n)
+    volume = volume.tail(tail_n)
+
+    return close, volume
+
+def _weekly_short_term_state(series_price: pd.Series) -> tuple[str, float, float]:
+    """
+    Weekly view of short vs long using 10-wk vs 30-wk MAs.
+      - ShortTermUptrend: Close > MA10 > MA30
+      - StageConflict   : Close > MA30 but MA10<=MA30, or MA10>MA30 but Close<=MA10
+      - Weak            : otherwise
+    Returns (state, ma10_last, ma30_last)
+    """
+    s = series_price.dropna()
+    if len(s) < max(MA10_WEEKS, MA_WEEKS) + 5:
+        return ("Unknown", np.nan, np.nan)
+
+    ma10 = s.rolling(MA10_WEEKS).mean()
+    ma30 = s.rolling(MA_WEEKS).mean()
+    c = float(s.iloc[-1])
+    m10 = float(ma10.iloc[-1])
+    m30 = float(ma30.iloc[-1])
+
+    if (c > m10) and (m10 > m30):
+        state = "ShortTermUptrend"
+    elif (c > m30) and not (m10 > m30):
+        state = "StageConflict"
+    elif (m10 > m30) and not (c > m10):
+        state = "StageConflict"
+    else:
+        state = "Weak"
+    return (state, m10, m30)
+
+def compute_stage_for_ticker(closes: pd.Series, bench: pd.Series):
+    s = closes.dropna().copy()
+    b = bench.reindex_like(s).dropna()
+
+    idx = s.index.intersection(b.index)
+    s = s.loc[idx]
+    b = b.loc[idx]
+
+    if len(s) < MA_WEEKS + SLOPE_WINDOW + 5 or len(b) < RS_MA_WEEKS + 5:
+        return {"error": "insufficient_data"}
+
+    ma = s.rolling(MA_WEEKS).mean()
+
+    # MA slope over last SLOPE_WINDOW weeks
+    ma_slope = ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
+    ma_slope_last = ma_slope.iloc[-1]
+    ma_last = ma.iloc[-1]
+    price_last = s.iloc[-1]
+    dist_ma_pct = (price_last - ma_last) / ma_last if ma_last and not math.isclose(ma_last, 0.0) else np.nan
+
+    # Relative Strength line vs. benchmark (price ratio)
+    rs = s / b
+    rs_ma = rs.rolling(RS_MA_WEEKS).mean()
+    rs_slope = rs_ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
+    rs_last = rs.iloc[-1]
+    rs_ma_last = rs_ma.iloc[-1]
+    rs_above = bool(rs_last > rs_ma_last)
+    rs_slope_last = rs_slope.iloc[-1]
+
+    # Flags
+    price_above_ma = bool(price_last > ma_last)
+    ma_up = bool(ma_slope_last > 0)
+    near_ma = bool(abs(dist_ma_pct) <= NEAR_MA_BAND)
+    rs_up = bool(rs_above and rs_slope_last > 0)
+    rs_down = bool((not rs_above) and rs_slope_last < 0)
+
+    # Stage rules (heuristic)
+    if price_above_ma and ma_up and rs_up:
+        stage = "Stage 2 (Uptrend)"
+    elif (not price_above_ma) and (ma_slope_last < 0) and rs_down:
+        stage = "Stage 4 (Downtrend)"
+    elif near_ma and abs(ma_slope_last) < (abs(ma_last) * 0.0005):
+        stage = "Stage 1 (Basing)"
+    else:
+        stage = "Stage 3 (Topping)"
+
+    notes = []
+    if price_above_ma and not ma_up:
+        notes.append("Price>MA but MA not rising")
+    if (not price_above_ma) and ma_up:
+        notes.append("Price<MA but MA rising (watch)")
+    if rs_above and rs_slope_last <= 0:
+        notes.append("RS above MA but flattening")
+    if (not rs_above) and rs_slope_last >= 0:
+        notes.append("RS below MA but improving")
+
+    st_state, ma10_last, _ma30_chk = _weekly_short_term_state(s)
+
+    return {
+        "price": float(price_last),
+        "ma10": float(ma10_last) if pd.notna(ma10_last) else np.nan,
+        "ma30": float(ma_last),
+        "dist_ma_pct": float(dist_ma_pct) if pd.notna(dist_ma_pct) else np.nan,
+        "ma_slope_per_wk": float(ma_slope_last) if pd.notna(ma_slope_last) else np.nan,
+        "rs": float(rs_last),
+        "rs_ma30": float(rs_ma_last) if pd.notna(rs_ma_last) else np.nan,
+        "rs_above_ma": bool(rs_above),
+        "rs_slope_per_wk": float(rs_slope_last) if pd.notna(rs_slope_last) else np.nan,
+        "stage": stage,
+        "short_term_state_wk": st_state,
+        "notes": "; ".join(notes),
+    }
+
+def classify_buy_signal(stage: str) -> tuple[str, str]:
+    stage = stage or ""
+    if stage.startswith("Stage 2"):
+        return ("BUY", '<span class="badge buy">Buy</span>')
+    if stage.startswith("Stage 1"):
+        return ("WATCH", '<span class="badge watch">Watch</span>')
+    if stage == "Filtered":
+        return ("AVOID", '<span class="badge avoid">Avoid</span>')
+    return ("AVOID", '<span class="badge avoid">Avoid</span>')
+
+def build_report_df(close_w: pd.DataFrame,
+                    volume_w: pd.DataFrame,
+                    tickers: list[str],
+                    benchmark: str,
+                    min_price: int = 0,
+                    min_avg_volume: int = 0):
+    if benchmark not in close_w.columns:
+        raise KeyError(f"Benchmark '{benchmark}' not found in downloaded data.")
+    bench = close_w[benchmark].dropna()
+
+    last_close = close_w.ffill().iloc[-1]
+    avg_vol_10w = volume_w.rolling(10).mean().ffill().iloc[-1]
+
+    rows = []
+    for t in tickers:
+        if t not in close_w.columns:
+            rows.append({"ticker": t, "stage": "N/A", "notes": "no_data"})
+            continue
+
+        lc = float(last_close.get(t, np.nan)) if pd.notna(last_close.get(t, np.nan)) else np.nan
+        av = float(avg_vol_10w.get(t, np.nan)) if pd.notna(avg_vol_10w.get(t, np.nan)) else np.nan
+        if (min_price and (pd.isna(lc) or lc < min_price)) or (min_avg_volume and (pd.isna(av) or av < min_avg_volume)):
+            s = close_w[t].dropna()
+            st_state, ma10_last, _ = _weekly_short_term_state(s)
+            rows.append({
+                "ticker": t, "stage": "Filtered", "price": lc,
+                "ma10": float(ma10_last) if pd.notna(ma10_last) else np.nan,
+                "ma30": np.nan, "short_term_state_wk": st_state,
+                "notes": "below min_price/volume"
+            })
+            continue
+
+        res = compute_stage_for_ticker(close_w[t], bench)
+        res["ticker"] = t
+        rows.append(res)
+
+    df = pd.DataFrame(rows)
+
+    # Ensure expected columns exist
+    cols = [
+        "ticker", "stage", "price", "ma10", "ma30", "dist_ma_pct", "ma_slope_per_wk",
+        "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "short_term_state_wk", "notes"
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[cols]
+
+    # Buy Signal columns (plain + HTML badge)
+    df["buy_signal"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[0])
+    df["buy_signal_html"] = df["stage"].apply(lambda s: classify_buy_signal(str(s))[1])
+
+    # Sort: Stage 2 (Buy) first, then Stage 1 (Watch), then by distance above MA
+    stage_rank = {
+        "Stage 2 (Uptrend)": 0,
+        "Stage 1 (Basing)": 1,
+        "Stage 3 (Topping)": 2,
+        "Stage 4 (Downtrend)": 3,
+        "Filtered": 8,
+        "N/A": 9,
+    }
+    df["stage_rank"] = df["stage"].map(stage_rank).fillna(9)
+    df = df.sort_values(by=["stage_rank", "dist_ma_pct"], ascending=[True, False]).reset_index(drop=True)
+    return df.drop(columns=["stage_rank"])
+
+# ---------- Tiny inline charts ----------
+def _fig_to_base64(fig) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+def make_tiny_chart_html(series_price: pd.Series, benchmark: pd.Series) -> str:
+    s = series_price.dropna()
+    b = benchmark.reindex_like(s).dropna()
+    idx = s.index.intersection(b.index)
+    if len(idx) < MA_WEEKS + 5:
+        return ""
+    s = s.loc[idx]
+    b = b.loc[idx]
+
+    ma30 = s.rolling(MA_WEEKS).mean()
+    ma10 = s.rolling(MA10_WEEKS).mean()
+    rs = (s / b).rolling(RS_MA_WEEKS).mean()
+
+    fig, ax1 = plt.subplots(figsize=(3.0, 1.4))
+    ax1.plot(s.index, s.values, linewidth=1.2)
+    ax1.plot(ma10.index, ma10.values, linewidth=1.0)
+    ax1.plot(ma30.index, ma30.values, linewidth=1.0)
+    ax1.set_xticks([]); ax1.set_yticks([]); ax1.grid(False)
+    ax2 = ax1.twinx()
+    ax2.plot(rs.index, rs.values, linewidth=0.8)
+    ax2.set_xticks([]); ax2.set_yticks([])
+    for spine in (*ax1.spines.values(), *ax2.spines.values()):
+        spine.set_visible(False)
+    img_src = _fig_to_base64(fig)
+    return f'<img src="{img_src}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
+
+def attach_tiny_charts(df: pd.DataFrame, close_w: pd.DataFrame, benchmark: str, top_n: int = TOP_N_CHARTS) -> pd.DataFrame:
+    out = df.copy()
+    out["chart"] = ""
+    bench_series = close_w[benchmark].dropna()
+    for i, row in out.head(top_n).iterrows():
+        t = row["ticker"]
+        if t in close_w.columns:
+            try:
+                out.at[i, "chart"] = make_tiny_chart_html(close_w[t], bench_series)
+            except Exception:
+                out.at[i, "chart"] = ""
+    return out
+
+# ---------- HTML ----------
+def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
+    styled = df.copy()
+
+    # Pretty percentages
+    for c in ["dist_ma_pct", "ma_slope_per_wk", "rs_slope_per_wk"]:
+        if c in styled.columns:
+            styled[c] = styled[c].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "")
+
+    if "rs_above_ma" in styled.columns:
+        styled["rs_above_ma"] = styled["rs_above_ma"].map({True: "Yes", False: "No"})
+
+    # Use HTML badge for buy signal
+    if "buy_signal_html" in styled.columns:
+        styled["Buy Signal"] = styled["buy_signal_html"]
+    else:
+        styled["Buy Signal"] = styled.get("buy_signal", "")
+
+    columns_order = [
+        "ticker", "Buy Signal", "chart",
+        "stage", "short_term_state_wk",
+        "price", "ma10", "ma30", "dist_ma_pct",
+        "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk",
+        "notes"
+    ]
+    for c in columns_order:
+        if c not in styled.columns:
+            styled[c] = ""
+    styled = styled[columns_order]
+
+    table_html = styled.to_html(index=False, border=0, justify="center", escape=False)
+    css = """
+    <style>
+      body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height:1.45; padding:20px; color:#111; }
+      h2 { margin: 0 0 4px 0; }
+      .sub { color:#666; margin-bottom:16px; }
+      .summary { background:#f6f8fa; border:1px solid #eaecef; padding:10px 12px; border-radius:8px; margin:10px 0 16px 0; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; vertical-align: top; }
+      th { text-align:left; background:#fafafa; }
+      .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; border:1px solid transparent; }
+      .badge.buy { background:#eaffea; color:#106b21; border-color:#b8e7b9; }
+      .badge.watch { background:#fff6d6; color:#6b5310; border-color:#f0e2a6; }
+      .badge.avoid { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
+      img { image-rendering:-webkit-optimize-contrast; }
+    </style>
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    html = f"""{css}
+    <h2>{title}</h2>
+    <div class="sub">Generated {now}</div>
+    <div class="summary">{summary_line}</div>
+    {table_html}
+    """
+    return html
+
+# ---------- Main ----------
+def main():
+    cfg, tickers, benchmark, tz, output_dir, include_pdf, min_price, min_avg_volume = load_config()
+
+    if not tickers:
+        print("No tickers resolved from config.yaml (check universe.mode/custom/extra).")
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Universe size: {len(tickers)} tickers (benchmark: {benchmark})")
+    print("Downloading weekly data (Yahoo Finance)…")
+    close_w, volume_w = fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK)
+
+    print("Computing Weinstein stages…")
+    report_df = build_report_df(
+        close_w=close_w,
+        volume_w=volume_w,
+        tickers=tickers,
+        benchmark=benchmark,
+        min_price=min_price,
+        min_avg_volume=min_avg_volume,
+    )
+
+    # Add tiny charts for top candidates
+    report_with_charts = attach_tiny_charts(report_df, close_w, benchmark, top_n=TOP_N_CHARTS)
+
+    # Summary counts
+    buy_count = int((report_df["buy_signal"] == "BUY").sum())
+    watch_count = int((report_df["buy_signal"] == "WATCH").sum())
+    avoid_count = int((report_df["buy_signal"] == "AVOID").sum())
+    total = int(len(report_df))
+    summary_line = f"<strong>Summary:</strong> ✅ Buy: {buy_count} &nbsp; | &nbsp; 🟡 Watch: {watch_count} &nbsp; | &nbsp; 🔴 Avoid: {avoid_count} &nbsp; (Total: {total})"
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    csv_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.csv")
+    html_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.html")
+
+    # Save CSV (plain signal) and ALSO write the pipeline-friendly CSV
+    report_df.to_csv(csv_path, index=False)
+    # normalized CSV path expected by other steps:
+    classic_csv_path = os.path.join(output_dir, "scan_sp500.csv")
     try:
-        df = pd.read_csv(csv_path)
+        report_df.to_csv(classic_csv_path, index=False)
     except Exception as e:
-        print(f"⚠️  Failed to read classic CSV: {e}")
-        return None
-    if df.empty:
-        return None
-    return _render_classic_from_df(df, benchmark=benchmark)
+        print(f"⚠️  Could not write {classic_csv_path}: {e}")
 
+    # Build HTML with badges + charts + summary
+    html = df_to_html(
+        report_with_charts,
+        title=f"Weinstein Weekly — Benchmark: {benchmark}",
+        summary_line=summary_line
+    )
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
 
-def _render_classic_block_fallback_from_signals(sh, benchmark: str = "SPY") -> Optional[str]:
-    """If the CSV is missing, try to assemble a compatible dataframe from the Signals tab."""
+    # ALSO write the pipeline-friendly HTML path used by run_weekly.sh
+    combined_html = os.path.join(output_dir, "combined_weekly_email.html")
     try:
-        ws = sh.worksheet("Signals")
-    except Exception:
-        return None
-    values = ws.get_all_values()
-    if not values:
-        return None
-    header, rows = values[0], values[1:]
-    df = pd.DataFrame(rows, columns=header)
-    # Try to slim to useful columns; names are normalized later anyway.
-    # We'll rely on whatever exists in the sheet.
-    return _render_classic_from_df(df, benchmark=benchmark)
-
-
-# --------------------------------------------------------------------------------------
-# Top-level builder
-# --------------------------------------------------------------------------------------
-def build_weekly_summary(sheet_url: str, classic_csv: str = "./output/scan_sp500.csv") -> Tuple[str, bytes, pd.DataFrame]:
-    print("📊 Generating weekly Weinstein report…")
-    print("🔑 Authorizing service account…")
-    gc = _service_account_client()
-    sh = gc.open_by_url(sheet_url)
-
-    portfolio_html, csv_bytes, df_positions = _build_portfolio_block(sh)
-
-    # 1) Try CSV (original behavior)
-    classic_html = _render_classic_block_from_csv(classic_csv, benchmark="SPY")
-    if classic_html is None:
-        print(f"ℹ️  Classic scan CSV not found at {classic_csv}. Using Signals tab fallback.")
-        # 2) Fallback: build from Signals tab
-        classic_html = _render_classic_block_fallback_from_signals(sh, benchmark="SPY")
-
-    parts = []
-    if classic_html:
-        parts.append(classic_html)
-    else:
-        print("ℹ️  Could not build classic section from CSV nor Signals; proceeding with portfolio-only content.")
-    parts.append(portfolio_html)
-    html_body = "\n<hr/>\n".join(parts)
-
-    return html_body, csv_bytes, df_positions
-
-
-# --------------------------------------------------------------------------------------
-# Simple SMTP sender using config.yaml
-# --------------------------------------------------------------------------------------
-def _send_email_with_smtp(subject: str, html_body: str, csv_bytes: bytes, cfg_path="config.yaml") -> bool:
-    smtp_cfg = _read_smtp_from_yaml(cfg_path)
-    if not smtp_cfg or not smtp_cfg.get("enabled"):
-        print("ℹ️  Email sending is disabled in config.yaml or config not found.")
-        return False
-
-    recipients = smtp_cfg["recipients"]
-    if not recipients:
-        print("⚠️  Email enabled but no recipients configured under notifications.email.recipients")
-        return False
-    if not smtp_cfg["password"]:
-        print("⚠️  Email enabled but no app password found (yaml smtp.app_password or env GMAIL_APP_PASSWORD).")
-        return False
-
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    from email.mime.base import MIMEBase
-    from email import encoders
-
-    msg = MIMEMultipart()
-    msg["From"] = smtp_cfg["sender"]
-    msg["To"] = ", ".join(recipients)
-    prefix = smtp_cfg.get("subject_prefix") or ""
-    if prefix and not prefix.endswith(" "):
-        prefix += " "
-    msg["Subject"] = f"{prefix}Weinstein Weekly — {dt.date.today().isoformat()}"
-
-    msg.attach(MIMEText(html_body, "html"))
-
-    part = MIMEBase("application", "octet-stream")
-    part.set_payload(csv_bytes)
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f'attachment; filename="weekly_positions.csv"')
-    msg.attach(part)
-
-    try:
-        with smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"]) as server:
-            server.starttls()
-            server.login(smtp_cfg["username"], smtp_cfg["password"])
-            server.sendmail(smtp_cfg["sender"], recipients, msg.as_string())
-        print("📧 Email sent via SMTP.")
-        return True
+        with open(combined_html, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"✅ Combined weekly report written: {combined_html}")
     except Exception as e:
-        print(f"⚠️  SMTP send failed: {e}")
-        return False
+        print(f"⚠️  Could not write {combined_html}: {e}")
 
+    # Email it via your existing mailer
+    subject = f"Weinstein Weekly Report — {datetime.now().strftime('%b %d, %Y')}"
+    top_lines = report_df[["ticker", "stage", "buy_signal"]].head(12).to_string(index=False)
+    body_text = (
+        f"Summary: BUY={buy_count}, WATCH={watch_count}, AVOID={avoid_count} (Total={total})\n\n"
+        f"Files:\n- {csv_path}\n- {html_path}\n- {classic_csv_path}\n- {combined_html}\n\nTop lines:\n{top_lines}\n"
+    )
+    send_email(subject=subject, html_body=html, text_body=body_text, cfg_path="config.yaml")
 
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    # New/primary flags
-    parser.add_argument("--email", action="store_true", help="Send email using SMTP settings in config.yaml")
-    parser.add_argument("--sheet-url", required=True, help="Google Sheet URL")
-    parser.add_argument("--classic-csv", default="./output/scan_sp500.csv", help="Path to classic scan CSV")
-
-    # Legacy flags (accepted for compatibility with run_weekly.sh)
-    parser.add_argument("--write", action="store_true", help="(legacy) Write HTML (always done)")
-    parser.add_argument("--attach-html", action="store_true", help="(legacy) Also send email")
-
-    args = parser.parse_args(argv)
-
-    html_body, csv_bytes, _ = build_weekly_summary(args.sheet_url, classic_csv=args.classic_csv)
-
-    os.makedirs("output", exist_ok=True)
-    out_html = os.path.join("output", "combined_weekly_email.html")
-    with open(out_html, "w", encoding="utf-8") as f:
-        f.write(html_body)
-    print(f"✅ Combined weekly report written: {out_html}")
-
-    # Determine whether to email
-    send_email = bool(args.email or args.attach_html)
-    if send_email:
-        ok = _send_email_with_smtp(
-            subject=f"Weinstein Weekly — {dt.date.today().isoformat()}",
-            html_body=html_body,
-            csv_bytes=csv_bytes,
-            cfg_path=os.environ.get("CONFIG_FILE", "config.yaml"),
-        )
-        if not ok:
-            print("⚠️  Email step did not complete.")
+    # ---- Optional Google Sheets logging of weekly signals ----
+    if log_signal is not None:
+        print("Logging weekly signals to Google Sheets…")
+        for _, r in report_df.iterrows():
+            try:
+                event = str(r.get("buy_signal", "AVOID"))
+                stage = str(r.get("stage", ""))
+                st_state = str(r.get("short_term_state_wk", ""))
+                price = None if pd.isna(r.get("price", np.nan)) else float(r["price"])
+                log_signal(
+                    event=event,
+                    ticker=str(r["ticker"]),
+                    price=price,
+                    pivot=None,
+                    stage=stage,
+                    short_term_state=st_state,
+                    vol_pace=None,
+                    notes="",
+                    source="weekly"
+                )
+            except Exception as e:
+                print(f"  Sheets log failed for {r.get('ticker')}: {e}")
     else:
-        print("ℹ️  Email not requested (pass --email or legacy --attach-html to send).")
+        print("gsheet_helpers.log_signal not available; skipping Sheets logging.")
 
+    print(f"Saved:\n - {csv_path}\n - {html_path}")
+    print("Done.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit as e:
-        # propagate argparse exit codes intact
-        raise
-    except Exception as ex:
-        print(f"❌ Fatal error: {ex}")
-        sys.exit(1)
+    main()
