@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_weekly.sh – build BOTH weekly outputs:
 #   1) Performance Dashboard (Google Sheets tabs)
-#   2) Weinstein Weekly report (HTML/CSV/etc)
+#   2) Weinstein Weekly report (HTML/CSV + Email)
 #
 # Uses YAML ONLY to discover the Google Sheet URL.
 # No --config is passed to the Python scripts.
@@ -15,7 +15,7 @@ red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 
 CONFIG_PATH="${CONFIG_FILE:-./config.yaml}"
 
-# Activate venv if present
+# Activate virtual environment if present
 source .venv/bin/activate 2>/dev/null || true
 
 bold "🧾 Using config: $CONFIG_PATH"
@@ -58,21 +58,18 @@ except Exception as e:
 PY
 } 2>/dev/null
 
-# 1) Build the Google Sheets dashboard tabs (NO --config here)
+# 1️⃣ Build the Google Sheets dashboard tabs
 bold "📊 Building portfolio dashboard (Sheets)…"
 python3 build_performance_dashboard.py
 
-# 2) Generate the Weinstein Weekly report – pass ONLY --sheet-url (no --config)
+# 2️⃣ Generate + email the Weinstein Weekly report
 if [[ -z "${SHEET_URL}" ]]; then
   red "SHEET_URL not found in YAML. Set sheets.sheet_url OR sheets.daily_intake_sheet_id."
   exit 1
 fi
 
-bold "📰 Generating Weinstein Weekly report…"
-# Default behavior is just to write files; enable email/attach with env WEEKLY_FLAGS if you want.
-# Example: WEEKLY_FLAGS="--email --attach-html" ./run_weekly.sh
-WEEKLY_FLAGS_STR="${WEEKLY_FLAGS:-}"
-# shellcheck disable=SC2086
-python3 weinstein_report_weekly.py --sheet-url "${SHEET_URL}" --write ${WEEKLY_FLAGS_STR}
+bold "📰 Generating + emailing Weinstein Weekly report…"
+# Always send email with HTML attachment by default
+python3 weinstein_report_weekly.py --sheet-url "${SHEET_URL}" --write --email --attach-html
 
-green "✅ Weekly pipeline finished (Sheets + Weinstein report)."
+green "✅ Weekly pipeline finished (Sheets + Weinstein report emailed)."
