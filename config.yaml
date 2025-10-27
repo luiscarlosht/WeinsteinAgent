@@ -5,6 +5,7 @@ app:
   benchmark: SPY
   include_charts: true
 sheets:
+  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
   open_positions_tab: "Open_Positions"
   signals_tab: "Signals"
   output_dir: "./output"
@@ -38,7 +39,7 @@ risk:
   stop_below_ma_pct: 5#
 #google:
 #  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
-sheets:
-  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
+#sheets:
+#  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
 
 
