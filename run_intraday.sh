@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# run_intraday.sh – intraday watcher (YAML-driven)
-#
+# ============================================================
+# run_intraday.sh – Launches Weinstein Intraday Watcher
+# ------------------------------------------------------------
 # Example cron (ET every 10 min during session):
 # */10 9-16 * * 1-5 /bin/bash -lc 'cd ~/WeinsteinAgent && ./run_intraday.sh'
-#
-# You can still pin timezone with CRON_TZ if desired.
+# ============================================================
 
 set -euo pipefail
 
@@ -21,26 +21,33 @@ if [[ ! -r "$CONFIG_PATH" ]]; then
   exit 2
 fi
 
-# Activate venv if present
-source .venv/bin/activate 2>/dev/null || true
+# ------------------------------------------------------------
+# Activate virtual environment if it exists
+# ------------------------------------------------------------
+if [[ -d ".venv" ]]; then
+  source .venv/bin/activate 2>/dev/null || true
+fi
 
 bold "⚡ Intraday watcher using config: $CONFIG_PATH"
 
-# If your intraday Python supports --config, pass it here.
-# Replace the script name below with the one you actually use for intraday.
-# Common names from this project: weinstein_intraday.py or intraday_watcher.py
-PY_SCRIPT=""
-for cand in weinstein_intraday.py intraday_watcher.py intraday.py; do
-  [[ -f "$cand" ]] && PY_SCRIPT="$cand" && break
-done
+# ------------------------------------------------------------
+# Hard-wire the correct intraday Python script
+# ------------------------------------------------------------
+PY_SCRIPT="weinstein_intraday_watcher.py"
 
-if [[ -z "$PY_SCRIPT" ]]; then
-  red "Could not find an intraday Python script (tried: weinstein_intraday.py, intraday_watcher.py, intraday.py)."
-  red "Add or rename your intraday script accordingly."
+if [[ ! -f "$PY_SCRIPT" ]]; then
+  red "Error: Cannot find $PY_SCRIPT in the current directory."
+  red "Make sure you're in the ~/WeinsteinAgent folder."
   exit 2
 fi
 
+# ------------------------------------------------------------
+# Run the intraday watcher
+# ------------------------------------------------------------
 yellow "• Running: python3 $PY_SCRIPT --config $CONFIG_PATH"
-python3 "$PY_SCRIPT" --config "$CONFIG_PATH" "$@"
+python3 "$PY_SCRIPT" --config "$CONFIG_PATH" "$@" || {
+  red "❌ Intraday watcher encountered an error."
+  exit 1
+}
 
 green "✅ Intraday tick complete."
