@@ -2,19 +2,19 @@
 # weinstein_report_weekly.py
 #
 # Weekly report generator:
-# - Credential discovery prefers creds/gcp_service_account.json
-# - SMTP app password read from config.yaml (notifications.email.smtp.app_password)
-# - Builds portfolio summary + per-position snapshot from your Google Sheet
-# - If ./output/scan_sp500.csv exists, merges the classic Weinstein scan and renders:
-#     "Weinstein Weekly — Benchmark: SPY", generated timestamp,
-#     Buy/Watch/Avoid counts, and the scan table (robust column matching).
+# - Prefers creds/gcp_service_account.json (then creds/service_account.json or GOOGLE_APPLICATION_CREDENTIALS).
+# - SMTP app password read from config.yaml (notifications.email.smtp.app_password) or env GMAIL_APP_PASSWORD.
+# - Builds portfolio summary + per-position snapshot from Google Sheet.
+# - Classic section:
+#     * If ./output/scan_sp500.csv exists, render from it (original behavior).
+#     * Otherwise FALL BACK to build a classic-style table from the "Signals" tab.
 # - Writes output/combined_weekly_email.html
 # - Email sending:
-#     * --email                  -> send email (new flag)
-#     * --attach-html (legacy)   -> send email (compat with run_weekly.sh)
-#     * --write (legacy)         -> write HTML (already default; accepted & ignored)
+#     * --email                  -> send email via SMTP settings in config.yaml
+#     * --attach-html (legacy)   -> send email (compat with older run_weekly.sh)
+#     * --write (legacy)         -> accepted no-op (we always write HTML)
 #
-# Exit code 0 on success; non-zero on obvious failures.
+# Exit code 0 on success.
 
 import os
 import io
@@ -111,11 +111,11 @@ def _write_df(sh, name: str, df: pd.DataFrame):
         pass
     ws = sh.add_worksheet(title=name, rows=max(2, len(df) + 1), cols=max(2, len(df.columns)))
     if df.empty:
-        ws.update("A1", [[name]])
+        ws.update(values=[[name]], range_name="A1")
         return
-    ws.update("A1", [list(df.columns)])
+    ws.update(values=[list(df.columns)], range_name="A1")
     if len(df) > 0:
-        ws.update("A2", df.values.tolist())
+        ws.update(values=df.values.tolist(), range_name="A2")
 
 
 # --------------------------------------------------------------------------------------
@@ -145,10 +145,13 @@ def _build_portfolio_block(sh) -> Tuple[str, bytes, pd.DataFrame]:
     cost_total = _get_money("Cost Basis Total")
     current_value = _get_money("Current Value")
     gain_dollar = current_value - cost_total
-    gain_pct = (gain_dollar / cost_total.replace(0, pd.NA)).fillna(0.0) * 100.0
+    # avoid FutureWarning: convert to float early
+    cost_total_float = pd.to_numeric(cost_total, errors="coerce").astype(float)
+    denom = cost_total_float.replace(0, pd.NA)
+    gain_pct = (pd.to_numeric(gain_dollar, errors="coerce").astype(float) / denom).fillna(0.0) * 100.0
 
     total_gain = float(gain_dollar.sum())
-    portfolio_pct = float((gain_dollar.sum() / cost_total.sum() * 100.0) if cost_total.sum() else 0.0)
+    portfolio_pct = float((gain_dollar.sum() / cost_total_float.sum() * 100.0) if cost_total_float.sum() else 0.0)
     avg_pct = float(gain_pct.mean() if len(gain_pct) else 0.0)
 
     summary_html = f"""
@@ -211,6 +214,7 @@ def _build_portfolio_block(sh) -> Tuple[str, bytes, pd.DataFrame]:
 
 # --------------------------------------------------------------------------------------
 # Classic scan loader + renderer (robust to column naming)
+# Adds fallback: build from Signals sheet if CSV is missing.
 # --------------------------------------------------------------------------------------
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -230,27 +234,23 @@ def _label_to_bucket(val: str) -> str:
         return "Buy"
     if s.startswith("watch") or s.startswith("hold") or "basing" in s:
         return "Watch"
+    if s.startswith("avoid") or s.startswith("sell"):
+        return "Avoid"
     return "Avoid"
 
-def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str]:
-    if not os.path.exists(csv_path):
-        print(f"ℹ️  Classic scan CSV not found at {csv_path}. Skipping classic merge.")
-        return None
-
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        print("ℹ️  Classic scan CSV is empty. Skipping classic merge.")
+def _render_classic_from_df(df: pd.DataFrame, benchmark: str = "SPY") -> Optional[str]:
+    if df is None or df.empty:
         return None
 
     df = _normalize_columns(df)
 
     # identify key columns (robust to names)
     col_ticker = _pick_first(df, ["ticker", "symbol"])
-    col_label  = _pick_first(df, ["buy_signal", "signal", "recommendation", "verdict", "label", "rating"])
+    col_label  = _pick_first(df, ["buy_signal", "signal", "recommendation", "verdict", "label", "rating", "rec"])
     col_stage  = _pick_first(df, ["stage", "weinstein_stage"])
-    col_price  = _pick_first(df, ["price", "last", "close"])
+    col_price  = _pick_first(df, ["price", "last", "close", "last_price"])
     col_ma30   = _pick_first(df, ["ma30", "sma_30", "sma30"])
-    col_dist   = _pick_first(df, ["dist_ma_pct", "dist_from_ma_pct", "price_to_ma_pct"])
+    col_dist   = _pick_first(df, ["dist_ma_pct", "dist_from_ma_pct", "price_to_ma_pct", "dist_from_ma_30_pct"])
     col_slope  = _pick_first(df, ["ma_slope_per_wk", "ma_slope_weekly", "ma_trend_wk"])
     col_rs     = _pick_first(df, ["rs", "relative_strength"])
     col_rsma   = _pick_first(df, ["rs_ma30", "rs_ma_30", "rs_sma30"])
@@ -259,10 +259,7 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
     col_notes  = _pick_first(df, ["notes", "comment", "reason"])
 
     # derive counts
-    if col_label is None:
-        df["__label__"] = "Avoid"
-        col_label = "__label__"
-    buckets = df[col_label].fillna("").map(_label_to_bucket)
+    buckets = df[col_label].fillna("").map(_label_to_bucket) if col_label else pd.Series(["Avoid"] * len(df))
     buy_n = int((buckets == "Buy").sum())
     watch_n = int((buckets == "Watch").sum())
     avoid_n = int((buckets == "Avoid").sum())
@@ -270,19 +267,22 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
 
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Prepare rendered DF with preferred columns
     out_cols = []
+
     def _add(col_name: Optional[str], title: str):
         nonlocal out_cols
         if col_name and col_name in df.columns:
             out_cols.append((col_name, title))
 
+    # ticker
     _add(col_ticker, "ticker")
 
+    # pretty label
     pretty_label_col = "__pretty_label__"
     df[pretty_label_col] = buckets
     _add(pretty_label_col, "Buy Signal")
 
+    # chart link
     chart_col = "__chart__"
     def _chart_link(t):
         t = (t or "").strip().upper()
@@ -290,6 +290,7 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
     df[chart_col] = df[col_ticker].map(_chart_link) if col_ticker else ""
     _add(chart_col, "chart")
 
+    # remaining
     _add(col_stage, "stage")
     _add(col_price, "price")
     _add(col_ma30, "ma30")
@@ -317,9 +318,37 @@ def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str
     table += "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>\n"
     for _, r in out_df.iterrows():
         table += "<tr>" + "".join(f"<td>{r[h]}</td>" for h in headers) + "</tr>\n"
-        # no truncation
     table += "</table>\n"
     return hdr + table
+
+
+def _render_classic_block_from_csv(csv_path: str, benchmark: str = "SPY") -> Optional[str]:
+    if not os.path.exists(csv_path):
+        return None
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"⚠️  Failed to read classic CSV: {e}")
+        return None
+    if df.empty:
+        return None
+    return _render_classic_from_df(df, benchmark=benchmark)
+
+
+def _render_classic_block_fallback_from_signals(sh, benchmark: str = "SPY") -> Optional[str]:
+    """If the CSV is missing, try to assemble a compatible dataframe from the Signals tab."""
+    try:
+        ws = sh.worksheet("Signals")
+    except Exception:
+        return None
+    values = ws.get_all_values()
+    if not values:
+        return None
+    header, rows = values[0], values[1:]
+    df = pd.DataFrame(rows, columns=header)
+    # Try to slim to useful columns; names are normalized later anyway.
+    # We'll rely on whatever exists in the sheet.
+    return _render_classic_from_df(df, benchmark=benchmark)
 
 
 # --------------------------------------------------------------------------------------
@@ -332,11 +361,19 @@ def build_weekly_summary(sheet_url: str, classic_csv: str = "./output/scan_sp500
     sh = gc.open_by_url(sheet_url)
 
     portfolio_html, csv_bytes, df_positions = _build_portfolio_block(sh)
-    classic_html = _render_classic_block(classic_csv, benchmark="SPY")
+
+    # 1) Try CSV (original behavior)
+    classic_html = _render_classic_block_from_csv(classic_csv, benchmark="SPY")
+    if classic_html is None:
+        print(f"ℹ️  Classic scan CSV not found at {classic_csv}. Using Signals tab fallback.")
+        # 2) Fallback: build from Signals tab
+        classic_html = _render_classic_block_fallback_from_signals(sh, benchmark="SPY")
 
     parts = []
     if classic_html:
         parts.append(classic_html)
+    else:
+        print("ℹ️  Could not build classic section from CSV nor Signals; proceeding with portfolio-only content.")
     parts.append(portfolio_html)
     html_body = "\n<hr/>\n".join(parts)
 
