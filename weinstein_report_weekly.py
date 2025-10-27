@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 # weinstein_report_weekly.py
 #
-# Drop-in replacement that:
-#  - Fixes credential discovery (prefers creds/gcp_service_account.json)
-#  - Reads SMTP app password from config.yaml at notifications.email.smtp.app_password
-#  - Keeps your output & prints the same (Weekly_Report tab + HTML/CSV + optional email)
+# Weekly report generator:
+# - Fixes credential discovery (prefers creds/gcp_service_account.json)
+# - Reads SMTP app password from config.yaml (notifications.email.smtp.app_password)
+# - Builds portfolio summary + per-position snapshot
+# - If ./output/scan_sp500.csv exists, merges the classic Weinstein scan and renders:
+#     "Weinstein Weekly — Benchmark: SPY", generated timestamp,
+#     Buy/Watch/Avoid counts, and the scan table (robust columns).
+# - Writes output/combined_weekly_email.html
+# - Optionally emails via SMTP with --email
 
 import os
-import sys
 import io
+import sys
 import argparse
 import datetime as dt
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, List
 
 import pandas as pd
 
@@ -29,6 +34,7 @@ try:
 except Exception:
     gspread = None
     _Creds = None
+
 
 # --------------------------------------------------------------------------------------
 # Credentials: prefer creds/gcp_service_account.json, then creds/service_account.json,
@@ -63,6 +69,7 @@ def _service_account_client():
     creds = _Creds.from_service_account_file(sa_path, scopes=scopes)
     return gspread.authorize(creds)
 
+
 # --------------------------------------------------------------------------------------
 # Read email settings from config.yaml (and fallback env var for app password)
 # --------------------------------------------------------------------------------------
@@ -87,6 +94,7 @@ def _read_smtp_from_yaml(cfg_path="config.yaml"):
         print(f"⚠️  Could not read SMTP config from YAML: {ex}")
         return None
 
+
 # --------------------------------------------------------------------------------------
 # Utility: write or replace a sheet tab with a DataFrame
 # --------------------------------------------------------------------------------------
@@ -104,52 +112,40 @@ def _write_df(sh, name: str, df: pd.DataFrame):
     if len(df) > 0:
         ws.update("A2", df.values.tolist())
 
-# --------------------------------------------------------------------------------------
-# Build the simple weekly summary you showed in your logs
-# --------------------------------------------------------------------------------------
-def build_weekly_summary(sheet_url: str) -> Tuple[str, bytes, pd.DataFrame]:
-    print("📊 Generating weekly Weinstein report…")
-    print("🔑 Authorizing service account…")
-    gc = _service_account_client()
-    sh = gc.open_by_url(sheet_url)
 
-    # Pull holdings/open positions to build the summary table
+# --------------------------------------------------------------------------------------
+# Portfolio report (unchanged behavior but resilient to missing columns)
+# --------------------------------------------------------------------------------------
+def _build_portfolio_block(sh) -> Tuple[str, bytes, pd.DataFrame]:
+    # Load Open_Positions (fallback to Holdings)
     try:
         ws = sh.worksheet("Open_Positions")
     except Exception:
-        # fallback to a common alt name if needed
         ws = sh.worksheet("Holdings")
     values = ws.get_all_values()
     header, rows = values[0], values[1:]
     df = pd.DataFrame(rows, columns=header)
 
-    # Compute a minimal set of metrics so your email looks like the current format
-    # We’ll try to read columns that typically exist; if missing, we’ll be robust.
-    def _money(col):
+    def _money(series: pd.Series) -> pd.Series:
+        return (series.replace({"\\$": "", ",": ""}, regex=True)
+                      .replace("", "0")
+                      .pipe(pd.to_numeric, errors="coerce")
+                      .fillna(0.0))
+
+    def _get_money(col: str) -> pd.Series:
         if col not in df.columns:
             return pd.Series([0.0]*len(df))
-        return (df[col]
-                .replace({"\\$": "", ",": ""}, regex=True)
-                .replace("", "0")
-                .astype(float))
+        return _money(df[col])
 
-    def _num(col):
-        if col not in df.columns:
-            return pd.Series([0.0]*len(df))
-        return pd.to_numeric(df[col].replace("", "0"), errors="coerce").fillna(0.0)
-
-    current_value = _money("Current Value")
-    cost_total    = _money("Cost Basis Total")
-    gain_dollar   = current_value - cost_total
-    gain_pct      = (gain_dollar / cost_total.replace(0, pd.NA)).fillna(0.0) * 100.0
+    cost_total = _get_money("Cost Basis Total")
+    current_value = _get_money("Current Value")
+    gain_dollar = current_value - cost_total
+    gain_pct = (gain_dollar / cost_total.replace(0, pd.NA)).fillna(0.0) * 100.0
 
     total_gain = float(gain_dollar.sum())
-    # "Portfolio % Gain": total gain divided by total cost
     portfolio_pct = float((gain_dollar.sum() / cost_total.sum() * 100.0) if cost_total.sum() else 0.0)
-    # "Average % Gain": mean of per-position pct
-    avg_pct = float(gain_pct.mean()) if len(gain_pct) else 0.0
+    avg_pct = float(gain_pct.mean() if len(gain_pct) else 0.0)
 
-    # Emit the pretty HTML block (current format)
     summary_html = f"""
 <h2>Weinstein Weekly - Summary</h2>
 <table border="1" cellspacing="0" cellpadding="6">
@@ -160,8 +156,7 @@ def build_weekly_summary(sheet_url: str) -> Tuple[str, bytes, pd.DataFrame]:
 </table>
 """
 
-    # Keep your “Per-position Snapshot” table
-    # We’ll try to echo the columns you showed; if missing we skip gracefully.
+    # Per-position snapshot table (if columns exist)
     cols_keep = [
         "Symbol", "Description", "Quantity", "Last Price", "Current Value",
         "Cost Basis Total", "Average Cost Basis", "Total Gain/Loss Dollar",
@@ -169,22 +164,22 @@ def build_weekly_summary(sheet_url: str) -> Tuple[str, bytes, pd.DataFrame]:
     ]
     present = [c for c in cols_keep if c in df.columns]
     if present:
-        # add computed columns if they’re missing so the table stays rich
+        # enrich if missing
         if "Total Gain/Loss Dollar" not in df.columns:
             df["Total Gain/Loss Dollar"] = gain_dollar.map(lambda x: f"{x:,.2f}")
         if "Total Gain/Loss Percent" not in df.columns:
             df["Total Gain/Loss Percent"] = gain_pct.map(lambda x: f"{x:.2f}%")
 
         snap = df[present].copy()
-        # format some money/price fields if they exist
         for col in ["Last Price", "Current Value", "Cost Basis Total", "Average Cost Basis"]:
             if col in snap.columns:
-                snap[col] = pd.to_numeric(snap[col].replace({"\\$": "", ",": ""}, regex=True), errors="coerce").fillna(0.0)
-                snap[col] = snap[col].map(lambda x: f"${x:,.2f}")
+                snap[col] = pd.to_numeric(
+                    snap[col].replace({"\\$": "", ",": ""}, regex=True),
+                    errors="coerce"
+                ).fillna(0.0).map(lambda x: f"${x:,.2f}")
         if "Quantity" in snap.columns:
             snap["Quantity"] = pd.to_numeric(snap["Quantity"], errors="coerce").fillna(0.0).map(lambda x: f"{x:,.2f}")
 
-        # HTML table
         snap_html = "<h3>Per-position Snapshot</h3>\n<table border='1' cellspacing='0' cellpadding='4'>\n"
         snap_html += "<tr>" + "".join(f"<th>{c}</th>" for c in snap.columns) + "</tr>\n"
         for _, r in snap.iterrows():
@@ -193,21 +188,163 @@ def build_weekly_summary(sheet_url: str) -> Tuple[str, bytes, pd.DataFrame]:
     else:
         snap_html = "<p>(No per-position columns found to render a snapshot.)</p>"
 
-    html_body = summary_html + "\n" + snap_html
-
-    # CSV bytes
+    # CSV for attachment
     csv_buf = io.StringIO()
     df.to_csv(csv_buf, index=False)
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
-    # Also write the Weekly_Report tab you showed in logs
+    # Also write Weekly_Report tab
     _write_df(sh, "Weekly_Report", pd.DataFrame({
         "Metric": ["Total Gain/Loss ($)", "Portfolio % Gain", "Average % Gain"],
         "Value":  [f"${total_gain:,.2f}", f"{portfolio_pct:.2f}%", f"{avg_pct:.2f}%"],
     }))
     print("✅ Wrote Weekly_Report tab.")
     print("🎯 Done.")
-    return html_body, csv_bytes, df
+
+    return summary_html + "\n" + snap_html, csv_bytes, df
+
+
+# --------------------------------------------------------------------------------------
+# Classic scan loader + renderer (robust to column naming)
+# --------------------------------------------------------------------------------------
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    mapping = {c: c.strip().lower().replace(" ", "_") for c in df.columns}
+    df.columns = [mapping[c] for c in df.columns]
+    return df
+
+def _pick_first(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+def _label_to_bucket(val: str) -> str:
+    s = (val or "").strip().lower()
+    if s.startswith("buy") or s == "long" or s == "accumulate":
+        return "Buy"
+    if s.startswith("watch") or s.startswith("hold") or "basing" in s:
+        return "Watch"
+    return "Avoid"
+
+def _render_classic_block(csv_path: str, benchmark: str = "SPY") -> Optional[str]:
+    if not os.path.exists(csv_path):
+        print(f"ℹ️  Classic scan CSV not found at {csv_path}. Skipping classic merge.")
+        return None
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print("ℹ️  Classic scan CSV is empty. Skipping classic merge.")
+        return None
+
+    df = _normalize_columns(df)
+
+    # identify key columns (robust to names)
+    col_ticker = _pick_first(df, ["ticker", "symbol"])
+    col_label  = _pick_first(df, ["buy_signal", "signal", "recommendation", "verdict", "label", "rating"])
+    col_stage  = _pick_first(df, ["stage", "weinstein_stage"])
+    col_price  = _pick_first(df, ["price", "last", "close"])
+    col_ma30   = _pick_first(df, ["ma30", "sma_30", "sma30"])
+    col_dist   = _pick_first(df, ["dist_ma_pct", "dist_from_ma_pct", "price_to_ma_pct"])
+    col_slope  = _pick_first(df, ["ma_slope_per_wk", "ma_slope_weekly", "ma_trend_wk"])
+    col_rs     = _pick_first(df, ["rs", "relative_strength"])
+    col_rsma   = _pick_first(df, ["rs_ma30", "rs_ma_30", "rs_sma30"])
+    col_rs_ab  = _pick_first(df, ["rs_above_ma", "rs_gt_ma", "rs_vs_ma"])
+    col_rsslp  = _pick_first(df, ["rs_slope_per_wk", "rs_slope_weekly"])
+    col_notes  = _pick_first(df, ["notes", "comment", "reason"])
+
+    # derive counts
+    if col_label is None:
+        # fabricate a neutral column so we still show something
+        df["__label__"] = "Avoid"
+        col_label = "__label__"
+    buckets = df[col_label].fillna("").map(_label_to_bucket)
+    buy_n = int((buckets == "Buy").sum())
+    watch_n = int((buckets == "Watch").sum())
+    avoid_n = int((buckets == "Avoid").sum())
+    total_n = int(len(df))
+
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Prepare rendered DF with the preferred columns/order if present
+    out_cols = []
+    def _add(col_name: str, title: str):
+        nonlocal out_cols
+        if col_name and col_name in df.columns:
+            out_cols.append((col_name, title))
+
+    _add(col_ticker, "ticker")
+    # 'Buy Signal' column: normalize to "Buy/Watch/Avoid"
+    pretty_label_col = "__pretty_label__"
+    df[pretty_label_col] = buckets
+    _add(pretty_label_col, "Buy Signal")
+
+    # Chart hyperlink
+    chart_col = "__chart__"
+    def _chart_link(t):
+        t = (t or "").strip().upper()
+        return f'<a href="https://www.tradingview.com/symbols/{t}/" target="_blank">chart</a>' if t else ""
+    df[chart_col] = df[col_ticker].map(_chart_link) if col_ticker else ""
+    _add(chart_col, "chart")
+
+    _add(col_stage, "stage")
+    _add(col_price, "price")
+    _add(col_ma30, "ma30")
+    _add(col_dist, "dist_ma_pct")
+    _add(col_slope, "ma_slope_per_wk")
+    _add(col_rs, "rs")
+    _add(col_rsma, "rs_ma30")
+    _add(col_rs_ab, "rs_above_ma")
+    _add(col_rsslp, "rs_slope_per_wk")
+    _add(col_notes, "notes")
+
+    if not out_cols:
+        # if we couldn't identify anything, just show the raw CSV
+        out_df = df
+        headers = list(out_df.columns)
+    else:
+        headers = [t for _, t in out_cols]
+        out_df = pd.DataFrame({t: df[c] for c, t in out_cols})
+
+    # build HTML
+    hdr = f"""
+<h2>Weinstein Weekly — Benchmark: {benchmark}</h2>
+<p><em>Generated {ts}</em></p>
+<p><strong>Summary:</strong> ✅ Buy: {buy_n} &nbsp;&nbsp;|&nbsp;&nbsp; 🟡 Watch: {watch_n} &nbsp;&nbsp;|&nbsp;&nbsp; 🔴 Avoid: {avoid_n} &nbsp;&nbsp; (Total: {total_n})</p>
+"""
+    table = "<table border='1' cellspacing='0' cellpadding='4'>\n"
+    table += "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>\n"
+    # don't truncate; render everything
+    for _, r in out_df.iterrows():
+        table += "<tr>" + "".join(f"<td>{r[h]}</td>" for h in headers) + "</tr>\n"
+    table += "</table>\n"
+    return hdr + table
+
+
+# --------------------------------------------------------------------------------------
+# Top-level builder
+# --------------------------------------------------------------------------------------
+def build_weekly_summary(sheet_url: str, classic_csv: str = "./output/scan_sp500.csv") -> Tuple[str, bytes, pd.DataFrame]:
+    print("📊 Generating weekly Weinstein report…")
+    print("🔑 Authorizing service account…")
+    gc = _service_account_client()
+    sh = gc.open_by_url(sheet_url)
+
+    # Portfolio block
+    portfolio_html, csv_bytes, df_positions = _build_portfolio_block(sh)
+
+    # Classic block (if present)
+    classic_html = _render_classic_block(classic_csv, benchmark="SPY")
+
+    # Assemble combined HTML
+    parts = []
+    if classic_html:
+        parts.append(classic_html)
+    parts.append(portfolio_html)
+    html_body = "\n<hr/>\n".join(parts)
+
+    return html_body, csv_bytes, df_positions
+
 
 # --------------------------------------------------------------------------------------
 # Simple SMTP sender using config.yaml
@@ -242,7 +379,7 @@ def _send_email_with_smtp(subject: str, html_body: str, csv_bytes: bytes, cfg_pa
 
     msg.attach(MIMEText(html_body, "html"))
 
-    # attach CSV
+    # attach CSV of positions
     part = MIMEBase("application", "octet-stream")
     part.set_payload(csv_bytes)
     encoders.encode_base64(part)
@@ -260,21 +397,19 @@ def _send_email_with_smtp(subject: str, html_body: str, csv_bytes: bytes, cfg_pa
         print(f"⚠️  SMTP send failed: {e}")
         return False
 
+
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--write", action="store_true", help="(kept for compatibility; HTML always written to output)")
     parser.add_argument("--email", action="store_true", help="Send email using SMTP settings in config.yaml")
-    parser.add_argument("--attach-html", action="store_true", help="(kept for compatibility; body is HTML)")
     parser.add_argument("--sheet-url", required=True, help="Google Sheet URL")
-    parser.add_argument("--config", help="(ignored; kept for compatibility)")
+    parser.add_argument("--classic-csv", default="./output/scan_sp500.csv", help="Path to classic scan CSV")
     args = parser.parse_args(argv)
 
-    html_body, csv_bytes, df = build_weekly_summary(args.sheet_url)
+    html_body, csv_bytes, _ = build_weekly_summary(args.sheet_url, classic_csv=args.classic_csv)
 
-    # Always write combined output HTML (kept same path used by run_weekly.sh)
     os.makedirs("output", exist_ok=True)
     out_html = os.path.join("output", "combined_weekly_email.html")
     with open(out_html, "w", encoding="utf-8") as f:
@@ -282,13 +417,13 @@ def main(argv=None):
     print(f"✅ Combined weekly report written: {out_html}")
 
     if args.email:
-        # Subject roughly like before
         subject = f"Weinstein Weekly — {dt.date.today().isoformat()}"
         ok = _send_email_with_smtp(subject, html_body, csv_bytes, cfg_path=os.environ.get("CONFIG_FILE", "config.yaml"))
         if not ok:
             print("⚠️  Email step did not complete.")
     else:
         print("ℹ️  --email not passed; skipping email.")
+
 
 if __name__ == "__main__":
     main()
