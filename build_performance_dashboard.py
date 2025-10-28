@@ -7,6 +7,8 @@ Build Google Sheets dashboard tabs:
 - Open_Positions
 - Performance_By_Source
 - OpenLots_Detail
+- Open_Positions_Snapshot   (NEW – aggregates open lots per ticker with live P/L)
+- Weekly_Report             (NEW – summary metrics that reference the snapshot)
 
 Reads tabs:
   - Signals
@@ -73,7 +75,7 @@ def load_cfg(path: str) -> dict:
     """Load YAML; tolerate missing file by returning {}."""
     if not path or not os.path.exists(path):
         return {}
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 def resolve_sheet_url(cfg: dict) -> Optional[str]:
@@ -396,7 +398,6 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, 
 
 # ─────────────────────────────
 # FIFO MATCHING
-# (unchanged)
 # ─────────────────────────────
 def build_realized_and_open(
     tx: pd.DataFrame,
@@ -529,7 +530,7 @@ def build_realized_and_open(
     return realized_df, open_df, unmatched_sells
 
 # ─────────────────────────────
-# PERFORMANCE TABLE (unchanged)
+# PERFORMANCE TABLE
 # ─────────────────────────────
 def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
     if realized_df.empty:
@@ -566,7 +567,7 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
 
     for c in ["Trades", "Wins", "OpenLots", "OpenTickers"]:
         if c in perf.columns:
-            perf[c] = pd.to_numeric(perf[c], errors="coerce").fillna(0).astype(int)
+            perf[c] = pd.to_numeric(p, errors="coerce").fillna(0).astype(int) if (p:=perf[c]) is not None else 0
     for c in ["WinRate%", "AvgReturn%", "MedianReturn%"]:
         if c in perf.columns:
             perf[c] = pd.to_numeric(perf[c], errors="coerce").fillna(0.0)
@@ -598,7 +599,7 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
     return perf
 
 # ─────────────────────────────
-# REPORT HELPERS (unchanged)
+# REPORT HELPERS
 # ─────────────────────────────
 def print_unknown_sources(realized_df: pd.DataFrame, open_df: pd.DataFrame):
     unk_real = []
@@ -622,6 +623,87 @@ def print_open_breakdown(open_df: pd.DataFrame):
     g = open_df.groupby(["Source", "Ticker"]).size().rename("Lots").reset_index()
     for _, r in g.sort_values(["Source", "Ticker"]).iterrows():
         print(f"  - {r['Source']}: {r['Ticker']} → {int(r['Lots'])} lot(s)")
+
+# ─────────────────────────────
+# SNAPSHOT + WEEKLY REPORT WRITERS (NEW)
+# ─────────────────────────────
+def write_snapshot_sheet(gc, sheet_url: str, tab_open_detail: str = "OpenLots_Detail",
+                         snapshot_tab: str = "Open_Positions_Snapshot"):
+    """
+    Creates/overwrites a sheet 'Open_Positions_Snapshot' and fills it with
+    ARRAYFORMULA-based aggregation that references OpenLots_Detail.
+    Columns:
+      A Ticker
+      B Quantity
+      C Avg Entry (weighted)
+      D Cost Basis Total
+      E PriceNow (GOOGLEFINANCE w/ exchange fallbacks)
+      F Current Value
+      G Total Gain/Loss $
+      H Total Gain/Loss %
+    """
+    ws = open_ws(gc, sheet_url, snapshot_tab)
+    ws.clear()
+    # Headers
+    ws.update("A1:H1", [[
+        "Ticker", "Quantity", "Avg Entry", "Cost Basis Total",
+        "PriceNow", "Current Value", "Total Gain/Loss $", "Total Gain/Loss %"
+    ]])
+
+    # A2:B via QUERY (Ticker + sum qty)
+    a2 = (
+        f'=QUERY({tab_open_detail}!B:C,'
+        f'"select B, sum(C) where B is not null group by B label sum(C) \'Quantity\'",1)'
+    )
+    # C2: weighted avg entry = SUMIF(qty*entry)/SUMIF(qty)
+    c2 = (
+        f'=ARRAYFORMULA(IF(A2:A="","",'
+        f'  ROUND('
+        f'    SUMIF({tab_open_detail}!B:B,A2:A,{tab_open_detail}!C:C*{tab_open_detail}!D:D)/'
+        f'    SUMIF({tab_open_detail}!B:B,A2:A,{tab_open_detail}!C:C)'
+        f'  ,4)))'
+    )
+    # D2: cost basis
+    d2 = '=ARRAYFORMULA(IF(A2:A="","", ROUND(B2:B * C2:C, 2)))'
+    # E2: live price (fallback across exchanges)
+    e2 = (
+        '=ARRAYFORMULA(IF(A2:A="","",'
+        ' IFERROR(GOOGLEFINANCE(A2:A,"price"),'
+        '  IFERROR(GOOGLEFINANCE("NYSE:"&A2:A,"price"),'
+        '   IFERROR(GOOGLEFINANCE("NASDAQ:"&A2:A,"price"),"")))))'
+    )
+    # F2: current value
+    f2 = '=ARRAYFORMULA(IF(A2:A="","", ROUND(B2:B * E2:E, 2)))'
+    # G2: P/L $
+    g2 = '=ARRAYFORMULA(IF(A2:A="","", ROUND(F2:F - D2:D, 2)))'
+    # H2: P/L %
+    h2 = '=ARRAYFORMULA(IF(A2:A="","", IF(D2:D=0,"", ROUND((F2:F/D2:D - 1)*100, 2))))'
+
+    # Set the starter cells (array formulas will spill down automatically)
+    ws.update("A2", a2)
+    ws.update("C2", c2)
+    ws.update("D2", d2)
+    ws.update("E2", e2)
+    ws.update("F2", f2)
+    ws.update("G2", g2)
+    ws.update("H2", h2)
+
+def write_weekly_report_sheet(gc, sheet_url: str, snapshot_tab: str = "Open_Positions_Snapshot",
+                              weekly_tab: str = "Weekly_Report"):
+    """
+    Creates/overwrites 'Weekly_Report' with 3 metrics that reference the snapshot.
+    Values are numeric (you can format as $ / % in Sheets).
+    """
+    ws = open_ws(gc, sheet_url, weekly_tab)
+    ws.clear()
+    ws.update("A1:B1", [["Metric", "Value"]])
+
+    rows = [
+        ["Total Gain/Loss ($)", f'=IFERROR(SUM({snapshot_tab}!G2:G), 0)'],
+        ["Portfolio % Gain",    f'=IFERROR(SUM({snapshot_tab}!G2:G) / SUM({snapshot_tab}!D2:D), 0)'],
+        ["Average % Gain",      f'=IFERROR(AVERAGE(FILTER({snapshot_tab}!H2:H, LEN({snapshot_tab}!H2:H))), 0)'],
+    ]
+    ws.update("A2:B4", rows)
 
 # ─────────────────────────────
 # MAIN
@@ -723,6 +805,13 @@ def main():
     write_tab(ws_open, open_df)
     write_tab(ws_perf, perf_df)
     write_tab(ws_open_detail, open_detail_df)
+
+    # NEW: build the snapshot and weekly summary (solves the "zeros" issue)
+    try:
+        write_snapshot_sheet(gc, sheet_url, tab_open_detail=tab_open_det, snapshot_tab="Open_Positions_Snapshot")
+        write_weekly_report_sheet(gc, sheet_url, snapshot_tab="Open_Positions_Snapshot", weekly_tab="Weekly_Report")
+    except Exception as e:
+        print(f"⚠️ Could not refresh snapshot/weekly tabs: {e}")
 
     print(f"✅ Wrote {tab_real}: {len(realized_df)} rows")
     print(f"✅ Wrote {tab_openpos}: {len(open_df)} rows")
