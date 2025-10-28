@@ -6,6 +6,7 @@ app:
 
 sheets:
   url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
+  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
   open_positions_tab: "Open_Positions"
   signals_tab: "Signals"
   output_dir: "./output"
