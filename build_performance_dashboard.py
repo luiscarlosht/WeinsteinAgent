@@ -858,7 +858,7 @@ def main():
         snap_ws = open_ws(gc, sheet_url, TAB_SNAPSHOT)
         weekly_ws = open_ws(gc, sheet_url, TAB_WEEKLY)
 
-        snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping)
+        snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping, price_source="yfinance")
         write_tab(snap_ws, snapshot_df)
 
         weekly_df = build_weekly_df(TAB_SNAPSHOT)
