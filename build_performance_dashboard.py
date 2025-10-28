@@ -7,8 +7,8 @@ Build Google Sheets dashboard tabs:
 - Open_Positions
 - Performance_By_Source
 - OpenLots_Detail
-- Open_Positions_Snapshot   (NEW – aggregates open lots per ticker with live P/L)
-- Weekly_Report             (NEW – summary metrics that reference the snapshot)
+- Open_Positions_Snapshot   (NEW)
+- Weekly_Report             (NEW)
 
 Reads tabs:
   - Signals
@@ -65,6 +65,10 @@ TAB_OPEN         = "Open_Positions"
 TAB_PERF         = "Performance_By_Source"
 TAB_OPEN_DETAIL  = "OpenLots_Detail"
 
+# NEW tabs
+TAB_SNAPSHOT     = "Open_Positions_Snapshot"
+TAB_WEEKLY       = "Weekly_Report"
+
 DEFAULT_EXCHANGE_PREFIX = "NYSE: "
 ROW_CHUNK = 500
 
@@ -75,7 +79,7 @@ def load_cfg(path: str) -> dict:
     """Load YAML; tolerate missing file by returning {}."""
     if not path or not os.path.exists(path):
         return {}
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r") as f:
         return yaml.safe_load(f) or {}
 
 def resolve_sheet_url(cfg: dict) -> Optional[str]:
@@ -129,6 +133,10 @@ def read_tab(ws) -> pd.DataFrame:
     return strip_strings_df(df)
 
 def write_tab(ws, df: pd.DataFrame):
+    """
+    Safe writer that always provides VALUES first, then range_name, to match the
+    current gspread signature (and avoid the "Invalid value at 'data.values'" error).
+    """
     ws.clear()
     if df.empty:
         ws.resize(rows=100, cols=8)
@@ -139,7 +147,7 @@ def write_tab(ws, df: pd.DataFrame):
     header = [str(c) for c in df.columns]
     data = [header] + df.astype(str).fillna("").values.tolist()
 
-    # Chunked upload (new gspread signature: update(values, range_name=...))
+    # Chunked upload (values first, then range_name)
     start = 0
     r = 1
     while start < len(data):
@@ -212,11 +220,23 @@ def read_mapping(gc, sheet_url: str) -> Dict[str, Dict[str, str]]:
     except Exception:
         return {}
 
-def googlefinance_formula_for(ticker: str, row_idx: int, mapping: Dict[str, Dict[str, str]]) -> str:
+def googlefinance_symbol_for(ticker: str, mapping: Dict[str, Dict[str, str]]) -> str:
+    """
+    Resolve the GOOGLEFINANCE symbol string for a ticker, preferring Mapping.FormulaSym,
+    else `${DEFAULT_EXCHANGE_PREFIX}${base_symbol}`.
+    """
     base = base_symbol_from_string(ticker)
     mapped = mapping.get(ticker, {}) or mapping.get(base, {}) or {}
-    sym = mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
-    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_idx},"price"), ""))'
+    return mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
+
+def googlefinance_formula_for_cell(ticker: str, row_idx: int, mapping: Dict[str, Dict[str, str]]) -> str:
+    """
+    Build a robust GOOGLEFINANCE(price) formula:
+      1) Try mapped/static exchange symbol
+      2) Fallback to the value in column A (Symbol) of this row
+    """
+    sym = googlefinance_symbol_for(ticker, mapping)
+    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(A{row_idx},"price"), ""))'
 
 # ─────────────────────────────
 # LOAD SIGNALS
@@ -373,7 +393,7 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
     return df_tr[["When", "Type", "Symbol", "Qty", "Price"]], pd.DataFrame()
 
 # ─────────────────────────────
-# LIVE PRICE FORMULAS
+# LIVE PRICE FORMULAS (Open_Positions tab)
 # ─────────────────────────────
 def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
     if open_df.empty:
@@ -385,7 +405,10 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, 
         tkr = r["Ticker"]
         ep  = r.get("EntryPrice")
         row_index = idx + 2  # header row is 1
-        formula = googlefinance_formula_for(tkr, row_index, mapping)
+        # NOTE: This formula assumes the "Ticker" is in column B on that tab.
+        # It is fine for our Open_Positions layout.
+        sym = googlefinance_symbol_for(tkr, mapping)
+        formula = f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_index},"price"), ""))'
         price_now.append(formula)
         try:
             epf = float(ep)
@@ -409,6 +432,7 @@ def build_realized_and_open(
     if tx.empty:
         return pd.DataFrame(), pd.DataFrame(), []
 
+    # Index signals by (Ticker, time), only BUY signals
     sig_buy = sig[(sig["Direction"].str.upper() == "BUY") & sig["Ticker"].ne("")].copy()
     sig_buy.sort_values(["Ticker", "TimestampUTC"], inplace=True, ignore_index=True)
 
@@ -567,7 +591,7 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
 
     for c in ["Trades", "Wins", "OpenLots", "OpenTickers"]:
         if c in perf.columns:
-            perf[c] = pd.to_numeric(p, errors="coerce").fillna(0).astype(int) if (p:=perf[c]) is not None else 0
+            perf[c] = pd.to_numeric(perf[c], errors="coerce").fillna(0).astype(int)
     for c in ["WinRate%", "AvgReturn%", "MedianReturn%"]:
         if c in perf.columns:
             perf[c] = pd.to_numeric(perf[c], errors="coerce").fillna(0.0)
@@ -625,85 +649,103 @@ def print_open_breakdown(open_df: pd.DataFrame):
         print(f"  - {r['Source']}: {r['Ticker']} → {int(r['Lots'])} lot(s)")
 
 # ─────────────────────────────
-# SNAPSHOT + WEEKLY REPORT WRITERS (NEW)
+# NEW: SNAPSHOT & WEEKLY BUILDERS
 # ─────────────────────────────
-def write_snapshot_sheet(gc, sheet_url: str, tab_open_detail: str = "OpenLots_Detail",
-                         snapshot_tab: str = "Open_Positions_Snapshot"):
+def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
     """
-    Creates/overwrites a sheet 'Open_Positions_Snapshot' and fills it with
-    ARRAYFORMULA-based aggregation that references OpenLots_Detail.
-    Columns:
-      A Ticker
-      B Quantity
-      C Avg Entry (weighted)
-      D Cost Basis Total
-      E PriceNow (GOOGLEFINANCE w/ exchange fallbacks)
-      F Current Value
-      G Total Gain/Loss $
-      H Total Gain/Loss %
+    Aggregate OpenLots_Detail to a one-row-per-ticker snapshot and attach
+    GOOGLEFINANCE formulas for live price + derived P/L columns.
+    Returns a DataFrame with evaluated strings (formulas kept as strings).
     """
-    ws = open_ws(gc, sheet_url, snapshot_tab)
-    ws.clear()
-    # Headers
-    ws.update("A1:H1", [[
-        "Ticker", "Quantity", "Avg Entry", "Cost Basis Total",
-        "PriceNow", "Current Value", "Total Gain/Loss $", "Total Gain/Loss %"
-    ]])
+    if open_detail_df.empty:
+        return pd.DataFrame(columns=[
+            "Symbol","Description","Quantity","Entry Price",
+            "Last Price","Current Value","Cost Basis Total","Average Cost Basis",
+            "Total Gain/Loss Dollar","Total Gain/Loss Percent"
+        ])
 
-    # A2:B via QUERY (Ticker + sum qty)
-    a2 = (
-        f'=QUERY({tab_open_detail}!B:C,'
-        f'"select B, sum(C) where B is not null group by B label sum(C) \'Quantity\'",1)'
-    )
-    # C2: weighted avg entry = SUMIF(qty*entry)/SUMIF(qty)
-    c2 = (
-        f'=ARRAYFORMULA(IF(A2:A="","",'
-        f'  ROUND('
-        f'    SUMIF({tab_open_detail}!B:B,A2:A,{tab_open_detail}!C:C*{tab_open_detail}!D:D)/'
-        f'    SUMIF({tab_open_detail}!B:B,A2:A,{tab_open_detail}!C:C)'
-        f'  ,4)))'
-    )
-    # D2: cost basis
-    d2 = '=ARRAYFORMULA(IF(A2:A="","", ROUND(B2:B * C2:C, 2)))'
-    # E2: live price (fallback across exchanges)
-    e2 = (
-        '=ARRAYFORMULA(IF(A2:A="","",'
-        ' IFERROR(GOOGLEFINANCE(A2:A,"price"),'
-        '  IFERROR(GOOGLEFINANCE("NYSE:"&A2:A,"price"),'
-        '   IFERROR(GOOGLEFINANCE("NASDAQ:"&A2:A,"price"),"")))))'
-    )
-    # F2: current value
-    f2 = '=ARRAYFORMULA(IF(A2:A="","", ROUND(B2:B * E2:E, 2)))'
-    # G2: P/L $
-    g2 = '=ARRAYFORMULA(IF(A2:A="","", ROUND(F2:F - D2:D, 2)))'
-    # H2: P/L %
-    h2 = '=ARRAYFORMULA(IF(A2:A="","", IF(D2:D=0,"", ROUND((F2:F/D2:D - 1)*100, 2))))'
+    df = open_detail_df.copy()
+    df["OpenQty"] = pd.to_numeric(df.get("OpenQty", np.nan), errors="coerce")
+    df["EntryPrice"] = pd.to_numeric(df.get("EntryPrice", np.nan), errors="coerce")
 
-    # Set the starter cells (array formulas will spill down automatically)
-    ws.update("A2", a2)
-    ws.update("C2", c2)
-    ws.update("D2", d2)
-    ws.update("E2", e2)
-    ws.update("F2", f2)
-    ws.update("G2", g2)
-    ws.update("H2", h2)
+    grp = df.groupby("Ticker", dropna=False)
+    rows = []
+    for symbol, g in grp:
+        if not symbol or pd.isna(symbol):
+            continue
+        qty = float(pd.to_numeric(g["OpenQty"], errors="coerce").fillna(0).sum())
+        # Weighted avg entry price
+        ep = g[["OpenQty", "EntryPrice"]].dropna()
+        if not ep.empty and float(ep["OpenQty"].sum()) > 0:
+            wavg_entry = float((ep["OpenQty"] * ep["EntryPrice"]).sum()) / float(ep["OpenQty"].sum())
+        else:
+            wavg_entry = np.nan
 
-def write_weekly_report_sheet(gc, sheet_url: str, snapshot_tab: str = "Open_Positions_Snapshot",
-                              weekly_tab: str = "Weekly_Report"):
-    """
-    Creates/overwrites 'Weekly_Report' with 3 metrics that reference the snapshot.
-    Values are numeric (you can format as $ / % in Sheets).
-    """
-    ws = open_ws(gc, sheet_url, weekly_tab)
-    ws.clear()
-    ws.update("A1:B1", [["Metric", "Value"]])
+        rows.append({"Symbol": symbol, "Quantity": qty, "Entry Price": wavg_entry})
 
-    rows = [
-        ["Total Gain/Loss ($)", f'=IFERROR(SUM({snapshot_tab}!G2:G), 0)'],
-        ["Portfolio % Gain",    f'=IFERROR(SUM({snapshot_tab}!G2:G) / SUM({snapshot_tab}!D2:D), 0)'],
-        ["Average % Gain",      f'=IFERROR(AVERAGE(FILTER({snapshot_tab}!H2:H, LEN({snapshot_tab}!H2:H))), 0)'],
+    snap = pd.DataFrame(rows)
+    if snap.empty:
+        snap = pd.DataFrame(columns=["Symbol","Quantity","Entry Price"])
+
+    # Round some numerics for readability
+    if "Quantity" in snap.columns:
+        snap["Quantity"] = snap["Quantity"].apply(lambda x: round(x, 6) if pd.notna(x) else "")
+    if "Entry Price" in snap.columns:
+        snap["Entry Price"] = snap["Entry Price"].apply(lambda x: round(x, 6) if pd.notna(x) else "")
+
+    # Insert description placeholder (optional mapping could fill later)
+    snap.insert(1, "Description", "")
+
+    # Add formula columns that depend on row index
+    last_price = []
+    cur_val = []
+    cost_total = []
+    avg_cost = []
+    gl_dollar = []
+    gl_percent = []
+
+    for i in range(len(snap)):
+        row_index = i + 2  # header is row 1
+        sym = str(snap.at[i, "Symbol"])
+        price_formula = googlefinance_formula_for_cell(sym, row_index, mapping)
+        last_price.append(price_formula)
+        # E = Last Price, C = Quantity, D = Entry Price (after insertion positions)
+        # Columns: A Symbol, B Description, C Quantity, D Entry Price, E Last Price, F Current Value, G Cost Basis Total, H Average Cost Basis, I Total Gain/Loss Dollar, J Total Gain/Loss Percent
+        cur_val.append(f"=IFERROR(C{row_index}*E{row_index},)")
+        cost_total.append(f"=IFERROR(C{row_index}*D{row_index},)")
+        avg_cost.append(f"=D{row_index}")
+        gl_dollar.append(f"=IFERROR(F{row_index}-G{row_index},)")
+        gl_percent.append(f"=IFERROR(IF(G{row_index}>0,(F{row_index}/G{row_index}-1)*100,),)")
+
+    snap["Last Price"] = last_price
+    snap["Current Value"] = cur_val
+    snap["Cost Basis Total"] = cost_total
+    snap["Average Cost Basis"] = avg_cost
+    snap["Total Gain/Loss Dollar"] = gl_dollar
+    snap["Total Gain/Loss Percent"] = gl_percent
+
+    cols = [
+        "Symbol","Description","Quantity","Entry Price","Last Price","Current Value",
+        "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"
     ]
-    ws.update("A2:B4", rows)
+    return snap[cols]
+
+def build_weekly_df(snapshot_tab_name: str = TAB_SNAPSHOT) -> pd.DataFrame:
+    """
+    Build the 2-column Weekly_Report with formulas that reference the snapshot tab.
+    We keep simple, robust formulas so Sheets computes everything (even with live prices).
+    """
+    metrics = ["Total Gain/Loss ($)", "Portfolio % Gain", "Average % Gain"]
+    # I = Total Gain/Loss Dollar, G = Cost Basis Total, J = Total Gain/Loss Percent (in snapshot)
+    values = [
+        f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I),0)",
+        f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I)/SUM('{snapshot_tab_name}'!G2:G),0)",
+        f"=IFERROR(AVERAGE(IF('{snapshot_tab_name}'!J2:J<>\"\",'{snapshot_tab_name}'!J2:J,)),0)"
+    ]
+    # For the AVERAGE with blank handling, Sheets needs array formula behavior—this works as-is.
+
+    df = pd.DataFrame({"Metric": metrics, "Value": values})
+    return df
 
 # ─────────────────────────────
 # MAIN
@@ -770,8 +812,8 @@ def main():
     )
 
     # Optionally add live price formulas to Open_Positions
+    mapping = read_mapping(gc, sheet_url)
     if not args.no_live and not open_df.empty:
-        mapping = read_mapping(gc, sheet_url)
         open_df = add_live_price_formulas(open_df, mapping)
 
     # Pretty column order
@@ -795,7 +837,7 @@ def main():
         detail_cols = [c for c in ["Source","Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen","Timeframe","SignalTimeUTC","SignalPrice","PriceNow","Unrealized%"] if c in open_detail_df.columns]
         open_detail_df = open_detail_df[detail_cols].sort_values(["Source","Ticker","EntryTimeUTC"], ignore_index=True)
 
-    # Write tabs
+    # Write core tabs
     ws_real = open_ws(gc, sheet_url, tab_real)
     ws_open = open_ws(gc, sheet_url, tab_openpos)
     ws_perf = open_ws(gc, sheet_url, tab_perf)
@@ -806,17 +848,23 @@ def main():
     write_tab(ws_perf, perf_df)
     write_tab(ws_open_detail, open_detail_df)
 
-    # NEW: build the snapshot and weekly summary (solves the "zeros" issue)
-    try:
-        write_snapshot_sheet(gc, sheet_url, tab_open_detail=tab_open_det, snapshot_tab="Open_Positions_Snapshot")
-        write_weekly_report_sheet(gc, sheet_url, snapshot_tab="Open_Positions_Snapshot", weekly_tab="Weekly_Report")
-    except Exception as e:
-        print(f"⚠️ Could not refresh snapshot/weekly tabs: {e}")
-
     print(f"✅ Wrote {tab_real}: {len(realized_df)} rows")
     print(f"✅ Wrote {tab_openpos}: {len(open_df)} rows")
     print(f"✅ Wrote {tab_perf}: {len(perf_df)} rows")
     print(f"✅ Wrote {tab_open_det}: {len(open_detail_df)} rows")
+
+    # NEW: build Snapshot + Weekly from OpenLots_Detail
+    try:
+        snap_ws = open_ws(gc, sheet_url, TAB_SNAPSHOT)
+        weekly_ws = open_ws(gc, sheet_url, TAB_WEEKLY)
+
+        snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping)
+        write_tab(snap_ws, snapshot_df)
+
+        weekly_df = build_weekly_df(TAB_SNAPSHOT)
+        write_tab(weekly_ws, weekly_df)
+    except Exception as e:
+        print(f"⚠️ Could not refresh snapshot/weekly tabs: {type(e).__name__}: {e}")
 
     if unmatched_sells:
         print(f"⚠️ Summary: {len(unmatched_sells)} unmatched SELL events (use --debug to print details).")
