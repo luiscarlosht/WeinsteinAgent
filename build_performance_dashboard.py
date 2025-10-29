@@ -7,8 +7,8 @@ Build Google Sheets dashboard tabs:
 - Open_Positions
 - Performance_By_Source
 - OpenLots_Detail
-- Open_Positions_Snapshot   (NEW)
-- Weekly_Report             (NEW)
+- Open_Positions_Snapshot   (new)
+- Weekly_Report              (new)
 
 Reads tabs:
   - Signals
@@ -26,10 +26,19 @@ Features
 - Adds totals row at top of Performance_By_Source.
 - Adds OpenLots_Detail tab with one row per open lot.
 
-This version loads configuration from config.yaml:
+Config (config.yaml):
   sheets.url or sheets.sheet_url
   google.service_account_json
   sheets.open_positions_tab, sheets.signals_tab (optional)
+  reporting.output_dir (optional)
+
+NEW:
+- --price-source sheets|yfinance
+  sheets   => snapshot Last Price is a GOOGLEFINANCE formula (computed in Sheets)
+  yfinance => snapshot Last Price is numeric (fetched via yfinance)
+
+- Always writes a numeric CSV copy: <output_dir>/Open_Positions.csv
+  (if price-source=sheets, it fills numeric prices for the CSV via yfinance)
 """
 
 from __future__ import annotations
@@ -46,6 +55,12 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 import yaml
+
+# For numeric price fetching when desired
+try:
+    import yfinance as yf
+except Exception:
+    yf = None  # handled gracefully if not installed
 
 # ─────────────────────────────
 # DEFAULTS (can be overridden by YAML or CLI)
@@ -64,8 +79,6 @@ TAB_REALIZED     = "Realized_Trades"
 TAB_OPEN         = "Open_Positions"
 TAB_PERF         = "Performance_By_Source"
 TAB_OPEN_DETAIL  = "OpenLots_Detail"
-
-# NEW tabs
 TAB_SNAPSHOT     = "Open_Positions_Snapshot"
 TAB_WEEKLY       = "Weekly_Report"
 
@@ -79,12 +92,12 @@ def load_cfg(path: str) -> dict:
     """Load YAML; tolerate missing file by returning {}."""
     if not path or not os.path.exists(path):
         return {}
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 def resolve_sheet_url(cfg: dict) -> Optional[str]:
     sheets = cfg.get("sheets", {}) or {}
-    # support both keys
+    # support both keys & env
     return sheets.get("url") or sheets.get("sheet_url") or os.getenv("SHEET_URL")
 
 def resolve_service_account_file(cfg: dict) -> str:
@@ -133,10 +146,6 @@ def read_tab(ws) -> pd.DataFrame:
     return strip_strings_df(df)
 
 def write_tab(ws, df: pd.DataFrame):
-    """
-    Safe writer that always provides VALUES first, then range_name, to match the
-    current gspread signature (and avoid the "Invalid value at 'data.values'" error).
-    """
     ws.clear()
     if df.empty:
         ws.resize(rows=100, cols=8)
@@ -147,7 +156,7 @@ def write_tab(ws, df: pd.DataFrame):
     header = [str(c) for c in df.columns]
     data = [header] + df.astype(str).fillna("").values.tolist()
 
-    # Chunked upload (values first, then range_name)
+    # Chunked upload
     start = 0
     r = 1
     while start < len(data):
@@ -220,23 +229,12 @@ def read_mapping(gc, sheet_url: str) -> Dict[str, Dict[str, str]]:
     except Exception:
         return {}
 
-def googlefinance_symbol_for(ticker: str, mapping: Dict[str, Dict[str, str]]) -> str:
-    """
-    Resolve the GOOGLEFINANCE symbol string for a ticker, preferring Mapping.FormulaSym,
-    else `${DEFAULT_EXCHANGE_PREFIX}${base_symbol}`.
-    """
+def googlefinance_formula_for(ticker: str, row_idx: int, mapping: Dict[str, Dict[str, str]]) -> str:
     base = base_symbol_from_string(ticker)
     mapped = mapping.get(ticker, {}) or mapping.get(base, {}) or {}
-    return mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
-
-def googlefinance_formula_for_cell(ticker: str, row_idx: int, mapping: Dict[str, Dict[str, str]]) -> str:
-    """
-    Build a robust GOOGLEFINANCE(price) formula:
-      1) Try mapped/static exchange symbol
-      2) Fallback to the value in column A (Symbol) of this row
-    """
-    sym = googlefinance_symbol_for(ticker, mapping)
-    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(A{row_idx},"price"), ""))'
+    sym = mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
+    # row_idx is used in the fallback GOOGLEFINANCE(B{row_idx}, "price")
+    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_idx},"price"), ""))'
 
 # ─────────────────────────────
 # LOAD SIGNALS
@@ -274,8 +272,22 @@ def _looks_like_trade_mask(action: pd.Series, typ: pd.Series, desc: pd.Series) -
     desc_up   = desc.fillna("").astype(str).str.upper()
     return (
         action_up.str.contains(_TRADE_PATT, regex=True, na=False)
-        | typ_up.str.contains(_TRADE_PATT, regex=True, na=False)
-        | desc_up.str.contains(_TRADE_PATT, regex=True, na=False)
+        | typ_up.str_contains(_TRADE_PATT, regex=True, na=False)
+        | desc_up.str_contains(_TRADE_PATT, regex=True, na=False)
+    )
+
+# Pandas .str.contains alias fix for older pandas
+def _safe_contains(series: pd.Series, pat: str) -> pd.Series:
+    return series.astype(str).str.upper().str.contains(pat, regex=True, na=False)
+
+def _looks_like_trade_mask(action: pd.Series, typ: pd.Series, desc: pd.Series) -> pd.Series:
+    action_up = action.fillna("").astype(str)
+    typ_up    = typ.fillna("").astype(str)
+    desc_up   = desc.fillna("").astype(str)
+    return (
+        _safe_contains(action_up, _TRADE_PATT)
+        | _safe_contains(typ_up, _TRADE_PATT)
+        | _safe_contains(desc_up, _TRADE_PATT)
     )
 
 def _classify_type(a: str, t: str, d: str) -> str:
@@ -386,14 +398,14 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
     df_tr.reset_index(drop=True, inplace=True)
 
     if debug:
-        print(f"• load_transactions: after cleaning → {len(df_tr)} trades")
         preview_cols = [c for c in ["Run Date","Account","Account Number","Action","Symbol","Description","Type","Quantity","Price ($)","Settlement Date","When","Qty","Price"] if c in df_tr.columns]
+        print(f"• load_transactions: after cleaning → {len(df_tr)} trades")
         print(df_tr[preview_cols].head(8).to_string(index=False))
 
     return df_tr[["When", "Type", "Symbol", "Qty", "Price"]], pd.DataFrame()
 
 # ─────────────────────────────
-# LIVE PRICE FORMULAS (Open_Positions tab)
+# LIVE PRICE FORMULAS
 # ─────────────────────────────
 def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
     if open_df.empty:
@@ -405,10 +417,7 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, 
         tkr = r["Ticker"]
         ep  = r.get("EntryPrice")
         row_index = idx + 2  # header row is 1
-        # NOTE: This formula assumes the "Ticker" is in column B on that tab.
-        # It is fine for our Open_Positions layout.
-        sym = googlefinance_symbol_for(tkr, mapping)
-        formula = f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_index},"price"), ""))'
+        formula = googlefinance_formula_for(tkr, row_index, mapping)
         price_now.append(formula)
         try:
             epf = float(ep)
@@ -432,7 +441,6 @@ def build_realized_and_open(
     if tx.empty:
         return pd.DataFrame(), pd.DataFrame(), []
 
-    # Index signals by (Ticker, time), only BUY signals
     sig_buy = sig[(sig["Direction"].str.upper() == "BUY") & sig["Ticker"].ne("")].copy()
     sig_buy.sort_values(["Ticker", "TimestampUTC"], inplace=True, ignore_index=True)
 
@@ -623,129 +631,132 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
     return perf
 
 # ─────────────────────────────
-# REPORT HELPERS
+# SNAPSHOT / WEEKLY HELPERS
 # ─────────────────────────────
-def print_unknown_sources(realized_df: pd.DataFrame, open_df: pd.DataFrame):
-    unk_real = []
-    if not realized_df.empty:
-        unk_real = sorted(set(realized_df.loc[realized_df["Source"].eq("(unknown)"), "Ticker"]))
-    unk_open = []
-    if not open_df.empty:
-        unk_open = sorted(set(open_df.loc[open_df["Source"].eq("(unknown)"), "Ticker"]))
-
-    if unk_real or unk_open:
-        print("🔎 Unknown Source tickers:")
-        if unk_real:
-            print("  • Realized:", ", ".join(unk_real))
-        if unk_open:
-            print("  • Open    :", ", ".join(unk_open))
-
-def print_open_breakdown(open_df: pd.DataFrame):
-    if open_df.empty:
-        return
-    print("🔍 Open breakdown:")
-    g = open_df.groupby(["Source", "Ticker"]).size().rename("Lots").reset_index()
-    for _, r in g.sort_values(["Source", "Ticker"]).iterrows():
-        print(f"  - {r['Source']}: {r['Ticker']} → {int(r['Lots'])} lot(s)")
-
-# ─────────────────────────────
-# NEW: SNAPSHOT & WEEKLY BUILDERS
-# ─────────────────────────────
-def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
+def _fetch_last_prices_yf(tickers: list[str]) -> dict:
     """
-    Aggregate OpenLots_Detail to a one-row-per-ticker snapshot and attach
-    GOOGLEFINANCE formulas for live price + derived P/L columns.
-    Returns a DataFrame with evaluated strings (formulas kept as strings).
+    Return {symbol: last_close_price} using yfinance.
     """
-    if open_detail_df.empty:
+    if not tickers or yf is None:
+        return {}
+    uniq = sorted({t for t in tickers if t})
+    try:
+        data = yf.download(uniq, period="5d", interval="1d", group_by="column", auto_adjust=True, progress=False)
+    except Exception:
+        data = None
+
+    out = {}
+    if data is None is True:
+        return out
+
+    if data is None or (hasattr(data, "empty") and data.empty):
+        # fallback per-ticker to be safe
+        for t in uniq:
+            try:
+                hist = yf.download(t, period="5d", interval="1d", progress=False, auto_adjust=True)
+                if not hist.empty:
+                    out[t] = float(hist["Close"].iloc[-1])
+            except Exception:
+                pass
+        return out
+
+    # MultiIndex vs single
+    if isinstance(data.columns, pd.MultiIndex):
+        if ("Close" in data.columns.get_level_values(0)):
+            close = data["Close"]
+            for t in uniq:
+                try:
+                    val = close[t].dropna().iloc[-1]
+                    if pd.notna(val):
+                        out[t] = float(val)
+                except Exception:
+                    pass
+    else:
+        # single ticker
+        if "Close" in data.columns:
+            ser = data["Close"].dropna()
+            if not ser.empty:
+                t = uniq[0]
+                out[t] = float(ser.iloc[-1])
+    return out
+
+
+def build_snapshot_from_open_detail(
+    open_detail_df: pd.DataFrame,
+    mapping: dict | None = None,
+    *,
+    price_source: str = "sheets"
+) -> pd.DataFrame:
+    """
+    Construct a per-position snapshot with numeric fields the email can read.
+    Returns columns:
+      Symbol, Description, Quantity, Last Price, Current Value,
+      Cost Basis Total, Average Cost Basis, Total Gain/Loss Dollar, Total Gain/Loss Percent
+
+    - If price_source == "sheets": 'Last Price' is a GOOGLEFINANCE formula string.
+    - If price_source == "yfinance": 'Last Price' is a numeric float from Yahoo.
+    """
+    if open_detail_df is None or open_detail_df.empty:
         return pd.DataFrame(columns=[
-            "Symbol","Description","Quantity","Entry Price",
-            "Last Price","Current Value","Cost Basis Total","Average Cost Basis",
-            "Total Gain/Loss Dollar","Total Gain/Loss Percent"
+            "Symbol","Description","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"
         ])
 
     df = open_detail_df.copy()
-    df["OpenQty"] = pd.to_numeric(df.get("OpenQty", np.nan), errors="coerce")
-    df["EntryPrice"] = pd.to_numeric(df.get("EntryPrice", np.nan), errors="coerce")
+    df["Symbol"] = df["Ticker"].astype(str)
+    df["Quantity"] = pd.to_numeric(df.get("OpenQty", np.nan), errors="coerce")
+    df["Average Cost Basis"] = pd.to_numeric(df.get("EntryPrice", np.nan), errors="coerce")
+    df["Description"] = ""  # optional mapping could fill this
 
-    grp = df.groupby("Ticker", dropna=False)
-    rows = []
-    for symbol, g in grp:
-        if not symbol or pd.isna(symbol):
-            continue
-        qty = float(pd.to_numeric(g["OpenQty"], errors="coerce").fillna(0).sum())
-        # Weighted avg entry price
-        ep = g[["OpenQty", "EntryPrice"]].dropna()
-        if not ep.empty and float(ep["OpenQty"].sum()) > 0:
-            wavg_entry = float((ep["OpenQty"] * ep["EntryPrice"]).sum()) / float(ep["OpenQty"].sum())
-        else:
-            wavg_entry = np.nan
+    if price_source == "sheets":
+        # Last Price as formula; numeric fields left blank (computed either in-sheet or in the CSV step)
+        last_price = []
+        for i, r in df.iterrows():
+            row_index = i + 2  # header row is 1
+            tkr = str(r["Symbol"])
+            formula = googlefinance_formula_for(tkr, row_index, mapping or {})
+            last_price.append(formula)
+        df["Last Price"] = last_price
+        df["Current Value"] = ""
+        df["Cost Basis Total"] = ""
+        df["Total Gain/Loss Dollar"] = ""
+        df["Total Gain/Loss Percent"] = ""
+    else:
+        prices = _fetch_last_prices_yf(df["Symbol"].dropna().unique().tolist())
+        df["Last Price"] = df["Symbol"].map(prices).astype(float)
+        df["Cost Basis Total"] = (df["Quantity"] * df["Average Cost Basis"]).astype(float)
+        df["Current Value"] = (df["Quantity"] * df["Last Price"]).astype(float)
+        df["Total Gain/Loss Dollar"] = (df["Current Value"] - df["Cost Basis Total"]).astype(float)
+        df["Total Gain/Loss Percent"] = np.where(
+            df["Average Cost Basis"].fillna(0) > 0,
+            (df["Last Price"] / df["Average Cost Basis"] - 1) * 100.0,
+            np.nan
+        )
 
-        rows.append({"Symbol": symbol, "Quantity": qty, "Entry Price": wavg_entry})
+    cols = ["Symbol","Description","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    snap = df[cols].copy()
+    return snap
 
-    snap = pd.DataFrame(rows)
-    if snap.empty:
-        snap = pd.DataFrame(columns=["Symbol","Quantity","Entry Price"])
 
-    # Round some numerics for readability
-    if "Quantity" in snap.columns:
-        snap["Quantity"] = snap["Quantity"].apply(lambda x: round(x, 6) if pd.notna(x) else "")
-    if "Entry Price" in snap.columns:
-        snap["Entry Price"] = snap["Entry Price"].apply(lambda x: round(x, 6) if pd.notna(x) else "")
-
-    # Insert description placeholder (optional mapping could fill later)
-    snap.insert(1, "Description", "")
-
-    # Add formula columns that depend on row index
-    last_price = []
-    cur_val = []
-    cost_total = []
-    avg_cost = []
-    gl_dollar = []
-    gl_percent = []
-
-    for i in range(len(snap)):
-        row_index = i + 2  # header is row 1
-        sym = str(snap.at[i, "Symbol"])
-        price_formula = googlefinance_formula_for_cell(sym, row_index, mapping)
-        last_price.append(price_formula)
-        # E = Last Price, C = Quantity, D = Entry Price (after insertion positions)
-        # Columns: A Symbol, B Description, C Quantity, D Entry Price, E Last Price, F Current Value, G Cost Basis Total, H Average Cost Basis, I Total Gain/Loss Dollar, J Total Gain/Loss Percent
-        cur_val.append(f"=IFERROR(C{row_index}*E{row_index},)")
-        cost_total.append(f"=IFERROR(C{row_index}*D{row_index},)")
-        avg_cost.append(f"=D{row_index}")
-        gl_dollar.append(f"=IFERROR(F{row_index}-G{row_index},)")
-        gl_percent.append(f"=IFERROR(IF(G{row_index}>0,(F{row_index}/G{row_index}-1)*100,),)")
-
-    snap["Last Price"] = last_price
-    snap["Current Value"] = cur_val
-    snap["Cost Basis Total"] = cost_total
-    snap["Average Cost Basis"] = avg_cost
-    snap["Total Gain/Loss Dollar"] = gl_dollar
-    snap["Total Gain/Loss Percent"] = gl_percent
-
-    cols = [
-        "Symbol","Description","Quantity","Entry Price","Last Price","Current Value",
-        "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"
-    ]
-    return snap[cols]
-
-def build_weekly_df(snapshot_tab_name: str = TAB_SNAPSHOT) -> pd.DataFrame:
+def write_weekly_report_tab(ws_weekly, snapshot_tab_name: str = TAB_SNAPSHOT):
     """
-    Build the 2-column Weekly_Report with formulas that reference the snapshot tab.
-    We keep simple, robust formulas so Sheets computes everything (even with live prices).
+    Writes/refreshes the Weekly_Report tab with formulas pointing to the snapshot tab.
     """
-    metrics = ["Total Gain/Loss ($)", "Portfolio % Gain", "Average % Gain"]
-    # I = Total Gain/Loss Dollar, G = Cost Basis Total, J = Total Gain/Loss Percent (in snapshot)
-    values = [
-        f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I),0)",
-        f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I)/SUM('{snapshot_tab_name}'!G2:G),0)",
-        f"=IFERROR(AVERAGE(IF('{snapshot_tab_name}'!J2:J<>\"\",'{snapshot_tab_name}'!J2:J,)),0)"
-    ]
-    # For the AVERAGE with blank handling, Sheets needs array formula behavior—this works as-is.
+    metrics = pd.DataFrame([
+        ["Total Gain/Loss ($)", f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I),0)"],
+        ["Portfolio % Gain",    f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I)/SUM('{snapshot_tab_name}'!G2:G),0)"],
+        ["Average % Gain",      f"=IFERROR(AVERAGE(IF('{snapshot_tab_name}'!J2:J<>\"\",'{snapshot_tab_name}'!J2:J,)),0)"],
+    ], columns=["Metric","Value"])
 
-    df = pd.DataFrame({"Metric": metrics, "Value": values})
-    return df
+    ws_weekly.clear()
+    ws_weekly.resize(rows=max(10, len(metrics) + 5), cols=2)
+    header = ["Metric","Value"]
+    data = [header] + metrics.values.tolist()
+    ws_weekly.update(data, range_name=f"A1:B{len(data)}")
 
 # ─────────────────────────────
 # MAIN
@@ -756,6 +767,8 @@ def main():
     ap.add_argument("--no-live", action="store_true", help="Do NOT add GOOGLEFINANCE formulas to Open_Positions.")
     ap.add_argument("--strict-signals", action="store_true", help="Only use signals at/before BUY; no fallback.")
     ap.add_argument("--sell-cutoff", type=str, default=None, help="Ignore SELLs before this date (YYYY-MM-DD).")
+    ap.add_argument("--price-source", choices=["sheets", "yfinance"], default="sheets",
+                    help="Where to fetch snapshot prices. 'sheets' = GOOGLEFINANCE formulas. 'yfinance' = numeric prices.")
     ap.add_argument("--debug", action="store_true", help="Verbose debug output")
     args = ap.parse_args()
     DEBUG = args.debug
@@ -772,6 +785,8 @@ def main():
     tab_open_det= TAB_OPEN_DETAIL
     tab_tx      = TAB_TRANSACTIONS
     tab_hold    = TAB_HOLDINGS
+
+    price_source = args.price_source
 
     print("📊 Building performance dashboard…")
     if not sheet_url:
@@ -811,9 +826,9 @@ def main():
         tx, sig, sell_cutoff=sell_cutoff_ts, strict_signals=args.strict_signals, debug=DEBUG
     )
 
-    # Optionally add live price formulas to Open_Positions
-    mapping = read_mapping(gc, sheet_url)
-    if not args.no_live and not open_df.empty:
+    # Optionally add live price formulas to Open_Positions (only sensible for 'sheets' mode)
+    if (not args.no_live) and (not open_df.empty) and (price_source == "sheets"):
+        mapping = read_mapping(gc, sheet_url)
         open_df = add_live_price_formulas(open_df, mapping)
 
     # Pretty column order
@@ -853,16 +868,48 @@ def main():
     print(f"✅ Wrote {tab_perf}: {len(perf_df)} rows")
     print(f"✅ Wrote {tab_open_det}: {len(open_detail_df)} rows")
 
-    # NEW: build Snapshot + Weekly from OpenLots_Detail
+    # Snapshot + Weekly + CSV for email
     try:
-        snap_ws = open_ws(gc, sheet_url, TAB_SNAPSHOT)
-        weekly_ws = open_ws(gc, sheet_url, TAB_WEEKLY)
+        mapping = read_mapping(gc, sheet_url)
+        snapshot_df = build_snapshot_from_open_detail(
+            open_detail_df,
+            mapping=mapping,
+            price_source=price_source
+        )
+        ws_snapshot = open_ws(gc, sheet_url, TAB_SNAPSHOT)
+        write_tab(ws_snapshot, snapshot_df)
 
-        snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping, price_source="yfinance")
-        write_tab(snap_ws, snapshot_df)
+        ws_weekly = open_ws(gc, sheet_url, TAB_WEEKLY)
+        write_weekly_report_tab(ws_weekly, snapshot_tab_name=TAB_SNAPSHOT)
 
-        weekly_df = build_weekly_df(TAB_SNAPSHOT)
-        write_tab(weekly_ws, weekly_df)
+        # Choose output dir for the CSV
+        out_dir = ((cfg.get("reporting") or {}).get("output_dir")
+                   or (cfg.get("sheets") or {}).get("output_dir")
+                   or "./output")
+        os.makedirs(out_dir, exist_ok=True)
+        csv_path = os.path.join(out_dir, "Open_Positions.csv")
+
+        # For the email step we need numerics. If we used 'sheets' formulas for Last Price,
+        # re-fill numeric prices via yfinance JUST for the CSV:
+        csv_df = snapshot_df.copy()
+        if price_source == "sheets":
+            prices = _fetch_last_prices_yf(csv_df["Symbol"].dropna().unique().tolist())
+            # Ensure numeric
+            csv_df["Quantity"] = pd.to_numeric(csv_df["Quantity"], errors="coerce")
+            csv_df["Average Cost Basis"] = pd.to_numeric(csv_df["Average Cost Basis"], errors="coerce")
+            csv_df["Last Price"] = csv_df["Symbol"].map(prices).astype(float)
+            csv_df["Cost Basis Total"] = (csv_df["Quantity"] * csv_df["Average Cost Basis"]).astype(float)
+            csv_df["Current Value"] = (csv_df["Quantity"] * csv_df["Last Price"]).astype(float)
+            csv_df["Total Gain/Loss Dollar"] = (csv_df["Current Value"] - csv_df["Cost Basis Total"]).astype(float)
+            csv_df["Total Gain/Loss Percent"] = np.where(
+                csv_df["Average Cost Basis"].fillna(0) > 0,
+                (csv_df["Last Price"] / csv_df["Average Cost Basis"] - 1) * 100.0,
+                np.nan
+            )
+
+        csv_df.to_csv(csv_path, index=False)
+        print(f"📝 Wrote local CSV for email: {csv_path}")
+
     except Exception as e:
         print(f"⚠️ Could not refresh snapshot/weekly tabs: {type(e).__name__}: {e}")
 
@@ -871,6 +918,30 @@ def main():
         if DEBUG:
             for line in unmatched_sells:
                 print("  •", line)
+
+    # Unknowns / breakdown
+    def print_unknown_sources(realized_df: pd.DataFrame, open_df: pd.DataFrame):
+        unk_real = []
+        if not realized_df.empty:
+            unk_real = sorted(set(realized_df.loc[realized_df["Source"].eq("(unknown)"), "Ticker"]))
+        unk_open = []
+        if not open_df.empty:
+            unk_open = sorted(set(open_df.loc[open_df["Source"].eq("(unknown)"), "Ticker"]))
+
+        if unk_real or unk_open:
+            print("🔎 Unknown Source tickers:")
+            if unk_real:
+                print("  • Realized:", ", ".join(unk_real))
+            if unk_open:
+                print("  • Open    :", ", ".join(unk_open))
+
+    def print_open_breakdown(open_df: pd.DataFrame):
+        if open_df.empty:
+            return
+        print("🔍 Open breakdown:")
+        g = open_df.groupby(["Source", "Ticker"]).size().rename("Lots").reset_index()
+        for _, r in g.sort_values(["Source", "Ticker"]).iterrows():
+            print(f"  - {r['Source']}: {r['Ticker']} → {int(r['Lots'])} lot(s)")
 
     print_unknown_sources(realized_df, open_df)
     print_open_breakdown(open_df)
