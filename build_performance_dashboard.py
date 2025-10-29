@@ -104,9 +104,9 @@ def resolve_service_account_file(cfg: dict) -> str:
     google = cfg.get("google", {}) or {}
     # env var GOOGLE_APPLICATION_CREDENTIALS also allowed
     return (
-        google.get("service_account_json")
-        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        or DEFAULT_SERVICE_ACCOUNT_FILE
+        google.get("service_account_json") or
+        os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or
+        DEFAULT_SERVICE_ACCOUNT_FILE
     )
 
 def resolve_tab_name(cfg: dict, key: str, default_name: str) -> str:
@@ -146,15 +146,19 @@ def read_tab(ws) -> pd.DataFrame:
     return strip_strings_df(df)
 
 def write_tab(ws, df: pd.DataFrame):
+    """
+    Writes a DataFrame to a worksheet using USER_ENTERED so formulas evaluate.
+    """
     ws.clear()
     if df.empty:
         ws.resize(rows=100, cols=8)
-        ws.update([["(empty)"]], range_name="A1")
+        ws.update([["(empty)"]], range_name="A1", value_input_option="USER_ENTERED")
         return
     rows, cols = df.shape
     ws.resize(rows=max(100, rows + 5), cols=max(min(26, cols + 2), 8))
     header = [str(c) for c in df.columns]
-    data = [header] + df.astype(str).fillna("").values.tolist()
+    # keep original types; formulas stay strings but USER_ENTERED will evaluate them
+    data = [header] + df.astype(object).where(pd.notna(df), "").values.tolist()
 
     # Chunked upload
     start = 0
@@ -166,7 +170,7 @@ def write_tab(ws, df: pd.DataFrame):
         top_left = gspread.utils.rowcol_to_a1(r, 1)
         bottom_right = gspread.utils.rowcol_to_a1(r + len(block) - 1, ncols)
         rng = f"{top_left}:{bottom_right}"
-        ws.update(block, range_name=rng)
+        ws.update(block, range_name=rng, value_input_option="USER_ENTERED")
         r += len(block)
         start = end
 
@@ -265,16 +269,6 @@ def load_signals(df_sig: pd.DataFrame) -> pd.DataFrame:
 # LOAD TRANSACTIONS
 # ─────────────────────────────
 _TRADE_PATT = r"\b(?:YOU\s+)?(?:BOUGHT|SOLD|BUY|SELL)\b"
-
-def _looks_like_trade_mask(action: pd.Series, typ: pd.Series, desc: pd.Series) -> pd.Series:
-    action_up = action.fillna("").astype(str).str.upper()
-    typ_up    = typ.fillna("").astype(str).str.upper()
-    desc_up   = desc.fillna("").astype(str).str.upper()
-    return (
-        action_up.str.contains(_TRADE_PATT, regex=True, na=False)
-        | typ_up.str_contains(_TRADE_PATT, regex=True, na=False)
-        | desc_up.str_contains(_TRADE_PATT, regex=True, na=False)
-    )
 
 # Pandas .str.contains alias fix for older pandas
 def _safe_contains(series: pd.Series, pat: str) -> pd.Series:
@@ -640,14 +634,11 @@ def _fetch_last_prices_yf(tickers: list[str]) -> dict:
     if not tickers or yf is None:
         return {}
     uniq = sorted({t for t in tickers if t})
+    out = {}
     try:
         data = yf.download(uniq, period="5d", interval="1d", group_by="column", auto_adjust=True, progress=False)
     except Exception:
         data = None
-
-    out = {}
-    if data is None is True:
-        return out
 
     if data is None or (hasattr(data, "empty") and data.empty):
         # fallback per-ticker to be safe
@@ -745,18 +736,30 @@ def build_snapshot_from_open_detail(
 def write_weekly_report_tab(ws_weekly, snapshot_tab_name: str = TAB_SNAPSHOT):
     """
     Writes/refreshes the Weekly_Report tab with formulas pointing to the snapshot tab.
+
+    Important: the snapshot column order is:
+      A Symbol
+      B Description
+      C Quantity
+      D Last Price
+      E Current Value
+      F Cost Basis Total
+      G Average Cost Basis
+      H Total Gain/Loss Dollar
+      I Total Gain/Loss Percent
     """
     metrics = pd.DataFrame([
-        ["Total Gain/Loss ($)", f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I),0)"],
-        ["Portfolio % Gain",    f"=IFERROR(SUM('{snapshot_tab_name}'!I2:I)/SUM('{snapshot_tab_name}'!G2:G),0)"],
-        ["Average % Gain",      f"=IFERROR(AVERAGE(IF('{snapshot_tab_name}'!J2:J<>\"\",'{snapshot_tab_name}'!J2:J,)),0)"],
+        ["Total Gain/Loss ($)", f"=IFERROR(SUM('{snapshot_tab_name}'!H2:H),0)"],
+        ["Portfolio % Gain",    f"=IFERROR(SUM('{snapshot_tab_name}'!H2:H)/SUM('{snapshot_tab_name}'!F2:F),0)"],
+        ["Average % Gain",      f"=IFERROR(AVERAGE(IF('{snapshot_tab_name}'!I2:I<>\"\",'{snapshot_tab_name}'!I2:I,)),0)"],
     ], columns=["Metric","Value"])
 
     ws_weekly.clear()
     ws_weekly.resize(rows=max(10, len(metrics) + 5), cols=2)
     header = ["Metric","Value"]
     data = [header] + metrics.values.tolist()
-    ws_weekly.update(data, range_name=f"A1:B{len(data)}")
+    # USER_ENTERED so formulas compute immediately
+    ws_weekly.update(data, range_name=f"A1:B{len(data)}", value_input_option="USER_ENTERED")
 
 # ─────────────────────────────
 # MAIN
