@@ -104,9 +104,9 @@ def resolve_service_account_file(cfg: dict) -> str:
     google = cfg.get("google", {}) or {}
     # env var GOOGLE_APPLICATION_CREDENTIALS also allowed
     return (
-        google.get("service_account_json") or
-        os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or
-        DEFAULT_SERVICE_ACCOUNT_FILE
+        google.get("service_account_json")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        or DEFAULT_SERVICE_ACCOUNT_FILE
     )
 
 def resolve_tab_name(cfg: dict, key: str, default_name: str) -> str:
@@ -145,20 +145,57 @@ def read_tab(ws) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=[h.strip() for h in header])
     return strip_strings_df(df)
 
+def _to_user_value(x):
+    """Convert Python/pandas/numpy types to values accepted by Sheets JSON.
+       - Keep numbers numeric
+       - Keep formulas/strings as strings
+       - Convert pandas.Timestamp to ISO-8601 string
+       - Turn NaN/NaT/None into empty string
+    """
+    if x is None:
+        return ""
+    # pandas NaT
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    # Timestamp
+    if isinstance(x, pd.Timestamp):
+        return x.isoformat()
+    # numpy scalar handling
+    if isinstance(x, (np.floating,)):
+        # JSON can't serialize nan/inf; we handled NaN above; just cast to float
+        return float(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    # plain numbers
+    if isinstance(x, (int, float)):
+        return x
+    # strings (incl. formulas like "=GOOGLEFINANCE(...)")
+    if isinstance(x, str):
+        return x
+    # fallback to string
+    return str(x)
+
 def write_tab(ws, df: pd.DataFrame):
     """
     Writes a DataFrame to a worksheet using USER_ENTERED so formulas evaluate.
+    Converts timestamps and NaN to JSON-serializable values.
     """
     ws.clear()
     if df.empty:
         ws.resize(rows=100, cols=8)
         ws.update([["(empty)"]], range_name="A1", value_input_option="USER_ENTERED")
         return
-    rows, cols = df.shape
-    ws.resize(rows=max(100, rows + 5), cols=max(min(26, cols + 2), 8))
+
+    # Convert all cells to user-entered friendly values
+    rows_list = df.applymap(_to_user_value).values.tolist()
     header = [str(c) for c in df.columns]
-    # keep original types; formulas stay strings but USER_ENTERED will evaluate them
-    data = [header] + df.astype(object).where(pd.notna(df), "").values.tolist()
+    data = [header] + rows_list
+
+    rows, cols = len(data) - 1, len(header)
+    ws.resize(rows=max(100, rows + 5), cols=max(min(26, cols + 2), 8))
 
     # Chunked upload
     start = 0
