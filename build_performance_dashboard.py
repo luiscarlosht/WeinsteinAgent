@@ -190,7 +190,7 @@ def write_tab(ws, df: pd.DataFrame):
         return
 
     # Convert all cells to user-entered friendly values
-    rows_list = df.applymap(_to_user_value).values.tolist()
+    rows_list = df.map(_to_user_value).values.tolist()
     header = [str(c) for c in df.columns]
     data = [header] + rows_list
 
