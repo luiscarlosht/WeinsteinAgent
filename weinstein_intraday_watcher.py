@@ -12,6 +12,9 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
+# 🔹 NEW: Industry helper
+from industry_utils import attach_industry
+
 # ---------------- Tunables ----------------
 WEEKLY_OUTPUT_DIR = "./output"            # where weekly CSVs are saved
 WEEKLY_FILE_PREFIX = "weinstein_weekly_"  # we pick the newest
@@ -64,11 +67,6 @@ def newest_weekly_csv():
 def load_weekly_report():
     path = newest_weekly_csv()
     df = pd.read_csv(path)
-    # normalize column names (some pandas versions may lowercase)
-    cols = {c.lower(): c for c in df.columns}
-    # Ensure 'ticker' and 'stage' exist
-    def getcol(name):
-        return cols.get(name, name) if name in cols else name
     return df, path
 
 def load_positions():
@@ -121,7 +119,7 @@ def compute_atr(daily_df, t, n=14):
     return float(atr.dropna().iloc[-1]) if len(atr.dropna()) else np.nan
 
 def last_weekly_pivot_high(ticker, daily_df, weeks=PIVOT_LOOKBACK_WEEKS):
-    bars = weeks * 5  # proxy for N weeks
+    bars = weeks * 5
     if isinstance(daily_df.columns, pd.MultiIndex):
         try:
             highs = daily_df[("High", ticker)]
@@ -144,7 +142,6 @@ def volume_pace_today_vs_50dma(ticker, daily_df):
         return np.nan
     v50 = v.rolling(50).mean().iloc[-2] if len(v) > 50 else np.nan
     today_vol = v.iloc[-1]
-    # crude intraday fraction estimate (UTC time heuristic):
     now = datetime.utcnow()
     minutes = now.hour * 60 + now.minute
     start = 13*60 + 30  # 13:30 UTC (09:30 ET)
@@ -238,7 +235,6 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
 
 # ---------------- Ranking helpers ----------------
 def stage_order(stage: str) -> int:
-    # Stage 2 first (0), then Stage 1 (1), others later
     if isinstance(stage, str):
         if stage.startswith("Stage 2"):
             return 0
@@ -247,10 +243,6 @@ def stage_order(stage: str) -> int:
     return 9
 
 def buy_sort_key(item):
-    """
-    Sort BUY by:
-    weekly_rank asc, stage_order asc, volume pace desc, px/pivot desc, px/ma desc
-    """
     wr = int(item.get("weekly_rank", 999999)) if pd.notna(item.get("weekly_rank", np.nan)) else 999999
     st = stage_order(item.get("stage", ""))
     pace = item.get("pace", np.nan)
@@ -263,10 +255,6 @@ def buy_sort_key(item):
     return (wr, st, -pace, -ratio_pivot, -ratio_ma)
 
 def near_sort_key(item):
-    """
-    Sort NEAR by:
-    weekly_rank asc, stage_order asc, |px - pivot| asc (closer better), volume pace desc
-    """
     wr = int(item.get("weekly_rank", 999999)) if pd.notna(item.get("weekly_rank", np.nan)) else 999999
     st = stage_order(item.get("stage", ""))
     px = item.get("price", np.nan)
@@ -281,15 +269,13 @@ def run():
     cfg, benchmark = load_config()
     weekly_df, weekly_csv_path = load_weekly_report()
 
-    # Pull & normalize the columns we need from weekly
-    # Expect columns: ticker, stage, ma30, rs_above_ma, rank (from weekly report)
-    # Normalize in case casing differs
-    wcols = {c.lower(): c for c in weekly_df.columns}
-    col_ticker = wcols.get("ticker", "ticker")
-    col_stage  = wcols.get("stage", "stage")
-    col_ma30   = wcols.get("ma30", "ma30")
-    col_rs_abv = wcols.get("rs_above_ma", "rs_above_ma")
-    col_rank   = wcols.get("rank", "rank") if "rank" in wcols else None
+    # Normalize column names (be tolerant to casing)
+    wcols_lower = {c.lower(): c for c in weekly_df.columns}
+    col_ticker = wcols_lower.get("ticker", "ticker")
+    col_stage  = wcols_lower.get("stage", "stage")
+    col_ma30   = wcols_lower.get("ma30", "ma30")
+    col_rs_abv = wcols_lower.get("rs_above_ma", "rs_above_ma")
+    col_rank   = wcols_lower.get("rank", None)  # weekly might not have 'rank'
 
     focus = weekly_df[
         weekly_df[col_stage].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])
@@ -300,15 +286,21 @@ def run():
         col_stage: "stage",
         col_ma30: "ma30",
         col_rs_abv: "rs_above_ma",
-        (col_rank if col_rank else "rank"): "weekly_rank"
+        (col_rank if col_rank else "weekly_rank"): "weekly_rank"
     }, inplace=True)
 
-    # Safety: if no weekly_rank, fill with large numbers to de-prioritize uniformly
     if "weekly_rank" not in focus.columns:
         focus["weekly_rank"] = 999999
 
-    tickers = sorted(set(focus["ticker"].tolist() + [benchmark]))
+    # 🔹 Add Industry & Sector to intraday focus (independent of weekly CSV)
+    focus = attach_industry(
+        focus,
+        ticker_col="ticker",
+        out_col="industry",
+        cache_path=os.path.join(WEEKLY_OUTPUT_DIR, "industry_cache.csv")
+    )
 
+    tickers = sorted(set(focus["ticker"].tolist() + [benchmark]))
     intraday, daily = get_intraday(tickers)
 
     # Current prices from intraday
@@ -331,7 +323,6 @@ def run():
         if t == benchmark:
             continue
 
-        # Last price
         px = float(last_closes.get(t, np.nan)) if (hasattr(last_closes, "index") and t in last_closes.index) else (float(last_closes.values[-1]) if len(last_closes.values) else np.nan)
         if np.isnan(px):
             continue
@@ -343,7 +334,6 @@ def run():
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
 
-        # Two-bar confirm above pivot(+headroom) AND above MA proxy
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
         ma_ok = (pd.notna(ma30))
         pivot_ok = pd.notna(pivot)
@@ -356,7 +346,6 @@ def run():
         else:
             confirm = False
 
-        # Volume confirmation on last bar
         vol_ok = True
         if REQUIRE_RISING_BAR_VOL:
             vols2 = get_last_n_intraday_volumes(intraday, t, n=2)
@@ -368,7 +357,6 @@ def run():
 
         rs_ok = rs_above
 
-        # BUY signal
         if (
             stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
             and confirm
@@ -384,25 +372,20 @@ def run():
                 "stage": stage,
                 "ma30": ma30,
                 "weekly_rank": weekly_rank,
+                "industry": row.get("industry",""),
+                "sector": row.get("sector",""),
             }
             buy_signals.append(item)
-
-            # charts for top candidates only (we'll sort first, then attach)
         else:
-            # ---- NEAR-TRIGGER logic (early heads-up) ----
             if stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)") and rs_ok and pivot_ok and ma_ok and pd.notna(px):
                 near = False
                 above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
                 if above_ma:
-                    # within 0.3% below pivot and not yet a full confirm
                     if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (px < pivot * (1.0 + MIN_BREAKOUT_PCT)):
                         near = True
-                    # or first close above pivot*(1+headroom) but lacking 2-bar confirm
                     elif (px >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and not confirm:
                         near = True
-
                 vol_near_ok = (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN)
-
                 if near and vol_near_ok:
                     near_signals.append({
                         "ticker": t,
@@ -412,10 +395,11 @@ def run():
                         "stage": stage,
                         "ma30": ma30,
                         "weekly_rank": weekly_rank,
+                        "industry": row.get("industry",""),
+                        "sector": row.get("sector",""),
                         "reason": "near pivot/confirm"
                     })
 
-        # SELL logic for tracked positions
         pos = held.get(t)
         if pos:
             entry = float(pos.get("entry", np.nan))
@@ -424,7 +408,7 @@ def run():
             trail = px - TRAIL_ATR_MULT * atr if pd.notna(atr) else None
 
             breach_hard = (pd.notna(hard_stop) and px <= hard_stop)
-            breach_ma = (pd.notna(ma30) and px <= ma30 * 0.97)  # 3% below MA30
+            breach_ma = (pd.notna(ma30) and px <= ma30 * 0.97)
             breach_trail = (trail is not None and px <= trail)
 
             if breach_hard or breach_ma or breach_trail:
@@ -437,11 +421,15 @@ def run():
                     "price": px,
                     "reasons": ", ".join(why),
                     "stage": stage,
-                    "weekly_rank": weekly_rank
+                    "weekly_rank": weekly_rank,
+                    "industry": row.get("industry",""),
+                    "sector": row.get("sector",""),
                 })
 
         info_rows.append({
             "ticker": t,
+            "industry": row.get("industry",""),
+            "sector": row.get("sector",""),
             "stage": stage,
             "price": px,
             "ma30": ma30,
@@ -456,7 +444,6 @@ def run():
     buy_signals.sort(key=buy_sort_key)
     near_signals.sort(key=near_sort_key)
 
-    # add inline charts for top-ranked buys first, then near (until limit)
     charts_added = 0
     chart_imgs = []
     for item in buy_signals:
@@ -479,7 +466,6 @@ def run():
 
     # -------- Build Email --------
     info_df = pd.DataFrame(info_rows)
-    # Order snapshot roughly by recommendation: weekly_rank, stage_order, ticker
     if not info_df.empty:
         info_df["stage_rank"] = info_df["stage"].apply(stage_order)
         info_df["weekly_rank"] = pd.to_numeric(info_df["weekly_rank"], errors="coerce").fillna(999999).astype(int)
@@ -494,15 +480,14 @@ def run():
             pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
             wr = it.get("weekly_rank", None)
             wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+            label = f"<b>{i}.</b> <b>{it['ticker']}</b> ({it.get('industry','') or '—'}) @ {it['price']:.2f}"
             if kind == "SELL":
                 lis.append(
-                    f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} — {it['reasons']} "
-                    f"({it['stage']}, weekly {wr_str})</li>"
+                    f"<li>{label} — {it['reasons']} ({it['stage']}, weekly {wr_str})</li>"
                 )
             else:
                 lis.append(
-                    f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} "
-                    f"(pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
+                    f"<li>{label} (pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
                 )
         return "<ol>" + "\n".join(lis) + "</ol>"
 
@@ -544,20 +529,20 @@ def run():
         pace_str = "—" if (b.get("pace") is None or pd.isna(b.get("pace"))) else f"{b['pace']:.2f}x"
         wr = b.get("weekly_rank", None)
         wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-        text += f"{i}. {b['ticker']} @ {b['price']:.2f} (pivot {b['pivot']:.2f}, pace {pace_str}, {b['stage']}, weekly {wr_str})\n"
+        text += f"{i}. {b['ticker']} ({b.get('industry','') or '—'}) @ {b['price']:.2f} (pivot {b['pivot']:.2f}, pace {pace_str}, {b['stage']}, weekly {wr_str})\n"
 
     text += "\nNEAR-TRIGGER (ranked):\n"
     for i, n in enumerate(near_signals, start=1):
         pace_str = "—" if (n.get("pace") is None or pd.isna(n.get("pace"))) else f"{n['pace']:.2f}x"
         wr = n.get("weekly_rank", None)
         wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-        text += f"{i}. {n['ticker']} @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']}, weekly {wr_str})\n"
+        text += f"{i}. {n['ticker']} ({n.get('industry','') or '—'}) @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']}, weekly {wr_str})\n"
 
     text += "\nSELL:\n"
     for i, s in enumerate(sell_signals, start=1):
         wr = s.get("weekly_rank", None)
         wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-        text += f"{i}. {s['ticker']} @ {s['price']:.2f} — {s['reasons']} ({s['stage']}, weekly {wr_str})\n"
+        text += f"{i}. {s['ticker']} ({s.get('industry','') or '—'}) @ {s['price']:.2f} — {s['reasons']} ({s['stage']}, weekly {wr_str})\n"
 
     send_email(
         subject=f"Intraday Watch — {len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_signals)} SELL",
