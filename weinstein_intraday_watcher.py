@@ -264,7 +264,7 @@ def near_sort_key(item):
     pace = pace if pd.notna(pace) else -1e9
     return (wr, st, dist, -pace)
 
-# ---------------- Holdings helpers (with colored badges & summary & % cells) ----------------
+# ---------------- Holdings helpers (with colored badges & summary & % and $ cells) ----------------
 def _try_read_open_positions_local(output_dir: str) -> pd.DataFrame | None:
     for fname in ["Open_Positions.csv", "open_positions.csv"]:
         p = os.path.join(output_dir, fname)
@@ -404,6 +404,19 @@ def _pct_cell_html(pct_number):  # pct_number is in PERCENT units (e.g., -26.31,
     txt = f"{pct_number:.2f}%" if pct_number is not None and pd.notna(pct_number) else ""
     return f'<span class="{klass}">{txt}</span>'
 
+def _money_cell_html(amount_float):
+    """Colored $ cell for Total Gain/Loss Dollar."""
+    if amount_float is None or pd.isna(amount_float):
+        klass = "money neu"
+    else:
+        if amount_float > 0:
+            klass = "money pos"
+        elif amount_float < 0:
+            klass = "money neg"
+        else:
+            klass = "money neu"
+    return f'<span class="{klass}">{_money(amount_float)}</span>'
+
 def _summary_row_html(metric: str, value_str: str, numeric_value: float | None) -> str:
     if numeric_value is None or pd.isna(numeric_value):
         klass = "val neu"
@@ -419,7 +432,7 @@ def _summary_row_html(metric: str, value_str: str, numeric_value: float | None) 
 def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str:
     """
     Build summary + per-position snapshot with colored badges,
-    colored summary values, and colored per-position % column.
+    colored summary values, colored % column, and colored $ gain/loss.
     """
     # ---- Summary (custom HTML to control colors) ----
     total_gl = metrics["total_gl_dollar"]
@@ -443,29 +456,31 @@ def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str
     # ---- Snapshot table ----
     snap = positions_merged.copy()
 
-    # Keep the raw numeric % for coloring before formatting
-    raw_pct = snap["Total Gain/Loss Percent"].copy()  # already in PERCENT units (e.g., -26.31)
+    # Keep raw numeric columns for targeted coloring
+    raw_pct = snap["Total Gain/Loss Percent"].copy()    # in PERCENT units
+    raw_gl_dollar = snap["Total Gain/Loss Dollar"].copy()
 
-    # Money-format numeric columns
+    # Money-format the non-colored money columns
     snap["Last Price"] = snap["Last Price"].apply(_money)
     snap["Current Value"] = snap["Current Value"].apply(_money)
     snap["Cost Basis Total"] = snap["Cost Basis Total"].apply(_money)
     snap["Average Cost Basis"] = snap["Average Cost Basis"].apply(_money)
-    snap["Total Gain/Loss Dollar"] = snap["Total Gain/Loss Dollar"].apply(_money)
 
-    # Build colored % HTML column
+    # Colored percent & dollar HTML columns
     snap["TGLP_colored"] = raw_pct.apply(_pct_cell_html)
+    snap["TGLD_colored"] = raw_gl_dollar.apply(_money_cell_html)
 
     # Colored Recommendation badge
     snap["RecommendationBadge"] = snap["Recommendation"].apply(_rec_badge_html)
 
     cols = ["Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
             "Cost Basis Total","Average Cost Basis",
-            "Total Gain/Loss Dollar","TGLP_colored","RecommendationBadge"]
+            "TGLD_colored","TGLP_colored","RecommendationBadge"]
     for c in cols:
         if c not in snap.columns:
             snap[c] = ""
     snap = snap[cols].rename(columns={
+        "TGLD_colored": "Total Gain/Loss Dollar",
         "TGLP_colored": "Total Gain/Loss Percent",
         "RecommendationBadge": "Recommendation"
     })
@@ -522,11 +537,11 @@ def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str
         border-color: #d7dde8;
       }
 
-      /* Colored percent cells */
-      .pct { font-weight: 600; }
-      .pct.pos { color: #106b21; }
-      .pct.neg { color: #8a1111; }
-      .pct.neu { color: #555; }
+      /* Colored percent and money cells in snapshot */
+      .pct, .money { font-weight: 600; }
+      .pct.pos, .money.pos { color: #106b21; }
+      .pct.neg, .money.neg { color: #8a1111; }
+      .pct.neu, .money.neu { color: #555; }
     </style>
     """
     return f"""{css}
