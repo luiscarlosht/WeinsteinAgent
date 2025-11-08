@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
-# 🔹 Industry helper
+# 🔹 Industry helper (added previously)
 from industry_utils import attach_industry
 
 # ---------------- Tunables ----------------
@@ -264,7 +264,7 @@ def near_sort_key(item):
     pace = pace if pd.notna(pace) else -1e9
     return (wr, st, dist, -pace)
 
-# ---------------- Holdings helpers (with colored badges & summary) ----------------
+# ---------------- Holdings helpers (with colored badges & summary & % cells) ----------------
 def _try_read_open_positions_local(output_dir: str) -> pd.DataFrame | None:
     for fname in ["Open_Positions.csv", "open_positions.csv"]:
         p = os.path.join(output_dir, fname)
@@ -372,13 +372,10 @@ def _merge_stage_and_recommend(positions: pd.DataFrame, stage_df: pd.DataFrame) 
 def _money(x):
     return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
 
-def _pct(x):
-    return f"{x*100:.2f}%" if (x is not None and pd.notna(x)) else ""
+def _pct_str(x_float_as_fraction):
+    return f"{x_float_as_fraction*100:.2f}%" if (x_float_as_fraction is not None and pd.notna(x_float_as_fraction)) else ""
 
 def _rec_badge_html(text: str) -> str:
-    """
-    Return a colored badge <span> for the Recommendation value.
-    """
     t = (text or "").strip().upper()
     if t == "HOLD (STRONG)":
         cls = "rec rec-strong"
@@ -394,13 +391,20 @@ def _rec_badge_html(text: str) -> str:
         label = text or "—"
     return f'<span class="{cls}">{label}</span>'
 
+def _pct_cell_html(pct_number):  # pct_number is in PERCENT units (e.g., -26.31, 2.58)
+    if pct_number is None or pd.isna(pct_number):
+        klass = "pct neu"
+    else:
+        if pct_number > 0:
+            klass = "pct pos"
+        elif pct_number < 0:
+            klass = "pct neg"
+        else:
+            klass = "pct neu"
+    txt = f"{pct_number:.2f}%" if pct_number is not None and pd.notna(pct_number) else ""
+    return f'<span class="{klass}">{txt}</span>'
+
 def _summary_row_html(metric: str, value_str: str, numeric_value: float | None) -> str:
-    """
-    Build a single summary row with colored Value cell:
-      positive -> .val.pos (green)
-      negative -> .val.neg (red)
-      else     -> .val.neu (gray)
-    """
     if numeric_value is None or pd.isna(numeric_value):
         klass = "val neu"
     else:
@@ -414,17 +418,18 @@ def _summary_row_html(metric: str, value_str: str, numeric_value: float | None) 
 
 def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str:
     """
-    Build summary + per-position snapshot with colored badges and colored summary values.
+    Build summary + per-position snapshot with colored badges,
+    colored summary values, and colored per-position % column.
     """
     # ---- Summary (custom HTML to control colors) ----
     total_gl = metrics["total_gl_dollar"]
-    port_pct = metrics["portfolio_pct_gain"]
-    avg_pct  = metrics["average_pct_gain"]
+    port_pct = metrics["portfolio_pct_gain"]           # fraction (e.g., -0.0587)
+    avg_pct  = metrics["average_pct_gain"]             # fraction
 
     summary_rows = [
         _summary_row_html("Total Gain/Loss ($)", _money(total_gl), total_gl),
-        _summary_row_html("Portfolio % Gain",     _pct(port_pct),  port_pct),
-        _summary_row_html("Average % Gain",       _pct(avg_pct),   avg_pct),
+        _summary_row_html("Portfolio % Gain",     _pct_str(port_pct),  port_pct),
+        _summary_row_html("Average % Gain",       _pct_str(avg_pct),   avg_pct),
     ]
     summary_html = f"""
     <table class="summary-table">
@@ -435,26 +440,35 @@ def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str
     </table>
     """
 
-    # ---- Snapshot table with colored badges in Recommendation ----
+    # ---- Snapshot table ----
     snap = positions_merged.copy()
+
+    # Keep the raw numeric % for coloring before formatting
+    raw_pct = snap["Total Gain/Loss Percent"].copy()  # already in PERCENT units (e.g., -26.31)
+
+    # Money-format numeric columns
     snap["Last Price"] = snap["Last Price"].apply(_money)
     snap["Current Value"] = snap["Current Value"].apply(_money)
     snap["Cost Basis Total"] = snap["Cost Basis Total"].apply(_money)
     snap["Average Cost Basis"] = snap["Average Cost Basis"].apply(_money)
     snap["Total Gain/Loss Dollar"] = snap["Total Gain/Loss Dollar"].apply(_money)
-    snap["Total Gain/Loss Percent"] = snap["Total Gain/Loss Percent"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
 
-    # Add colored badge column
+    # Build colored % HTML column
+    snap["TGLP_colored"] = raw_pct.apply(_pct_cell_html)
+
+    # Colored Recommendation badge
     snap["RecommendationBadge"] = snap["Recommendation"].apply(_rec_badge_html)
 
     cols = ["Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
             "Cost Basis Total","Average Cost Basis",
-            "Total Gain/Loss Dollar","Total Gain/Loss Percent","RecommendationBadge"]
+            "Total Gain/Loss Dollar","TGLP_colored","RecommendationBadge"]
     for c in cols:
         if c not in snap.columns:
             snap[c] = ""
-    # Rename the badge column to display header as 'Recommendation'
-    snap = snap[cols].rename(columns={"RecommendationBadge":"Recommendation"})
+    snap = snap[cols].rename(columns={
+        "TGLP_colored": "Total Gain/Loss Percent",
+        "RecommendationBadge": "Recommendation"
+    })
 
     snapshot_html = snap.to_html(index=False, border=0, escape=False)
 
@@ -507,6 +521,12 @@ def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str
         color: #4b5563;           /* slate gray */
         border-color: #d7dde8;
       }
+
+      /* Colored percent cells */
+      .pct { font-weight: 600; }
+      .pct.pos { color: #106b21; }
+      .pct.neg { color: #8a1111; }
+      .pct.neu { color: #555; }
     </style>
     """
     return f"""{css}
@@ -548,7 +568,7 @@ def run():
     if "weekly_rank" not in focus.columns:
         focus["weekly_rank"] = 999999
 
-    # 🔹 Add Industry & Sector
+    # 🔹 Add Industry & Sector (cached)
     focus = attach_industry(
         focus,
         ticker_col="ticker",
