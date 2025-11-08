@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
-# 🔹 NEW: Industry helper
+# 🔹 Industry helper (added previously)
 from industry_utils import attach_industry
 
 # ---------------- Tunables ----------------
@@ -264,18 +264,174 @@ def near_sort_key(item):
     pace = pace if pd.notna(pace) else -1e9
     return (wr, st, dist, -pace)
 
+# ---------------- Holdings helpers (borrowed from weekly) ----------------
+def _try_read_open_positions_local(output_dir: str) -> pd.DataFrame | None:
+    for fname in ["Open_Positions.csv", "open_positions.csv"]:
+        p = os.path.join(output_dir, fname)
+        if os.path.exists(p):
+            try:
+                df = pd.read_csv(p)
+                if not df.empty:
+                    return df
+            except Exception:
+                pass
+    return None
+
+def _read_open_positions_gsheet(cfg: dict, tab_name: str = "Open_Positions") -> pd.DataFrame:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    sheet_url = cfg.get("sheets", {}).get("url")
+    keyfile = cfg.get("google", {}).get("service_account_json")
+    if not sheet_url or not keyfile:
+        raise RuntimeError("Missing sheets.url or google.service_account_json in config.yaml")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(keyfile, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(sheet_url)
+    if cfg.get("sheets", {}).get("open_positions_tab"):
+        tab_name = cfg["sheets"]["open_positions_tab"]
+    ws = sh.worksheet(tab_name)
+    data = ws.get_all_records()
+    return pd.DataFrame(data)
+
+def _coerce_numlike(series: pd.Series) -> pd.Series:
+    def conv(x):
+        if pd.isna(x):
+            return np.nan
+        if isinstance(x, (int, float, np.number)):
+            return float(x)
+        s = str(x).replace(",", "").replace("$", "").strip()
+        if s.endswith("%"):
+            s = s[:-1]
+        try:
+            return float(s)
+        except Exception:
+            return np.nan
+    return series.apply(conv)
+
+def _normalize_open_positions_columns(df: pd.DataFrame) -> pd.DataFrame:
+    ren = {
+        "Ticker": "Symbol", "symbol": "Symbol", "SYMBOL": "Symbol",
+        "Qty": "Quantity", "Shares": "Quantity", "quantity": "Quantity",
+        "Last": "Last Price", "Price": "Last Price", "LastPrice": "Last Price",
+        "Current Value $": "Current Value", "Market Value": "Current Value", "MarketValue": "Current Value",
+        "Cost Basis": "Cost Basis Total", "Cost": "Cost Basis Total",
+        "Avg Cost": "Average Cost Basis", "AvgCost": "Average Cost Basis",
+        "Gain $": "Total Gain/Loss Dollar", "Gain": "Total Gain/Loss Dollar",
+        "Gain %": "Total Gain/Loss Percent", "GainPct": "Total Gain/Loss Percent",
+        "Name": "Description", "Description/Name": "Description",
+    }
+    out = df.rename(columns=ren).copy()
+    required = [
+        "Symbol","Description","Quantity","Last Price","Current Value",
+        "Cost Basis Total","Average Cost Basis",
+        "Total Gain/Loss Dollar","Total Gain/Loss Percent"
+    ]
+    for c in required:
+        if c not in out.columns:
+            out[c] = np.nan
+    num_cols = ["Quantity","Last Price","Current Value","Cost Basis Total",
+                "Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"]
+    for c in num_cols:
+        out[c] = _coerce_numlike(out[c])
+    out = out[required].dropna(how="all")
+    return out
+
+def _compute_portfolio_metrics(positions: pd.DataFrame) -> dict:
+    cur = float(positions["Current Value"].fillna(0).sum())
+    cost = float(positions["Cost Basis Total"].fillna(0).sum())
+    gl_dollar = cur - cost
+    port_pct = (gl_dollar / cost) if cost else 0.0
+    row_pct = positions["Total Gain/Loss Percent"].dropna().astype(float)
+    avg_pct = float(row_pct.mean())/100.0 if len(row_pct) else 0.0
+    return {
+        "total_gl_dollar": gl_dollar,
+        "portfolio_pct_gain": port_pct,
+        "average_pct_gain": avg_pct,
+        "total_current_value": cur,
+        "total_cost_basis": cost,
+    }
+
+def _merge_stage_and_recommend(positions: pd.DataFrame, stage_df: pd.DataFrame) -> pd.DataFrame:
+    stage_min = stage_df[["ticker","stage","rs_above_ma","industry","sector"]].rename(columns={"ticker":"Symbol"})
+    out = positions.merge(stage_min, on="Symbol", how="left")
+    def recommend(row):
+        pct = row.get("Total Gain/Loss Percent", np.nan)
+        stage = str(row.get("stage", ""))
+        rs_above = bool(row.get("rs_above_ma", False))
+        if stage.startswith("Stage 2") and (rs_above or (pd.notna(pct) and pct >= 20)):
+            return "HOLD (Strong)"
+        if stage.startswith("Stage 4") and pd.notna(pct) and pct < 0:
+            return "SELL"
+        if pd.notna(pct) and pct <= -8:
+            return "SELL"
+        return "HOLD"
+    out["Recommendation"] = out.apply(recommend, axis=1)
+    return out
+
+def _money(x):
+    return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
+
+def _pct(x):
+    return f"{x*100:.2f}%" if (x is not None and pd.notna(x)) else ""
+
+def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str:
+    summary = pd.DataFrame([
+        ["Total Gain/Loss ($)", _money(metrics["total_gl_dollar"])],
+        ["Portfolio % Gain",     _pct(metrics["portfolio_pct_gain"])],
+        ["Average % Gain",       _pct(metrics["average_pct_gain"])],
+    ], columns=["Metric","Value"])
+    summary_html = summary.to_html(index=False, border=0)
+
+    snap = positions_merged.copy()
+    snap["Last Price"] = snap["Last Price"].apply(_money)
+    snap["Current Value"] = snap["Current Value"].apply(_money)
+    snap["Cost Basis Total"] = snap["Cost Basis Total"].apply(_money)
+    snap["Average Cost Basis"] = snap["Average Cost Basis"].apply(_money)
+    snap["Total Gain/Loss Dollar"] = snap["Total Gain/Loss Dollar"].apply(_money)
+    snap["Total Gain/Loss Percent"] = snap["Total Gain/Loss Percent"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+
+    cols = ["Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis",
+            "Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"]
+    for c in cols:
+        if c not in snap.columns:
+            snap[c] = ""
+    snap = snap[cols]
+    snapshot_html = snap.to_html(index=False, border=0)
+
+    css = """
+    <style>
+      .blk { margin-top:20px; }
+      .blk h3 { margin: 0 0 6px 0; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; vertical-align: top; }
+      th { text-align:left; background:#fafafa; }
+    </style>
+    """
+    return f"""{css}
+    <div class="blk">
+      <h3>Weinstein Weekly – Summary</h3>
+      {summary_html}
+    </div>
+    <div class="blk">
+      <h3>Per-position Snapshot</h3>
+      {snapshot_html}
+    </div>
+    """
+
 # ---------------- Logic ----------------
 def run():
     cfg, benchmark = load_config()
     weekly_df, weekly_csv_path = load_weekly_report()
 
-    # Normalize column names (be tolerant to casing)
+    # Normalize column names
     wcols_lower = {c.lower(): c for c in weekly_df.columns}
     col_ticker = wcols_lower.get("ticker", "ticker")
     col_stage  = wcols_lower.get("stage", "stage")
     col_ma30   = wcols_lower.get("ma30", "ma30")
     col_rs_abv = wcols_lower.get("rs_above_ma", "rs_above_ma")
-    col_rank   = wcols_lower.get("rank", None)  # weekly might not have 'rank'
+    col_rank   = wcols_lower.get("rank", None)
 
     focus = weekly_df[
         weekly_df[col_stage].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])
@@ -292,7 +448,7 @@ def run():
     if "weekly_rank" not in focus.columns:
         focus["weekly_rank"] = 999999
 
-    # 🔹 Add Industry & Sector to intraday focus (independent of weekly CSV)
+    # 🔹 Add Industry & Sector
     focus = attach_industry(
         focus,
         ticker_col="ticker",
@@ -464,7 +620,7 @@ def run():
                 chart_imgs.append((t, data_uri))
                 charts_added += 1
 
-    # -------- Build Email --------
+    # -------- Build core Intraday HTML --------
     info_df = pd.DataFrame(info_rows)
     if not info_df.empty:
         info_df["stage_rank"] = info_df["stage"].apply(stage_order)
@@ -522,6 +678,26 @@ def run():
     <h4>Snapshot (ordered by weekly rank & stage)</h4>
     {info_df.to_html(index=False)}
     """
+
+    # -------- Append the SAME holdings block as Weekly (bottom) --------
+    # Build a minimal "stage_df" compatible with weekly merge helper
+    stage_df_for_merge = focus[["ticker","stage","rs_above_ma","industry","sector"]].copy()
+
+    # Try local Open_Positions.csv first, else Google Sheet via config
+    try:
+        holdings_df = _try_read_open_positions_local(WEEKLY_OUTPUT_DIR)
+        if holdings_df is None:
+            holdings_df = _read_open_positions_gsheet(cfg, tab_name=cfg.get("sheets", {}).get("open_positions_tab","Open_Positions"))
+    except Exception as e:
+        holdings_df = None
+
+    if holdings_df is not None and not holdings_df.empty:
+        pos_norm = _normalize_open_positions_columns(holdings_df)
+        # Merge to add stage/industry/sector and compute Recommendation (same logic as weekly)
+        pos_merged = _merge_stage_and_recommend(pos_norm, stage_df_for_merge)
+        metrics = _compute_portfolio_metrics(pos_norm)
+        holdings_html = holdings_sections_html(pos_merged, metrics)
+        html = html + holdings_html  # 🔚 append at bottom
 
     # Plain-text
     text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n"
