@@ -294,6 +294,9 @@ def _colored_summary_html(m):
       .sumtbl td.pos { color:#0b6b2e; }
       .sumtbl td.neg { color:#a30a0a; }
       .sumtbl td.neu { color:#444; }
+      .num-pos { color:#106b21; font-weight:600; }
+      .num-neg { color:#8a1111; font-weight:600; }
+      .num-neu { color:#444; }
       .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid transparent;}
       .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; } /* dark green */
       .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; } /* green */
@@ -324,17 +327,22 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
     ]
     for c in cols:
         if c not in df.columns: df[c] = np.nan
+
+    # Keep numeric copy for coloring decisions
+    num = df[cols].copy()
+
+    # Make formatted copy for display
     d = df[cols].copy()
 
-    # Format numbers
-    def moneycol(c):
-        d[c] = d[c].apply(lambda x: _money(x))
-    def pctcol(c):
-        d[c] = d[c].apply(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "")
+    def money(x): return _money(x)
+    def pctv(x):  return (f"{float(x):.2f}%" if pd.notna(x) else "")
 
-    for c in ["Last Price","Current Value","Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar"]:
-        moneycol(c)
-    pctcol("Total Gain/Loss Percent")
+    d["Last Price"] = d["Last Price"].apply(money)
+    d["Current Value"] = d["Current Value"].apply(money)
+    d["Cost Basis Total"] = d["Cost Basis Total"].apply(money)
+    d["Average Cost Basis"] = d["Average Cost Basis"].apply(money)
+    d["Total Gain/Loss Dollar"] = d["Total Gain/Loss Dollar"].apply(money)
+    d["Total Gain/Loss Percent"] = d["Total Gain/Loss Percent"].apply(pctv)
 
     # Color badges in Recommendation
     def rec_badge(s):
@@ -351,9 +359,30 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
     # HTML
     th = "".join([f"<th>{c}</th>" for c in cols])
     rows = []
-    for _, r in d.iterrows():
-        tds = "".join([f"<td>{r[c] if pd.notna(r[c]) else ''}</td>" for c in cols])
-        rows.append(f"<tr>{tds}</tr>")
+    for i in range(len(d)):
+        r = d.iloc[i]
+        rn = num.iloc[i]  # numeric companion
+
+        # Decide class for colored numeric cells
+        def sign_cls(val):
+            if pd.isna(val): return "num-neu"
+            return "num-pos" if val > 0 else ("num-neg" if val < 0 else "num-neu")
+
+        gl_d_cls = sign_cls(rn["Total Gain/Loss Dollar"])
+        gl_p_cls = sign_cls(rn["Total Gain/Loss Percent"])
+
+        tds = []
+        for c in cols:
+            if c == "Total Gain/Loss Dollar":
+                tds.append(f"<td class='{gl_d_cls}'>{r[c]}</td>")
+            elif c == "Total Gain/Loss Percent":
+                tds.append(f"<td class='{gl_p_cls}'>{r[c]}</td>")
+            else:
+                val = r[c] if pd.notna(r[c]) else ""
+                tds.append(f"<td>{val}</td>")
+
+        rows.append(f"<tr>{''.join(tds)}</tr>")
+
     body = "\n".join(rows)
 
     return f"""
