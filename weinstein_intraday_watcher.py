@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
-# 🔹 Industry helper (added previously)
+# 🔹 Industry helper
 from industry_utils import attach_industry
 
 # ---------------- Tunables ----------------
@@ -264,7 +264,7 @@ def near_sort_key(item):
     pace = pace if pd.notna(pace) else -1e9
     return (wr, st, dist, -pace)
 
-# ---------------- Holdings helpers (borrowed from weekly) ----------------
+# ---------------- Holdings helpers (with colored badges & summary) ----------------
 def _try_read_open_positions_local(output_dir: str) -> pd.DataFrame | None:
     for fname in ["Open_Positions.csv", "open_positions.csv"]:
         p = os.path.join(output_dir, fname)
@@ -375,14 +375,67 @@ def _money(x):
 def _pct(x):
     return f"{x*100:.2f}%" if (x is not None and pd.notna(x)) else ""
 
-def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str:
-    summary = pd.DataFrame([
-        ["Total Gain/Loss ($)", _money(metrics["total_gl_dollar"])],
-        ["Portfolio % Gain",     _pct(metrics["portfolio_pct_gain"])],
-        ["Average % Gain",       _pct(metrics["average_pct_gain"])],
-    ], columns=["Metric","Value"])
-    summary_html = summary.to_html(index=False, border=0)
+def _rec_badge_html(text: str) -> str:
+    """
+    Return a colored badge <span> for the Recommendation value.
+    """
+    t = (text or "").strip().upper()
+    if t == "HOLD (STRONG)":
+        cls = "rec rec-strong"
+        label = "HOLD (Strong)"
+    elif t == "HOLD":
+        cls = "rec rec-hold"
+        label = "HOLD"
+    elif t == "SELL":
+        cls = "rec rec-sell"
+        label = "SELL"
+    else:
+        cls = "rec rec-neu"
+        label = text or "—"
+    return f'<span class="{cls}">{label}</span>'
 
+def _summary_row_html(metric: str, value_str: str, numeric_value: float | None) -> str:
+    """
+    Build a single summary row with colored Value cell:
+      positive -> .val.pos (green)
+      negative -> .val.neg (red)
+      else     -> .val.neu (gray)
+    """
+    if numeric_value is None or pd.isna(numeric_value):
+        klass = "val neu"
+    else:
+        if numeric_value > 0:
+            klass = "val pos"
+        elif numeric_value < 0:
+            klass = "val neg"
+        else:
+            klass = "val neu"
+    return f"<tr><td class='metric'>{metric}</td><td class='{klass}'>{value_str}</td></tr>"
+
+def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str:
+    """
+    Build summary + per-position snapshot with colored badges and colored summary values.
+    """
+    # ---- Summary (custom HTML to control colors) ----
+    total_gl = metrics["total_gl_dollar"]
+    port_pct = metrics["portfolio_pct_gain"]
+    avg_pct  = metrics["average_pct_gain"]
+
+    summary_rows = [
+        _summary_row_html("Total Gain/Loss ($)", _money(total_gl), total_gl),
+        _summary_row_html("Portfolio % Gain",     _pct(port_pct),  port_pct),
+        _summary_row_html("Average % Gain",       _pct(avg_pct),   avg_pct),
+    ]
+    summary_html = f"""
+    <table class="summary-table">
+      <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+      <tbody>
+        {''.join(summary_rows)}
+      </tbody>
+    </table>
+    """
+
+    # ---- Snapshot table with colored badges in Recommendation ----
     snap = positions_merged.copy()
     snap["Last Price"] = snap["Last Price"].apply(_money)
     snap["Current Value"] = snap["Current Value"].apply(_money)
@@ -391,22 +444,69 @@ def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str
     snap["Total Gain/Loss Dollar"] = snap["Total Gain/Loss Dollar"].apply(_money)
     snap["Total Gain/Loss Percent"] = snap["Total Gain/Loss Percent"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
 
+    # Add colored badge column
+    snap["RecommendationBadge"] = snap["Recommendation"].apply(_rec_badge_html)
+
     cols = ["Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
             "Cost Basis Total","Average Cost Basis",
-            "Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"]
+            "Total Gain/Loss Dollar","Total Gain/Loss Percent","RecommendationBadge"]
     for c in cols:
         if c not in snap.columns:
             snap[c] = ""
-    snap = snap[cols]
-    snapshot_html = snap.to_html(index=False, border=0)
+    # Rename the badge column to display header as 'Recommendation'
+    snap = snap[cols].rename(columns={"RecommendationBadge":"Recommendation"})
 
+    snapshot_html = snap.to_html(index=False, border=0, escape=False)
+
+    # ---- Minimal CSS ----
     css = """
     <style>
       .blk { margin-top:20px; }
       .blk h3 { margin: 0 0 6px 0; }
+
       table { border-collapse: collapse; width: 100%; }
       th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; vertical-align: top; }
       th { text-align:left; background:#fafafa; }
+
+      /* Summary table with colored values */
+      .summary-table { width: 100%; margin: 4px 0 10px 0; }
+      .summary-table th { background:#f8f9fb; color:#333; }
+      .metric { width: 50%; }
+      .val { font-weight: 600; }
+      .val.pos { color: #106b21; }   /* dark green */
+      .val.neg { color: #8a1111; }   /* red */
+      .val.neu { color: #555; }      /* neutral gray */
+
+      /* Recommendation colored badges */
+      .rec {
+        display:inline-block;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        border: 1px solid transparent;
+        letter-spacing: 0.2px;
+      }
+      .rec-strong {
+        background: #eaffea;
+        color: #0f5e1d;           /* darker green text */
+        border-color: #b8e7b9;
+      }
+      .rec-hold {
+        background: #effaf0;
+        color: #1e7a1e;           /* green text */
+        border-color: #cdebd0;
+      }
+      .rec-sell {
+        background: #ffe8e6;
+        color: #8a1111;           /* red text */
+        border-color: #f3b3ae;
+      }
+      .rec-neu {
+        background: #eef1f6;
+        color: #4b5563;           /* slate gray */
+        border-color: #d7dde8;
+      }
     </style>
     """
     return f"""{css}
@@ -696,7 +796,7 @@ def run():
         holdings_html = holdings_sections_html(pos_merged, metrics)
         html = html + '<hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">' \
                     + '<h3 style="margin:8px 0 6px 0;">Your Holdings (snapshot)</h3>' \
-                    + holdings_html  # 🔚 append at bottom with header
+                    + holdings_html
 
     # Plain-text
     text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n"
