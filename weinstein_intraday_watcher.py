@@ -679,25 +679,24 @@ def run():
     {info_df.to_html(index=False)}
     """
 
-    # -------- Append the SAME holdings block as Weekly (bottom) --------
-    # Build a minimal "stage_df" compatible with weekly merge helper
+    # -------- Append the SAME holdings block as Weekly (bottom) + divider header --------
     stage_df_for_merge = focus[["ticker","stage","rs_above_ma","industry","sector"]].copy()
 
-    # Try local Open_Positions.csv first, else Google Sheet via config
     try:
         holdings_df = _try_read_open_positions_local(WEEKLY_OUTPUT_DIR)
         if holdings_df is None:
             holdings_df = _read_open_positions_gsheet(cfg, tab_name=cfg.get("sheets", {}).get("open_positions_tab","Open_Positions"))
-    except Exception as e:
+    except Exception:
         holdings_df = None
 
     if holdings_df is not None and not holdings_df.empty:
         pos_norm = _normalize_open_positions_columns(holdings_df)
-        # Merge to add stage/industry/sector and compute Recommendation (same logic as weekly)
         pos_merged = _merge_stage_and_recommend(pos_norm, stage_df_for_merge)
         metrics = _compute_portfolio_metrics(pos_norm)
         holdings_html = holdings_sections_html(pos_merged, metrics)
-        html = html + holdings_html  # 🔚 append at bottom
+        html = html + '<hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">' \
+                    + '<h3 style="margin:8px 0 6px 0;">Your Holdings (snapshot)</h3>' \
+                    + holdings_html  # 🔚 append at bottom with header
 
     # Plain-text
     text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n"
