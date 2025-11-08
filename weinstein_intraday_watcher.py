@@ -245,27 +245,128 @@ def _normalize_open_positions_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _merge_stage_and_recommend(positions: pd.DataFrame, weekly_df: pd.DataFrame) -> pd.DataFrame:
-    # Select minimal stage info from weekly
     w = weekly_df.rename(columns=str.lower)
     need = ["ticker","stage","rs_above_ma"]
     for n in need:
         if n not in w.columns: w[n] = np.nan
     stage_min = w[need].rename(columns={"ticker": "Symbol"})
-
     out = positions.merge(stage_min, on="Symbol", how="left")
 
     def recommend(row):
         pct = row.get("Total Gain/Loss Percent", np.nan)
         stage = str(row.get("stage", ""))
-        # Weekly logic replicated:
-        #  - SELL if Stage 4 and negative P/L
-        #  - SELL if drawdown <= -8% regardless of stage
         if (stage.startswith("Stage 4") and pd.notna(pct) and pct < 0) or (pd.notna(pct) and pct <= -8.0):
             return "SELL"
         return "HOLD (Strong)" if stage.startswith("Stage 2") else "HOLD"
 
     out["Recommendation"] = out.apply(recommend, axis=1)
     return out
+
+# ---- holdings summary (colored) ----
+def _money(x):
+    return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
+
+def _pct(x):
+    return f"{x:.2f}%" if (x is not None and pd.notna(x)) else ""
+
+def _compute_portfolio_metrics(pos: pd.DataFrame) -> dict:
+    cur = float(pos["Current Value"].fillna(0).sum())
+    cost = float(pos["Cost Basis Total"].fillna(0).sum())
+    gl_dollar = cur - cost
+    port_pct = (gl_dollar / cost * 100.0) if cost else 0.0
+    row_pct = pos["Total Gain/Loss Percent"].dropna().astype(float)
+    avg_pct = float(row_pct.mean()) if len(row_pct) else 0.0
+    return {"gl_dollar": gl_dollar, "port_pct": port_pct, "avg_pct": avg_pct}
+
+def _colored_summary_html(m):
+    # green if positive, red if negative
+    def cls(v): return "pos" if v > 0 else ("neg" if v < 0 else "neu")
+    rows = [
+        ("Total Gain/Loss ($)", _money(m["gl_dollar"]), cls(m["gl_dollar"])),
+        ("Portfolio % Gain",     _pct(m["port_pct"]),   cls(m["port_pct"])),
+        ("Average % Gain",       _pct(m["avg_pct"]),    cls(m["avg_pct"])),
+    ]
+    tr = "\n".join([f"<tr><td>{k}</td><td class='{c}'><b>{v}</b></td></tr>" for k,v,c in rows])
+    css = """
+    <style>
+      .sumtbl { border-collapse: collapse; width: 100%; max-width: 520px; }
+      .sumtbl td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; }
+      .sumtbl td.pos { color:#0b6b2e; }
+      .sumtbl td.neg { color:#a30a0a; }
+      .sumtbl td.neu { color:#444; }
+      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid transparent;}
+      .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; } /* dark green */
+      .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; } /* green */
+      .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; } /* red */
+      .tab-holdings { border-collapse: collapse; width:100%; }
+      .tab-holdings th, .tab-holdings td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
+      .tab-holdings th { text-align:left; background:#fafafa; }
+    </style>
+    """
+    return css + f"""
+    <div class="blk">
+      <h3>Weinstein Weekly – Summary</h3>
+      <table class="sumtbl">
+        <tbody>
+          {tr}
+        </tbody>
+      </table>
+    </div>
+    """
+
+def _format_holdings_table(df: pd.DataFrame) -> str:
+    # Ensure columns & order
+    for c in ["industry","sector"]:
+        if c not in df.columns: df[c] = np.nan
+    cols = [
+        "Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
+        "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"
+    ]
+    for c in cols:
+        if c not in df.columns: df[c] = np.nan
+    d = df[cols].copy()
+
+    # Format numbers
+    def moneycol(c):
+        d[c] = d[c].apply(lambda x: _money(x))
+    def pctcol(c):
+        d[c] = d[c].apply(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "")
+
+    for c in ["Last Price","Current Value","Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar"]:
+        moneycol(c)
+    pctcol("Total Gain/Loss Percent")
+
+    # Color badges in Recommendation
+    def rec_badge(s):
+        s = str(s or "")
+        if s.upper().startswith("SELL"):
+            return "<span class='rec-badge rec-sell'>SELL</span>"
+        if s.upper().startswith("HOLD (STRONG"):
+            return "<span class='rec-badge rec-strong'>HOLD (Strong)</span>"
+        if s.upper().startswith("HOLD"):
+            return "<span class='rec-badge rec-hold'>HOLD</span>"
+        return s
+    d["Recommendation"] = d["Recommendation"].apply(rec_badge)
+
+    # HTML
+    th = "".join([f"<th>{c}</th>" for c in cols])
+    rows = []
+    for _, r in d.iterrows():
+        tds = "".join([f"<td>{r[c] if pd.notna(r[c]) else ''}</td>" for c in cols])
+        rows.append(f"<tr>{tds}</tr>")
+    body = "\n".join(rows)
+
+    return f"""
+    <div class="blk">
+      <h3>Per-position Snapshot</h3>
+      <table class="tab-holdings">
+        <thead><tr>{th}</tr></thead>
+        <tbody>
+          {body}
+        </tbody>
+      </table>
+    </div>
+    """
 
 # ---------------- Charting ----------------
 def make_tiny_chart_png(ticker, benchmark, daily_df):
@@ -385,7 +486,6 @@ def run():
     else:
         last_closes = intraday["Close"].ffill().tail(1)
 
-    # quick map for price lookup
     def px_now(t):
         if hasattr(last_closes, "index") and (t in last_closes.index):
             return float(last_closes.get(t, np.nan))
@@ -398,7 +498,7 @@ def run():
     buy_signals = []
     near_signals = []
     sell_signals = []          # risk-rule breaches from tracked positions
-    sell_from_positions = []   # new: SELL recs based on your holdings + weekly stage
+    sell_from_positions = []   # SELL recs based on your holdings + weekly stage
     info_rows = []
     chart_imgs = []
 
@@ -525,15 +625,16 @@ def run():
             "weekly_rank": weekly_rank
         })
 
-    # ---------- NEW: SELL recommendations from holdings ----------
+    # ---------- NEW: SELL recommendations from holdings AND build colored holdings block ----------
+    holdings_block_html = ""
     holdings_raw = _load_open_positions_local()
     if holdings_raw is not None and not holdings_raw.empty:
         pos_norm = _normalize_open_positions_columns(holdings_raw)
         merged = _merge_stage_and_recommend(pos_norm, weekly_df)
 
-        # Build SELL items using current live price if available; fallback to "Last Price" from holdings
+        # SELL-from-positions list
         for _, r in merged.iterrows():
-            if str(r.get("Recommendation", "")).upper() == "SELL":
+            if str(r.get("Recommendation", "")).upper().startswith("SELL"):
                 t = str(r.get("Symbol", "")).strip()
                 if not t: continue
                 live_px = px_now(t)
@@ -542,7 +643,7 @@ def run():
                 pct = r.get("Total Gain/Loss Percent", np.nan)
                 stg = str(r.get("stage", ""))
                 if pd.notna(pct) and pct <= -8.0: reasons.append("drawdown ≤ −8%")
-                if stg.startswith("Stage 4"):     reasons.append("Stage 4 + negative P/L")
+                if stg.startswith("Stage 4") and (pd.notna(pct) and pct < 0): reasons.append("Stage 4 + negative P/L")
                 if not reasons: reasons.append("strategy rule")
                 sell_from_positions.append({
                     "ticker": t,
@@ -552,6 +653,10 @@ def run():
                     "weekly_rank": np.nan,
                     "source": "positions"
                 })
+
+        # Colored summary + snapshot table HTML
+        metrics = _compute_portfolio_metrics(pos_norm)
+        holdings_block_html = _colored_summary_html(metrics) + _format_holdings_table(merged)
 
     # -------- Ranking & charts for top-n --------
     buy_signals.sort(key=buy_sort_key)
@@ -641,6 +746,10 @@ def run():
     {info_df.to_html(index=False)}
     """
 
+    # Append the WEEKLY-STYLE holdings report at the very end
+    if holdings_block_html:
+        html += "<hr/>" + holdings_block_html
+
     # Plain-text summary
     text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n"
     for i, b in enumerate(buy_signals, start=1):
@@ -656,8 +765,8 @@ def run():
         wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
         text += f"{i}. {n['ticker']} @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']}, weekly {wr_str})\n"
 
-    text += "\nSELL / RISK:\n"
     all_sells = sell_signals + sell_from_positions
+    text += "\nSELL / RISK:\n"
     if not all_sells:
         text += "No SELL signals.\n"
     else:
