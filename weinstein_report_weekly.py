@@ -27,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ---- Optional Google Sheets pull (Signals + Mapping) ----
+# ---- Optional Google Sheets pull (Signals + Mapping + Open_Positions fallback) ----
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -50,6 +50,7 @@ TOP_N_CHARTS = 20
 # Spreadsheet tabs (only used if Sheets is configured)
 TAB_SIGNALS = "Signals"
 TAB_MAPPING = "Mapping"
+TAB_OPEN_POSITIONS = "Open_Positions"  # fallback if local CSV not found
 
 # ========= Utilities =========
 def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
@@ -339,6 +340,18 @@ def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
       .rec-hold   { background:#effaf0; color:#1e7a1e; border-color:#cdebd0; }
       .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
       .rec-neu    { background:#eef1f6; color:#4b5563; border-color:#d7dde8; }
+      /* Snapshot & summary coloring */
+      .pct, .money { font-weight: 600; }
+      .pct.pos, .money.pos { color: #106b21; }
+      .pct.neg, .money.neg { color: #8a1111; }
+      .pct.neu, .money.neu { color: #555; }
+      .summary-table { width: 100%; margin: 4px 0 10px 0; }
+      .summary-table th { background:#f8f9fb; color:#333; }
+      .metric { width: 50%; }
+      .val { font-weight: 700; }
+      .val.pos { color: #106b21; }
+      .val.neg { color: #8a1111; }
+      .val.neu { color: #555; }
       img { image-rendering:-webkit-optimize-contrast; }
     </style>
     """
@@ -350,6 +363,256 @@ def df_to_html(df: pd.DataFrame, title: str, summary_line: str):
     {table_html}
     """
     return html
+
+# ---------- Holdings/Snapshot helpers (restores your missing block) ----------
+def _try_read_open_positions_local(output_dir: str) -> pd.DataFrame | None:
+    for fname in ["Open_Positions.csv", "open_positions.csv"]:
+        p = os.path.join(output_dir, fname)
+        if os.path.exists(p):
+            try:
+                df = pd.read_csv(p)
+                if not df.empty:
+                    return df
+            except Exception:
+                pass
+    return None
+
+def _read_open_positions_gsheet(cfg: dict, tab_name: str = TAB_OPEN_POSITIONS) -> pd.DataFrame:
+    """
+    Fallback: read Open_Positions from Google Sheet via service account.
+    Expects:
+      cfg['sheets']['url'] or cfg['sheets']['sheet_url']
+      cfg['google']['service_account_json']
+    """
+    if not (gspread and Credentials):
+        raise RuntimeError("gspread not available")
+    sheets = (cfg.get("sheets", {}) or {})
+    google = (cfg.get("google", {}) or {})
+    sheet_url = sheets.get("sheet_url") or sheets.get("url")
+    keyfile = google.get("service_account_json")
+    if not sheet_url or not keyfile:
+        raise RuntimeError("Missing sheets.url/sheet_url or google.service_account_json in config.yaml")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = Credentials.from_service_account_file(keyfile, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(sheet_url)
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        return pd.DataFrame()
+    data = ws.get_all_records()
+    return pd.DataFrame(data)
+
+def _coerce_numlike(series: pd.Series) -> pd.Series:
+    def conv(x):
+        if pd.isna(x):
+            return np.nan
+        if isinstance(x, (int, float, np.number)):
+            return float(x)
+        s = str(x)
+        s = s.replace(",", "").replace("$", "").strip()
+        if s.endswith("%"):
+            s = s[:-1]
+        try:
+            return float(s)
+        except Exception:
+            return np.nan
+    return series.apply(conv)
+
+def _normalize_open_positions_columns(df: pd.DataFrame) -> pd.DataFrame:
+    ren = {
+        "Ticker": "Symbol", "symbol": "Symbol", "SYMBOL": "Symbol",
+        "Qty": "Quantity", "Shares": "Quantity", "quantity": "Quantity",
+        "Last": "Last Price", "Price": "Last Price", "LastPrice": "Last Price",
+        "Current Value $": "Current Value", "Market Value": "Current Value", "MarketValue": "Current Value",
+        "Cost Basis": "Cost Basis Total", "Cost": "Cost Basis Total",
+        "Avg Cost": "Average Cost Basis", "AvgCost": "Average Cost Basis",
+        "Gain $": "Total Gain/Loss Dollar", "Gain": "Total Gain/Loss Dollar",
+        "Gain %": "Total Gain/Loss Percent", "GainPct": "Total Gain/Loss Percent",
+        "Name": "Description", "Description/Name": "Description",
+    }
+    out = df.rename(columns=ren).copy()
+
+    # Ensure required columns exist
+    required = [
+        "Symbol","Description","Quantity","Last Price","Current Value",
+        "Cost Basis Total","Average Cost Basis",
+        "Total Gain/Loss Dollar","Total Gain/Loss Percent"
+    ]
+    for c in required:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    # Coerce numerics robustly
+    num_cols = ["Quantity","Last Price","Current Value","Cost Basis Total",
+                "Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"]
+    for c in num_cols:
+        out[c] = _coerce_numlike(out[c])
+
+    # Drop fully empty rows if any
+    out = out.dropna(how="all")
+    return out[required]
+
+def _compute_portfolio_metrics(positions: pd.DataFrame) -> dict:
+    cur = float(positions["Current Value"].fillna(0).sum())
+    cost = float(positions["Cost Basis Total"].fillna(0).sum())
+    gl_dollar = cur - cost
+    port_pct = (gl_dollar / cost) if cost else 0.0
+
+    row_pct = positions["Total Gain/Loss Percent"].dropna().astype(float)
+    avg_pct = float(row_pct.mean())/100.0 if len(row_pct) else 0.0
+
+    return {
+        "total_gl_dollar": gl_dollar,
+        "portfolio_pct_gain": port_pct,
+        "average_pct_gain": avg_pct,
+        "total_current_value": cur,
+        "total_cost_basis": cost,
+    }
+
+def _merge_stage_and_recommend(positions: pd.DataFrame, stage_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bring in stage + RS + industry + sector for held symbols
+    and produce Recommendation (HOLD (Strong) / HOLD / SELL).
+    """
+    stage_min = stage_df[["ticker","stage","rs_above_ma","industry","sector"]].rename(columns={"ticker":"Symbol"})
+    out = positions.merge(stage_min, on="Symbol", how="left")
+
+    def recommend(row):
+        pct = row.get("Total Gain/Loss Percent", np.nan)  # PERCENT units
+        stage = str(row.get("stage", ""))
+        rs_above = bool(row.get("rs_above_ma", False))
+
+        if stage.startswith("Stage 2") and (rs_above or (pd.notna(pct) and pct >= 20)):
+            return "HOLD (Strong)"
+        if stage.startswith("Stage 4") and pd.notna(pct) and pct < 0:
+            return "SELL"
+        if pd.notna(pct) and pct <= -8:
+            return "SELL"
+        return "HOLD"
+
+    out["Recommendation"] = out.apply(recommend, axis=1)
+    return out
+
+def _money(amount_float):
+    return f"${amount_float:,.2f}" if (amount_float is not None and pd.notna(amount_float)) else ""
+
+def _pct_str_fraction(x_float_as_fraction):
+    return f"{x_float_as_fraction*100:.2f}%" if (x_float_as_fraction is not None and pd.notna(x_float_as_fraction)) else ""
+
+def _pct_cell_html_percent_units(pct_number):
+    if pct_number is None or pd.isna(pct_number):
+        klass = "pct neu"
+    else:
+        if pct_number > 0: klass = "pct pos"
+        elif pct_number < 0: klass = "pct neg"
+        else: klass = "pct neu"
+    txt = f"{pct_number:.2f}%" if pct_number is not None and pd.notna(pct_number) else ""
+    return f'<span class="{klass}">{txt}</span>'
+
+def _money_cell_html(amount_float):
+    if amount_float is None or pd.isna(amount_float):
+        klass = "money neu"
+    else:
+        if amount_float > 0: klass = "money pos"
+        elif amount_float < 0: klass = "money neg"
+        else: klass = "money neu"
+    return f'<span class="{klass}">{_money(amount_float)}</span>'
+
+def _rec_badge_hold_html(text: str) -> str:
+    t = (text or "").strip().upper()
+    if t == "HOLD (STRONG)":   cls, label = "rec rec-strong", "HOLD (Strong)"
+    elif t == "HOLD":          cls, label = "rec rec-hold",   "HOLD"
+    elif t == "SELL":          cls, label = "rec rec-sell",   "SELL"
+    else:                      cls, label = "rec rec-neu",    (text or "—")
+    return f'<span class="{cls}">{label}</span>'
+
+def holdings_sections_html(positions_merged: pd.DataFrame, metrics: dict) -> str:
+    """
+    Build summary + per-position snapshot with colored badges,
+    colored summary values, colored % column, and colored $ gain/loss.
+    """
+    # ---- Summary ----
+    total_gl = metrics["total_gl_dollar"]
+    port_pct = metrics["portfolio_pct_gain"]           # fraction (e.g., -0.0587)
+    avg_pct  = metrics["average_pct_gain"]             # fraction
+
+    def _summary_row_html(metric: str, value_str: str, numeric_value: float | None) -> str:
+        if numeric_value is None or pd.isna(numeric_value):
+            klass = "val neu"
+        else:
+            if numeric_value > 0: klass = "val pos"
+            elif numeric_value < 0: klass = "val neg"
+            else: klass = "val neu"
+        return f"<tr><td class='metric'>{metric}</td><td class='{klass}'>{value_str}</td></tr>"
+
+    summary_rows = [
+        _summary_row_html("Total Gain/Loss ($)", _money(total_gl), total_gl),
+        _summary_row_html("Portfolio % Gain",     _pct_str_fraction(port_pct),  port_pct),
+        _summary_row_html("Average % Gain",       _pct_str_fraction(avg_pct),   avg_pct),
+    ]
+    summary_html = f"""
+    <table class="summary-table">
+      <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+      <tbody>
+        {''.join(summary_rows)}
+      </tbody>
+    </table>
+    """
+
+    # ---- Snapshot table ----
+    snap = positions_merged.copy()
+
+    # Keep raw numeric columns for targeted coloring
+    raw_pct = snap["Total Gain/Loss Percent"].copy()    # in PERCENT units
+    raw_gl_dollar = snap["Total Gain/Loss Dollar"].copy()
+
+    # Money-format the non-colored money columns
+    snap["Last Price"] = snap["Last Price"].apply(_money)
+    snap["Current Value"] = snap["Current Value"].apply(_money)
+    snap["Cost Basis Total"] = snap["Cost Basis Total"].apply(_money)
+    snap["Average Cost Basis"] = snap["Average Cost Basis"].apply(_money)
+
+    # Colored percent & dollar HTML columns
+    snap["TGLP_colored"] = raw_pct.apply(_pct_cell_html_percent_units)
+    snap["TGLD_colored"] = raw_gl_dollar.apply(_money_cell_html)
+
+    # Colored Recommendation badge
+    snap["RecommendationBadge"] = snap["Recommendation"].apply(_rec_badge_hold_html)
+
+    cols = ["Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis",
+            "TGLD_colored","TGLP_colored","Recommendation"]
+    for c in cols:
+        if c not in snap.columns:
+            snap[c] = ""
+    snap = snap[cols].rename(columns={
+        "TGLD_colored": "Total Gain/Loss Dollar",
+        "TGLP_colored": "Total Gain/Loss Percent",
+    })
+
+    snapshot_html = snap.to_html(index=False, border=0, escape=False)
+
+    css = """
+    <style>
+      .blk { margin-top:20px; }
+      .blk h3 { margin: 0 0 6px 0; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 14px; vertical-align: top; }
+      th { text-align:left; background:#fafafa; }
+    </style>
+    """
+    return f"""{css}
+    <div class="blk">
+      <h3>Weinstein Weekly – Summary</h3>
+      {summary_html}
+    </div>
+    <div class="blk">
+      <h3>Per-position Snapshot</h3>
+      {snapshot_html}
+    </div>
+    """
 
 # ---------- Build report ----------
 def build_block(close_w: pd.DataFrame, volume_w: pd.DataFrame, tickers: list[str], bench_sym: str,
@@ -467,7 +730,7 @@ def main():
     html_path = os.path.join(output_dir, f"weinstein_weekly_{ts}.html")
     combined.to_csv(csv_path, index=False)
 
-    # HTML email: Equity section + Crypto section (if any)
+    # HTML sections: Equity + Crypto
     buy_count = int((eq_df["buy_signal"] == "BUY").sum())
     watch_count = int((eq_df["buy_signal"] == "WATCH").sum())
     avoid_count = int((eq_df["buy_signal"] == "AVOID").sum())
@@ -493,7 +756,30 @@ def main():
             summary_line=summary_line_cr
         )
 
-    html = html_core + ("<hr/>" + html_crypto if html_crypto else "")
+    # ---------- Holdings Snapshot block (restored) ----------
+    # Try local CSV first (created by your performance builder), else fallback to reading the Sheet tab.
+    holdings_df = _try_read_open_positions_local(output_dir)
+    if holdings_df is None:
+        try:
+            holdings_df = _read_open_positions_gsheet(cfg, tab_name=TAB_OPEN_POSITIONS)
+        except Exception as e:
+            print(f"⚠️  Could not load Open_Positions (no CSV and sheet read failed): {e}")
+            holdings_df = None
+
+    extra_html = ""
+    if holdings_df is not None and not holdings_df.empty:
+        pos_norm = _normalize_open_positions_columns(holdings_df)
+
+        # only need minimal stage/rs/industry/sector for held symbols:
+        stage_df_for_merge = combined[["ticker","stage","rs_above_ma","industry","sector"]].copy()
+        pos_merged = _merge_stage_and_recommend(pos_norm, stage_df_for_merge)
+        metrics = _compute_portfolio_metrics(pos_norm)
+        extra_html = holdings_sections_html(pos_merged, metrics)
+    else:
+        extra_html = "<!-- holdings not available -->"
+
+    # Build final HTML
+    html = html_core + (("<hr/>" + html_crypto) if html_crypto else "") + extra_html
 
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
