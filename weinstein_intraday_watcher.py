@@ -140,6 +140,26 @@ def _save_intraday_state(st):
     with open(INTRADAY_STATE_FILE, "w") as f:
         json.dump(st, f, indent=2)
 
+# --- NEW: Normalize legacy state (backfill missing keys safely) ---
+def _normalize_trigger_state(st: dict) -> dict:
+    """Backfill missing keys for legacy state entries (pre-sell fields)."""
+    if not isinstance(st, dict):
+        return {}
+    for sym, entry in list(st.items()):
+        if not isinstance(entry, dict):
+            st[sym] = {
+                "state": "IDLE", "near_hits": [], "cooldown": 0,
+                "sell_state": "IDLE", "sell_hits": [], "sell_cooldown": 0,
+            }
+            continue
+        entry.setdefault("state", "IDLE")
+        entry.setdefault("near_hits", [])
+        entry.setdefault("cooldown", 0)
+        entry.setdefault("sell_state", "IDLE")
+        entry.setdefault("sell_hits", [])
+        entry.setdefault("sell_cooldown", 0)
+    return st
+
 def _elapsed_in_current_bar_minutes(intraday_df, ticker):
     # Works for 60m/30m bars; uses last index timestamp and now()
     try:
@@ -643,6 +663,9 @@ def run(_config_path="./config.yaml"):
 
     # trigger state
     trigger_state = _load_intraday_state()
+    # Normalize legacy state and persist back (one-time cleanup)
+    trigger_state = _normalize_trigger_state(trigger_state)
+    _save_intraday_state(trigger_state)
 
     buy_signals = []
     near_signals = []
@@ -732,10 +755,19 @@ def run(_config_path="./config.yaml"):
             "state":"IDLE", "near_hits":[], "cooldown":0,
             "sell_state":"IDLE", "sell_hits":[], "sell_cooldown":0
         })
+        # Ensure defaults exist for legacy entries
+        st.setdefault("state", "IDLE")
+        st.setdefault("near_hits", [])
+        st.setdefault("cooldown", 0)
+        st.setdefault("sell_state", "IDLE")
+        st.setdefault("sell_hits", [])
+        st.setdefault("sell_cooldown", 0)
+
         # BUY hits
         st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, NEAR_HITS_WINDOW)
-        if st.get("cooldown", 0) > 0:
-            st["cooldown"] = int(st["cooldown"]) - 1
+        cd = int(st.get("cooldown", 0))
+        if cd > 0:
+            st["cooldown"] = cd - 1
         state_now = st.get("state", "IDLE")
         if state_now == "IDLE" and near_now:
             state_now = "NEAR"
@@ -746,16 +778,17 @@ def run(_config_path="./config.yaml"):
             st["cooldown"] = COOLDOWN_SCANS
         elif state_now == "TRIGGERED":
             pass
-        elif st["cooldown"] > 0 and not near_now:
+        elif int(st.get("cooldown", 0)) > 0 and not near_now:
             state_now = "COOLDOWN"
-        elif st["cooldown"] == 0 and not near_now and not confirm:
+        elif int(st.get("cooldown", 0)) == 0 and not near_now and not confirm:
             state_now = "IDLE"
         st["state"] = state_now
 
         # SELL hits
         st["sell_hits"], sell_hit_count = _update_hits(st.get("sell_hits", []), sell_near_now, SELL_NEAR_HITS_WINDOW)
-        if st.get("sell_cooldown", 0) > 0:
-            st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
+        scd = int(st.get("sell_cooldown", 0))
+        if scd > 0:
+            st["sell_cooldown"] = scd - 1
         sell_state = st.get("sell_state", "IDLE")
         if sell_state == "IDLE" and sell_near_now:
             sell_state = "NEAR"
@@ -766,9 +799,9 @@ def run(_config_path="./config.yaml"):
             st["sell_cooldown"] = SELL_COOLDOWN_SCANS
         elif sell_state == "TRIGGERED":
             pass
-        elif st["sell_cooldown"] > 0 and not sell_near_now:
+        elif int(st.get("sell_cooldown", 0)) > 0 and not sell_near_now:
             sell_state = "COOLDOWN"
-        elif st["sell_cooldown"] == 0 and not sell_near_now and not sell_confirm:
+        elif int(st.get("sell_cooldown", 0)) == 0 and not sell_near_now and not sell_confirm:
             sell_state = "IDLE"
         st["sell_state"] = sell_state
 
@@ -873,7 +906,7 @@ def run(_config_path="./config.yaml"):
             if not rec.startswith("SELL"):
                 continue
             sym = str(r.get("Symbol", "")).strip()
-            if not sym: 
+            if not sym:
                 continue
             live_px = px_now(sym)
             use_px = live_px if pd.notna(live_px) else float(r.get("Last Price", np.nan))
@@ -968,9 +1001,12 @@ def run(_config_path="./config.yaml"):
             else:  # BUY / NEAR
                 pace_val = it.get("pace", None)
                 pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+                # guard pivot formatting
+                pivot_val = it.get("pivot", np.nan)
+                pivot_str = f"{pivot_val:.2f}" if pd.notna(pivot_val) else "—"
                 lis.append(
                     f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} "
-                    f"(pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
+                    f"(pivot {pivot_str}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
                 )
         return "<ol>" + "\n".join(lis) + "</ol>"
 
@@ -1019,14 +1055,18 @@ def run(_config_path="./config.yaml"):
         pace_str = "—" if (b.get("pace") is None or pd.isna(b.get("pace"))) else f"{b['pace']:.2f}x"
         wr = b.get("weekly_rank", None)
         wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-        text += f"{i}. {b['ticker']} @ {b['price']:.2f} (pivot {b['pivot']:.2f}, pace {pace_str}, {b['stage']}, weekly {wr_str})\n"
+        pv = b.get("pivot", np.nan)
+        pv_str = f"{pv:.2f}" if pd.notna(pv) else "—"
+        text += f"{i}. {b['ticker']} @ {b['price']:.2f} (pivot {pv_str}, pace {pace_str}, {b['stage']}, weekly {wr_str})\n"
 
     text += "\nNEAR-TRIGGER (ranked):\n"
     for i, n in enumerate(near_signals, start=1):
         pace_str = "—" if (n.get("pace") is None or pd.isna(n.get("pace"))) else f"{n['pace']:.2f}x"
         wr = n.get("weekly_rank", None)
         wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-        text += f"{i}. {n['ticker']} @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']}, weekly {wr_str})\n"
+        pv = n.get("pivot", np.nan)
+        pv_str = f"{pv:.2f}" if pd.notna(pv) else "—"
+        text += f"{i}. {n['ticker']} @ {n['price']:.2f} (pivot {pv_str}, pace {pace_str}, {n['stage']}, weekly {wr_str})\n"
 
     text += "\nSELL TRIGGERS (ranked):\n"
     for i, s in enumerate(sell_triggers, start=1):
