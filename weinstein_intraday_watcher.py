@@ -1,6 +1,6 @@
 # === weinstein_intraday_watcher.py ===
 import os, io, json, math, time, base64, yaml, argparse, sys
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -23,9 +23,11 @@ PIVOT_LOOKBACK_WEEKS = 10     # breakout pivot high window (weekly proxy)
 VOL_PACE_MIN = 1.30           # today's est. full-day vol vs 50-DMA for BUY
 BUY_DIST_ABOVE_MA_MIN = 0.00  # >= 0% above 30-wk MA proxy (SMA150)
 
-# Confirmation
+# Confirmation: 2 bars for <=30m, 60m uses 1-bar with intrabar checks below
 CONFIRM_BARS = 2
-MIN_BREAKOUT_PCT = 0.004      # 0.4% above pivot for BUY confirm
+
+# Breakout quality guards
+MIN_BREAKOUT_PCT = 0.004      # 0.4% above pivot for BUY confirm (was 0.5%)
 REQUIRE_RISING_BAR_VOL = True
 INTRADAY_AVG_VOL_WINDOW = 20
 INTRADAY_LASTBAR_AVG_MULT = 1.20
@@ -52,7 +54,7 @@ OPEN_POSITIONS_CSV_CANDIDATES = [
     "./output/open_positions.csv",
 ]
 
-# --- LOGGING ---
+# --- NEW (LOGGING) ---
 VERBOSE = True  # default; can be overridden via --quiet
 
 def _ts():
@@ -64,7 +66,7 @@ def log(msg, *, level="info"):
     prefix = {"info":"•", "ok":"✅", "step":"▶️", "warn":"⚠️", "err":"❌", "debug":"··"}.get(level, "•")
     print(f"{prefix} [{_ts()}] {msg}", flush=True)
 
-# --- Stateful trigger tunables (BUY) ---
+# --- NEW: Stateful trigger tunables (BUY) ---
 INTRADAY_STATE_FILE = "./state/intraday_triggers.json"  # per-ticker trigger state
 SCAN_INTERVAL_MIN = 10                                  # cron cadence (minutes)
 
@@ -75,9 +77,9 @@ COOLDOWN_SCANS = 24         # ~4 hours cooldown at 10-min cadence
 # 60m-specific confirmation easing (BUY)
 CONFIRM_BARS_60M = 1
 INTRABAR_CONFIRM_MIN_ELAPSED = 40   # minutes elapsed in current 60m bar
-INTRABAR_VOLPACE_MIN = 1.20         # current bar pace vs avg 60m bar
+INTRABAR_VOLPACE_MIN = 1.20         # projected current bar pace vs avg 60m bar
 
-# --- SELL TRIGGERS ---
+# --- NEW (SELL TRIGGERS) ---
 SELL_NEAR_ABOVE_MA_PCT = 0.005   # within +0.5% above MA counts as "near-sell"
 SELL_BREAK_PCT = 0.005           # 0.5% confirmed break below MA30 proxy
 SELL_NEAR_HITS_WINDOW = 6        # ~1 hour (if 10-min cadence)
@@ -91,8 +93,6 @@ def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="./config.yaml")
     p.add_argument("--quiet", action="store_true", help="reduce console noise")
-    p.add_argument("--selftest", action="store_true", help="run synthetic test without yfinance")
-    p.add_argument("--no-email", action="store_true", help="skip sending email (prints only)")
     return p.parse_args()
 
 # ---------------- Config / IO ----------------
@@ -127,7 +127,7 @@ def save_positions(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-# --- Intraday trigger state (per symbol) ---
+# --- NEW: Intraday trigger state (per symbol) ---
 def _load_intraday_state():
     path = INTRADAY_STATE_FILE
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -140,6 +140,7 @@ def _save_intraday_state(st):
     with open(INTRADAY_STATE_FILE, "w") as f:
         json.dump(st, f, indent=2)
 
+# --- NEW: normalize legacy trigger state safely ---
 def _normalize_trigger_state(st: dict) -> dict:
     """Backfill missing keys for legacy state entries (pre-sell fields)."""
     if not isinstance(st, dict):
@@ -280,7 +281,7 @@ def get_intraday_avg_volume(intraday_df, ticker, window=INTRADAY_AVG_VOL_WINDOW)
         return np.nan
     return float(v.tail(window).mean())
 
-# --- Intrabar volume pace vs average bar volume ---
+# --- NEW: Intrabar volume pace vs average bar volume ---
 def intrabar_volume_pace(intraday_df, ticker, avg_window=INTRADAY_AVG_VOL_WINDOW, bar_minutes=60):
     try:
         if isinstance(intraday_df.columns, pd.MultiIndex):
@@ -337,6 +338,7 @@ def _normalize_open_positions_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Gain $": "Total Gain/Loss Dollar", "Gain": "Total Gain/Loss Dollar",
         "Gain %": "Total Gain/Loss Percent", "GainPct": "Total Gain/Loss Percent",
         "Name": "Description", "Description/Name": "Description",
+        # optional industry/sector if present already
         "industry": "industry", "sector": "sector", "Industry": "industry", "Sector": "sector",
     }
     out = df.rename(columns=ren).copy()
@@ -390,6 +392,7 @@ def _compute_portfolio_metrics(pos: pd.DataFrame) -> dict:
     return {"gl_dollar": gl_dollar, "port_pct": port_pct, "avg_pct": avg_pct}
 
 def _colored_summary_html(m):
+    # green if positive, red if negative
     def cls(v): return "pos" if v > 0 else ("neg" if v < 0 else "neu")
     rows = [
         ("Total Gain/Loss ($)", _money(m["gl_dollar"]), cls(m["gl_dollar"])),
@@ -428,6 +431,7 @@ def _colored_summary_html(m):
     """
 
 def _format_holdings_table(df: pd.DataFrame) -> str:
+    # Ensure columns & order
     for c in ["industry","sector"]:
         if c not in df.columns: df[c] = np.nan
     cols = [
@@ -437,7 +441,10 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
     for c in cols:
         if c not in df.columns: df[c] = np.nan
 
+    # Keep numeric copy for coloring decisions
     num = df[cols].copy()
+
+    # Make formatted copy for display
     d = df[cols].copy()
 
     def money(x): return _money(x)
@@ -450,6 +457,7 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
     d["Total Gain/Loss Dollar"] = d["Total Gain/Loss Dollar"].apply(money)
     d["Total Gain/Loss Percent"] = d["Total Gain/Loss Percent"].apply(pctv)
 
+    # Color badges in Recommendation
     def rec_badge(s):
         s = str(s or "")
         if s.upper().startswith("SELL"):
@@ -461,12 +469,14 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
         return s
     d["Recommendation"] = d["Recommendation"].apply(rec_badge)
 
+    # HTML
     th = "".join([f"<th>{c}</th>" for c in cols])
     rows = []
     for i in range(len(d)):
         r = d.iloc[i]
-        rn = num.iloc[i]
+        rn = num.iloc[i]  # numeric companion
 
+        # Decide class for colored numeric cells
         def sign_cls(val):
             if pd.isna(val): return "num-neu"
             return "num-pos" if val > 0 else ("num-neg" if val < 0 else "num-neu")
@@ -590,118 +600,23 @@ def sell_sort_key(item):
     pace = pace if pd.notna(pace) else -1e9
     return (wr, st, -dist_below, -pace)
 
-# ---------------- SELL helpers ----------------
+# ---------------- Logic ----------------
 def _price_below_ma(px, ma):
     return pd.notna(px) and pd.notna(ma) and px <= ma * (1.0 - SELL_BREAK_PCT)
 
 def _near_sell_zone(px, ma):
+    # Either just above MA (potential crack) or slightly below without confirmation
     if pd.isna(px) or pd.isna(ma):
         return False
     return (px >= ma * (1.0 - SELL_BREAK_PCT)) and (px <= ma * (1.0 + SELL_NEAR_ABOVE_MA_PCT))
 
-# ---------------- SELFTEST (synthetic data) ----------------
-def _build_synthetic_weekly():
-    # Create a tiny weekly "focus" with 3 tickers + benchmark
-    data = [
-        {"ticker":"TESTBUY",  "stage":"Stage 2 (Uptrend)", "ma30":100.0, "rs_above_ma":True, "weekly_rank":10},
-        {"ticker":"TESTNEAR", "stage":"Stage 2 (Uptrend)", "ma30":200.0, "rs_above_ma":True, "weekly_rank":20},
-        {"ticker":"TESTSELL", "stage":"Stage 2 (Uptrend)", "ma30":300.0, "rs_above_ma":True, "weekly_rank":30},
-    ]
-    return pd.DataFrame(data), "SELFTEST_WEEKLY.csv"
-
-def _build_synthetic_intraday_daily(benchmark="SPY"):
-    # 12 bars of 60m for intraday
-    end = datetime.utcnow()
-    idx = pd.date_range(end=end - timedelta(hours=11), periods=12, freq="H")
-    # Design closes to trigger scenarios:
-    # TESTBUY: pivot ~ 105, price recently broke above pivot and MA
-    close_buy = np.array([95,97,99,100,101,102,103,104,104.8,105.5,106.0,106.4])
-    vol_buy   = np.linspace(10000, 20000, 12)
-
-    # TESTNEAR: hovering just below pivot 210, above MA 200
-    close_near = np.array([198,199,200,201,202,205,206,207,208.9,209.5,209.8,209.9])
-    vol_near   = np.linspace(8000, 16000, 12)
-
-    # TESTSELL: cracks below MA=300 recently
-    close_sell = np.array([305,304,303,302,301.5,301.0,300.5,300.2,299.8,299.0,298.5,298.0])
-    vol_sell   = np.linspace(12000, 22000, 12)
-
-    # Benchmark arbitrary
-    close_bmk  = np.linspace(400, 410, 12)
-    vol_bmk    = np.linspace(5e6, 6e6, 12)
-
-    def _mk_df(close, vol):
-        return pd.DataFrame({"Close": close, "Volume": vol}, index=idx)
-
-    d_buy  = _mk_df(close_buy, vol_buy)
-    d_near = _mk_df(close_near, vol_near)
-    d_sell = _mk_df(close_sell, vol_sell)
-    d_bmk  = _mk_df(close_bmk, vol_bmk)
-
-    # MultiIndex columns like yfinance: level0 fields, level1 tickers
-    intraday = pd.concat(
-        {
-            "Close": pd.concat({"TESTBUY": d_buy["Close"],
-                                "TESTNEAR": d_near["Close"],
-                                "TESTSELL": d_sell["Close"],
-                                benchmark: d_bmk["Close"]}, axis=1),
-            "Volume": pd.concat({"TESTBUY": d_buy["Volume"],
-                                 "TESTNEAR": d_near["Volume"],
-                                 "TESTSELL": d_sell["Volume"],
-                                 benchmark: d_bmk["Volume"]}, axis=1),
-        }, axis=1
-    )
-
-    # Build daily with ~24 months; make High/Low around Close; Volume rising
-    d_days = pd.date_range(end=datetime.utcnow().date(), periods=400, freq="D")
-    def _mk_daily(base_close):
-        c = np.clip(base_close + np.random.normal(0, 1, size=len(d_days)).cumsum()/20 + base_close*0, 1, None)
-        h = c * (1 + np.random.uniform(0.002, 0.01, size=len(c)))
-        l = c * (1 - np.random.uniform(0.002, 0.01, size=len(c)))
-        v = np.linspace(1e6, 2e6, len(c))
-        return pd.DataFrame({"High":h, "Low":l, "Close":c, "Volume":v}, index=d_days)
-
-    daily = pd.concat(
-        {
-            "High":   pd.concat({"TESTBUY": _mk_daily(100)["High"],
-                                 "TESTNEAR": _mk_daily(200)["High"],
-                                 "TESTSELL": _mk_daily(300)["High"],
-                                 benchmark: _mk_daily(400)["High"]}, axis=1),
-            "Low":    pd.concat({"TESTBUY": _mk_daily(100)["Low"],
-                                 "TESTNEAR": _mk_daily(200)["Low"],
-                                 "TESTSELL": _mk_daily(300)["Low"],
-                                 benchmark: _mk_daily(400)["Low"]}, axis=1),
-            "Close":  pd.concat({"TESTBUY": _mk_daily(100)["Close"],
-                                 "TESTNEAR": _mk_daily(200)["Close"],
-                                 "TESTSELL": _mk_daily(300)["Close"],
-                                 benchmark: _mk_daily(400)["Close"]}, axis=1),
-            "Volume": pd.concat({"TESTBUY": _mk_daily(100)["Volume"],
-                                 "TESTNEAR": _mk_daily(200)["Volume"],
-                                 "TESTSELL": _mk_daily(300)["Volume"],
-                                 benchmark: _mk_daily(400)["Volume"]}, axis=1),
-        }, axis=1
-    )
-
-    return intraday, daily
-
-# ---------------- Logic ----------------
-def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
+def run(_config_path="./config.yaml"):
     log("Loading weekly report + config...", level="step")
     cfg, benchmark = load_config(_config_path)
+    weekly_df, weekly_csv_path = load_weekly_report()
+    log(f"Weekly CSV: {weekly_csv_path}", level="debug")
 
-    if selftest:
-        weekly_df, weekly_csv_path = _build_synthetic_weekly()
-        intraday, daily = _build_synthetic_intraday_daily(benchmark=benchmark)
-        log(f"(SELFTEST) Using synthetic weekly & prices; benchmark={benchmark}", level="warn")
-    else:
-        weekly_df, weekly_csv_path = load_weekly_report()
-        log(f"Weekly CSV: {weekly_csv_path}", level="debug")
-        tickers = sorted(set(weekly_df["ticker"].tolist() + [benchmark])) if "ticker" in weekly_df.columns else [benchmark]
-        log("Downloading intraday + daily bars...", level="step")
-        intraday, daily = get_intraday(tickers)
-        log("Price data downloaded.", level="ok")
-
-    # Pull & normalize weekly columns
+    # Pull & normalize the columns we need from weekly
     wcols = {c.lower(): c for c in weekly_df.columns}
     col_ticker = wcols.get("ticker", "ticker")
     col_stage  = wcols.get("stage", "stage")
@@ -726,6 +641,11 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
 
     log(f"Focus universe: {len(focus)} symbols (Stage 1/2).", level="info")
 
+    tickers = sorted(set(focus["ticker"].tolist() + [benchmark]))
+    log("Downloading intraday + daily bars...", level="step")
+    intraday, daily = get_intraday(tickers)
+    log("Price data downloaded.", level="ok")
+
     # Current prices from intraday
     if isinstance(intraday.columns, pd.MultiIndex):
         last_closes = intraday["Close"].ffill().iloc[-1]
@@ -741,8 +661,10 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
     state = load_positions()
     held = state.get("positions", {})
 
-    # trigger state (normalize + persist back once)
-    trigger_state = _normalize_trigger_state(_load_intraday_state())
+    # trigger state
+    trigger_state = _load_intraday_state()
+    # Normalize legacy state & persist back (one-time cleanup)
+    trigger_state = _normalize_trigger_state(trigger_state)
     _save_intraday_state(trigger_state)
 
     buy_signals = []
@@ -776,10 +698,11 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
         pivot_ok = pd.notna(pivot)
         rs_ok = rs_above
 
+        # Precompute intrabar (used by buy 60m + sell 60m)
         elapsed = _elapsed_in_current_bar_minutes(intraday, t) if INTRADAY_INTERVAL == "60m" else None
         pace_intra = intrabar_volume_pace(intraday, t, bar_minutes=60) if INTRADAY_INTERVAL == "60m" else None
 
-        # --- BUY confirm ---
+        # --- BUY confirm (multi-path) ---
         confirm = False
         vol_ok = True
         if ma_ok and pivot_ok and closes_n:
@@ -797,7 +720,7 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
                     vols2 = get_last_n_intraday_volumes(intraday, t, n=2)
                     vavg = get_intraday_avg_volume(intraday, t, window=INTRADAY_AVG_VOL_WINDOW)
                     if len(vols2) >= 2 and pd.notna(vavg) and vavg > 0:
-                        vol_ok = (vols2[-1] >= INTRADAY_LASTBAR_AVG_MULT * vavg)
+                        vol_ok = (vols2[-1] >= INTRADAY_LASTBAR_AVG_MULT * vavg)  # relaxed "rising" requirement
                     else:
                         vol_ok = False
 
@@ -826,11 +749,13 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
                 if closes_n2:
                     sell_confirm = all((c <= ma30 * (1.0 - SELL_BREAK_PCT)) for c in closes_n2[-CONFIRM_BARS:])
 
-        # --- state container (defensive defaults + legacy backfill) ---
-        st = trigger_state.get(t, {
+        # --- promotion state machine container ---
+        ts_key = t
+        st = trigger_state.get(ts_key, {
             "state":"IDLE", "near_hits":[], "cooldown":0,
             "sell_state":"IDLE", "sell_hits":[], "sell_cooldown":0
         })
+        # Ensure defaults exist (belt-and-suspenders for legacy entries)
         st.setdefault("state", "IDLE")
         st.setdefault("near_hits", [])
         st.setdefault("cooldown", 0)
@@ -838,7 +763,7 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
         st.setdefault("sell_hits", [])
         st.setdefault("sell_cooldown", 0)
 
-        # BUY machine
+        # BUY hits
         st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, NEAR_HITS_WINDOW)
         cd = int(st.get("cooldown", 0))
         if cd > 0:
@@ -859,7 +784,7 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
             state_now = "IDLE"
         st["state"] = state_now
 
-        # SELL machine
+        # SELL hits
         st["sell_hits"], sell_hit_count = _update_hits(st.get("sell_hits", []), sell_near_now, SELL_NEAR_HITS_WINDOW)
         scd = int(st.get("sell_cooldown", 0))
         if scd > 0:
@@ -880,7 +805,7 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
             sell_state = "IDLE"
         st["sell_state"] = sell_state
 
-        trigger_state[t] = st
+        trigger_state[ts_key] = st
 
         # --- SELL risk (tracked positions.json) ---
         pos = held.get(t)
@@ -962,6 +887,7 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
             "weekly_rank": weekly_rank
         })
 
+        # Per-symbol debug (optional)
         log(f"{t}: buy_state={st['state']} near_hits={sum(st.get('near_hits', []))} | "
             f"sell_state={st['sell_state']} sell_hits={sum(st.get('sell_hits', []))}", level="debug")
 
@@ -1113,7 +1039,7 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
     <h4>Sell / Risk Triggers (Tracked Positions & Position Recommendations)</h4>
     {bullets(sell_signals + sell_from_positions, "SELL")}
     <h4>Snapshot (ordered by weekly rank & stage)</h4>
-    {pd.DataFrame(info_rows).to_html(index=False)}
+    {info_df.to_html(index=False)}
     """
 
     # Append the WEEKLY-STYLE holdings report at the very end
@@ -1121,73 +1047,53 @@ def run(_config_path="./config.yaml", *, selftest=False, no_email=False):
         html += "<hr/>" + holdings_block_html
 
     # Plain-text summary
-    def _mk_txt_buy():
-        out = []
-        for i, b in enumerate(buy_signals, start=1):
-            pace_str = "—" if (b.get("pace") is None or pd.isna(b.get("pace"))) else f"{b['pace']:.2f}x"
-            wr = b.get("weekly_rank", None)
-            wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-            out.append(f"{i}. {b['ticker']} @ {b['price']:.2f} (pivot {b['pivot']:.2f}, pace {pace_str}, {b['stage']}, weekly {wr_str})")
-        return "\n".join(out) if out else "No BUY signals."
+    text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n"
+    for i, b in enumerate(buy_signals, start=1):
+        pace_str = "—" if (b.get("pace") is None or pd.isna(b.get("pace"))) else f"{b['pace']:.2f}x"
+        wr = b.get("weekly_rank", None)
+        wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+        text += f"{i}. {b['ticker']} @ {b['price']:.2f} (pivot {b['pivot']:.2f}, pace {pace_str}, {b['stage']}, weekly {wr_str})\n"
 
-    def _mk_txt_near():
-        out = []
-        for i, n in enumerate(near_signals, start=1):
-            pace_str = "—" if (n.get("pace") is None or pd.isna(n.get("pace"))) else f"{n['pace']:.2f}x"
-            wr = n.get("weekly_rank", None)
-            wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-            out.append(f"{i}. {n['ticker']} @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']}, weekly {wr_str})")
-        return "\n".join(out) if out else "No NEAR signals."
+    text += "\nNEAR-TRIGGER (ranked):\n"
+    for i, n in enumerate(near_signals, start=1):
+        pace_str = "—" if (n.get("pace") is None or pd.isna(n.get("pace"))) else f"{n['pace']:.2f}x"
+        wr = n.get("weekly_rank", None)
+        wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+        text += f"{i}. {n['ticker']} @ {n['price']:.2f} (pivot {n['pivot']:.2f}, pace {pace_str}, {n['stage']}, weekly {wr_str})\n"
 
-    def _mk_txt_selltrig():
-        out = []
-        for i, s in enumerate(sell_triggers, start=1):
-            pace_str = "—" if (s.get("pace") is None or pd.isna(s.get("pace"))) else f"{s['pace']:.2f}x"
-            wr = s.get("weekly_rank", None)
-            wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
-            ma_str = f"{s.get('ma30', float('nan')):.2f}" if pd.notna(s.get("ma30", np.nan)) else "—"
-            out.append(f"{i}. {s['ticker']} @ {s['price']:.2f} (below MA150 {ma_str}, pace {pace_str}, {s.get('stage','')}, weekly {wr_str})")
-        return "\n".join(out) if out else "No SELL-TRIGGER signals."
+    text += "\nSELL TRIGGERS (ranked):\n"
+    for i, s in enumerate(sell_triggers, start=1):
+        pace_str = "—" if (s.get("pace") is None or pd.isna(s.get("pace"))) else f"{s['pace']:.2f}x"
+        wr = s.get("weekly_rank", None)
+        wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+        ma_str = f"{s.get('ma30', float('nan')):.2f}" if pd.notna(s.get("ma30", np.nan)) else "—"
+        text += f"{i}. {s['ticker']} @ {s['price']:.2f} (below MA150 {ma_str}, pace {pace_str}, {s.get('stage','')}, weekly {wr_str})\n"
 
-    def _mk_txt_sells():
-        all_sells = sell_signals + sell_from_positions
-        if not all_sells:
-            return "No SELL signals."
-        out = []
+    all_sells = sell_signals + sell_from_positions
+    text += "\nSELL / RISK:\n"
+    if not all_sells:
+        text += "No SELL signals.\n"
+    else:
         for i, s in enumerate(all_sells, start=1):
             wr = s.get("weekly_rank", None)
             wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
             src = s.get("source","")
             lab = " (Position SELL)" if src == "positions" else ""
             price_str = f"{s['price']:.2f}" if pd.notna(s.get("price", np.nan)) else "—"
-            out.append(f"{i}. {s['ticker']} @ {price_str} — {s.get('reasons','')} ({s.get('stage','')}, weekly {wr_str}){lab}")
-        return "\n".join(out)
+            text += f"{i}. {s['ticker']} @ {price_str} — {s.get('reasons','')} ({s.get('stage','')}, weekly {wr_str}){lab}\n"
 
-    text = (
-        f"Weinstein Intraday Watch — {now}\n\n"
-        "BUY (ranked):\n" + _mk_txt_buy() + "\n\n"
-        "NEAR-TRIGGER (ranked):\n" + _mk_txt_near() + "\n\n"
-        "SELL TRIGGERS (ranked):\n" + _mk_txt_selltrig() + "\n\n"
-        "SELL / RISK:\n" + _mk_txt_sells() + "\n"
-    )
-
-    # Persist state
+    # Persist state & send
     _save_intraday_state(trigger_state)
 
-    subject_counts = f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_triggers)} SELL-TRIG / {len(sell_signals + sell_from_positions)} SELL"
-    if no_email:
-        log("(no-email) Skipping send. Subject would be:", level="warn")
-        print(f"Subject: Intraday Watch — {subject_counts}\n")
-        print(text)
-    else:
-        log("Sending email...", level="step")
-        send_email(
-            subject=f"Intraday Watch — {'[SELFTEST] ' if selftest else ''}{subject_counts}",
-            html_body=html,
-            text_body=text,
-            cfg_path=_config_path
-        )
-        log("Email sent.", level="ok")
+    subject_counts = f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_triggers)} SELL-TRIG / {len(all_sells)} SELL"
+    log("Sending email...", level="step")
+    send_email(
+        subject=f"Intraday Watch — {subject_counts}",
+        html_body=html,
+        text_body=text,
+        cfg_path=_config_path
+    )
+    log("Email sent.", level="ok")
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
@@ -1195,7 +1101,7 @@ if __name__ == "__main__":
     VERBOSE = not args.quiet
     log(f"Intraday watcher starting with config: {args.config}", level="step")
     try:
-        run(_config_path=args.config, selftest=args.selftest, no_email=args.no_email)
+        run(_config_path=args.config)
         log("Intraday tick complete.", level="ok")
     except Exception as e:
         log(f"Error: {e}", level="err")
