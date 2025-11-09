@@ -31,7 +31,6 @@ INTRADAY_AVG_VOL_WINDOW = 20
 INTRADAY_LASTBAR_AVG_MULT = 1.20
 
 NEAR_BELOW_PIVOT_PCT = 0.003
-NEAR_VOL_PACE_MIN = 1.00
 
 HARD_STOP_PCT = 0.08
 TRAIL_ATR_MULT = 2.0
@@ -221,6 +220,7 @@ def volume_pace_today_vs_50dma(ticker, daily_df):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
     if _is_crypto(ticker):
+        # 24h day; pace by fraction of day elapsed
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elapsed = max(0.0, (now - day_start).total_seconds())
         fraction = min(1.0, max(0.05, elapsed / (24*3600.0)))
@@ -361,7 +361,7 @@ def _merge_stage_and_recommend(positions: pd.DataFrame, weekly_df: pd.DataFrame)
     out["Recommendation"] = out.apply(recommend, axis=1)
     return out
 
-# ---- Summary HTML helpers (unchanged) ----
+# ---- Summary HTML helpers (with colored Recommendation badges) ----
 def _money(x): return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
 def _pct(x):   return f"{x:.2f}%" if (x is not None and pd.notna(x)) else ""
 
@@ -392,10 +392,10 @@ def _colored_summary_html(m):
       .num-pos { color:#106b21; font-weight:600; }
       .num-neg { color:#8a1111; font-weight:600; }
       .num-neu { color:#444; }
-      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid transparent;}
-      .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; }
-      .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; }
-      .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
+      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid transparent;letter-spacing:0.2px;}
+      .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; }   /* HOLD (Strong) darker green */
+      .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; }  /* HOLD green */
+      .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }  /* SELL red */
       .tab-holdings { border-collapse: collapse; width:100%; }
       .tab-holdings th, .tab-holdings td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
       .tab-holdings th { text-align:left; background:#fafafa; }
@@ -431,13 +431,20 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
     d["Average Cost Basis"] = d["Average Cost Basis"].apply(money)
     d["Total Gain/Loss Dollar"] = d["Total Gain/Loss Dollar"].apply(money)
     d["Total Gain/Loss Percent"] = d["Total Gain/Loss Percent"].apply(pctv)
+
+    # Color badges for Recommendation
     def rec_badge(s):
         s = str(s or "")
-        if s.upper().startswith("SELL"): return "<span class='rec-badge rec-sell'>SELL</span>"
-        if s.upper().startswith("HOLD (STRONG"): return "<span class='rec-badge rec-strong'>HOLD (Strong)</span>"
-        if s.upper().startswith("HOLD"): return "<span class='rec-badge rec-hold'>HOLD</span>"
+        up = s.upper()
+        if up.startswith("SELL"):
+            return "<span class='rec-badge rec-sell'>SELL</span>"
+        if up.startswith("HOLD (STRONG"):
+            return "<span class='rec-badge rec-strong'>HOLD (Strong)</span>"
+        if up.startswith("HOLD"):
+            return "<span class='rec-badge rec-hold'>HOLD</span>"
         return s
     d["Recommendation"] = d["Recommendation"].apply(rec_badge)
+
     th = "".join([f"<th>{c}</th>" for c in cols])
     rows = []
     for i in range(len(d)):
@@ -554,10 +561,11 @@ def run(_config_path="./config.yaml"):
     weekly_df, weekly_csv_path = load_weekly_report()
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
 
-    # Normalize expected columns
+    # Normalize expected columns (ensure crypto rows are present from weekly report)
     w = weekly_df.rename(columns=str.lower)
     for miss in ["ticker","stage","ma30","rs_above_ma","asset_class"]:
         if miss not in w.columns: w[miss] = np.nan
+
     focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])][["ticker","stage","ma30","rs_above_ma","asset_class"]].copy()
     if "rank" in w.columns: focus["weekly_rank"] = w["rank"]
     else: focus["weekly_rank"] = 999999
@@ -589,11 +597,11 @@ def run(_config_path="./config.yaml"):
 
     log("Evaluating candidates...", level="step")
     for _, row in focus.iterrows():
-        t = row["ticker"]; 
-        if t in (benchmark, CRYPTO_BENCHMARK): 
+        t = row["ticker"]
+        if t in (benchmark, CRYPTO_BENCHMARK):
             continue
         px = px_now(t)
-        if np.isnan(px): 
+        if np.isnan(px):
             continue
 
         stage = str(row["stage"]); ma30 = float(row.get("ma30", np.nan))
@@ -709,7 +717,7 @@ def run(_config_path="./config.yaml"):
         # --- EMIT by state ---
         if st["state"] == "TRIGGERED" and (
             stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
-            and rs_above and confirm and vol_ok
+            and rs_ok and confirm and vol_ok
             and (pd.isna(pace) or pace >= VOL_PACE_MIN)
         ):
             buy_signals.append({
@@ -857,7 +865,7 @@ def run(_config_path="./config.yaml"):
       +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×.
       For 60m bars: ≥{INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {INTRABAR_VOLPACE_MIN}×.<br>
       NEAR-TRIGGER: Stage 1/2 + RS ok, price within {NEAR_BELOW_PIVOT_PCT*100:.1f}% below pivot or first close over pivot but not fully confirmed yet,
-      volume pace ≥ {NEAR_VOL_PACE_MIN}×.<br>
+      volume pace ≥ 1.00×.<br>
       SELL-TRIGGER: Confirmed crack below MA150 by {SELL_BREAK_PCT*100:.1f}% with persistence; for 60m bars, ≥{SELL_INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {SELL_INTRABAR_VOLPACE_MIN}×.
     </i></p>
     <h4>Buy Triggers (ranked)</h4>
