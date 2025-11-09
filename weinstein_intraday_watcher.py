@@ -22,10 +22,12 @@ LOOKBACK_DAYS = 60            # intraday history window
 PIVOT_LOOKBACK_WEEKS = 10     # breakout pivot high window (weekly proxy)
 VOL_PACE_MIN = 1.30           # today's est. full-day vol vs 50-DMA for BUY
 BUY_DIST_ABOVE_MA_MIN = 0.00  # >= 0% above 30-wk MA proxy (SMA150)
-CONFIRM_BARS = 2              # require last N bars >= pivot & >= MA proxy
+
+# Confirmation: 2 bars for <=30m, 60m uses 1-bar with intrabar checks below
+CONFIRM_BARS = 2
 
 # Breakout quality guards
-MIN_BREAKOUT_PCT = 0.005      # +0.5% above pivot for BUY confirm
+MIN_BREAKOUT_PCT = 0.004      # eased from 0.005 → 0.4% above pivot for BUY confirm
 REQUIRE_RISING_BAR_VOL = True
 INTRADAY_AVG_VOL_WINDOW = 20
 INTRADAY_LASTBAR_AVG_MULT = 1.20
@@ -51,6 +53,20 @@ OPEN_POSITIONS_CSV_CANDIDATES = [
     "./output/Open_Positions.csv",
     "./output/open_positions.csv",
 ]
+
+# --- NEW: Stateful trigger tunables ---
+INTRADAY_STATE_FILE = "./state/intraday_triggers.json"  # per-ticker trigger state
+SCAN_INTERVAL_MIN = 10                                  # cron cadence (minutes)
+
+# Promotion & confirmation
+NEAR_HITS_WINDOW = 6        # ~1 hour window at 10-min cadence
+NEAR_HITS_MIN = 3           # require 3 hits in the window to ARM
+COOLDOWN_SCANS = 24         # ~4 hours cooldown at 10-min cadence
+
+# 60m-specific confirmation easing
+CONFIRM_BARS_60M = 1
+INTRABAR_CONFIRM_MIN_ELAPSED = 40   # minutes elapsed in current 60m bar
+INTRABAR_VOLPACE_MIN = 1.20         # current bar pace vs avg 60m bar
 
 # ---------------- Config / IO ----------------
 def load_config(path="config.yaml"):
@@ -83,6 +99,41 @@ def load_positions():
 def save_positions(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+# --- NEW: Intraday trigger state (per symbol) ---
+def _load_intraday_state():
+    path = INTRADAY_STATE_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+def _save_intraday_state(st):
+    with open(INTRADAY_STATE_FILE, "w") as f:
+        json.dump(st, f, indent=2)
+
+def _now_utc_minutes():
+    return int(datetime.utcnow().timestamp() // 60)
+
+def _elapsed_in_current_bar_minutes(intraday_df, ticker):
+    # Works for 60m/30m bars; uses last index timestamp and now()
+    try:
+        if isinstance(intraday_df.columns, pd.MultiIndex):
+            ts = intraday_df[("Close", ticker)].dropna().index[-1]
+        else:
+            ts = intraday_df["Close"].dropna().index[-1]
+        last_bar_start = pd.Timestamp(ts).to_pydatetime()
+        return max(0, int((datetime.utcnow() - last_bar_start).total_seconds() // 60))
+    except Exception:
+        return 0
+
+def _update_hits(window_arr, hit, window=NEAR_HITS_WINDOW):
+    window_arr = (window_arr or [])
+    window_arr.append(1 if hit else 0)
+    if len(window_arr) > window:
+        window_arr = window_arr[-window:]
+    return window_arr, sum(window_arr)
 
 # ---------------- Data helpers ----------------
 def _safe_div(a, b):
@@ -185,6 +236,27 @@ def get_intraday_avg_volume(intraday_df, ticker, window=20):
     if len(v) < window:
         return np.nan
     return float(v.tail(window).mean())
+
+# --- NEW: Intrabar volume pace vs average bar volume ---
+def intrabar_volume_pace(intraday_df, ticker, avg_window=INTRADAY_AVG_VOL_WINDOW, bar_minutes=60):
+    if isinstance(intraday_df.columns, pd.MultiIndex):
+        try:
+            v = intraday_df[("Volume", ticker)].dropna()
+        except Exception:
+            return np.nan
+    else:
+        try:
+            v = intraday_df["Volume"].dropna()
+        except Exception:
+            return np.nan
+    if len(v) < max(avg_window, 2):
+        return np.nan
+    last_bar_vol = float(v.iloc[-1])
+    avg_bar_vol = float(v.tail(avg_window).mean())
+    elapsed = _elapsed_in_current_bar_minutes(intraday_df, ticker)
+    frac = min(1.0, max(0.05, elapsed / float(bar_minutes)))  # avoid div/0 early
+    est_full = last_bar_vol / frac if frac > 0 else last_bar_vol
+    return float(_safe_div(est_full, avg_bar_vol))
 
 # ---------------- Holdings helpers (local CSV) ----------------
 def _coerce_numlike(series: pd.Series) -> pd.Series:
@@ -524,6 +596,9 @@ def run():
     state = load_positions()
     held = state.get("positions", {})
 
+    # --- NEW: trigger state
+    trigger_state = _load_intraday_state()
+
     buy_signals = []
     near_signals = []
     sell_signals = []          # risk-rule breaches from tracked positions
@@ -548,74 +623,80 @@ def run():
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
 
-        # 2-bar confirm above pivot(+headroom) and above MA proxy
+        # Gather recent closes and flags
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
         ma_ok = pd.notna(ma30)
         pivot_ok = pd.notna(pivot)
-        if ma_ok and pivot_ok and closes_n:
-            confirm = all(
-                (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and
-                (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
-                for c in closes_n[-CONFIRM_BARS:]
-            )
-        else:
-            confirm = False
-
-        # Volume confirmation on last bar
-        vol_ok = True
-        if REQUIRE_RISING_BAR_VOL:
-            vols2 = get_last_n_intraday_volumes(intraday, t, n=2)
-            vavg = get_intraday_avg_volume(intraday, t, window=INTRADAY_AVG_VOL_WINDOW)
-            if len(vols2) >= 2 and pd.notna(vavg) and vavg > 0:
-                vol_ok = (vols2[-1] > vols2[-2]) and (vols2[-1] >= INTRADAY_LASTBAR_AVG_MULT * vavg)
-            else:
-                vol_ok = False
-
         rs_ok = rs_above
 
-        # BUY
-        if (
-            stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
-            and confirm
-            and rs_ok
-            and (pd.isna(pace) or pace >= VOL_PACE_MIN)
-            and vol_ok
-        ):
-            item = {
-                "ticker": t,
-                "price": px,
-                "pivot": pivot,
-                "pace": None if pd.isna(pace) else float(pace),
-                "stage": stage,
-                "ma30": ma30,
-                "weekly_rank": weekly_rank,
-            }
-            buy_signals.append(item)
-        else:
-            # NEAR-TRIGGER
-            if stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)") and rs_ok and pivot_ok and ma_ok and pd.notna(px):
-                near = False
-                above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
-                if above_ma:
-                    if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (px < pivot * (1.0 + MIN_BREAKOUT_PCT)):
-                        near = True
-                    elif (px >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and not confirm:
-                        near = True
+        # --- NEW: multi-path confirm depending on bar size, with intrabar volume pace ---
+        confirm = False
+        vol_ok = True
 
-                vol_near_ok = (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN)
-                if near and vol_near_ok:
-                    near_signals.append({
-                        "ticker": t,
-                        "price": px,
-                        "pivot": pivot,
-                        "pace": None if pd.isna(pace) else float(pace),
-                        "stage": stage,
-                        "ma30": ma30,
-                        "weekly_rank": weekly_rank,
-                        "reason": "near pivot/confirm"
-                    })
+        if ma_ok and pivot_ok and closes_n:
+            def _price_ok(c):
+                return (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
 
-        # SELL risk (tracked positions.json)
+            if INTRADAY_INTERVAL == "60m":
+                last_c = closes_n[-1]
+                elapsed = _elapsed_in_current_bar_minutes(intraday, t)
+                pace_intra = intrabar_volume_pace(intraday, t, bar_minutes=60)
+                price_ok = _price_ok(last_c)
+                vol_ok = (pd.isna(pace_intra) or pace_intra >= INTRABAR_VOLPACE_MIN)
+                confirm = price_ok and (elapsed >= INTRABAR_CONFIRM_MIN_ELAPSED) and vol_ok
+            else:
+                need = max(CONFIRM_BARS, 2)
+                confirm = all(_price_ok(c) for c in closes_n[-need:])
+                if REQUIRE_RISING_BAR_VOL:
+                    vols2 = get_last_n_intraday_volumes(intraday, t, n=2)
+                    vavg = get_intraday_avg_volume(intraday, t, window=INTRADAY_AVG_VOL_WINDOW)
+                    if len(vols2) >= 2 and pd.notna(vavg) and vavg > 0:
+                        # relaxed: only require last bar >= avg * MULT, not "rising"
+                        vol_ok = (vols2[-1] >= INTRADAY_LASTBAR_AVG_MULT * vavg)
+                    else:
+                        vol_ok = False
+
+        # --- NEW: compute "near_now" using your original near logic
+        near_now = False
+        if stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)") and rs_ok and pivot_ok and ma_ok and pd.notna(px):
+            above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
+            if above_ma:
+                if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (px < pivot * (1.0 + MIN_BREAKOUT_PCT)):
+                    near_now = True
+                elif (px >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and not confirm:
+                    near_now = True
+
+        # --- NEW: promotion state machine (IDLE -> NEAR -> ARMED -> TRIGGERED -> COOLDOWN)
+        ts_key = t
+        st = trigger_state.get(ts_key, {"state":"IDLE", "near_hits":[],"cooldown":0})
+
+        # Maintain hits window
+        st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, NEAR_HITS_WINDOW)
+        cooldown = int(st.get("cooldown", 0))
+        state_now = st.get("state", "IDLE")
+
+        if cooldown > 0:
+            st["cooldown"] = cooldown - 1
+
+        if state_now == "IDLE" and near_now:
+            state_now = "NEAR"
+        elif state_now in ("IDLE","NEAR") and near_count >= NEAR_HITS_MIN:
+            state_now = "ARMED"
+        elif state_now == "ARMED" and confirm and vol_ok:
+            state_now = "TRIGGERED"
+            st["cooldown"] = COOLDOWN_SCANS
+        elif state_now == "TRIGGERED":
+            # stays until we emit below; then we push to COOLDOWN
+            pass
+        elif cooldown > 0 and not near_now:
+            state_now = "COOLDOWN"
+        elif cooldown == 0 and not near_now and not confirm:
+            state_now = "IDLE"
+
+        st["state"] = state_now
+        trigger_state[ts_key] = st
+
+        # --- SELL risk (tracked positions.json)
         pos = held.get(t)
         if pos:
             entry = float(pos.get("entry", np.nan))
@@ -642,6 +723,38 @@ def run():
                     "source": "risk"
                 })
 
+        # --- NEW: emit by state
+        if st["state"] == "TRIGGERED" and (
+            stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
+            and rs_ok and confirm and vol_ok
+            and (pd.isna(pace) or pace >= VOL_PACE_MIN)
+        ):
+            buy_signals.append({
+                "ticker": t,
+                "price": px,
+                "pivot": pivot,
+                "pace": None if pd.isna(pace) else float(pace),
+                "stage": stage,
+                "ma30": ma30,
+                "weekly_rank": weekly_rank,
+            })
+            # immediately transition to cooldown so we don't re-emit
+            trigger_state[t]["state"] = "COOLDOWN"
+
+        elif st["state"] in ("NEAR","ARMED"):
+            if (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN):
+                near_signals.append({
+                    "ticker": t,
+                    "price": px,
+                    "pivot": pivot,
+                    "pace": None if pd.isna(pace) else float(pace),
+                    "stage": stage,
+                    "ma30": ma30,
+                    "weekly_rank": weekly_rank,
+                    "reason": "near/armed"
+                })
+
+        # Info row for snapshot
         info_rows.append({
             "ticker": t,
             "stage": stage,
@@ -758,9 +871,9 @@ def run():
     html = f"""
     <h3>Weinstein Intraday Watch — {now}</h3>
     <p><i>
-      BUY: Weekly Stage 1/2 + two-bar confirm over ~10-week pivot & 30-wk MA proxy (SMA150),
-      +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×,
-      and last bar vol rising & ≥ {INTRADAY_LASTBAR_AVG_MULT:.1f}× intraday {INTRADAY_AVG_VOL_WINDOW}-bar avg.<br>
+      BUY: Weekly Stage 1/2 + confirm over ~10-week pivot & 30-wk MA proxy (SMA150),
+      +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×.
+      For 60m bars: ≥{INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {INTRABAR_VOLPACE_MIN}×.<br>
       NEAR-TRIGGER: Stage 1/2 + RS ok, price within {NEAR_BELOW_PIVOT_PCT*100:.1f}% below pivot or first close over pivot but not fully confirmed yet,
       volume pace ≥ {NEAR_VOL_PACE_MIN}×.
     </i></p>
@@ -806,6 +919,9 @@ def run():
             lab = " (Position SELL)" if src == "positions" else ""
             price_str = f"{s['price']:.2f}" if pd.notna(s.get("price", np.nan)) else "—"
             text += f"{i}. {s['ticker']} @ {price_str} — {s.get('reasons','')} ({s.get('stage','')}, weekly {wr_str}){lab}\n"
+
+    # --- NEW: save trigger state
+    _save_intraday_state(trigger_state)
 
     send_email(
         subject=f"Intraday Watch — {len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(all_sells)} SELL",
