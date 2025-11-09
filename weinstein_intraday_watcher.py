@@ -12,6 +12,14 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
+# ---- Optional Google Sheets pull (Signals) for crypto discovery ----
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
 # ---------------- Tunables ----------------
 WEEKLY_OUTPUT_DIR = "./output"
 WEEKLY_FILE_PREFIX = "weinstein_weekly_"
@@ -49,15 +57,6 @@ OPEN_POSITIONS_CSV_CANDIDATES = [
 
 VERBOSE = True
 
-def _ts():
-    return datetime.now().strftime("%H:%M:%S")
-
-def log(msg, *, level="info"):
-    if not VERBOSE and level == "debug":
-        return
-    prefix = {"info":"•", "ok":"✅", "step":"▶️", "warn":"⚠️", "err":"❌", "debug":"··"}.get(level, "•")
-    print(f"{prefix} [{_ts()}] {msg}", flush=True)
-
 # --- Stateful trigger tunables (BUY) ---
 INTRADAY_STATE_FILE = "./state/intraday_triggers.json"
 SCAN_INTERVAL_MIN = 10
@@ -79,6 +78,9 @@ SELL_COOLDOWN_SCANS = 24
 SELL_INTRABAR_CONFIRM_MIN_ELAPSED = 40
 SELL_INTRABAR_VOLPACE_MIN = 1.20
 
+# ---- Sheets tabs (only for crypto universe discovery) ----
+TAB_SIGNALS = "Signals"
+
 # ---------------- CLI ----------------
 def _parse_args():
     p = argparse.ArgumentParser()
@@ -92,7 +94,11 @@ def load_config(path):
         cfg = yaml.safe_load(f)
     app = cfg.get("app", {}) or {}
     benchmark = app.get("benchmark", BENCHMARK_DEFAULT)
-    return cfg, benchmark
+    sheets = cfg.get("sheets", {}) or {}
+    google = cfg.get("google", {}) or {}
+    sheet_url = sheets.get("url") or sheets.get("sheet_url")
+    service_account_file = google.get("service_account_json")
+    return cfg, benchmark, sheet_url, service_account_file
 
 def newest_weekly_csv():
     files = [f for f in os.listdir(WEEKLY_OUTPUT_DIR) if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")]
@@ -220,7 +226,6 @@ def volume_pace_today_vs_50dma(ticker, daily_df):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
     if _is_crypto(ticker):
-        # 24h day; pace by fraction of day elapsed
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elapsed = max(0.0, (now - day_start).total_seconds())
         fraction = min(1.0, max(0.05, elapsed / (24*3600.0)))
@@ -361,7 +366,49 @@ def _merge_stage_and_recommend(positions: pd.DataFrame, weekly_df: pd.DataFrame)
     out["Recommendation"] = out.apply(recommend, axis=1)
     return out
 
-# ---- Summary HTML helpers (with colored Recommendation badges) ----
+# ---------------- Sheets helpers (crypto from Signals) ----------------
+def _auth_sheets(service_account_file: str):
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
+    return gspread.authorize(creds)
+
+def _read_tab(gc, sheet_url: str, title: str) -> pd.DataFrame:
+    sh = gc.open_by_url(sheet_url)
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return pd.DataFrame()
+    vals = ws.get_all_values()
+    if not vals: return pd.DataFrame()
+    header, rows = vals[0], vals[1:]
+    df = pd.DataFrame(rows, columns=[h.strip() for h in header])
+    for c in df.columns:
+        df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+    return df
+
+def _is_crypto_symbol_yf(sym: str) -> bool:
+    s = (sym or "").strip().upper()
+    return s.endswith("-USD") and len(s) >= 6 and all(ch.isalnum() or ch in "-." for ch in s)
+
+def _crypto_from_signals(sheet_url: str, service_account_file: str) -> list[str]:
+    """Harvest crypto tickers from existing Signals tab (no rewiring)."""
+    if not (gspread and Credentials and sheet_url and service_account_file and os.path.exists(service_account_file)):
+        return []
+    try:
+        gc = _auth_sheets(service_account_file)
+        sig = _read_tab(gc, sheet_url, TAB_SIGNALS)
+        if sig.empty: return []
+        tcol = next((c for c in sig.columns if c.lower() in ("ticker","symbol")), "Ticker")
+        raw = sig[tcol].astype(str).str.upper().str.strip()
+        out = []
+        for t in raw:
+            if _is_crypto_symbol_yf(t):
+                out.append(t)
+        return list(dict.fromkeys(out))
+    except Exception:
+        return []
+
+# ---- Summary HTML helpers (colored + badges kept) ----
 def _money(x): return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
 def _pct(x):   return f"{x:.2f}%" if (x is not None and pd.notna(x)) else ""
 
@@ -392,13 +439,19 @@ def _colored_summary_html(m):
       .num-pos { color:#106b21; font-weight:600; }
       .num-neg { color:#8a1111; font-weight:600; }
       .num-neu { color:#444; }
-      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid transparent;letter-spacing:0.2px;}
-      .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; }   /* HOLD (Strong) darker green */
-      .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; }  /* HOLD green */
-      .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }  /* SELL red */
+      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid transparent;}
+      .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; }
+      .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; }
+      .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
       .tab-holdings { border-collapse: collapse; width:100%; }
       .tab-holdings th, .tab-holdings td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
       .tab-holdings th { text-align:left; background:#fafafa; }
+      .tab-crypto { border-collapse: collapse; width:100%; }
+      .tab-crypto th, .tab-crypto td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
+      .pill { display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #e2e8f0;background:#eef2f7;color:#334155;font-size:12px;font-weight:600;}
+      .pill-buy   { background:#eaffea; color:#106b21; border-color:#b8e7b9; }
+      .pill-watch { background:#effaf0; color:#1e7a1e; border-color:#cdebd0; }
+      .pill-avoid { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
     </style>
     """
     return css + f"""
@@ -431,20 +484,13 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
     d["Average Cost Basis"] = d["Average Cost Basis"].apply(money)
     d["Total Gain/Loss Dollar"] = d["Total Gain/Loss Dollar"].apply(money)
     d["Total Gain/Loss Percent"] = d["Total Gain/Loss Percent"].apply(pctv)
-
-    # Color badges for Recommendation
     def rec_badge(s):
         s = str(s or "")
-        up = s.upper()
-        if up.startswith("SELL"):
-            return "<span class='rec-badge rec-sell'>SELL</span>"
-        if up.startswith("HOLD (STRONG"):
-            return "<span class='rec-badge rec-strong'>HOLD (Strong)</span>"
-        if up.startswith("HOLD"):
-            return "<span class='rec-badge rec-hold'>HOLD</span>"
+        if s.upper().startswith("SELL"): return "<span class='rec-badge rec-sell'>SELL</span>"
+        if s.upper().startswith("HOLD (STRONG"): return "<span class='rec-badge rec-strong'>HOLD (Strong)</span>"
+        if s.upper().startswith("HOLD"): return "<span class='rec-badge rec-hold'>HOLD</span>"
         return s
     d["Recommendation"] = d["Recommendation"].apply(rec_badge)
-
     th = "".join([f"<th>{c}</th>" for c in cols])
     rows = []
     for i in range(len(d)):
@@ -554,18 +600,70 @@ def _near_sell_zone(px, ma):
     if pd.isna(px) or pd.isna(ma): return False
     return (px >= ma * (1.0 - SELL_BREAK_PCT)) and (px <= ma * (1.0 + SELL_NEAR_ABOVE_MA_PCT))
 
+# ---------------- Crypto Email Block ----------------
+def _badge(text):
+    t = (text or "").upper()
+    if t == "BUY":   return "<span class='pill pill-buy'>Buy</span>"
+    if t == "WATCH": return "<span class='pill pill-watch'>Watch</span>"
+    if t == "AVOID": return "<span class='pill pill-avoid'>Avoid</span>"
+    return f"<span class='pill'>{text}</span>"
+
+def _crypto_section_from_weekly(weekly_df: pd.DataFrame) -> str:
+    if weekly_df is None or weekly_df.empty:
+        return ""
+    w = weekly_df.rename(columns=str.lower)
+    if "asset_class" not in w.columns:
+        return ""
+    c = w[w["asset_class"].astype(str).str.lower() == "crypto"].copy()
+    if c.empty:
+        return ""
+    # counts
+    if "buy_signal" not in c.columns: c["buy_signal"] = c["stage"].apply(lambda s: "BUY" if isinstance(s,str) and s.startswith("Stage 2") else ("WATCH" if isinstance(s,str) and s.startswith("Stage 1") else "AVOID"))
+    cb = int((c["buy_signal"] == "BUY").sum())
+    cw = int((c["buy_signal"] == "WATCH").sum())
+    ca = int((c["buy_signal"] == "AVOID").sum())
+    ct = int(len(c))
+    # display cols
+    for need in ["short_term_state_wk","price","ma30","rs_above_ma","notes"]:
+        if need not in c.columns: c[need] = np.nan
+    view = c[["ticker","stage","short_term_state_wk","price","ma30","rs_above_ma","buy_signal","notes"]].copy()
+    view["buy_signal"] = view["buy_signal"].apply(_badge)
+    # format small bits
+    def fmt_price(x):
+        try:
+            return f"{float(x):.2f}"
+        except Exception:
+            return ""
+    def fmt_ma(x):
+        try:
+            return f"{float(x):.2f}"
+        except Exception:
+            return ""
+    view["price"] = view["price"].apply(fmt_price)
+    view["ma30"]  = view["ma30"].apply(fmt_ma)
+    view["rs_above_ma"] = view["rs_above_ma"].map({True:"Yes", False:"No"}).fillna("")
+    html_tbl = view.to_html(index=False, escape=False, classes="tab-crypto", border=0)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    header = f"""
+      <h3>Crypto Weekly — Benchmark: {CRYPTO_BENCHMARK}</h3>
+      <div style="color:#555;margin-bottom:8px;">Generated {now}</div>
+      <div class="summary" style="background:#f6f8fa;border:1px solid #eaecef;padding:8px 10px;border-radius:8px;margin:6px 0 12px 0;">
+        <strong>Crypto Summary:</strong> ✅ Buy: {cb} &nbsp; | &nbsp; 🟡 Watch: {cw} &nbsp; | &nbsp; 🔴 Avoid: {ca} &nbsp; (Total: {ct})
+      </div>
+    """
+    return header + html_tbl
+
 # ---------------- Main logic ----------------
 def run(_config_path="./config.yaml"):
     log("Loading weekly report + config...", level="step")
-    cfg, benchmark = load_config(_config_path)
+    cfg, benchmark, sheet_url, service_account_file = load_config(_config_path)
     weekly_df, weekly_csv_path = load_weekly_report()
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
 
-    # Normalize expected columns (ensure crypto rows are present from weekly report)
+    # Normalize expected columns
     w = weekly_df.rename(columns=str.lower)
     for miss in ["ticker","stage","ma30","rs_above_ma","asset_class"]:
         if miss not in w.columns: w[miss] = np.nan
-
     focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])][["ticker","stage","ma30","rs_above_ma","asset_class"]].copy()
     if "rank" in w.columns: focus["weekly_rank"] = w["rank"]
     else: focus["weekly_rank"] = 999999
@@ -574,6 +672,12 @@ def run(_config_path="./config.yaml"):
 
     # Benchmarks to ensure RS charts render: equity + crypto
     needs = sorted(set(focus["ticker"].tolist() + [benchmark, CRYPTO_BENCHMARK]))
+
+    # (Optional) Also pull crypto tickers straight from Signals (no rewiring) to ensure price access
+    extra_crypto = _crypto_from_signals(sheet_url, service_account_file) if (sheet_url and service_account_file) else []
+    if extra_crypto:
+        needs = sorted(set(needs + extra_crypto))
+
     log("Downloading intraday + daily bars...", level="step")
     intraday, daily = get_intraday(needs)
     log("Price data downloaded.", level="ok")
@@ -595,6 +699,16 @@ def run(_config_path="./config.yaml"):
     buy_signals, near_signals, sell_signals = [], [], []
     sell_triggers, sell_from_positions, info_rows, chart_imgs = [], [], [], []
 
+    # dynamic requirements based on interval
+    if INTRADAY_INTERVAL == "60m":
+        CONFIRM_MIN_ELAPSED = INTRABAR_CONFIRM_MIN_ELAPSED
+        INTRA_PACE_MIN = INTRABAR_VOLPACE_MIN
+        CONFIRM_BARS_NEED = 1
+    else:
+        CONFIRM_MIN_ELAPSED = None
+        INTRA_PACE_MIN = None
+        CONFIRM_BARS_NEED = max(CONFIRM_BARS, 2)
+
     log("Evaluating candidates...", level="step")
     for _, row in focus.iterrows():
         t = row["ticker"]
@@ -610,7 +724,7 @@ def run(_config_path="./config.yaml"):
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
 
-        closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
+        closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS_NEED, 2))
         ma_ok = pd.notna(ma30); pivot_ok = pd.notna(pivot); rs_ok = rs_above
 
         elapsed = _elapsed_in_current_bar_minutes(intraday, t) if INTRADAY_INTERVAL == "60m" else None
@@ -623,8 +737,8 @@ def run(_config_path="./config.yaml"):
                 return (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
             if INTRADAY_INTERVAL == "60m":
                 last_c = closes_n[-1]; price_ok = _price_ok(last_c)
-                vol_ok = (pd.isna(pace_intra) or pace_intra >= INTRABAR_VOLPACE_MIN)
-                confirm = price_ok and (elapsed is not None and elapsed >= INTRABAR_CONFIRM_MIN_ELAPSED) and vol_ok
+                vol_ok = (pd.isna(pace_intra) or pace_intra >= INTRA_PACE_MIN)
+                confirm = price_ok and (elapsed is not None and elapsed >= CONFIRM_MIN_ELAPSED) and vol_ok
             else:
                 need = max(CONFIRM_BARS, 2)
                 confirm = all(_price_ok(c) for c in closes_n[-need:])
@@ -700,7 +814,8 @@ def run(_config_path="./config.yaml"):
             hard_stop = float(pos.get("stop", np.nan)) if pd.notna(pos.get("stop", np.nan)) \
                         else (entry * (1 - HARD_STOP_PCT) if pd.notna(entry) else np.nan)
             atr = compute_atr(daily, t, n=14)
-            trail = px - TRAIL_ATR_MULT * atr if pd.notna(atr) else None
+            trail = px - TRAIL_A
+TR_MULT * atr if pd.notna(atr) else None
             breach_hard = (pd.notna(hard_stop) and px <= hard_stop)
             breach_ma = (pd.notna(ma30) and px <= ma30 * 0.97)
             breach_trail = (trail is not None and px <= trail)
@@ -726,7 +841,7 @@ def run(_config_path="./config.yaml"):
             })
             trigger_state[t]["state"] = "COOLDOWN"
         elif st["state"] in ("NEAR","ARMED"):
-            if (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN):
+            if (pd.isna(pace) or pace >= 1.00):
                 near_signals.append({
                     "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
                     "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "reason": "near/armed"
@@ -812,6 +927,9 @@ def run(_config_path="./config.yaml"):
 
     log(f"Charts prepared: {len(chart_imgs)}", level="debug")
 
+    # -------- Build Crypto Section (from weekly + Signals) --------
+    crypto_block_html = _crypto_section_from_weekly(weekly_df)
+
     # -------- Build Email --------
     info_df = pd.DataFrame(info_rows)
     if not info_df.empty:
@@ -883,6 +1001,8 @@ def run(_config_path="./config.yaml"):
 
     if holdings_block_html:
         html += "<hr/>" + holdings_block_html
+    if crypto_block_html:
+        html += "<hr/>" + crypto_block_html
 
     # Plain text
     def _lines(items, kind):
@@ -917,6 +1037,16 @@ def run(_config_path="./config.yaml"):
         cfg_path=_config_path
     )
     log("Email sent.", level="ok")
+
+# ---------------- Logging helpers ----------------
+def _ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+def log(msg, *, level="info"):
+    if not VERBOSE and level == "debug":
+        return
+    prefix = {"info":"•", "ok":"✅", "step":"▶️", "warn":"⚠️", "err":"❌", "debug":"··"}.get(level, "•")
+    print(f"{prefix} [{_ts()}] {msg}", flush=True)
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
