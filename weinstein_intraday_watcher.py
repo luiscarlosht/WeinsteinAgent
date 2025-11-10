@@ -31,7 +31,6 @@ INTRADAY_AVG_VOL_WINDOW = 20
 INTRADAY_LASTBAR_AVG_MULT = 1.20
 
 NEAR_BELOW_PIVOT_PCT = 0.003
-NEAR_VOL_PACE_MIN = 1.00
 
 HARD_STOP_PCT = 0.08
 TRAIL_ATR_MULT = 2.0
@@ -49,6 +48,18 @@ OPEN_POSITIONS_CSV_CANDIDATES = [
 ]
 
 VERBOSE = True
+
+# Sheets discovery of crypto tickers (optional, non-disruptive)
+TAB_SIGNALS = "Signals"
+TAB_MAPPING = "Mapping"
+
+# Optional Google Sheets pull (Signals + Mapping)
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
@@ -260,7 +271,7 @@ def get_last_n_intraday_volumes(intraday_df, ticker, n=2):
         v = intraday_df["Volume"].dropna()
     return list(map(float, v.tail(n).values))
 
-def get_intraday_avg_volume(intraday_df, ticker, window=20):
+def get_intraday_avg_volume(intraday_df, ticker, window=INTRADAY_AVG_VOL_WINDOW):
     if isinstance(intraday_df.columns, pd.MultiIndex):
         try:
             v = intraday_df[("Volume", ticker)].dropna()
@@ -292,13 +303,10 @@ def intrabar_volume_pace(intraday_df, ticker, avg_window=INTRADAY_AVG_VOL_WINDOW
 # ---------------- Holdings helpers ----------------
 def _coerce_numlike(series: pd.Series) -> pd.Series:
     def conv(x):
-        if pd.isna(x):
-            return np.nan
-        if isinstance(x, (int, float, np.number)):
-            return float(x)
+        if pd.isna(x): return np.nan
+        if isinstance(x, (int, float, np.number)): return float(x)
         s = str(x).replace(",", "").replace("$", "").strip()
-        if s.endswith("%"):
-            s = s[:-1]
+        if s.endswith("%"): s = s[:-1]
         try:
             return float(s)
         except Exception:
@@ -307,18 +315,15 @@ def _coerce_numlike(series: pd.Series) -> pd.Series:
 
 def _find_open_positions_csv() -> str | None:
     for p in OPEN_POSITIONS_CSV_CANDIDATES:
-        if os.path.exists(p):
-            return p
+        if os.path.exists(p): return p
     return None
 
 def _load_open_positions_local() -> pd.DataFrame | None:
     p = _find_open_positions_csv()
-    if not p:
-        return None
+    if not p: return None
     try:
         df = pd.read_csv(p)
-        if df is None or df.empty:
-            return None
+        if df is None or df.empty: return None
         return df
     except Exception:
         return None
@@ -343,12 +348,10 @@ def _normalize_open_positions_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Total Gain/Loss Dollar","Total Gain/Loss Percent"
     ]
     for c in required:
-        if c not in out.columns:
-            out[c] = np.nan
+        if c not in out.columns: out[c] = np.nan
     num_cols = ["Quantity","Last Price","Current Value","Cost Basis Total",
                 "Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"]
-    for c in num_cols:
-        out[c] = _coerce_numlike(out[c])
+    for c in num_cols: out[c] = _coerce_numlike(out[c])
     out = out.dropna(how="all")
     return out
 
@@ -356,8 +359,7 @@ def _merge_stage_and_recommend(positions: pd.DataFrame, weekly_df: pd.DataFrame)
     w = weekly_df.rename(columns=str.lower)
     need = ["ticker","stage","rs_above_ma","industry","sector","asset_class"]
     for n in need:
-        if n not in w.columns:
-            w[n] = np.nan
+        if n not in w.columns: w[n] = np.nan
     stage_min = w[need].rename(columns={"ticker":"Symbol"})
     out = positions.merge(stage_min, on="Symbol", how="left")
 
@@ -367,16 +369,12 @@ def _merge_stage_and_recommend(positions: pd.DataFrame, weekly_df: pd.DataFrame)
         if (stage.startswith("Stage 4") and pd.notna(pct) and pct < 0) or (pd.notna(pct) and pct <= -8.0):
             return "SELL"
         return "HOLD (Strong)" if stage.startswith("Stage 2") else "HOLD"
-
     out["Recommendation"] = out.apply(recommend, axis=1)
     return out
 
-# ---- Summary HTML helpers ----
-def _money(x): 
-    return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
-
-def _pct(x):   
-    return f"{x:.2f}%" if (x is not None and pd.notna(x)) else ""
+# ---- Summary HTML helpers (colored summary + per-position table with colored badges) ----
+def _money(x): return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
+def _pct(x):   return f"{x:.2f}%" if (x is not None and pd.notna(x)) else ""
 
 def _compute_portfolio_metrics(pos: pd.DataFrame) -> dict:
     cur = float(pos["Current Value"].fillna(0).sum())
@@ -388,8 +386,7 @@ def _compute_portfolio_metrics(pos: pd.DataFrame) -> dict:
     return {"gl_dollar": gl_dollar, "port_pct": port_pct, "avg_pct": avg_pct}
 
 def _colored_summary_html(m):
-    def cls(v): 
-        return "pos" if v > 0 else ("neg" if v < 0 else "neu")
+    def cls(v): return "pos" if v > 0 else ("neg" if v < 0 else "neu")
     rows = [
         ("Total Gain/Loss ($)", _money(m["gl_dollar"]), cls(m["gl_dollar"])),
         ("Portfolio % Gain",     _pct(m["port_pct"]),   cls(m["port_pct"])),
@@ -406,13 +403,18 @@ def _colored_summary_html(m):
       .num-pos { color:#106b21; font-weight:600; }
       .num-neg { color:#8a1111; font-weight:600; }
       .num-neu { color:#444; }
-      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid transparent;}
+      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid transparent;}
       .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; }
       .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; }
       .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
       .tab-holdings { border-collapse: collapse; width:100%; }
       .tab-holdings th, .tab-holdings td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
       .tab-holdings th { text-align:left; background:#fafafa; }
+      .crypto-tbl th, .crypto-tbl td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 13px; }
+      .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-weight:700; font-size:12px; }
+      .pill-buy { background:#eaffea; color:#0f5e1d; border:1px solid #b8e7b9; }
+      .pill-watch { background:#effaf0; color:#1e7a1e; border:1px solid #cdebd0; }
+      .pill-avoid { background:#ffe8e6; color:#8a1111; border:1px solid #f3b3ae; }
     </style>
     """
     return css + f"""
@@ -428,55 +430,37 @@ def _colored_summary_html(m):
 
 def _format_holdings_table(df: pd.DataFrame) -> str:
     for c in ["industry","sector"]:
-        if c not in df.columns:
-            df[c] = np.nan
+        if c not in df.columns: df[c] = np.nan
     cols = [
         "Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
         "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent","Recommendation"
     ]
     for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
-
+        if c not in df.columns: df[c] = np.nan
     num = df[cols].copy()
     d = df[cols].copy()
-
-    def money(x): 
-        return _money(x)
-
-    def pctv(x):  
-        return (f"{float(x):.2f}%" if pd.notna(x) else "")
-
+    def money(x): return _money(x)
+    def pctv(x):  return (f"{float(x):.2f}%" if pd.notna(x) else "")
     d["Last Price"] = d["Last Price"].apply(money)
     d["Current Value"] = d["Current Value"].apply(money)
     d["Cost Basis Total"] = d["Cost Basis Total"].apply(money)
     d["Average Cost Basis"] = d["Average Cost Basis"].apply(money)
     d["Total Gain/Loss Dollar"] = d["Total Gain/Loss Dollar"].apply(money)
     d["Total Gain/Loss Percent"] = d["Total Gain/Loss Percent"].apply(pctv)
-
     def rec_badge(s):
         s = str(s or "")
-        if s.upper().startswith("SELL"):
-            return "<span class='rec-badge rec-sell'>SELL</span>"
-        if s.upper().startswith("HOLD (STRONG"):
-            return "<span class='rec-badge rec-strong'>HOLD (Strong)</span>"
-        if s.upper().startswith("HOLD"):
-            return "<span class='rec-badge rec-hold'>HOLD</span>"
+        if s.upper().startswith("SELL"): return "<span class='rec-badge rec-sell'>SELL</span>"
+        if s.upper().startswith("HOLD (STRONG"): return "<span class='rec-badge rec-strong'>HOLD (Strong)</span>"
+        if s.upper().startswith("HOLD"): return "<span class='rec-badge rec-hold'>HOLD</span>"
         return s
-
     d["Recommendation"] = d["Recommendation"].apply(rec_badge)
-
     th = "".join([f"<th>{c}</th>" for c in cols])
     rows = []
     for i in range(len(d)):
-        r = d.iloc[i]
-        rn = num.iloc[i]
-
+        r = d.iloc[i]; rn = num.iloc[i]
         def sign_cls(val):
-            if pd.isna(val):
-                return "num-neu"
+            if pd.isna(val): return "num-neu"
             return "num-pos" if val > 0 else ("num-neg" if val < 0 else "num-neu")
-
         gl_d_cls = sign_cls(rn["Total Gain/Loss Dollar"])
         gl_p_cls = sign_cls(rn["Total Gain/Loss Percent"])
         tds = []
@@ -489,7 +473,6 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
                 val = r[c] if pd.notna(r[c]) else ""
                 tds.append(f"<td>{val}</td>")
         rows.append(f"<tr>{''.join(tds)}</tr>")
-
     body = "\n".join(rows)
     return f"""
     <div class="blk">
@@ -521,14 +504,12 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
     if len(close_t) < 50 or len(close_b) < 50:
         return None, None
     sma = close_t.rolling(SMA_DAYS).mean()
-    rs = (close_t / close_b)
-    rs_norm = rs / rs.iloc[0]
+    rs = (close_t / close_b); rs_norm = rs / rs.iloc[0]
     fig, ax1 = plt.subplots(figsize=(5.0, 2.4), dpi=150)
     ax1.plot(close_t.index, close_t.values, label=f"{ticker}")
     ax1.plot(sma.index, sma.values, label=f"SMA{SMA_DAYS}", linewidth=1.2)
     ax1.set_ylabel("Price")
-    ax1.tick_params(axis='x', labelsize=8)
-    ax1.tick_params(axis='y', labelsize=8)
+    ax1.tick_params(axis='x', labelsize=8); ax1.tick_params(axis='y', labelsize=8)
     ax2 = ax1.twinx()
     ax2.plot(rs_norm.index, rs_norm.values, linestyle="--", alpha=0.7, label="RS (norm)")
     ax2.set_ylabel("RS (norm)")
@@ -539,9 +520,7 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left", frameon=False)
     chart_path = os.path.join(CHART_DIR, f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-    fig.tight_layout(pad=0.8)
-    fig.savefig(chart_path, bbox_inches="tight")
-    plt.close(fig)
+    fig.tight_layout(pad=0.8); fig.savefig(chart_path, bbox_inches="tight"); plt.close(fig)
     with open(chart_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("ascii")
     return chart_path, f"data:image/png;base64,{b64}"
@@ -549,20 +528,15 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
 # ---------------- Ranking helpers ----------------
 def stage_order(stage: str) -> int:
     if isinstance(stage, str):
-        if stage.startswith("Stage 2"):
-            return 0
-        if stage.startswith("Stage 1"):
-            return 1
+        if stage.startswith("Stage 2"): return 0
+        if stage.startswith("Stage 1"): return 1
     return 9
 
 def buy_sort_key(item):
     wr = int(item.get("weekly_rank", 999999)) if pd.notna(item.get("weekly_rank", np.nan)) else 999999
     st = stage_order(item.get("stage", ""))
-    pace = item.get("pace", np.nan)
-    pace = pace if pd.notna(pace) else -1e9
-    px = item.get("price", np.nan)
-    pivot = item.get("pivot", np.nan)
-    ma = item.get("ma30", np.nan)
+    pace = item.get("pace", np.nan); pace = pace if pd.notna(pace) else -1e9
+    px = item.get("price", np.nan); pivot = item.get("pivot", np.nan); ma = item.get("ma30", np.nan)
     ratio_pivot = (px / pivot) if (pd.notna(px) and pd.notna(pivot) and pivot != 0) else -1e9
     ratio_ma = (px / ma) if (pd.notna(px) and pd.notna(ma) and ma != 0) else -1e9
     return (wr, st, -pace, -ratio_pivot, -ratio_ma)
@@ -570,31 +544,81 @@ def buy_sort_key(item):
 def near_sort_key(item):
     wr = int(item.get("weekly_rank", 999999)) if pd.notna(item.get("weekly_rank", np.nan)) else 999999
     st = stage_order(item.get("stage", ""))
-    px = item.get("price", np.nan)
-    pivot = item.get("pivot", np.nan)
+    px = item.get("price", np.nan); pivot = item.get("pivot", np.nan)
     dist = abs(px - pivot) if (pd.notna(px) and pd.notna(pivot)) else 1e9
-    pace = item.get("pace", np.nan)
-    pace = pace if pd.notna(pace) else -1e9
+    pace = item.get("pace", np.nan); pace = pace if pd.notna(pace) else -1e9
     return (wr, st, dist, -pace)
 
 def sell_sort_key(item):
     wr = int(item.get("weekly_rank", 999999)) if pd.notna(item.get("weekly_rank", np.nan)) else 999999
     st = stage_order(item.get("stage", ""))
-    px = item.get("price", np.nan)
-    ma = item.get("ma30", np.nan)
+    px = item.get("price", np.nan); ma = item.get("ma30", np.nan)
     dist_below = (ma - px) if (pd.notna(px) and pd.notna(ma)) else -1e9
-    pace = item.get("pace", np.nan)
-    pace = pace if pd.notna(pace) else -1e9
+    pace = item.get("pace", np.nan); pace = pace if pd.notna(pace) else -1e9
     return (wr, st, -dist_below, -pace)
 
 # ---------------- Logic helpers ----------------
-def _price_below_ma(px, ma):
-    return pd.notna(px) and pd.notna(ma) and px <= ma * (1.0 - SELL_BREAK_PCT)
-
+def _price_below_ma(px, ma): return pd.notna(px) and pd.notna(ma) and px <= ma * (1.0 - SELL_BREAK_PCT)
 def _near_sell_zone(px, ma):
-    if pd.isna(px) or pd.isna(ma):
-        return False
+    if pd.isna(px) or pd.isna(ma): return False
     return (px >= ma * (1.0 - SELL_BREAK_PCT)) and (px <= ma * (1.0 + SELL_NEAR_ABOVE_MA_PCT))
+
+# ---------------- Sheets helpers for crypto signals discovery ----------------
+def _auth_sheets(service_account_file: str):
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
+    return gspread.authorize(creds)
+
+def _read_tab(gc, sheet_url: str, title: str) -> pd.DataFrame:
+    sh = gc.open_by_url(sheet_url)
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return pd.DataFrame()
+    vals = ws.get_all_values()
+    if not vals: return pd.DataFrame()
+    header, rows = vals[0], vals[1:]
+    df = pd.DataFrame(rows, columns=[h.strip() for h in header])
+    for c in df.columns:
+        df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+    return df
+
+def _is_crypto_symbol_like_yf(sym: str) -> bool:
+    s = (sym or "").strip().upper()
+    return s.endswith("-USD") and len(s) >= 6 and all(ch.isalnum() or ch in "-." for ch in s)
+
+def _signals_crypto_universe_from_sheets(cfg: dict) -> list[str]:
+    sheets = (cfg.get("sheets") or {})
+    google = (cfg.get("google") or {})
+    sheet_url = sheets.get("url") or sheets.get("sheet_url")
+    svc_file  = google.get("service_account_json")
+    if not (gspread and Credentials and sheet_url and svc_file and os.path.exists(svc_file)):
+        return []
+    try:
+        gc = _auth_sheets(svc_file)
+        sig = _read_tab(gc, sheet_url, TAB_SIGNALS)
+        mapping = {}
+        try:
+            m = _read_tab(gc, sheet_url, TAB_MAPPING)
+            if not m.empty and "Ticker" in m.columns:
+                for _, r in m.iterrows():
+                    t = str(r.get("Ticker","")).strip().upper()
+                    tyf = str(r.get("TickerYF","")).strip().upper()
+                    if t: mapping[t] = tyf or ""
+        except Exception:
+            pass
+        if sig.empty: return []
+        tcol = next((c for c in sig.columns if c.lower() in ("ticker","symbol")), "Ticker")
+        raw = sig[tcol].astype(str).str.upper().str.strip()
+        out = []
+        for t in raw:
+            yf_sym = mapping.get(t, t)
+            if _is_crypto_symbol_like_yf(yf_sym):
+                out.append(yf_sym)
+        # de-dup preserving order
+        return list(dict.fromkeys(out))
+    except Exception:
+        return []
 
 # ---------------- Main logic ----------------
 def run(_config_path="./config.yaml"):
@@ -605,13 +629,13 @@ def run(_config_path="./config.yaml"):
 
     # Normalize expected columns
     w = weekly_df.rename(columns=str.lower)
-    for miss in ["ticker","stage","ma30","rs_above_ma","asset_class"]:
-        if miss not in w.columns:
-            w[miss] = np.nan
-    focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])][["ticker","stage","ma30","rs_above_ma","asset_class"]].copy()
-    if "rank" in w.columns:
+    for miss in ["ticker","stage","ma30","rs_above_ma","asset_class","price","ma10","dist_ma_pct","rs","rs_ma30","rs_slope_per_wk","short_term_state_wk","notes","buy_signal"]:
+        if miss not in w.columns: w[miss] = np.nan
+
+    focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])][["ticker","stage","ma30","rs_above_ma","asset_class","price","ma10"]].copy()
+    if "rank" in w.columns: 
         focus["weekly_rank"] = w["rank"]
-    else:
+    else: 
         focus["weekly_rank"] = 999999
 
     log(f"Focus universe: {len(focus)} symbols (Stage 1/2).", level="info")
@@ -633,8 +657,7 @@ def run(_config_path="./config.yaml"):
         vals = getattr(last_closes, "values", [])
         return float(vals[-1]) if len(vals) else np.nan
 
-    state = load_positions()
-    held = state.get("positions", {})
+    state = load_positions(); held = state.get("positions", {})
     trigger_state = _load_intraday_state()
 
     buy_signals, near_signals, sell_signals = [], [], []
@@ -645,35 +668,29 @@ def run(_config_path="./config.yaml"):
         t = row["ticker"]
         if t in (benchmark, CRYPTO_BENCHMARK):
             continue
-
         px = px_now(t)
         if np.isnan(px):
             continue
 
-        stage = str(row["stage"])
-        ma30 = float(row.get("ma30", np.nan))
+        stage = str(row["stage"]); ma30 = float(row.get("ma30", np.nan))
         rs_above = bool(row.get("rs_above_ma", False))
         weekly_rank = float(row.get("weekly_rank", np.nan))
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
 
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
-        ma_ok = pd.notna(ma30)
-        pivot_ok = pd.notna(pivot)
-        rs_ok = rs_above
+        ma_ok = pd.notna(ma30); pivot_ok = pd.notna(pivot); rs_ok = rs_above
 
         elapsed = _elapsed_in_current_bar_minutes(intraday, t) if INTRADAY_INTERVAL == "60m" else None
         pace_intra = intrabar_volume_pace(intraday, t, bar_minutes=60) if INTRADAY_INTERVAL == "60m" else None
 
         # --- BUY confirm ---
-        confirm = False
-        vol_ok = True
+        confirm = False; vol_ok = True
         if ma_ok and pivot_ok and closes_n:
             def _price_ok(c):
                 return (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
             if INTRADAY_INTERVAL == "60m":
-                last_c = closes_n[-1]
-                price_ok = _price_ok(last_c)
+                last_c = closes_n[-1]; price_ok = _price_ok(last_c)
                 vol_ok = (pd.isna(pace_intra) or pace_intra >= INTRABAR_VOLPACE_MIN)
                 confirm = price_ok and (elapsed is not None and elapsed >= INTRABAR_CONFIRM_MIN_ELAPSED) and vol_ok
             else:
@@ -698,10 +715,9 @@ def run(_config_path="./config.yaml"):
                     near_now = True
 
         # --- SELL near/confirm ---
-        sell_near_now = False
-        sell_confirm = False
-        sell_vol_ok = True
+        sell_near_now = False; sell_confirm = False; sell_vol_ok = True
         if ma_ok and pd.notna(px):
+            # near to crack zone
             sell_near_now = _near_sell_zone(px, ma30)
             if INTRADAY_INTERVAL == "60m":
                 sell_price_ok = _price_below_ma(px, ma30)
@@ -718,19 +734,14 @@ def run(_config_path="./config.yaml"):
             "state":"IDLE", "near_hits":[], "cooldown":0,
             "sell_state":"IDLE", "sell_hits":[], "sell_cooldown":0
         })
-
         # BUY hits
         st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, NEAR_HITS_WINDOW)
-        if st.get("cooldown", 0) > 0:
-            st["cooldown"] = int(st["cooldown"]) - 1
+        if st.get("cooldown", 0) > 0: st["cooldown"] = int(st["cooldown"]) - 1
         state_now = st.get("state", "IDLE")
-        if state_now == "IDLE" and near_now:
-            state_now = "NEAR"
-        elif state_now in ("IDLE","NEAR") and near_count >= NEAR_HITS_MIN:
-            state_now = "ARMED"
+        if state_now == "IDLE" and near_now: state_now = "NEAR"
+        elif state_now in ("IDLE","NEAR") and near_count >= NEAR_HITS_MIN: state_now = "ARMED"
         elif state_now == "ARMED" and confirm and vol_ok:
-            state_now = "TRIGGERED"
-            st["cooldown"] = COOLDOWN_SCANS
+            state_now = "TRIGGERED"; st["cooldown"] = COOLDOWN_SCANS
         elif state_now == "TRIGGERED":
             pass
         elif st["cooldown"] > 0 and not near_now:
@@ -741,16 +752,12 @@ def run(_config_path="./config.yaml"):
 
         # SELL hits
         st["sell_hits"], sell_hit_count = _update_hits(st.get("sell_hits", []), sell_near_now, SELL_NEAR_HITS_WINDOW)
-        if st.get("sell_cooldown", 0) > 0:
-            st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
+        if st.get("sell_cooldown", 0) > 0: st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
         sell_state = st.get("sell_state", "IDLE")
-        if sell_state == "IDLE" and sell_near_now:
-            sell_state = "NEAR"
-        elif sell_state in ("IDLE","NEAR") and sell_hit_count >= SELL_NEAR_HITS_MIN:
-            sell_state = "ARMED"
+        if sell_state == "IDLE" and sell_near_now: sell_state = "NEAR"
+        elif sell_state in ("IDLE","NEAR") and sell_hit_count >= SELL_NEAR_HITS_MIN: sell_state = "ARMED"
         elif sell_state == "ARMED" and sell_confirm and sell_vol_ok:
-            sell_state = "TRIGGERED"
-            st["sell_cooldown"] = SELL_COOLDOWN_SCANS
+            sell_state = "TRIGGERED"; st["sell_cooldown"] = SELL_COOLDOWN_SCANS
         elif sell_state == "TRIGGERED":
             pass
         elif st["sell_cooldown"] > 0 and not sell_near_now:
@@ -765,7 +772,8 @@ def run(_config_path="./config.yaml"):
         pos = held.get(t)
         if pos:
             entry = float(pos.get("entry", np.nan))
-            hard_stop = float(pos.get("stop", np.nan)) if pd.notna(pos.get("stop", np.nan)) else (entry * (1 - HARD_STOP_PCT) if pd.notna(entry) else np.nan)
+            hard_stop = float(pos.get("stop", np.nan)) if pd.notna(pos.get("stop", np.nan)) \
+                        else (entry * (1 - HARD_STOP_PCT) if pd.notna(entry) else np.nan)
             atr = compute_atr(daily, t, n=14)
             trail = px - TRAIL_ATR_MULT * atr if pd.notna(atr) else None
             breach_hard = (pd.notna(hard_stop) and px <= hard_stop)
@@ -773,19 +781,12 @@ def run(_config_path="./config.yaml"):
             breach_trail = (trail is not None and px <= trail)
             if breach_hard or breach_ma or breach_trail:
                 why = []
-                if breach_hard:
-                    why.append(f"≤ hard stop ({hard_stop:.2f})")
-                if breach_ma:
-                    why.append("≤ 30-wk MA proxy (−3%)")
-                if breach_trail:
-                    why.append(f"≤ ATR trail ({TRAIL_ATR_MULT}×)")
+                if breach_hard:  why.append(f"≤ hard stop ({hard_stop:.2f})")
+                if breach_ma:    why.append("≤ 30-wk MA proxy (−3%)")
+                if breach_trail: why.append(f"≤ ATR trail ({TRAIL_ATR_MULT}×)")
                 sell_signals.append({
-                    "ticker": t,
-                    "price": px,
-                    "reasons": ", ".join(why),
-                    "stage": stage,
-                    "weekly_rank": weekly_rank,
-                    "source": "risk"
+                    "ticker": t, "price": px, "reasons": ", ".join(why),
+                    "stage": stage, "weekly_rank": weekly_rank, "source": "risk"
                 })
 
         # --- EMIT by state ---
@@ -795,48 +796,28 @@ def run(_config_path="./config.yaml"):
             and (pd.isna(pace) or pace >= VOL_PACE_MIN)
         ):
             buy_signals.append({
-                "ticker": t,
-                "price": px,
-                "pivot": pivot,
-                "pace": None if pd.isna(pace) else float(pace),
-                "stage": stage,
-                "ma30": ma30,
-                "weekly_rank": weekly_rank,
+                "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
+                "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank,
             })
             trigger_state[t]["state"] = "COOLDOWN"
         elif st["state"] in ("NEAR","ARMED"):
             if (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN):
                 near_signals.append({
-                    "ticker": t,
-                    "price": px,
-                    "pivot": pivot,
-                    "pace": None if pd.isna(pace) else float(pace),
-                    "stage": stage,
-                    "ma30": ma30,
-                    "weekly_rank": weekly_rank,
-                    "reason": "near/armed"
+                    "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
+                    "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "reason": "near/armed"
                 })
 
         if st["sell_state"] == "TRIGGERED":
             sell_triggers.append({
-                "ticker": t,
-                "price": px,
-                "ma30": ma30,
-                "stage": stage,
-                "weekly_rank": weekly_rank,
-                "pace": None if pd.isna(pace) else float(pace)
+                "ticker": t, "price": px, "ma30": ma30, "stage": stage,
+                "weekly_rank": weekly_rank, "pace": None if pd.isna(pace) else float(pace)
             })
             trigger_state[t]["sell_state"] = "COOLDOWN"
 
         info_rows.append({
-            "ticker": t,
-            "stage": stage,
-            "price": px,
-            "ma30": ma30,
-            "pivot10w": pivot,
+            "ticker": t, "stage": stage, "price": px, "ma30": ma30, "pivot10w": pivot,
             "vol_pace_vs50dma": None if pd.isna(pace) else round(float(pace), 2),
-            "two_bar_confirm": confirm,
-            "last_bar_vol_ok": vol_ok if 'vol_ok' in locals() else None,
+            "two_bar_confirm": confirm, "last_bar_vol_ok": vol_ok if 'vol_ok' in locals() else None,
             "weekly_rank": weekly_rank
         })
         log(f"{t}: buy_state={st['state']} near_hits={sum(st.get('near_hits', []))} | "
@@ -854,31 +835,24 @@ def run(_config_path="./config.yaml"):
         sell_from_positions_map = {}
         for _, r in merged.iterrows():
             rec = str(r.get("Recommendation", "")).upper()
-            if not rec.startswith("SELL"):
+            if not rec.startswith("SELL"): 
                 continue
             sym = str(r.get("Symbol", "")).strip()
-            if not sym:
+            if not sym: 
                 continue
             live_px = px_now(sym)
             use_px = live_px if pd.notna(live_px) else float(r.get("Last Price", np.nan))
             reasons = []
             pct = r.get("Total Gain/Loss Percent", np.nan)
             stg = str(r.get("stage", ""))
-            if pd.notna(pct) and pct <= -8.0:
-                reasons.append("drawdown ≤ −8%")
-            if stg.startswith("Stage 4") and (pd.notna(pct) and pct < 0):
-                reasons.append("Stage 4 + negative P/L")
-            if not reasons:
-                reasons.append("strategy rule")
+            if pd.notna(pct) and pct <= -8.0: reasons.append("drawdown ≤ −8%")
+            if stg.startswith("Stage 4") and (pd.notna(pct) and pct < 0): reasons.append("Stage 4 + negative P/L")
+            if not reasons: reasons.append("strategy rule")
             entry = sell_from_positions_map.get(sym)
             if entry is None:
                 sell_from_positions_map[sym] = {
-                    "ticker": sym,
-                    "price": use_px if pd.notna(use_px) else np.nan,
-                    "reasons": set(reasons),
-                    "stage": stg,
-                    "weekly_rank": np.nan,
-                    "source": "positions",
+                    "ticker": sym, "price": use_px if pd.notna(use_px) else np.nan,
+                    "reasons": set(reasons), "stage": stg, "weekly_rank": np.nan, "source": "positions",
                 }
             else:
                 entry["reasons"].update(reasons)
@@ -894,33 +868,85 @@ def run(_config_path="./config.yaml"):
         holdings_block_html = _colored_summary_html(metrics) + _format_holdings_table(merged)
 
     # -------- Ranking & charts --------
-    buy_signals.sort(key=buy_sort_key)
-    near_signals.sort(key=near_sort_key)
-    sell_triggers.sort(key=sell_sort_key)
+    buy_signals.sort(key=buy_sort_key); near_signals.sort(key=near_sort_key); sell_triggers.sort(key=sell_sort_key)
 
-    charts_added = 0
-    chart_imgs = []
+    charts_added = 0; chart_imgs = []
     for item in buy_signals:
-        if charts_added >= MAX_CHARTS_PER_EMAIL:
-            break
+        if charts_added >= MAX_CHARTS_PER_EMAIL: break
         t = item["ticker"]
         bmk = CRYPTO_BENCHMARK if _is_crypto(t) else BENCHMARK_DEFAULT
         path, data_uri = make_tiny_chart_png(t, bmk, daily)
         if data_uri:
-            chart_imgs.append((t, data_uri))
-            charts_added += 1
+            chart_imgs.append((t, data_uri)); charts_added += 1
     if charts_added < MAX_CHARTS_PER_EMAIL:
         for item in near_signals:
-            if charts_added >= MAX_CHARTS_PER_EMAIL:
-                break
+            if charts_added >= MAX_CHARTS_PER_EMAIL: break
             t = item["ticker"]
             bmk = CRYPTO_BENCHMARK if _is_crypto(t) else BENCHMARK_DEFAULT
             path, data_uri = make_tiny_chart_png(t, bmk, daily)
             if data_uri:
-                chart_imgs.append((t, data_uri))
-                charts_added += 1
+                chart_imgs.append((t, data_uri)); charts_added += 1
 
     log(f"Charts prepared: {len(chart_imgs)}", level="debug")
+
+    # --------- Build Crypto “Signals” section (from Sheets) ----------
+    crypto_signals_html = ""
+    try:
+        crypto_list = _signals_crypto_universe_from_sheets(cfg)
+        if crypto_list:
+            # Restrict weekly rows to discovered crypto tickers
+            ww = w.copy()
+            ww["is_crypto_ticker"] = ww["ticker"].isin(crypto_list)
+            crypto_rows = ww[ww["is_crypto_ticker"]].copy()
+
+            # Format badges & numbers similar to weekly
+            def _pill(s):
+                s = str(s or "").upper()
+                if s == "BUY":   return "<span class='pill pill-buy'>Buy</span>"
+                if s == "WATCH": return "<span class='pill pill-watch'>Watch</span>"
+                return "<span class='pill pill-avoid'>Avoid</span>"
+
+            view = pd.DataFrame({
+                "ticker": crypto_rows["ticker"],
+                "asset_class": crypto_rows.get("asset_class","Crypto"),
+                "industry": crypto_rows.get("industry",""),
+                "sector": crypto_rows.get("sector",""),
+                "Buy Signal": crypto_rows.get("buy_signal","").map(_pill),
+                "stage": crypto_rows.get("stage",""),
+                "short_term_state_wk": crypto_rows.get("short_term_state_wk",""),
+                "price": crypto_rows.get("price",""),
+                "ma10": crypto_rows.get("ma10",""),
+                "ma30": crypto_rows.get("ma30",""),
+                "dist_ma_pct": crypto_rows.get("dist_ma_pct",""),
+                "ma_slope_per_wk": crypto_rows.get("ma_slope_per_wk",""),
+                "rs": crypto_rows.get("rs",""),
+                "rs_ma30": crypto_rows.get("rs_ma30",""),
+                "rs_above_ma": crypto_rows.get("rs_above_ma","").map({True:"Yes", False:"No"}),
+                "rs_slope_per_wk": crypto_rows.get("rs_slope_per_wk",""),
+                "notes": crypto_rows.get("notes",""),
+            })
+
+            # Percent formatting
+            for c in ["dist_ma_pct","ma_slope_per_wk","rs_slope_per_wk"]:
+                if c in view.columns:
+                    view[c] = view[c].apply(lambda x: f"{float(x)*100:.2f}%" if pd.notna(x) else "")
+
+            # Summary counts
+            cb = int((crypto_rows["buy_signal"] == "BUY").sum())
+            cw = int((crypto_rows["buy_signal"] == "WATCH").sum())
+            ca = int((crypto_rows["buy_signal"] == "AVOID").sum())
+            ct = int(len(crypto_rows))
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            crypto_signals_html = f"""
+            <hr/>
+            <h3>Crypto Signals — Benchmark: {CRYPTO_BENCHMARK}</h3>
+            <div class="sub">Generated {now}</div>
+            <div class="summary"><strong>Crypto Summary:</strong> ✅ Buy: {cb} &nbsp; | &nbsp; 🟡 Watch: {cw} &nbsp; | &nbsp; 🔴 Avoid: {ca} &nbsp; (Total: {ct})</div>
+            {view.to_html(index=False, escape=False, classes=['crypto-tbl'])}
+            """
+    except Exception as e:
+        log(f"Crypto Signals section skipped: {e}", level="warn")
 
     # -------- Build Email --------
     info_df = pd.DataFrame(info_rows)
@@ -991,8 +1017,13 @@ def run(_config_path="./config.yaml"):
     {pd.DataFrame(info_rows).to_html(index=False)}
     """
 
+    # Add holdings snapshot (equities + crypto mixed)
     if holdings_block_html:
         html += "<hr/>" + holdings_block_html
+
+    # Add dedicated Crypto Signals section (from Sheets “Signals”)
+    if crypto_signals_html:
+        html += crypto_signals_html
 
     # Plain text
     def _lines(items, kind):
@@ -1015,13 +1046,7 @@ def run(_config_path="./config.yaml"):
                 out.append(f"{i}. {it['ticker']} @ {it['price']:.2f} (pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})")
         return "\n".join(out) if out else f"No {kind} signals."
 
-    text = (
-        f"Weinstein Intraday Watch — {now}\n\n"
-        f"BUY (ranked):\n{_lines(buy_signals,'BUY')}\n\n"
-        f"NEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\n"
-        f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers,'SELLTRIG')}\n\n"
-        f"SELL / RISK:\n{_lines(sell_signals + sell_from_positions,'SELL')}\n"
-    )
+    text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n{_lines(buy_signals,'BUY')}\n\nNEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\nSELL TRIGGERS (ranked):\n{_lines(sell_triggers,'SELLTRIG')}\n\nSELL / RISK:\n{_lines(sell_signals + sell_from_positions,'SELL')}\n"
 
     _save_intraday_state(trigger_state)
     subject_counts = f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_triggers)} SELL-TRIG / {len(sell_signals)+len(sell_from_positions)} SELL"
