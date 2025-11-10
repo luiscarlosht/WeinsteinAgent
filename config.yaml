@@ -5,13 +5,19 @@ app:
   include_charts: true
 
 sheets:
+  # Primary Google Sheet
   url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
   sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
+
+  # Tabs used by the app
   open_positions_tab: "Open_Positions"
   signals_tab: "Signals"
+
+  # Where local CSV/PDFs land
   output_dir: "./output"
 
 google:
+  # Service account that the code uses to read the sheet
   service_account_json: "/home/luiscarlosht/WeinsteinAgent/creds/gcp_service_account.json"
   client_email: "500633565449-compute@developer.gserviceaccount.com"
 
@@ -31,10 +37,24 @@ notifications:
       app_password: "qnamoxtmakhnvlml"
 
 reporting:
+  # Files the job writes
   output_dir: "/home/luiscarlosht/WeinsteinAgent/output"
   include_pdf: true
   include_csv: true
   summary_lines: 10
+
+  # SECTION ORDER in the email / report:
+  # We place Crypto Weekly right before "Weinstein Weekly – Summary"
+  section_order:
+    - header
+    - buy_triggers
+    - near_triggers
+    - sell_triggers
+    - charts
+    - sell_risk_triggers         # keeps your "Sell / Risk Triggers" + Snapshot
+    - snapshot
+    - crypto_weekly_from_signals # <-- crypto summary from Signals goes here
+    - weekly_summary             # "Weinstein Weekly – Summary" comes after crypto
 
 universe:
   mode: "sp500"
@@ -46,3 +66,80 @@ risk:
   max_position_pct: 10
   tranche_plan: [30,30,20,20]
   stop_below_ma_pct: 5
+
+# ---- Intraday / trigger thresholds (used in logs/text) ----
+intraday:
+  # Confirms a BUY on ≥ 1.3x pace; NEAR uses ≥ 1.0x. Defining both avoids "NEAR_VOL_PACE_MIN not defined".
+  vol_pace_min: 1.3
+  near_vol_pace_min: 1.0
+  sell_intrabar_vol_pace_min: 1.2
+
+  # Text/logic thresholds (used in the prose you saw in the email)
+  confirm_headroom_pct: 0.4      # "% over pivot" headroom for confirm
+  near_below_pivot_pct: 0.3      # NEAR = within this % below pivot
+  crack_ma_pct: 0.5              # SELL trigger = below MA150 by this %
+  min_elapsed_minutes: 40        # 60m bars elapsed requirement
+  ma_proxy_length: 150           # MA150 as 30-wk proxy
+
+# ---- Crypto weekly block, fed by your Signals tab ----
+crypto:
+  enabled: true
+  benchmark: "BTC-USD"
+
+  # Pull the crypto watchlist from the Signals tab, not from a static list
+  source: "signals"                 # options: "signals" | "list"
+
+  # How to find crypto rows inside "Signals"
+  signals_filter:
+    include_directions: ["BUY"]     # only the names you’re actively watching/holding as BUY signals
+    include_timeframes: ["short","mid","long"]  # consider all, or narrow if you want
+    ticker_regex: "-USD$"           # treat rows whose Ticker ends with "-USD" as crypto (BTC-USD, ETH-USD, SOL-USD, etc.)
+    allow_blank_price: true         # some crypto entries have blank price/formulas; price will be fetched from market data
+    min_unique: 1
+
+  # What to compute and show per-coin (mirrors weekly equities table headers you like)
+  metrics:
+    include: ["stage","short_term_state_wk","price","ma10","ma30","dist_ma_pct","ma_slope_per_wk","rs","rs_ma30","rs_above_ma","rs_slope_per_wk","notes"]
+    stage_method: "weinstien"       # stage calc same as equities (2=uptrend, 3=topping, 4=downtrend)
+    rs_anchor: "benchmark"          # RS vs crypto.benchmark
+
+  # Tiny inline sparklines for each coin in the table
+  sparkline:
+    enabled: true
+    lookback_days: 21               # ~1 month of daily closes
+    width_px: 80
+    height_px: 20
+    pad_px: 2
+    ma_windows: [10,30]             # thin overlay MAs inside sparkline
+    show_markers: false
+
+  # Table labels / formatting
+  table:
+    title: "Crypto Weekly — Benchmark: BTC-USD"
+    uppercase_signals: true         # AVOID / BUY / WATCH in caps
+    buy_label: "Buy"
+    watch_label: "Watch"
+    avoid_label: "Avoid"
+    show_summary_line: true         # "Crypto Summary: ✅ Buy: X | 🟡 Watch: Y | 🔴 Avoid: Z (Total: N)"
+
+# ---- Email section visibility toggles (keep SELL / Risk Triggers present) ----
+sections:
+  header: true
+  buy_triggers: true
+  near_triggers: true
+  sell_triggers: true
+  charts: true
+  sell_risk_triggers: true          # ✅ ensures your SELL / Risk block stays in the email
+  snapshot: true
+  crypto_weekly_from_signals: true  # ✅ turn on crypto section sourced from Signals
+  weekly_summary: true
+
+# ---- Optional formatting niceties ----
+formatting:
+  number_format:
+    percent: "0.00'%'"             # e.g., -3.66%
+    price: "0.00"
+  emoji:
+    buy: "✅"
+    watch: "🟡"
+    avoid: "🔴"
