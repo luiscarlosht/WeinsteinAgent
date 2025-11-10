@@ -12,11 +12,19 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
+# ---- Optional Google Sheets pull (Signals + Mapping for crypto universe) ----
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
 # ---------------- Tunables ----------------
 WEEKLY_OUTPUT_DIR = "./output"
 WEEKLY_FILE_PREFIX = "weinstein_weekly_"
 BENCHMARK_DEFAULT = "SPY"
-CRYPTO_BENCHMARK  = "BTC-USD"  # for RS in weekly (intraday uses price/MA/pivot only)
+CRYPTO_BENCHMARK  = "BTC-USD"  # for RS
 
 INTRADAY_INTERVAL = "60m"     # '60m' or '30m'
 LOOKBACK_DAYS = 60
@@ -31,7 +39,7 @@ INTRADAY_AVG_VOL_WINDOW = 20
 INTRADAY_LASTBAR_AVG_MULT = 1.20
 
 NEAR_BELOW_PIVOT_PCT = 0.003
-NEAR_VOL_PACE_MIN = 1.00   # <-- keep defined (used in HTML description)
+NEAR_VOL_PACE_MIN = 1.00  # <-- restored
 
 HARD_STOP_PCT = 0.08
 TRAIL_ATR_MULT = 2.0
@@ -50,18 +58,15 @@ OPEN_POSITIONS_CSV_CANDIDATES = [
 
 VERBOSE = True
 
-# ---- Optional Google Sheets pull (Signals) ----
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
+# ----- Weinstein weekly-like params for crypto summary -----
+WEEKS_LOOKBACK = 180
+MA_WEEKS = 30
+MA10_WEEKS = 10
+RS_MA_WEEKS = 30
+SLOPE_WINDOW = 5
+NEAR_MA_BAND = 0.05
+TOP_N_TINY_CHARTS = 30  # in crypto table
 
-TAB_SIGNALS = "Signals"
-TAB_MAPPING = "Mapping"
-
-# ---------- Small helpers ----------
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
@@ -92,17 +97,24 @@ SELL_COOLDOWN_SCANS = 24
 SELL_INTRABAR_CONFIRM_MIN_ELAPSED = 40
 SELL_INTRABAR_VOLPACE_MIN = 1.20
 
+# ---------------- CLI ----------------
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="./config.yaml")
+    p.add_argument("--quiet", action="store_true", help="reduce console noise")
+    return p.parse_args()
+
 # ---------------- Config / IO ----------------
 def load_config(path):
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
     app = cfg.get("app", {}) or {}
+    benchmark = app.get("benchmark", BENCHMARK_DEFAULT)
     sheets = cfg.get("sheets", {}) or {}
     google = cfg.get("google", {}) or {}
-    benchmark = app.get("benchmark", BENCHMARK_DEFAULT)
     sheet_url = sheets.get("url") or sheets.get("sheet_url")
-    svc_file  = google.get("service_account_json")
-    return cfg, benchmark, sheet_url, svc_file
+    service_account_file = google.get("service_account_json")
+    return cfg, benchmark, sheet_url, service_account_file
 
 def newest_weekly_csv():
     files = [f for f in os.listdir(WEEKLY_OUTPUT_DIR) if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")]
@@ -408,7 +420,13 @@ def _colored_summary_html(m):
       .tab-holdings { border-collapse: collapse; width:100%; }
       .tab-holdings th, .tab-holdings td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
       .tab-holdings th { text-align:left; background:#fafafa; }
-      .crypto-section h4 { margin: 0.4rem 0; }
+      .tinytbl { border-collapse: collapse; width:100%; }
+      .tinytbl th, .tinytbl td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
+      .rec { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid transparent; letter-spacing:0.2px; }
+      .rec-strong { background:#eaffea; color:#0f5e1d; border-color:#b8e7b9; }
+      .rec-hold   { background:#effaf0; color:#1e7a1e; border-color:#cdebd0; }
+      .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
+      img { image-rendering:-webkit-optimize-contrast; }
     </style>
     """
     return css + f"""
@@ -480,244 +498,6 @@ def _format_holdings_table(df: pd.DataFrame) -> str:
     </div>
     """
 
-# ---------------- Tiny weekly-like charts (data-URI) ----------------
-def _fig_to_base64(fig) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
-    plt.close(fig)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-
-def _tiny_chart_html_weekly(series_price: pd.Series, bench: pd.Series) -> str:
-    s = series_price.dropna()
-    b = bench.reindex_like(s).dropna()
-    idx = s.index.intersection(b.index)
-    if len(idx) < 40:  # need enough points
-        return ""
-    s = s.loc[idx]; b = b.loc[idx]
-    ma10 = s.rolling(10).mean()
-    ma30 = s.rolling(30).mean()
-    rs = (s / b).rolling(30).mean()
-
-    fig, ax1 = plt.subplots(figsize=(3.0, 1.4))
-    ax1.plot(s.index, s.values, linewidth=1.2)
-    ax1.plot(ma10.index, ma10.values, linewidth=1.0)
-    ax1.plot(ma30.index, ma30.values, linewidth=1.0)
-    ax1.set_xticks([]); ax1.set_yticks([]); ax1.grid(False)
-    ax2 = ax1.twinx()
-    ax2.plot(rs.index, rs.values, linewidth=0.8, alpha=0.7)
-    ax2.set_xticks([]); ax2.set_yticks([])
-    for spine in (*ax1.spines.values(), *ax2.spines.values()):
-        spine.set_visible(False)
-    img = _fig_to_base64(fig)
-    return f'<img src="{img}" alt="chart" style="display:block;width:100%;max-width:240px;height:auto;border:0" />'
-
-# ---------------- Stage / RS (weekly) for crypto section ----------------
-MA_WEEKS = 30
-MA10_WEEKS = 10
-RS_MA_WEEKS = 30
-SLOPE_WINDOW = 5
-NEAR_MA_BAND = 0.05
-
-def _weekly_short_term_state(series_price: pd.Series):
-    s = series_price.dropna()
-    if len(s) < max(MA10_WEEKS, MA_WEEKS) + 5:
-        return ("Unknown", np.nan, np.nan)
-    ma10 = s.rolling(MA10_WEEKS).mean()
-    ma30 = s.rolling(MA_WEEKS).mean()
-    c = float(s.iloc[-1]); m10 = float(ma10.iloc[-1]); m30 = float(ma30.iloc[-1])
-    state = "Unknown"
-    if pd.notna(m10) and pd.notna(m30):
-        if (c > m10) and (m10 > m30): state = "ShortTermUptrend"
-        elif (c > m30) and not (m10 > m30): state = "StageConflict"
-        elif (m10 > m30) and not (c > m10): state = "StageConflict"
-        else: state = "Weak"
-    return (state, m10, m30)
-
-def _compute_stage(closes: pd.Series, bench: pd.Series):
-    s = closes.dropna().copy(); b = bench.reindex_like(s).dropna()
-    idx = s.index.intersection(b.index); s = s.loc[idx]; b = b.loc[idx]
-    if len(s) < MA_WEEKS + SLOPE_WINDOW + 5 or len(b) < RS_MA_WEEKS + 5:
-        return {"error":"insufficient_data"}
-    ma = s.rolling(MA_WEEKS).mean()
-    ma_slope = ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
-    ma_slope_last = ma_slope.iloc[-1]; ma_last = ma.iloc[-1]; price_last = s.iloc[-1]
-    dist_ma_pct = (price_last - ma_last) / ma_last if ma_last and not math.isclose(ma_last, 0.0) else np.nan
-    rs = s / b
-    rs_ma = rs.rolling(RS_MA_WEEKS).mean()
-    rs_slope = rs_ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
-    rs_last = rs.iloc[-1]; rs_ma_last = rs_ma.iloc[-1]
-    rs_above = bool(rs_last > rs_ma_last); rs_slope_last = rs_slope.iloc[-1]
-    price_above_ma = bool(price_last > ma_last); ma_up = bool(ma_slope_last > 0)
-    near_ma = bool(abs(dist_ma_pct) <= NEAR_MA_BAND)
-    rs_up = bool(rs_above and rs_slope_last > 0)
-    rs_down = bool((not rs_above) and rs_slope_last < 0)
-    if price_above_ma and ma_up and rs_up:
-        stage = "Stage 2 (Uptrend)"
-    elif (not price_above_ma) and (ma_slope_last < 0) and rs_down:
-        stage = "Stage 4 (Downtrend)"
-    elif near_ma and abs(ma_slope_last) < (abs(ma_last) * 0.0005):
-        stage = "Stage 1 (Basing)"
-    else:
-        stage = "Stage 3 (Topping)"
-    st_state, ma10_last, _ = _weekly_short_term_state(s)
-    return {
-        "price": float(price_last),
-        "ma10": float(ma10_last) if pd.notna(ma10_last) else np.nan,
-        "ma30": float(ma_last),
-        "dist_ma_pct": float(dist_ma_pct) if pd.notna(dist_ma_pct) else np.nan,
-        "ma_slope_per_wk": float(ma_slope_last) if pd.notna(ma_slope_last) else np.nan,
-        "rs": float(rs_last),
-        "rs_ma30": float(rs_ma_last) if pd.notna(rs_ma_last) else np.nan,
-        "rs_above_ma": bool(rs_above),
-        "rs_slope_per_wk": float(rs_slope_last) if pd.notna(rs_slope_last) else np.nan,
-        "stage": stage,
-        "short_term_state_wk": st_state,
-        "notes": "",
-    }
-
-def _buy_label(stage: str) -> str:
-    stage = stage or ""
-    if stage.startswith("Stage 2"): return "BUY"
-    if stage.startswith("Stage 1"): return "WATCH"
-    if stage == "Filtered": return "AVOID"
-    return "AVOID"
-
-# ---------------- Sheets: discover crypto tickers from Signals ----------------
-def _auth_sheets(service_account_file: str):
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
-    return gspread.authorize(creds)
-
-def _read_tab(gc, sheet_url: str, title: str) -> pd.DataFrame:
-    sh = gc.open_by_url(sheet_url)
-    try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        return pd.DataFrame()
-    vals = ws.get_all_values()
-    if not vals: return pd.DataFrame()
-    header, rows = vals[0], vals[1:]
-    df = pd.DataFrame(rows, columns=[h.strip() for h in header])
-    for c in df.columns:
-        df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
-    return df
-
-def _signals_crypto_universe(sheet_url: str, service_account_file: str) -> list[str]:
-    if not (gspread and Credentials and sheet_url and service_account_file and os.path.exists(service_account_file)):
-        return []
-    try:
-        gc = _auth_sheets(service_account_file)
-        sig = _read_tab(gc, sheet_url, TAB_SIGNALS)
-        if sig.empty: return []
-        tcol = next((c for c in sig.columns if c.lower() in ("ticker","symbol")), "Ticker")
-        raw = sig[tcol].astype(str).str.upper().str.strip()
-        # Accept only YF-style crypto tickers like BTC-USD / ETH-USD / SOL-USD
-        out = [t for t in raw if t.endswith("-USD") and len(t) >= 6]
-        # de-dup preserve order
-        return list(dict.fromkeys(out))
-    except Exception:
-        return []
-
-# ---------------- Crypto summary builder ----------------
-def _crypto_weekly_block_html(crypto_tickers: list[str]) -> str:
-    if not crypto_tickers:
-        return ""
-
-    uniq = list(dict.fromkeys(crypto_tickers + [CRYPTO_BENCHMARK]))
-    data = yf.download(
-        uniq, interval="1wk", period="10y",
-        auto_adjust=True, ignore_tz=True, progress=False, group_by="column"
-    )
-    # Extract Close with multi/single index safety
-    def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
-        if isinstance(df.columns, pd.MultiIndex):
-            top = field if field in df.columns.get_level_values(0) else "Adj Close"
-            out = df[top].copy()
-            keep = [t for t in tickers if t in out.columns]
-            return out[keep]
-        else:
-            # single symbol case
-            t0 = tickers[0] if tickers else "TICKER"
-            if field in df.columns:
-                out = df[[field]].copy(); out.columns = [t0]; return out
-            out = df[["Adj Close"]].copy(); out.columns = [t0]; return out
-
-    close = _extract_field(data, "Close", uniq).dropna(how="all")
-    if CRYPTO_BENCHMARK not in close.columns:
-        return ""
-
-    bench = close[CRYPTO_BENCHMARK].dropna()
-    rows = []
-    for t in crypto_tickers:
-        if t not in close.columns:
-            rows.append({"ticker": t, "asset_class":"Crypto", "stage":"N/A"})
-            continue
-        res = _compute_stage(close[t], bench)
-        res["ticker"] = t
-        res["asset_class"] = "Crypto"
-        rows.append(res)
-
-    df = pd.DataFrame(rows)
-    # compute buy label and tiny charts
-    df["Buy Signal"] = df["stage"].apply(_buy_label)
-    df["chart"] = ""
-    for i, r in df.iterrows():
-        t = r["ticker"]
-        try:
-            df.at[i, "chart"] = _tiny_chart_html_weekly(close[t], bench)
-        except Exception:
-            df.at[i, "chart"] = ""
-
-    # order columns like weekly
-    for c in ["industry","sector","short_term_state_wk","notes","ma10","ma30","dist_ma_pct",
-              "ma_slope_per_wk","rs","rs_ma30","rs_above_ma","rs_slope_per_wk","price"]:
-        if c not in df.columns: df[c] = "" if c in ("industry","sector","short_term_state_wk","notes") else np.nan
-    view_cols = [
-        "ticker","asset_class","industry","sector","Buy Signal","chart",
-        "stage","short_term_state_wk","price","ma10","ma30","dist_ma_pct",
-        "ma_slope_per_wk","rs","rs_ma30","rs_above_ma","rs_slope_per_wk","notes"
-    ]
-    show = df[view_cols].copy()
-
-    # pretty format percent-ish
-    def _pct_fmt(x):
-        try:
-            return f"{float(x)*100:.2f}%"
-        except Exception:
-            return x if isinstance(x, str) else ""
-    for c in ["dist_ma_pct","ma_slope_per_wk","rs_slope_per_wk"]:
-        show[c] = show[c].apply(_pct_fmt)
-    if "rs_above_ma" in show.columns:
-        show["rs_above_ma"] = show["rs_above_ma"].map({True:"Yes", False:"No", "":"", np.nan:""})
-
-    # counts
-    b = int((df["Buy Signal"] == "BUY").sum())
-    w = int((df["Buy Signal"] == "WATCH").sum())
-    a = int((df["Buy Signal"] == "AVOID").sum())
-    total = int(len(df))
-
-    # HTML table (no pandas Styler to keep email-safe)
-    thead = "".join([f"<th>{c}</th>" for c in show.columns])
-    trs = []
-    for _, r in show.iterrows():
-        tds = "".join([f"<td>{r[c]}</td>" for c in show.columns])
-        trs.append(f"<tr>{tds}</tr>")
-    tbody = "\n".join(trs)
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    block = f"""
-    <div class="crypto-section">
-      <h3>Crypto Weekly — Benchmark: {CRYPTO_BENCHMARK}</h3>
-      <div class="sub">Generated {now}</div>
-      <div class="summary"><b>Crypto Summary:</b> ✅ Buy: {b} &nbsp; | &nbsp; 🟡 Watch: {w} &nbsp; | &nbsp; 🔴 Avoid: {a} &nbsp; (Total: {total})</div>
-      <table style="border-collapse:collapse;width:100%;">
-        <thead style="background:#fafafa;"><tr>{thead}</tr></thead>
-        <tbody>{tbody}</tbody>
-      </table>
-    </div>
-    """
-    return block
-
 # ---------------- Charting ----------------
 def make_tiny_chart_png(ticker, benchmark, daily_df):
     os.makedirs(CHART_DIR, exist_ok=True)
@@ -757,6 +537,37 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
         b64 = base64.b64encode(f.read()).decode("ascii")
     return chart_path, f"data:image/png;base64,{b64}"
 
+# ---- Tiny inline chart (data URI) for crypto table ----
+def _fig_to_base64(fig) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+def _make_tiny_chart_html_from_series(series_price: pd.Series, bench_series: pd.Series) -> str:
+    s = series_price.dropna()
+    b = bench_series.reindex_like(s).dropna()
+    idx = s.index.intersection(b.index)
+    if len(idx) < MA_WEEKS + 5: 
+        return ""
+    s = s.loc[idx]; b = b.loc[idx]
+    ma30 = s.rolling(MA_WEEKS).mean()
+    ma10 = s.rolling(MA10_WEEKS).mean()
+    rs = (s / b).rolling(RS_MA_WEEKS).mean()
+    fig, ax1 = plt.subplots(figsize=(3.0, 1.2))
+    ax1.plot(s.index, s.values, linewidth=1.2)
+    ax1.plot(ma10.index, ma10.values, linewidth=1.0)
+    ax1.plot(ma30.index, ma30.values, linewidth=1.0)
+    ax1.set_xticks([]); ax1.set_yticks([]); ax1.grid(False)
+    ax2 = ax1.twinx()
+    ax2.plot(rs.index, rs.values, linewidth=0.8)
+    ax2.set_xticks([]); ax2.set_yticks([])
+    for spine in (*ax1.spines.values(), *ax2.spines.values()):
+        spine.set_visible(False)
+    img_src = _fig_to_base64(fig)
+    return f'<img src="{img_src}" alt="chart" style="display:block;width:100%;max-width:220px;height:auto;border:0" />'
+
 # ---------------- Ranking helpers ----------------
 def stage_order(stage: str) -> int:
     if isinstance(stage, str):
@@ -789,15 +600,277 @@ def sell_sort_key(item):
     pace = item.get("pace", np.nan); pace = pace if pd.notna(pace) else -1e9
     return (wr, st, -dist_below, -pace)
 
-# ---------------- Logic helpers ----------------
-def _price_below_ma(px, ma): return pd.notna(px) and pd.notna(ma) and px <= ma * (1.0 - SELL_BREAK_PCT)
-def _near_sell_zone(px, ma):
-    if pd.isna(px) or pd.isna(ma): return False
-    return (px >= ma * (1.0 - SELL_BREAK_PCT)) and (px <= ma * (1.0 + SELL_NEAR_ABOVE_MA_PCT))
+# ---------------- Google Sheets helpers (Signals → crypto universe) ----------------
+def _auth_sheets(service_account_file: str):
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
+    return gspread.authorize(creds)
+
+def _read_tab(gc, sheet_url: str, title: str) -> pd.DataFrame:
+    sh = gc.open_by_url(sheet_url)
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return pd.DataFrame()
+    vals = ws.get_all_values()
+    if not vals: return pd.DataFrame()
+    header, rows = vals[0], vals[1:]
+    df = pd.DataFrame(rows, columns=[h.strip() for h in header])
+    for c in df.columns:
+        df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+    return df
+
+def _is_crypto_symbol(sym: str) -> bool:
+    s = (sym or "").strip().upper()
+    return s.endswith("-USD") and len(s) >= 6 and all(ch.isalnum() or ch in "-." for ch in s)
+
+def _signals_crypto_universe(sheet_url: str, service_account_file: str) -> list[str]:
+    """Harvest crypto tickers from the existing 'Signals' tab (optionally map via 'Mapping')."""
+    if not (gspread and Credentials and sheet_url and service_account_file and os.path.exists(service_account_file)):
+        return []
+    try:
+        gc = _auth_sheets(service_account_file)
+        sig = _read_tab(gc, sheet_url, "Signals")
+        if sig.empty: return []
+        # Optional Mapping tab
+        mapping = {}
+        try:
+            m = _read_tab(gc, sheet_url, "Mapping")
+            if not m.empty and "Ticker" in m.columns:
+                for _, r in m.iterrows():
+                    t = str(r.get("Ticker","")).strip().upper()
+                    tyf = str(r.get("TickerYF","")).strip().upper()
+                    if t: mapping[t] = tyf or ""
+        except Exception:
+            pass
+        tcol = next((c for c in sig.columns if c.lower() in ("ticker","symbol")), "Ticker")
+        raw = sig[tcol].astype(str).str.upper().str.strip()
+        out = []
+        for t in raw:
+            yf_sym = mapping.get(t, t)
+            if _is_crypto_symbol(yf_sym):
+                out.append(yf_sym)
+        # de-dup preserve order
+        uniq = list(dict.fromkeys(out))
+        return uniq
+    except Exception:
+        return []
+
+# ---------------- Weekly-like engine for Crypto Summary ----------------
+def _weekly_short_term_state(series_price: pd.Series) -> tuple[str, float, float]:
+    s = series_price.dropna()
+    if len(s) < max(MA10_WEEKS, MA_WEEKS) + 5:
+        return ("Unknown", np.nan, np.nan)
+    ma10 = s.rolling(MA10_WEEKS).mean()
+    ma30 = s.rolling(MA_WEEKS).mean()
+    c = float(s.iloc[-1]); m10 = float(ma10.iloc[-1]); m30 = float(ma30.iloc[-1])
+    state = "Unknown"
+    if pd.notna(m10) and pd.notna(m30):
+        if (c > m10) and (m10 > m30): state = "ShortTermUptrend"
+        elif (c > m30) and not (m10 > m30): state = "StageConflict"
+        elif (m10 > m30) and not (c > m10): state = "StageConflict"
+        else: state = "Weak"
+    return (state, m10, m30)
+
+def compute_stage_for_ticker_weekly(closes: pd.Series, bench: pd.Series):
+    s = closes.dropna().copy(); b = bench.reindex_like(s).dropna()
+    idx = s.index.intersection(b.index); s = s.loc[idx]; b = b.loc[idx]
+    if len(s) < MA_WEEKS + SLOPE_WINDOW + 5 or len(b) < RS_MA_WEEKS + 5:
+        return {"error": "insufficient_data"}
+    ma = s.rolling(MA_WEEKS).mean()
+    ma_slope = ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
+    ma_slope_last = ma_slope.iloc[-1]; ma_last = ma.iloc[-1]; price_last = s.iloc[-1]
+    dist_ma_pct = (price_last - ma_last) / ma_last if ma_last and not math.isclose(ma_last, 0.0) else np.nan
+    rs = s / b
+    rs_ma = rs.rolling(RS_MA_WEEKS).mean()
+    rs_slope = rs_ma.diff(SLOPE_WINDOW) / float(SLOPE_WINDOW)
+    rs_last = rs.iloc[-1]; rs_ma_last = rs_ma.iloc[-1]
+    rs_above = bool(rs_last > rs_ma_last); rs_slope_last = rs_slope.iloc[-1]
+    price_above_ma = bool(price_last > ma_last); ma_up = bool(ma_slope_last > 0)
+    near_ma = bool(abs(dist_ma_pct) <= NEAR_MA_BAND)
+    rs_up = bool(rs_above and rs_slope_last > 0)
+    rs_down = bool((not rs_above) and rs_slope_last < 0)
+    if price_above_ma and ma_up and rs_up:
+        stage = "Stage 2 (Uptrend)"
+    elif (not price_above_ma) and (ma_slope_last < 0) and rs_down:
+        stage = "Stage 4 (Downtrend)"
+    elif near_ma and abs(ma_slope_last) < (abs(ma_last) * 0.0005):
+        stage = "Stage 1 (Basing)"
+    else:
+        stage = "Stage 3 (Topping)"
+    notes = []
+    if price_above_ma and not ma_up: notes.append("Price>MA but MA not rising")
+    if (not price_above_ma) and ma_up: notes.append("Price<MA but MA rising (watch)")
+    if rs_above and rs_slope_last <= 0: notes.append("RS above MA but flattening")
+    if (not rs_above) and rs_slope_last >= 0: notes.append("RS below MA but improving")
+    st_state, ma10_last, _ = _weekly_short_term_state(s)
+    return {
+        "price": float(price_last),
+        "ma10": float(ma10_last) if pd.notna(ma10_last) else np.nan,
+        "ma30": float(ma_last),
+        "dist_ma_pct": float(dist_ma_pct) if pd.notna(dist_ma_pct) else np.nan,
+        "ma_slope_per_wk": float(ma_slope_last) if pd.notna(ma_slope_last) else np.nan,
+        "rs": float(rs_last),
+        "rs_ma30": float(rs_ma_last) if pd.notna(rs_ma_last) else np.nan,
+        "rs_above_ma": bool(rs_above),
+        "rs_slope_per_wk": float(rs_slope_last) if pd.notna(rs_slope_last) else np.nan,
+        "stage": stage,
+        "short_term_state_wk": st_state,
+        "notes": "; ".join(notes),
+    }
+
+def _extract_field(df: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        raise ValueError("Empty dataframe returned by yfinance.")
+    if isinstance(df.columns, pd.MultiIndex):
+        avail_top = list(df.columns.get_level_values(0).unique())
+        use_field = field if field in avail_top else ("Adj Close" if "Adj Close" in avail_top else None)
+        if not use_field:
+            raise KeyError(f"Field '{field}' not found; available: {avail_top}")
+        out = df[use_field].copy()
+        keep = [t for t in tickers if t in out.columns]
+        if not keep:
+            raise KeyError(f"No requested tickers found in downloaded data. Requested={tickers[:5]}...")
+        return out[keep]
+    cols = set(df.columns.astype(str))
+    if field in cols:
+        t0 = tickers[0] if tickers else "TICKER"
+        out = df[[field]].copy(); out.columns = [t0]; return out
+    if "Adj Close" in cols:
+        t0 = tickers[0] if tickers else "TICKER"
+        out = df[["Adj Close"]].copy(); out.columns = [t0]; return out
+    raise KeyError(f"Field '{field}' not in downloaded data; got columns: {list(df.columns)}")
+
+def _fetch_weekly(tickers, benchmark, weeks=WEEKS_LOOKBACK):
+    uniq = list(dict.fromkeys((tickers or []) + [benchmark]))
+    if not uniq:
+        return None, None
+    data = yf.download(
+        uniq, interval="1wk", period="10y",
+        auto_adjust=True, ignore_tz=True, progress=False, group_by="column"
+    )
+    close = _extract_field(data, "Close", uniq)
+    volume = _extract_field(data, "Volume", uniq)
+    tail_n = max(weeks, MA_WEEKS + RS_MA_WEEKS + SLOPE_WINDOW + 10)
+    close = close.tail(tail_n); volume = volume.tail(tail_n)
+    return close, volume
+
+def _classify_buy_signal(stage: str) -> str:
+    stage = stage or ""
+    if stage.startswith("Stage 2"): return "BUY"
+    if stage.startswith("Stage 1"): return "WATCH"
+    if stage == "Filtered": return "AVOID"
+    return "AVOID"
+
+def _rec_badge_html(text: str) -> str:
+    t = (text or "").strip().upper()
+    if t == "BUY":   cls, label = "rec rec-strong", "Buy"
+    elif t == "WATCH": cls, label = "rec rec-hold", "Watch"
+    elif t == "AVOID": cls, label = "rec rec-sell", "Avoid"
+    else: cls, label = "rec rec-neu", (text or "—")
+    return f'<span class="{cls}">{label}</span>'
+
+def _crypto_df_to_html(df: pd.DataFrame, title: str, summary_line: str):
+    styled = df.copy()
+    for c in ["dist_ma_pct","ma_slope_per_wk","rs_slope_per_wk"]:
+        if c in styled.columns:
+            styled[c] = styled[c].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "")
+    if "rs_above_ma" in styled.columns:
+        styled["rs_above_ma"] = styled["rs_above_ma"].map({True: "Yes", False: "No"})
+    styled["Buy Signal"] = styled.get("buy_signal","").apply(_rec_badge_html)
+    columns_order = [
+        "ticker","asset_class","industry","sector","Buy Signal","chart",
+        "stage","short_term_state_wk",
+        "price","ma10","ma30","dist_ma_pct",
+        "ma_slope_per_wk","rs","rs_ma30","rs_above_ma","rs_slope_per_wk","notes"
+    ]
+    for c in columns_order:
+        if c not in styled.columns: styled[c] = ""
+    styled = styled[columns_order]
+    table_html = styled.to_html(index=False, border=0, justify="center", escape=False)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    html = f"""
+    <h3>{title}</h3>
+    <div style="color:#666;margin:-6px 0 12px 0;">Generated {now}</div>
+    <div class="summary" style="background:#f6f8fa;border:1px solid #eaecef;padding:8px 10px;border-radius:8px;margin:8px 0 12px 0;">{summary_line}</div>
+    {table_html}
+    """
+    return html
+
+def _attach_tiny_charts_crypto(df: pd.DataFrame, close_w: pd.DataFrame, bench_series: pd.Series, top_n: int = TOP_N_TINY_CHARTS) -> pd.DataFrame:
+    out = df.copy()
+    out["chart"] = ""
+    for i, row in out.head(top_n).iterrows():
+        t = row["ticker"]
+        if t in close_w.columns:
+            try:
+                out.at[i, "chart"] = _make_tiny_chart_html_from_series(close_w[t], bench_series)
+            except Exception:
+                out.at[i, "chart"] = ""
+    return out
+
+def build_crypto_summary_block(sheet_url: str, service_account_file: str) -> str:
+    """Builds the Crypto summary HTML block from Signals tab."""
+    crypto_tickers = _signals_crypto_universe(sheet_url, service_account_file)
+    crypto_tickers = [t for t in crypto_tickers if _is_crypto_symbol(t)]
+    if not crypto_tickers:
+        return ""  # nothing to show
+    close_w, volume_w = _fetch_weekly(crypto_tickers + [CRYPTO_BENCHMARK], CRYPTO_BENCHMARK, weeks=WEEKS_LOOKBACK)
+    if close_w is None or CRYPTO_BENCHMARK not in close_w.columns:
+        return ""
+    bench_series = close_w[CRYPTO_BENCHMARK].dropna()
+
+    rows = []
+    last_close = close_w.ffill().iloc[-1]
+    for t in crypto_tickers:
+        if t not in close_w.columns:
+            rows.append({"ticker": t, "stage": "N/A", "notes": "no_data", "asset_class": "Crypto"})
+            continue
+        res = compute_stage_for_ticker_weekly(close_w[t], bench_series)
+        res["ticker"] = t
+        res["asset_class"] = "Crypto"
+        rows.append(res)
+
+    df = pd.DataFrame(rows)
+
+    # Expected cols
+    cols = ["ticker","stage","price","ma10","ma30","dist_ma_pct","ma_slope_per_wk",
+            "rs","rs_ma30","rs_above_ma","rs_slope_per_wk","short_term_state_wk","notes","asset_class"]
+    for c in cols:
+        if c not in df.columns: df[c] = np.nan
+
+    df["buy_signal"] = df["stage"].apply(lambda s: _classify_buy_signal(str(s)))
+
+    stage_rank = {
+        "Stage 2 (Uptrend)": 0,
+        "Stage 1 (Basing)": 1,
+        "Stage 3 (Topping)": 2,
+        "Stage 4 (Downtrend)": 3,
+        "Filtered": 8,
+        "N/A": 9,
+    }
+    df["stage_rank"] = df["stage"].map(stage_rank).fillna(9)
+    df = df.sort_values(by=["stage_rank","dist_ma_pct"], ascending=[True, False]).reset_index(drop=True)
+    df = df.drop(columns=["stage_rank"])
+
+    with_charts = _attach_tiny_charts_crypto(df, close_w, bench_series, top_n=TOP_N_TINY_CHARTS)
+
+    cb = int((df["buy_signal"] == "BUY").sum())
+    cw = int((df["buy_signal"] == "WATCH").sum())
+    ca = int((df["buy_signal"] == "AVOID").sum())
+    ct = int(len(df))
+    summary_line = f"<strong>Crypto Summary:</strong> ✅ Buy: {cb} &nbsp; | &nbsp; 🟡 Watch: {cw} &nbsp; | &nbsp; 🔴 Avoid: {ca} &nbsp; (Total: {ct})"
+
+    html = _crypto_df_to_html(
+        with_charts,
+        title=f"Crypto Weekly — Benchmark: {CRYPTO_BENCHMARK}",
+        summary_line=summary_line
+    )
+    return html
 
 # ---------------- Main logic ----------------
 def run(_config_path="./config.yaml"):
-    log("Intraday watcher starting with config: {0}".format(_config_path), level="step")
+    log("Loading weekly report + config...", level="step")
     cfg, benchmark, sheet_url, service_account_file = load_config(_config_path)
     weekly_df, weekly_csv_path = load_weekly_report()
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
@@ -809,22 +882,11 @@ def run(_config_path="./config.yaml"):
     focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])][["ticker","stage","ma30","rs_above_ma","asset_class"]].copy()
     if "rank" in w.columns: focus["weekly_rank"] = w["rank"]
     else: focus["weekly_rank"] = 999999
+
     log(f"Focus universe: {len(focus)} symbols (Stage 1/2).", level="info")
 
     # Benchmarks to ensure RS charts render: equity + crypto
     needs = sorted(set(focus["ticker"].tolist() + [benchmark, CRYPTO_BENCHMARK]))
-
-    # --- Crypto summary (from Signals tab) ---
-    crypto_block_html = ""
-    crypto_tickers = _signals_crypto_universe(sheet_url, service_account_file)
-    if crypto_tickers:
-        try:
-            crypto_block_html = _crypto_weekly_block_html(crypto_tickers)
-            # also ensure we have intraday/daily bars for their charts if later needed
-            needs = sorted(set(needs + crypto_tickers))
-        except Exception as e:
-            log(f"Crypto summary build failed: {e}", level="warn")
-
     log("Downloading intraday + daily bars...", level="step")
     intraday, daily = get_intraday(needs)
     log("Price data downloaded.", level="ok")
@@ -900,9 +962,9 @@ def run(_config_path="./config.yaml"):
         # --- SELL near/confirm ---
         sell_near_now = False; sell_confirm = False; sell_vol_ok = True
         if ma_ok and pd.notna(px):
-            sell_near_now = _near_sell_zone(px, ma30)
+            sell_near_now = (px >= ma30 * (1.0 - SELL_BREAK_PCT)) and (px <= ma30 * (1.0 + SELL_NEAR_ABOVE_MA_PCT))
             if INTRADAY_INTERVAL == "60m":
-                sell_price_ok = _price_below_ma(px, ma30)
+                sell_price_ok = (px <= ma30 * (1.0 - SELL_BREAK_PCT))
                 sell_vol_ok = (pace_intra is None) or (pace_intra >= SELL_INTRABAR_VOLPACE_MIN)
                 sell_confirm = bool(sell_price_ok and (elapsed is not None and elapsed >= SELL_INTRABAR_CONFIRM_MIN_ELAPSED) and sell_vol_ok)
             else:
@@ -1063,7 +1125,7 @@ def run(_config_path="./config.yaml"):
 
     log(f"Charts prepared: {len(chart_imgs)}", level="debug")
 
-    # -------- Build Email --------
+    # -------- Build Email (main blocks first) --------
     info_df = pd.DataFrame(info_rows)
     if not info_df.empty:
         info_df["stage_rank"] = info_df["stage"].apply(stage_order)
@@ -1119,13 +1181,6 @@ def run(_config_path="./config.yaml"):
       volume pace ≥ {NEAR_VOL_PACE_MIN}×.<br>
       SELL-TRIGGER: Confirmed crack below MA150 by {SELL_BREAK_PCT*100:.1f}% with persistence; for 60m bars, ≥{SELL_INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {SELL_INTRABAR_VOLPACE_MIN}×.
     </i></p>
-    """
-
-    # Inject Crypto Weekly block (if any)
-    if crypto_block_html:
-        html += "<hr/>" + crypto_block_html
-
-    html += f"""
     <h4>Buy Triggers (ranked)</h4>
     {bullets(buy_signals, "BUY")}
     <h4>Near-Triggers (ranked)</h4>
@@ -1142,7 +1197,18 @@ def run(_config_path="./config.yaml"):
     if holdings_block_html:
         html += "<hr/>" + holdings_block_html
 
-    # Plain text
+    # ---------- Crypto Summary from Signals (APPENDED AT END) ----------
+    crypto_block = ""
+    if sheet_url and service_account_file and os.path.exists(service_account_file):
+        try:
+            crypto_block = build_crypto_summary_block(sheet_url, service_account_file)
+        except Exception as e:
+            log(f"Crypto summary build failed: {e}", level="warn")
+
+    if crypto_block:
+        html += "<hr/>" + crypto_block  # <-- at the end of the email
+
+    # -------- Plain text (no crypto table in text mode to keep it compact) --------
     def _lines(items, kind):
         out = []
         for i, it in enumerate(items, 1):
@@ -1178,10 +1244,7 @@ def run(_config_path="./config.yaml"):
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
-    args = _parse_args = argparse.ArgumentParser()
-    _parse_args.add_argument("--config", default="./config.yaml")
-    _parse_args.add_argument("--quiet", action="store_true", help="reduce console noise")
-    args = _parse_args.parse_args()
+    args = _parse_args()
     VERBOSE = not args.quiet
     log(f"Intraday watcher starting with config: {args.config}", level="step")
     try:
