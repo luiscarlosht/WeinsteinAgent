@@ -2,134 +2,138 @@
 # -*- coding: utf-8 -*-
 
 """
-Weinstein Intraday Watch
-- Loads config.yaml
-- Reads latest weekly equities CSV (for context + snapshot)
-- Optionally pulls 'Signals' from your Google Sheet to find any crypto tickers
-- Builds a Crypto Weekly block (benchmark BTC-USD) and prints it
-- Prints Intraday BUY/NEAR/SELL trigger shells (safe defaults)
-- Prints Snapshot (ticker, stage, price, ma30) from weekly CSV
-- Prints "Weinstein Weekly – Summary" section after the Crypto block
+Weinstein Intraday Watcher
+- Prints intraday trigger scan
+- Prints snapshot (from latest weekly CSV)
+- Prints Crypto Weekly (from Signals sheet & yfinance), placed BEFORE the "Weinstein Weekly – Summary"
+- Ends with the weekly portfolio summary snapshot (from Open_Positions sheet if present)
 
 Notes:
-- Keeps console output formatting consistent with your examples
-- Handles pandas truth-value & .tolist() pitfalls
-- Uses yfinance for prices; if unavailable, Crypto block downgrades gracefully
+- Requires: pyyaml, pandas, numpy, yfinance, gspread, oauth2client (for Google Sheets)
+- Uses service account JSON from config to read the Google Sheet (Signals, Open_Positions)
 """
+
+from __future__ import annotations
 
 import os
 import sys
-import io
 import glob
 import math
 import time
 import json
+import textwrap
 import datetime as dt
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Optional deps
-try:
-    import yaml
-except Exception:
-    yaml = None
-
+# soft deps
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
-# Optional Google Sheets (Signals)
-GSPREAD_AVAILABLE = True
+try:
+    import yaml
+except Exception as e:
+    print("Missing dependency pyyaml. pip install pyyaml", file=sys.stderr)
+    raise
+
+# Google Sheets (optional: only needed if you actually read tabs)
 try:
     import gspread
-    from google.oauth2.service_account import Credentials
+    from oauth2client.service_account import ServiceAccountCredentials
 except Exception:
-    GSPREAD_AVAILABLE = False
+    gspread = None
+    ServiceAccountCredentials = None
 
-# ========== Utility ==========
-def _now_ct() -> dt.datetime:
-    return dt.datetime.now()
 
-def _fmt_now_for_header(tz_name: str = "America/Chicago") -> str:
-    # Avoid tz lib dependency; print local time as-is with HH:MM
-    return _now_ct().strftime("%Y-%m-%d %H:%M")
+# ----------------------------
+# Small utils
+# ----------------------------
 
-def _safe_float_from_series(series: pd.Series, index: int = -1, default: float = float("nan")) -> float:
+def _now_tz(tzname: str) -> dt.datetime:
+    """Return timezone-aware 'now' in tzname."""
+    # Simple local offset approach; relies on system tz database if available.
+    # For Linux with tzdata, this is fine. If not, fallback to naive localtime.
     try:
-        if series is None or len(series) == 0:
-            return default
-        val = series.iloc[index]
-        return float(val)
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tzname)
+        return dt.datetime.now(tz)
     except Exception:
-        return default
+        return dt.datetime.now()
 
-def _slope_per_week(series: pd.Series, lookback_days: int = 5) -> float:
-    """Return last - prior(5 bars) as 'per-week' slope proxy."""
+
+def _fmt_pct(x: float, places: int = 2) -> str:
     try:
-        if series is None or len(series) < lookback_days + 1:
-            return float("nan")
-        return float(series.iloc[-1] - series.iloc[-1 - lookback_days])
+        return f"{x:.{places}f}%"
     except Exception:
-        return float("nan")
-
-def _pct(a: float) -> str:
-    if pd.isna(a) or a is None:
         return ""
-    return f"{a:.2f}%"
+
+
+def _fmt_usd(x: float, places: int = 2) -> str:
+    try:
+        return f"${x:,.{places}f}"
+    except Exception:
+        return ""
+
 
 def _sparkline(arr: List[float], width: int = 18) -> str:
-    # Simple unicode sparkline
+    """Return a tiny unicode sparkline from values."""
     if not arr:
         return ""
-    blocks = "▁▂▃▄▅▆▇█"
-    lo, hi = min(arr), max(arr)
-    if math.isclose(lo, hi):
-        return blocks[0] * min(len(arr), width)
-    # compress if needed
-    data = arr
+    # downsample to width
     if len(arr) > width:
-        # sample evenly to width
-        idxs = np.linspace(0, len(arr) - 1, width).astype(int)
-        data = [arr[i] for i in idxs]
+        idx = np.linspace(0, len(arr) - 1, width).astype(int)
+        arr = [arr[i] for i in idx]
+    chars = "▁▂▃▄▅▆▇█"
+    lo, hi = min(arr), max(arr)
+    if hi - lo < 1e-12:
+        return chars[0] * len(arr)
     out = []
-    for v in data:
+    for v in arr:
         t = (v - lo) / (hi - lo)
-        out.append(blocks[min(len(blocks) - 1, max(0, int(t * (len(blocks) - 1))))])
+        bucket = int(round(t * (len(chars) - 1)))
+        bucket = max(0, min(bucket, len(chars) - 1))
+        out.append(chars[bucket])
     return "".join(out)
 
-def _stage_from_price_ma(price: float, ma30: float, ma_slope: float) -> str:
-    if pd.isna(price) or pd.isna(ma30) or pd.isna(ma_slope):
-        return "Stage ? (Unknown)"
-    if price >= ma30 and ma_slope > 0:
-        return "Stage 2 (Uptrend)"
-    if price < ma30 and ma_slope < 0:
-        return "Stage 4 (Downtrend)"
-    # transitional / topping/basing
-    return "Stage 3 (Topping)" if price >= ma30 else "Stage 1 (Basing)"
 
-def _buy_watch_avoid(stage: str, rs_above_ma: bool, rs_slope_wk: float, dist_ma_pct: float) -> str:
-    # Conservative read:
-    # BUY: Stage 2 + RS above MA + RS slope >= 0
-    # WATCH: Stage 1/3 with improving RS slope (>=0) OR Stage 2 but RS not fully confirming
-    # AVOID: Stage 4 or RS below MA or extended under MA
-    if "Stage 2" in stage and rs_above_ma and (rs_slope_wk >= 0):
-        return "Buy"
-    if "Stage 4" in stage or not rs_above_ma:
-        return "Avoid"
-    # Stage 1/3 or partial confirms:
-    return "Watch"
+def _last(series: pd.Series) -> Optional[float]:
+    """Safe last value from a Series as float."""
+    if series is None or series.empty:
+        return None
+    # Ensure single value
+    return float(series.iloc[-1])
 
-# ========== Config ==========
+
+def _slope_last_5(series: pd.Series) -> Optional[float]:
+    """Slope (last - value 5 ago)."""
+    if series is None or len(series) < 6:
+        return None
+    return float(series.iloc[-1] - series.iloc[-6])
+
+
+def _safe_bool(x: Any) -> bool:
+    """Avoid pandas ambiguous truth-value traps."""
+    if isinstance(x, pd.Series) or isinstance(x, pd.DataFrame):
+        return not x.empty
+    return bool(x)
+
+
+# ----------------------------
+# Config
+# ----------------------------
+
 @dataclass
-class AppConfig:
+class AppCfg:
     mode_default: str = "weekly"
     timezone: str = "America/Chicago"
     benchmark: str = "SPY"
     include_charts: bool = True
+
 
 @dataclass
 class SheetsCfg:
@@ -139,436 +143,749 @@ class SheetsCfg:
     signals_tab: str = "Signals"
     output_dir: str = "./output"
 
-@dataclass
-class ReportingCfg:
-    output_dir: str = "./output"
-    include_pdf: bool = True
-    include_csv: bool = True
-    summary_lines: int = 10
 
 @dataclass
 class GoogleCfg:
     service_account_json: str = ""
     client_email: str = ""
 
+
 @dataclass
-class RootConfig:
-    app: AppConfig
-    sheets: SheetsCfg
-    reporting: ReportingCfg
-    google: GoogleCfg
+class SMTPAuthCfg:
+    host: str = "smtp.gmail.com"
+    port_ssl: int = 587
+    username: str = ""
+    app_password: str = ""
 
-def load_config(config_path: str) -> RootConfig:
-    if yaml is None:
-        raise RuntimeError("pyyaml is required to read config.yaml")
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
 
-    app = AppConfig(**raw.get("app", {}))
+@dataclass
+class EmailCfg:
+    enabled: bool = False
+    sender: str = ""
+    recipients: List[str] = field(default_factory=list)
+    subject_prefix: str = "Weinstein Report READY"
+    provider: str = "smtp"
+    smtp: SMTPAuthCfg = field(default_factory=SMTPAuthCfg)
+
+
+@dataclass
+class NotificationsCfg:
+    email: EmailCfg = field(default_factory=EmailCfg)
+
+
+@dataclass
+class ReportingCfg:
+    output_dir: str = "./output"
+    include_pdf: bool = True
+    include_csv: bool = True
+    summary_lines: int = 10
+    # Accept optional section_order to avoid TypeError in newer configs
+    section_order: Optional[List[str]] = None  # ignored here; included for compatibility
+
+
+@dataclass
+class UniverseCfg:
+    mode: str = "sp500"
+    extra: List[str] = field(default_factory=list)
+    min_price: float = 5.0
+    min_avg_volume: int = 1_000_000
+
+
+@dataclass
+class RiskCfg:
+    max_position_pct: float = 10.0
+    tranche_plan: List[int] = field(default_factory=lambda: [30, 30, 20, 20])
+    stop_below_ma_pct: float = 5.0
+
+
+@dataclass
+class Cfg:
+    app: AppCfg = field(default_factory=AppCfg)
+    sheets: SheetsCfg = field(default_factory=SheetsCfg)
+    google: GoogleCfg = field(default_factory=GoogleCfg)
+    notifications: NotificationsCfg = field(default_factory=NotificationsCfg)
+    reporting: ReportingCfg = field(default_factory=ReportingCfg)
+    universe: UniverseCfg = field(default_factory=UniverseCfg)
+    risk: RiskCfg = field(default_factory=RiskCfg)
+
+
+def load_config(path: str) -> Cfg:
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+
+    app = AppCfg(**raw.get("app", {}))
     sheets = SheetsCfg(**raw.get("sheets", {}))
-    reporting = ReportingCfg(**raw.get("reporting", {}))
     google = GoogleCfg(**raw.get("google", {}))
-    return RootConfig(app=app, sheets=sheets, reporting=reporting, google=google)
 
-# ========== Weekly CSV Helpers ==========
-def find_latest_weekly_csv(reporting_dir: str) -> Optional[str]:
-    patt = os.path.join(reporting_dir, "weinstein_weekly_equities_*.csv")
-    files = sorted(glob.glob(patt))
-    if not files:
+    notif_raw = raw.get("notifications", {})
+    email_raw = notif_raw.get("email", {})
+    smtp_raw = (email_raw or {}).get("smtp", {})
+    email = EmailCfg(
+        enabled=email_raw.get("enabled", False),
+        sender=email_raw.get("sender", ""),
+        recipients=email_raw.get("recipients", []) or [],
+        subject_prefix=email_raw.get("subject_prefix", "Weinstein Report READY"),
+        provider=email_raw.get("provider", "smtp"),
+        smtp=SMTPAuthCfg(
+            host=smtp_raw.get("host", "smtp.gmail.com"),
+            port_ssl=int(smtp_raw.get("port_ssl", 587)),
+            username=smtp_raw.get("username", ""),
+            app_password=smtp_raw.get("app_password", ""),
+        ),
+    )
+    notifications = NotificationsCfg(email=email)
+
+    reporting = ReportingCfg(**raw.get("reporting", {}))
+    universe = UniverseCfg(**raw.get("universe", {}))
+    risk = RiskCfg(**raw.get("risk", {}))
+
+    return Cfg(
+        app=app,
+        sheets=sheets,
+        google=google,
+        notifications=notifications,
+        reporting=reporting,
+        universe=universe,
+        risk=risk,
+    )
+
+
+# ----------------------------
+# Google Sheets helpers
+# ----------------------------
+
+def _open_gsheet(cfg: Cfg) -> Optional[gspread.Spreadsheet]:
+    if gspread is None or ServiceAccountCredentials is None:
         return None
-    return files[-1]
-
-def load_weekly_csv(path: str) -> pd.DataFrame:
+    if not cfg.google.service_account_json or not os.path.exists(cfg.google.service_account_json):
+        return None
     try:
-        df = pd.read_csv(path)
-    except Exception:
-        df = pd.DataFrame()
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(cfg.google.service_account_json, scope)
+        client = gspread.authorize(creds)
+        return client.open_by_url(cfg.sheets.url or cfg.sheets.sheet_url)
+    except Exception as e:
+        print(f"⚠️  Could not open Google Sheet: {e}", file=sys.stderr)
+        return None
+
+
+def _read_sheet_as_df(sh: gspread.Spreadsheet, tab_name: str) -> pd.DataFrame:
+    ws = sh.worksheet(tab_name)
+    rows = ws.get_all_values()
+    if not rows:
+        return pd.DataFrame()
+    header = rows[0]
+    data = rows[1:]
+    df = pd.DataFrame(data, columns=header)
+    # try numeric casting on common columns
+    for col in df.columns:
+        try:
+            df[col] = pd.to_numeric(df[col].str.replace(",", "").str.replace("$", ""), errors="ignore")
+        except Exception:
+            pass
     return df
 
-def snapshot_from_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return a tiny snapshot resembling:
-    ticker | stage | price | ma30
-    We try common column names from prior reports.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["ticker", "stage", "price", "ma30"])
 
-    # Guess columns
-    cols = {c.lower(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            if n in cols:
-                return cols[n]
+# ----------------------------
+# Weekly CSV discovery
+# ----------------------------
+
+def _find_latest_weekly_csv(reporting_dir: str) -> Optional[str]:
+    # pattern like: weinstein_weekly_equities_YYYYMMDD_HHMM.csv
+    pattern = os.path.join(reporting_dir, "weinstein_weekly_equities_*.csv")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
+
+
+# ----------------------------
+# Snapshot and Sell/Risk logic
+# ----------------------------
+
+def build_snapshot_from_weekly(latest_weekly_csv: Optional[str]) -> Tuple[str, pd.DataFrame]:
+    if not latest_weekly_csv or not os.path.exists(latest_weekly_csv):
+        return "Snapshot (ordered by weekly rank & stage)\n(no weekly CSV found)\n", pd.DataFrame()
+
+    try:
+        df = pd.read_csv(latest_weekly_csv)
+    except Exception as e:
+        return f"Snapshot (ordered by weekly rank & stage)\n(weekly CSV read error: {e})\n", pd.DataFrame()
+
+    # Try to normalize column names we need
+    rename_map = {}
+    for c in df.columns:
+        lc = c.strip().lower()
+        if lc in ("ticker", "symbol"):
+            rename_map[c] = "ticker"
+        elif lc in ("stage",):
+            rename_map[c] = "stage"
+        elif lc in ("price", "last", "last_price", "close"):
+            rename_map[c] = "price"
+        elif lc in ("ma30", "sma30"):
+            rename_map[c] = "ma30"
+        elif lc in ("weekly_rank", "rank", "rank_weekly"):
+            rename_map[c] = "weekly_rank"
+
+    df = df.rename(columns=rename_map)
+
+    # If no rank, fabricate one
+    if "weekly_rank" not in df.columns:
+        df["weekly_rank"] = 999999
+
+    # Keep the most important columns
+    cols = [c for c in ["ticker", "stage", "price", "ma30", "pivot10w", "vol_pace_vs50dma", "two_bar_confirm", "last_bar_vol_ok", "weekly_rank"] if c in df.columns]
+    if not cols:
+        # fallback to whatever is there
+        cols = list(df.columns)[:4]
+
+    # Order by weekly_rank then stage
+    df_small = df[cols].copy()
+    df_small = df_small.sort_values(by=["weekly_rank"] if "weekly_rank" in df_small.columns else cols[:1])
+
+    # Pretty text block (compact)
+    lines = ["Snapshot (ordered by weekly rank & stage)", "ticker\tstage\tprice\tma30"]
+    for _, r in df_small.iterrows():
+        ticker = str(r.get("ticker", ""))
+        stage = str(r.get("stage", ""))
+        price = r.get("price", "")
+        ma30 = r.get("ma30", "")
+        # format floats
+        price_s = f"{float(price):.6f}" if isinstance(price, (int, float, np.floating)) or str(price).replace('.', '', 1).isdigit() else str(price)
+        ma30_s = f"{float(ma30):.6f}" if isinstance(ma30, (int, float, np.floating)) or str(ma30).replace('.', '', 1).isdigit() else str(ma30)
+        lines.append(f"{ticker}\t{stage}\t{price_s}\t{ma30_s}")
+    return "\n".join(lines) + "\n", df_small
+
+
+def build_sell_risk_from_positions(sh: Optional[gspread.Spreadsheet],
+                                   open_positions_tab: str,
+                                   weekly_df: pd.DataFrame) -> str:
+    """
+    Simple SELL rules:
+    - If Total Gain/Loss Percent <= -8%  => Position SELL
+    - If weekly stage is 'Stage 4 (Downtrend)' AND Total Gain/Loss Dollar < 0 => Position SELL
+    """
+    lines = ["Sell / Risk Triggers (Tracked Positions & Position Recommendations)"]
+    if sh is None:
+        lines.append("(positions: sheet access unavailable)\n")
+        return "\n".join(lines)
+
+    try:
+        dfp = _read_sheet_as_df(sh, open_positions_tab)
+    except Exception as e:
+        lines.append(f"(positions read error: {e})\n")
+        return "\n".join(lines)
+
+    if dfp.empty:
+        lines.append("(no open positions)\n")
+        return "\n".join(lines)
+
+    # Normalize headers we use
+    def _col(df, candidates: List[str]) -> Optional[str]:
+        lcmap = {c.lower().strip(): c for c in df.columns}
+        for name in candidates:
+            if name.lower() in lcmap:
+                return lcmap[name.lower()]
         return None
 
-    tcol = pick("ticker", "symbol")
-    scol = pick("stage", "weinstein_stage", "stage_weekly")
-    pcol = pick("price", "last", "close", "last_price")
-    mcol = pick("ma30", "sma30", "ma_30", "ma_150_proxy", "sma150")
+    sym_col = _col(dfp, ["Symbol", "Ticker", "symbol", "ticker"])
+    last_price_col = _col(dfp, ["Last Price", "last", "Price"])
+    avg_cost_col = _col(dfp, ["Average Cost Basis", "Avg Cost", "Average Cost"])
+    gl_pct_col = _col(dfp, ["Total Gain/Loss Percent", "P/L %", "GL %"])
+    gl_dol_col = _col(dfp, ["Total Gain/Loss Dollar", "P/L", "GL $"])
 
-    out = pd.DataFrame()
-    out["ticker"] = df[tcol] if tcol in df.columns else ""
-    out["stage"] = df[scol] if (scol and scol in df.columns) else ""
-    out["price"] = df[pcol] if (pcol and pcol in df.columns) else np.nan
-    out["ma30"]  = df[mcol] if (mcol and mcol in df.columns) else np.nan
+    # Build weekly stage map
+    stage_map = {}
+    if not weekly_df.empty and "ticker" in weekly_df.columns and "stage" in weekly_df.columns:
+        for _, r in weekly_df.iterrows():
+            stage_map[str(r["ticker"])] = str(r["stage"])
 
-    return out.fillna("")
+    recs = []
+    idx = 1
 
-# ========== Google Sheets (Signals) ==========
-def read_signals_from_gsheet(cfg: RootConfig) -> pd.DataFrame:
+    for _, r in dfp.iterrows():
+        sym = str(r.get(sym_col, "")).strip() if sym_col else ""
+        if not sym:
+            continue
+
+        # compute loss percent if not present
+        gl_pct = None
+        if gl_pct_col and pd.notna(r.get(gl_pct_col)):
+            try:
+                gl_pct = float(str(r[gl_pct_col]).replace("%", "").strip())
+            except Exception:
+                gl_pct = None
+        if gl_pct is None and last_price_col and avg_cost_col:
+            try:
+                last_p = float(str(r[last_price_col]).replace("$", "").replace(",", ""))
+                avg_c = float(str(r[avg_cost_col]).replace("$", "").replace(",", ""))
+                if avg_c > 0:
+                    gl_pct = (last_p - avg_c) / avg_c * 100.0
+            except Exception:
+                gl_pct = None
+
+        gl_dol = None
+        if gl_dol_col and pd.notna(r.get(gl_dol_col)):
+            try:
+                gl_dol = float(str(r[gl_dol_col]).replace("$", "").replace(",", ""))
+            except Exception:
+                gl_dol = None
+
+        stage = stage_map.get(sym, "—")
+        reason = None
+
+        if gl_pct is not None and gl_pct <= -8.0:
+            reason = "drawdown ≤ −8%"
+        elif "Stage 4" in stage and gl_dol is not None and gl_dol < 0:
+            reason = "Stage 4 + negative P/L"
+
+        if reason:
+            # Try grabbing a last price to echo
+            px = None
+            if last_price_col and pd.notna(r.get(last_price_col)):
+                try:
+                    px = float(str(r[last_price_col]).replace("$", "").replace(",", ""))
+                except Exception:
+                    px = None
+            px_s = f"{px:.2f}" if px is not None else "—"
+            recs.append(f"{idx}. {sym} @ {px_s} — {reason} ({stage}, weekly —) (Position SELL)")
+            idx += 1
+
+    if not recs:
+        lines.append("(no SELLTRIG positions)\n")
+        return "\n".join(lines)
+
+    lines.extend(recs)
+    return "\n".join(lines)
+
+
+# ----------------------------
+# Crypto Section
+# ----------------------------
+
+def _classify_stage(price: float, ma30: float, ma30_slope: float) -> Tuple[str, str]:
     """
-    Try to read the 'Signals' tab from the provided Google Sheet.
-    If gspread is not available or fails, returns empty DataFrame.
+    Rough stage classification:
+    - Stage 2: price > ma30 and slope > 0
+    - Stage 4: price < ma30 and slope < 0
+    - Stage 3: price > ma30 and slope <= 0
+    - Stage 1: price < ma30 and slope >= 0
+    Returns (stage_label, short_term_state_wk)
     """
-    if not GSPREAD_AVAILABLE:
-        return pd.DataFrame()
+    if price is None or ma30 is None or ma30_slope is None:
+        return ("Unknown", "Unknown")
 
-    try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ]
-        creds = Credentials.from_service_account_file(cfg.google.service_account_json, scopes=scopes)
-        gc = gspread.authorize(creds)
+    if price > ma30 and ma30_slope > 0:
+        return ("Stage 2 (Uptrend)", "StageConflict")
+    if price < ma30 and ma30_slope < 0:
+        return ("Stage 4 (Downtrend)", "StageConflict")
+    if price > ma30 and ma30_slope <= 0:
+        return ("Stage 3 (Topping)", "StageConflict")
+    if price < ma30 and ma30_slope >= 0:
+        return ("Stage 1 (Basing)", "StageConflict")
+    return ("Unknown", "StageConflict")
 
-        sh = gc.open_by_url(cfg.sheets.sheet_url or cfg.sheets.url)
-        ws = sh.worksheet(cfg.sheets.signals_tab)
-        data = ws.get_all_records()
-        df = pd.DataFrame(data)
-        # Normalize header names
-        df.columns = [str(c).strip() for c in df.columns]
-        return df
-    except Exception:
-        return pd.DataFrame()
 
-def extract_crypto_tickers_from_signals(signals_df: pd.DataFrame) -> List[str]:
+def _decide_buy_flag(price: float, ma10: float, ma30: float, rs_last: float, rs_ma30: float, stage: str) -> str:
     """
-    Find crypto rows. We assume crypto tickers often contain '-USD'
-    (e.g., BTC-USD, ETH-USD, SOL-USD).
+    Very simple decision:
+    - BUY if stage is Stage 2 AND price > ma10 AND rs_last >= rs_ma30
+    - WATCH if stage in (Stage 1, Stage 3) and rs_last >= rs_ma30
+    - otherwise AVOID
     """
-    if signals_df is None or signals_df.empty:
-        return []
-    cols = {c.lower(): c for c in signals_df.columns}
-    tcol = cols.get("ticker", None)
-    if not tcol or tcol not in signals_df.columns:
-        return []
-    tickers = []
-    for v in signals_df[tcol]:
-        sv = str(v).strip()
-        if "-USD" in sv.upper():
-            tickers.append(sv.upper())
-    # de-dup while preserving order
-    seen = set()
-    out = []
-    for t in tickers:
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
+    if any(v is None for v in (price, ma10, ma30, rs_last, rs_ma30)):
+        return "Avoid"
 
-# ========== Prices & Crypto Block ==========
-def _yf_close_series(ticker: str, period: str = "90d", interval: str = "1d") -> pd.Series:
-    if yf is None:
-        return pd.Series(dtype=float)
-    try:
-        data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
-        if data is None or data.empty:
-            return pd.Series(dtype=float)
-        close = data["Close"].copy()
-        close.name = ticker
-        return close
-    except Exception:
-        return pd.Series(dtype=float)
+    if "Stage 2" in stage and price > ma10 and rs_last >= rs_ma30:
+        return "Buy"
+    if ("Stage 1" in stage or "Stage 3" in stage) and rs_last >= rs_ma30:
+        return "Watch"
+    return "Avoid"
 
-def _moving_average(series: pd.Series, window: int) -> pd.Series:
-    if series is None or series.empty:
-        return pd.Series(dtype=float)
-    return series.rolling(window=window, min_periods=max(1, window//2)).mean()
 
-def _relative_strength(price: pd.Series, bench: pd.Series) -> pd.Series:
-    if price is None or bench is None or price.empty or bench.empty:
+def _rs_series(asset_close: pd.Series, bench_close: pd.Series) -> pd.Series:
+    # Align
+    df = pd.concat([asset_close, bench_close], axis=1).dropna()
+    if df.shape[1] < 2 or df.empty:
         return pd.Series(dtype=float)
-    # Align indices
-    df = pd.concat([price, bench], axis=1, join="inner")
-    df.columns = ["p", "b"]
-    rs = df["p"] / df["b"]
+    rs = df.iloc[:, 0] / df.iloc[:, 1]
+    rs.name = "rs"
     return rs
 
-def _crypto_row(ticker: str, px: pd.Series, bench_px: pd.Series) -> Dict[str, object]:
+
+def build_crypto_section_from_signals(config_path: str, cfg: Cfg, benchmark: str = "BTC-USD") -> str:
     """
-    Build a row for the Crypto table.
+    - Read Signals sheet; pick crypto tickers (ending with -USD). If none found, use [BTC-USD, ETH-USD, SOL-USD]
+    - Download ~180 days of daily data via yfinance
+    - Compute ma10, ma30, rs vs benchmark
+    - Decide Buy/Watch/Avoid
+    - Build a table like the one you showed
     """
-    ma10 = _moving_average(px, 10)
-    ma30 = _moving_average(px, 30)
+    tz = cfg.app.timezone or "America/Chicago"
+    now = _now_tz(tz)
+    # Discover crypto tickers from Signals
+    crypto_tickers: List[str] = []
+    sh = _open_gsheet(cfg)
+    if sh is not None:
+        try:
+            sig = _read_sheet_as_df(sh, cfg.sheets.signals_tab)
+            if not sig.empty:
+                if "Ticker" in sig.columns:
+                    for t in sig["Ticker"].astype(str):
+                        t = t.strip().upper()
+                        if t.endswith("-USD"):
+                            crypto_tickers.append(t)
+        except Exception as e:
+            print(f"⚠️  Signals read failed: {e}", file=sys.stderr)
 
-    price = _safe_float_from_series(px, -1, default=float("nan"))
-    ma10_last = _safe_float_from_series(ma10, -1, default=float("nan"))
-    ma30_last = _safe_float_from_series(ma30, -1, default=float("nan"))
-
-    dist_ma = float("nan")
-    if not pd.isna(price) and not pd.isna(ma30_last) and ma30_last != 0:
-        dist_ma = ((price - ma30_last) / ma30_last) * 100.0
-
-    ma_slope_wk = _slope_per_week(ma30, lookback_days=5)
-
-    rs = _relative_strength(px, bench_px)
-    rs_ma30 = _moving_average(rs, 30)
-
-    rs_last = _safe_float_from_series(rs, -1, default=float("nan"))
-    rs_ma30_last = _safe_float_from_series(rs_ma30, -1, default=float("nan"))
-    rs_above_ma = (not pd.isna(rs_last) and not pd.isna(rs_ma30_last) and (rs_last >= rs_ma30_last))
-    rs_slope_wk = _slope_per_week(rs, lookback_days=5)
-
-    stage = _stage_from_price_ma(price, ma30_last, ma_slope_wk)
-    decision = _buy_watch_avoid(stage, rs_above_ma, rs_slope_wk, dist_ma)
-
-    return {
-        "ticker": ticker,
-        "asset_class": "Crypto",
-        "industry": "",
-        "sector": "",
-        "Buy Signal": decision.upper(),  # AVOID / WATCH / BUY
-        "chart": "chart",
-        "stage": stage,
-        "short_term_state_wk": "StageConflict" if ("Stage 1" in stage or "Stage 3" in stage) else "",
-        "price": price,
-        "ma10": ma10_last,
-        "ma30": ma30_last,
-        "dist_ma_pct": dist_ma,
-        "ma_slope_per_wk": ma_slope_wk,
-        "rs": rs_last if not pd.isna(rs_last) else "",
-        "rs_ma30": rs_ma30_last if not pd.isna(rs_ma30_last) else "",
-        "rs_above_ma": "Yes" if rs_above_ma else "No",
-        "rs_slope_per_wk": rs_slope_wk if not pd.isna(rs_slope_wk) else "",
-        "notes": "",
-    }
-
-def build_crypto_section_from_signals(cfg: RootConfig, benchmark: str = "BTC-USD") -> str:
-    """
-    Returns a ready-to-print Crypto Weekly section string.
-    Safe if signals or prices are missing.
-    """
-    # Pull signals for crypto tickers
-    sig_df = read_signals_from_gsheet(cfg)
-    crypto_tickers = extract_crypto_tickers_from_signals(sig_df)
     if not crypto_tickers:
-        # sensible defaults
         crypto_tickers = ["BTC-USD", "ETH-USD", "SOL-USD"]
 
-    # Download benchmark + member series
-    bench_px = _yf_close_series(benchmark, period="120d", interval="1d")
-    rows = []
+    # Unique and keep order
+    seen = set()
+    ordered_cryptos = []
     for t in crypto_tickers:
-        px = _yf_close_series(t, period="120d", interval="1d")
-        if px is None or px.empty or bench_px is None or bench_px.empty:
-            # Fill stub if data missing
-            rows.append({
-                "ticker": t,
-                "asset_class": "Crypto",
-                "industry": "",
-                "sector": "",
-                "Buy Signal": "AVOID",
-                "chart": "chart",
-                "stage": "Stage ? (Unknown)",
-                "short_term_state_wk": "",
-                "price": "",
-                "ma10": "",
-                "ma30": "",
-                "dist_ma_pct": "",
-                "ma_slope_per_wk": "",
-                "rs": "",
-                "rs_ma30": "",
-                "rs_above_ma": "No",
-                "rs_slope_per_wk": "",
-                "notes": "No data",
-            })
+        if t not in seen:
+            seen.add(t)
+            ordered_cryptos.append(t)
+
+    # need yfinance
+    if yf is None:
+        return "Crypto Weekly — (yfinance unavailable) \n"
+
+    # Fetch prices
+    period_days = 220
+    start = (now - dt.timedelta(days=period_days)).date().isoformat()
+    end = (now + dt.timedelta(days=1)).date().isoformat()
+
+    # Benchmark series
+    try:
+        bench = yf.download(benchmark, start=start, end=end, interval="1d", progress=False)
+        bench_close = bench["Close"].dropna() if not bench.empty and "Close" in bench.columns else pd.Series(dtype=float)
+    except Exception:
+        bench_close = pd.Series(dtype=float)
+
+    rows = []
+    summary_counts = {"Buy": 0, "Watch": 0, "Avoid": 0}
+
+    for tkr in ordered_cryptos:
+        try:
+            df = yf.download(tkr, start=start, end=end, interval="1d", progress=False)
+        except Exception:
+            df = pd.DataFrame()
+
+        if df.empty or "Close" not in df.columns:
+            # Blank row
+            rows.append(
+                dict(
+                    ticker=tkr,
+                    asset_class="Crypto",
+                    industry="",
+                    sector="",
+                    BuySignal="AVOID",
+                    chart="chart",
+                    stage="Unknown",
+                    short_term_state_wk="",
+                    price=np.nan,
+                    ma10=np.nan,
+                    ma30=np.nan,
+                    dist_ma_pct=np.nan,
+                    ma_slope_per_wk=np.nan,
+                    rs=np.nan,
+                    rs_ma30=np.nan,
+                    rs_above_ma="No",
+                    rs_slope_per_wk=np.nan,
+                    notes="NoData",
+                )
+            )
+            summary_counts["Avoid"] += 1
             continue
-        row = _crypto_row(t, px, bench_px)
-        rows.append(row)
 
-    # Classify counts
-    buys = sum(1 for r in rows if str(r.get("Buy Signal","")).upper() == "BUY")
-    avoids = sum(1 for r in rows if str(r.get("Buy Signal","")).upper() == "AVOID")
-    watches = sum(1 for r in rows if str(r.get("Buy Signal","")).upper() == "WATCH")
+        close = df["Close"].dropna()
+        ma10 = close.rolling(10).mean()
+        ma30 = close.rolling(30).mean()
 
-    # Render block
-    out = io.StringIO()
-    print("Crypto Weekly — Benchmark: BTC-USD", file=out)
-    print(f"Generated {_fmt_now_for_header(cfg.app.timezone)}", file=out)
-    print(f"Crypto Summary: ✅ Buy: {buys}   |   🟡 Watch: {watches}   |   🔴 Avoid: {avoids}   (Total: {len(rows)})", file=out)
-    header = [
-        "ticker","asset_class","industry","sector","Buy Signal","chart","stage","short_term_state_wk",
-        "price","ma10","ma30","dist_ma_pct","ma_slope_per_wk",
-        "rs","rs_ma30","rs_above_ma","rs_slope_per_wk","notes"
-    ]
-    print("\t".join(header), file=out)
+        price = _last(close)
+        ma10_last = _last(ma10)
+        ma30_last = _last(ma30)
+
+        # Distance to MA30
+        dist_ma_pct = None
+        if ma30_last and ma30_last != 0 and price is not None:
+            dist_ma_pct = (price - ma30_last) / ma30_last * 100.0
+
+        # slope per "wk" ~ last - value 5 days ago
+        ma30_slope = _slope_last_5(ma30)
+
+        # RS
+        rs = _rs_series(close, bench_close) if not bench_close.empty else pd.Series(dtype=float)
+        rs_ma30 = rs.rolling(30).mean() if not rs.empty else pd.Series(dtype=float)
+        rs_last = _last(rs) if not rs.empty else None
+        rs_ma30_last = _last(rs_ma30) if not rs_ma30.empty else None
+        rs_slope = _slope_last_5(rs) if not rs.empty else None
+
+        stage, short_conf = _classify_stage(price, ma30_last if ma30_last is not None else np.nan,
+                                            ma30_slope if ma30_slope is not None else np.nan)
+
+        decision = _decide_buy_flag(price, ma10_last, ma30_last, rs_last if rs_last is not None else -np.inf,
+                                    rs_ma30_last if rs_ma30_last is not None else np.inf, stage)
+
+        # Count
+        summary_counts[decision.capitalize() if decision else "Avoid"] = summary_counts.get(decision.capitalize(), 0) + 1
+
+        # notes
+        notes = ""
+        if decision.lower() == "avoid" and price is not None and ma30_last is not None and price < ma30_last:
+            notes = "Price"
+        rows.append(
+            dict(
+                ticker=tkr,
+                asset_class="Crypto",
+                industry="",
+                sector="",
+                BuySignal=decision.upper(),
+                chart="chart",
+                stage=stage,
+                short_term_state_wk=short_conf,
+                price=price,
+                ma10=ma10_last,
+                ma30=ma30_last,
+                dist_ma_pct=dist_ma_pct,
+                ma_slope_per_wk=ma30_slope,
+                rs=rs_last if rs_last is not None else np.nan,
+                rs_ma30=rs_ma30_last if rs_ma30_last is not None else np.nan,
+                rs_above_ma="Yes" if (rs_last is not None and rs_ma30_last is not None and rs_last >= rs_ma30_last) else "No",
+                rs_slope_per_wk=rs_slope if rs_slope is not None else np.nan,
+                notes=notes,
+            )
+        )
+
+    # Compose text block
+    total = sum(summary_counts.values())
+    line1 = f"Crypto Weekly — Benchmark: {benchmark}"
+    line2 = f"Generated {now.strftime('%Y-%m-%d %H:%M')}"
+    line3 = f"Crypto Summary: ✅ Buy: {summary_counts.get('Buy',0)}   |   🟡 Watch: {summary_counts.get('Watch',0)}   |   🔴 Avoid: {summary_counts.get('Avoid',0)}   (Total: {total})"
+
+    header = "\t".join([
+        "ticker", "asset_class", "industry", "sector", "Buy Signal", "chart", "stage",
+        "short_term_state_wk", "price", "ma10", "ma30", "dist_ma_pct",
+        "ma_slope_per_wk", "rs", "rs_ma30", "rs_above_ma", "rs_slope_per_wk", "notes"
+    ])
+
+    body_lines = []
     for r in rows:
-        vals = []
-        for k in header:
-            v = r.get(k, "")
-            if isinstance(v, float):
-                if "pct" in k:
-                    v = _pct(v)
-                else:
-                    v = f"{v:.6f}"
-            vals.append(str(v))
-        print("\t".join(vals), file=out)
-    return out.getvalue().rstrip()
+        body_lines.append("\t".join([
+            str(r["ticker"]),
+            str(r["asset_class"]),
+            str(r["industry"]),
+            str(r["sector"]),
+            str(r["BuySignal"]).title(),  # Show like Buy/Watch/Avoid
+            str(r["chart"]),
+            str(r["stage"]),
+            str(r["short_term_state_wk"]),
+            f"{r['price']:.6f}" if isinstance(r['price'], (int, float, np.floating)) and not math.isnan(r['price']) else str(r['price']),
+            f"{r['ma10']:.6f}" if isinstance(r['ma10'], (int, float, np.floating)) and not math.isnan(r['ma10']) else str(r['ma10']),
+            f"{r['ma30']:.6f}" if isinstance(r['ma30'], (int, float, np.floating)) and not math.isnan(r['ma30']) else str(r['ma30']),
+            _fmt_pct(r['dist_ma_pct'], 2) if isinstance(r['dist_ma_pct'], (int, float, np.floating)) and not math.isnan(r['dist_ma_pct']) else str(r['dist_ma_pct']),
+            f"{r['ma_slope_per_wk']:.2f}%" if isinstance(r['ma_slope_per_wk'], (int, float, np.floating)) and not math.isnan(r['ma_slope_per_wk']) else str(r['ma_slope_per_wk']),
+            f"{r['rs']:.6f}" if isinstance(r['rs'], (int, float, np.floating)) and not math.isnan(r['rs']) else str(r['rs']),
+            f"{r['rs_ma30']:.6f}" if isinstance(r['rs_ma30'], (int, float, np.floating)) and not math.isnan(r['rs_ma30']) else str(r['rs_ma30']),
+            str(r['rs_above_ma']),
+            f"{r['rs_slope_per_wk']:.2f}%" if isinstance(r['rs_slope_per_wk'], (int, float, np.floating)) and not math.isnan(r['rs_slope_per_wk']) else str(r['rs_slope_per_wk']),
+            str(r['notes']),
+        ]))
 
-# ========== Intraday shells (placeholders) ==========
-def evaluate_intraday_triggers() -> Tuple[List[str], List[str], List[str]]:
+    block = "\n".join([line1, line2, line3, header] + body_lines)
+    return block + "\n"
+
+
+# ----------------------------
+# Intraday triggers (skeleton)
+# ----------------------------
+
+def evaluate_intraday_candidates(cfg: Cfg) -> Tuple[List[str], List[str], List[str]]:
     """
-    Return (buys, nears, sells) lists of formatted lines.
-    In this compact version, we keep placeholders safe/empty.
+    Placeholder logic:
+    - Using the weekly CSV 'Stage 1/2' set as focus list (if that column exists)
+    - No real intraday checks here (to avoid heavy data dependency). Prints 'No signals' when none.
     """
-    return [], [], []
+    latest_weekly = _find_latest_weekly_csv(cfg.reporting.output_dir)
+    focus = []
+    if latest_weekly and os.path.exists(latest_weekly):
+        try:
+            df = pd.read_csv(latest_weekly)
+            # Try to select Stage 1/2
+            if "stage" in df.columns:
+                focus = df.loc[df["stage"].astype(str).str.contains("Stage 1|Stage 2", case=False, regex=True), "ticker"].astype(str).tolist()
+            elif "Ticker" in df.columns:
+                focus = df["Ticker"].astype(str).tolist()
+        except Exception:
+            pass
 
-# ========== Printing ==========
-def print_header(title_ts: Optional[str] = None, tz: str = "America/Chicago") -> None:
-    ts = title_ts or _fmt_now_for_header(tz)
-    print(f"Weinstein Intraday Watch — {ts}")
-    print("BUY: Weekly Stage 1/2 + confirm over ~10-week pivot & 30-wk MA proxy (SMA150), +0.4% headroom, RS support, volume pace ≥ 1.3×. For 60m bars: ≥40 min elapsed & intrabar pace ≥ 1.2×.")
-    print("NEAR-TRIGGER: Stage 1/2 + RS ok, price within 0.3% below pivot or first close over pivot but not fully confirmed yet, volume pace ≥ 1.0×.")
-    print("SELL-TRIGGER: Confirmed crack below MA150 by 0.5% with persistence; for 60m bars, ≥40 min elapsed & intrabar pace ≥ 1.2×.")
-    print()
+    # Here you would fetch 60m bars & compute:
+    #  - over 10-week pivot
+    #  - price vs SMA150 (as proxy 30-wk)
+    #  - RS support
+    #  - volume pace >= thresholds, etc.
+    # For now: return empty results to match your “No BUY/NEAR/SELL” when nothing qualifies.
+    buys, nears, sells = [], [], []
+    return buys, nears, sells
 
-def print_triggers(buys: List[str], nears: List[str], sells: List[str]) -> None:
-    print("Buy Triggers (ranked)")
-    if buys:
-        for i, line in enumerate(buys, 1):
-            print(f"{i}. {line}")
+
+# ----------------------------
+# Report assembly
+# ----------------------------
+
+def assemble_report(cfg: Cfg) -> str:
+    tz = cfg.app.timezone or "America/Chicago"
+    now = _now_tz(tz)
+    header = [
+        f"Weinstein Intraday Watch — {now.strftime('%Y-%m-%d %H:%M')}",
+        "BUY: Weekly Stage 1/2 + confirm over ~10-week pivot & 30-wk MA proxy (SMA150), +0.4% headroom, RS support, volume pace ≥ 1.3×. For 60m bars: ≥40 min elapsed & intrabar pace ≥ 1.2×.",
+        "NEAR-TRIGGER: Stage 1/2 + RS ok, price within 0.3% below pivot or first close over pivot but not fully confirmed yet, volume pace ≥ 1.0×.",
+        "SELL-TRIGGER: Confirmed crack below MA150 by 0.5% with persistence; for 60m bars, ≥40 min elapsed & intrabar pace ≥ 1.2×.",
+        "",
+    ]
+
+    buys, nears, sells = evaluate_intraday_candidates(cfg)
+
+    # BUY
+    lines = ["Buy Triggers (ranked)"]
+    if not buys:
+        lines.append("No BUY signals.")
     else:
-        print("No BUY signals.")
-    print()
-    print("Near-Triggers (ranked)")
-    if nears:
-        for i, line in enumerate(nears, 1):
-            print(f"{i}. {line}")
+        for i, s in enumerate(buys, 1):
+            lines.append(f"{i}. {s}")
+    lines.append("")
+
+    # NEAR
+    lines.append("Near-Triggers (ranked)")
+    if not nears:
+        lines.append("No NEAR signals.")
     else:
-        print("No NEAR signals.")
-    print("Sell Triggers (ranked)")
-    if sells:
-        for i, line in enumerate(sells, 1):
-            print(f"{i}. {line}")
+        for i, s in enumerate(nears, 1):
+            lines.append(f"{i}. {s}")
+    lines.append("")
+
+    # SELL
+    lines.append("Sell Triggers (ranked)")
+    if not sells:
+        lines.append("No SELLTRIG signals.")
     else:
-        print("No SELLTRIG signals.")
-    print()
-    print("Charts (Price + SMA150 ≈ 30-wk MA, RS normalized)")
+        for i, s in enumerate(sells, 1):
+            lines.append(f"{i}. {s}")
+    lines.append("")
+
+    # Charts placeholder
+    lines.append("Charts (Price + SMA150 ≈ 30-wk MA, RS normalized)")
     if buys or nears:
-        # list tickers implied in lines
-        pass
-    print()
+        for t in (buys + nears)[:4]:
+            lines.append(t)
+    lines.append("")  # blank
 
-def print_risk_triggers(tracked: Optional[List[str]] = None) -> None:
-    print("Sell / Risk Triggers (Tracked Positions & Position Recommendations)")
-    if tracked:
-        for line in tracked:
-            print(line)
+    # Sell / Risk Triggers (from positions)
+    sh = _open_gsheet(cfg)
+    # snapshot uses weekly csv
+    latest_weekly = _find_latest_weekly_csv(cfg.reporting.output_dir)
+    snapshot_text, snapshot_df = build_snapshot_from_weekly(latest_weekly)
+    sell_block = build_sell_risk_from_positions(sh, cfg.sheets.open_positions_tab, snapshot_df)
+
+    lines.append(sell_block)
+    lines.append("")
+
+    # Snapshot table
+    lines.append(snapshot_text.rstrip())
+    lines.append("")
+
+    # --------- CRYPTO WEEKLY goes here (BEFORE weekly summary) ----------
+    crypto_block = build_crypto_section_from_signals("", cfg, benchmark="BTC-USD")
+    lines.append(crypto_block.rstrip())
+    lines.append("")
+
+    # Weekly summary block (very light – pull a few lines if Open_Positions exists)
+    lines.append("Weinstein Weekly – Summary")
+    # If Open_Positions has totals, we can echo a few
+    if sh is not None:
+        try:
+            dfp = _read_sheet_as_df(sh, cfg.sheets.open_positions_tab)
+            # Try to display a couple of “headline” totals if present
+            # Otherwise just show a header and a cue line
+            if not dfp.empty:
+                lines.append("Per-position Snapshot")
+                # print a compact 2-4 columns if available
+                keep_cols = []
+                for c in ["Symbol", "Description", "industry", "sector", "Quantity", "Last Price",
+                          "Current Value", "Cost Basis Total", "Average Cost Basis",
+                          "Total Gain/Loss Dollar", "Total Gain/Loss Percent", "Recommendation"]:
+                    if c in dfp.columns:
+                        keep_cols.append(c)
+                if not keep_cols:
+                    keep_cols = dfp.columns[:6].tolist()
+                # show a limited set
+                sub = dfp[keep_cols].copy()
+                # Make a compact print
+                # mimic your email style with tab-sep
+                lines.append("\t".join(list(sub.columns)))
+                for _, r in sub.iterrows():
+                    parts = []
+                    for c in sub.columns:
+                        v = r[c]
+                        parts.append(str(v))
+                    lines.append("\t".join(parts))
+            else:
+                lines.append("(no positions found)")
+        except Exception as e:
+            lines.append(f"(weekly summary error: {e})")
     else:
-        # leave empty block; your pipeline often prints entries here when positions exist
-        pass
-    print()
+        lines.append("(weekly summary: sheet access unavailable)")
 
-def print_snapshot_from_weekly(snap: pd.DataFrame, max_rows: int = 200) -> None:
-    print("Snapshot (ordered by weekly rank & stage)")
-    if snap is None or snap.empty:
-        print("No snapshot available.")
-        print()
-        return
-    # Emit in a compact table: ticker  stage  price  ma30
-    print("ticker\tstage\tprice\tma30")
-    rows = min(len(snap), max_rows)
-    for i in range(rows):
-        r = snap.iloc[i]
-        t = str(r.get("ticker", ""))
-        s = str(r.get("stage", ""))
-        p = r.get("price", "")
-        m = r.get("ma30", "")
-        # numeric formatting
-        if isinstance(p, (int, float)) and not pd.isna(p):
-            p = f"{float(p):.6f}".rstrip("0").rstrip(".")
-        if isinstance(m, (int, float)) and not pd.isna(m):
-            m = f"{float(m):.6f}".rstrip("0").rstrip(".")
-        print(f"{t}\t{s}\t{p}\t{m}")
-    print()
+    lines.append("")
+    lines.append("✅ Intraday tick complete.")
 
-def print_weekly_summary_stub() -> None:
-    print("Weinstein Weekly – Summary")
-    # The detailed P/L table normally comes from your weekly generator.
-    # Here we print only the header; your pipeline usually appends position lines after.
-    print()
+    return "\n".join(header + lines)
 
-# ========== Runner ==========
-def run(_config_path: str) -> None:
-    print(f"▶️ [{dt.datetime.now().strftime('%H:%M:%S')}] Intraday watcher starting with config: {_config_path}")
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def run(_config_path: str):
+    print(f"▶️ [{time.strftime('%H:%M:%S')}] Intraday watcher starting with config: {_config_path}")
     cfg = load_config(_config_path)
 
-    # Weekly CSV
-    latest_csv = find_latest_weekly_csv(cfg.reporting.output_dir)
-    if latest_csv:
-        print(f"·· [{dt.datetime.now().strftime('%H:%M:%S')}] Weekly CSV: {latest_csv}")
-    else:
-        print("·· [--:--:--] Weekly CSV: <not found>")
+    # Try to note weekly csv
+    latest_weekly = _find_latest_weekly_csv(cfg.reporting.output_dir)
+    if latest_weekly:
+        print(f"·· [{time.strftime('%H:%M:%S')}] Weekly CSV: {latest_weekly}")
 
-    # Focus universe print (placeholder)
-    print("• [{}] Focus universe: {} symbols (Stage 1/2).".format(
-        dt.datetime.now().strftime('%H:%M:%S'),
-        116  # informational
-    ))
+    # Minimal universe log (if weekly available)
+    if latest_weekly and os.path.exists(latest_weekly):
+        try:
+            dfw = pd.read_csv(latest_weekly)
+            # stage 1/2 rows
+            if "stage" in dfw.columns:
+                focus_n = (dfw["stage"].astype(str).str.contains("Stage 1|Stage 2", case=False, regex=True)).sum()
+                print(f"• [{time.strftime('%H:%M:%S')}] Focus universe: {int(focus_n)} symbols (Stage 1/2).")
+        except Exception:
+            pass
 
-    # Simulate price download step (we rely on yfinance inside crypto)
-    print("▶️ [{}] Downloading intraday + daily bars...".format(dt.datetime.now().strftime('%H:%M:%S')))
-    print("✅ [{}] Price data downloaded.".format(dt.datetime.now().strftime('%H:%M:%S')))
+    # We won't do heavy intraday downloads here; just assemble & print
+    report = assemble_report(cfg)
+    print(report)
 
-    print("▶️ [{}] Evaluating candidates...".format(dt.datetime.now().strftime('%H:%M:%S')))
 
-    # Evaluate triggers (placeholders—keep compatible with your logs)
-    buys, nears, sells = evaluate_intraday_triggers()
-    # Example prints you had in logs; keep harmless:
-    if not buys and not nears:
-        pass
-
-    # ==== OUTPUT ====
-    print()
-    print_header(tz=cfg.app.timezone)
-    print_triggers(buys, nears, sells)
-
-    # Risk (tracked) — leave empty here; your downstream appends specifics
-    print_risk_triggers(tracked=None)
-
-    # Snapshot (from weekly CSV)
-    snap = pd.DataFrame()
-    if latest_csv:
-        wk = load_weekly_csv(latest_csv)
-        snap = snapshot_from_weekly(wk)
-    print_snapshot_from_weekly(snap)
-
-    # ==== CRYPTO BLOCK (inserted BEFORE Weekly – Summary) ====
-    try:
-        crypto_block = build_crypto_section_from_signals(cfg, benchmark="BTC-USD")
-        print(crypto_block)
-        print()
-    except Exception as e:
-        # Keep report alive even if crypto fails
-        print("Crypto Weekly — Benchmark: BTC-USD")
-        print(f"(Crypto section unavailable: {e})")
-        print()
-
-    # Weekly summary header (details typically appended by your weekly pipeline)
-    print_weekly_summary_stub()
-
-    print("✅ Intraday tick complete.")
-
-# ========== CLI ==========
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="./config.yaml")
-    args = parser.parse_args()
     try:
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--config", type=str, default="./config.yaml")
+        args = ap.parse_args()
         run(_config_path=args.config)
-    except Exception as ex:
+    except Exception as e:
         print("❌ Intraday watcher encountered an error.")
-        print(str(ex))
+        print(str(e))
         raise
