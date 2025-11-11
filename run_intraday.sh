@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
 # run_intraday.sh – Launches Weinstein Intraday Watcher
-# Also writes intraday_debug.csv/json for Signal Engine
+# and then runs Signal Engine + Diagnostics
 # ------------------------------------------------------------
-# Example cron (ET every 10 min during session):
-# */10 9-16 * * 1-5 /bin/bash -lc 'cd ~/WeinsteinAgent && ./run_intraday.sh'
+# Example:
+#   ./run_intraday.sh --dry-run
 # ============================================================
 
 set -euo pipefail
@@ -15,25 +15,45 @@ yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
 red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 
 CONFIG_PATH="${CONFIG_FILE:-./config.yaml}"
-OUTDIR="./output"
-DEBUG_CSV="${OUTDIR}/intraday_debug.csv"
-DEBUG_JSON="${OUTDIR}/intraday_debug.json"
 
-[[ -r "$CONFIG_PATH" ]] || { red "Config not found: $CONFIG_PATH"; exit 2; }
-[[ -d ".venv" ]] && source .venv/bin/activate 2>/dev/null || true
-mkdir -p "$OUTDIR"
+if [[ ! -r "$CONFIG_PATH" ]]; then
+  red "Config file not found or unreadable: $CONFIG_PATH"
+  red "Set CONFIG_FILE=./config.yaml or create ./config.yaml"
+  exit 2
+fi
 
-PY_SCRIPT="weinstein_intraday_watcher.py"
-[[ -f "$PY_SCRIPT" ]] || { red "Cannot find $PY_SCRIPT in repo root."; exit 2; }
+# Activate virtual environment if it exists
+if [[ -d ".venv" ]]; then
+  source .venv/bin/activate 2>/dev/null || true
+fi
 
 bold "⚡ Intraday watcher using config: $CONFIG_PATH"
-yellow "• Running: python3 $PY_SCRIPT --config $CONFIG_PATH"
 
-# Add --log-csv / --log-json so tools can consume the snapshot
-python3 "$PY_SCRIPT" \
-  --config "$CONFIG_PATH" \
-  --log-csv "$DEBUG_CSV" \
-  --log-json "$DEBUG_JSON" \
-  "$@" || { red "❌ Intraday watcher error."; exit 1; }
+PY_SCRIPT="weinstein_intraday_watcher.py"
+if [[ ! -f "$PY_SCRIPT" ]]; then
+  red "Error: Cannot find $PY_SCRIPT in the current directory."
+  red "Make sure you're in the ~/WeinsteinAgent folder."
+  exit 2
+fi
 
+yellow "• Running: python3 $PY_SCRIPT --config $CONFIG_PATH $*"
+python3 "$PY_SCRIPT" --config "$CONFIG_PATH" "$@" || {
+  red "❌ Intraday watcher encountered an error."
+  exit 1
+}
 green "✅ Intraday tick complete."
+
+# ---------------------------------------------
+# Follow-ups: Signal Engine, then Diagnostics
+# ---------------------------------------------
+if [[ -x "./run_signal_engine.sh" ]]; then
+  ./run_signal_engine.sh
+else
+  yellow "run_signal_engine.sh not found/executable; skipping."
+fi
+
+if [[ -x "./run_diag_intraday.sh" ]]; then
+  ./run_diag_intraday.sh
+else
+  yellow "run_diag_intraday.sh not found/executable; skipping."
+fi
