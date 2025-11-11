@@ -2,30 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Weinstein Intraday Watcher — with trigger test mode + rich diagnostics
-Adds a reliable Holdings Summary section + --holdings-csv override.
 
-Key adds in this version:
-- Always attempts to include a "Holdings Summary" block in the email.
-- New CLI flag --holdings-csv to explicitly point to a positions file.
-- Clear logging of which holdings CSV was used (path + row count).
-- The holdings block shows totals (GL$, portfolio %, avg % gain) and a compact table:
-  [Symbol, Quantity, Last Price, Total Gain/Loss %, Stage, Recommendation].
-- If no holdings file is found or it’s empty, the email shows a small note instead of silently omitting.
-
-Existing features kept:
-- Test/Easing mode (--test-ease or INTRADAY_TEST=1)
-- Per-ticker diagnostics CSV/JSON
-- Near/Armed/Triggered state machine with intrabar volume/elapsed gates (for 60m)
-- Optional ticker filter (--only MU,DDOG), --dry-run, charts, etc.
-
-Usage example:
-  INTRADAY_TEST=1 python3 weinstein_intraday_watcher.py --config ./config.yaml --only MU,DDOG \
-      --log-csv ./output/intraday_debug.csv --log-json ./output/intraday_debug.json --dry-run \
-      --holdings-csv ./output/Open_Positions.csv
+Adds:
+- Per-position Snapshot (sorted worst → best) with colored $/%, and badge pills
+- Keeps weekly summary card; holdings section now bundles both
+- Same trigger logic, diagnostics CSV/JSON, HTML save, optional dry run
 """
-import os, io, json, math, time, base64, yaml, argparse, sys
-from datetime import datetime, timezone, timedelta
 
+import os, io, json, math, base64, yaml, argparse
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -67,14 +52,10 @@ MAX_CHARTS_PER_EMAIL = 12
 PRICE_WINDOW_DAYS = 260
 SMA_DAYS = 150
 
-# You can still drop your file in one of these; --holdings-csv overrides them.
 OPEN_POSITIONS_CSV_CANDIDATES = [
     "./output/Open_Positions.csv",
     "./output/open_positions.csv",
 ]
-
-# Optional override via CLI
-HOLDINGS_CSV_OVERRIDE = None
 
 VERBOSE = True
 
@@ -133,7 +114,8 @@ def load_config(path):
     return cfg, benchmark, sheet_url, svc_file
 
 def newest_weekly_csv():
-    files = [f for f in os.listdir(WEEKLY_OUTPUT_DIR) if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")]
+    files = [f for f in os.listdir(WEEKLY_OUTPUT_DIR)
+             if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")]
     if not files:
         raise FileNotFoundError("No weekly CSV found in ./output. Run weinstein_report_weekly.py first.")
     files.sort(reverse=True)
@@ -151,10 +133,6 @@ def load_positions():
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     return {"positions": {}}
-
-def save_positions(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
 
 def _load_intraday_state():
     path = INTRADAY_STATE_FILE
@@ -175,7 +153,8 @@ def _elapsed_in_current_bar_minutes(intraday_df, ticker):
         else:
             ts = intraday_df["Close"].dropna().index[-1]
         last_bar_start = pd.Timestamp(ts).to_pydatetime()
-        return max(0, int((datetime.utcnow() - last_bar_start).total_seconds() // 60))
+        from datetime import datetime as _dt
+        return max(0, int((_dt.utcnow() - last_bar_start).total_seconds() // 60))
     except Exception:
         return 0
 
@@ -227,9 +206,7 @@ def compute_atr(daily_df, t, n=14):
     return float(atr.dropna().iloc[-1]) if len(atr.dropna()) else np.nan
 
 def last_weekly_pivot_high(ticker, daily_df, weeks=PIVOT_LOOKBACK_WEEKS):
-    bars = weeks * 5
-    if _is_crypto(ticker):
-        bars = weeks * 7  # crypto trades 7 days a week
+    bars = weeks * (7 if _is_crypto(ticker) else 5)
     if isinstance(daily_df.columns, pd.MultiIndex):
         try:
             highs = daily_df[("High", ticker)]
@@ -262,7 +239,6 @@ def volume_pace_today_vs_50dma(ticker, daily_df):
         elapsed = max(0.0, (now - day_start).total_seconds())
         fraction = min(1.0, max(0.05, elapsed / (24*3600.0)))
     else:
-        # Equity session: 13:30–20:00 UTC (6.5h)
         minutes = now.hour * 60 + now.minute
         start = 13*60 + 30
         end = 20*60 + 0
@@ -340,27 +316,18 @@ def _coerce_numlike(series: pd.Series) -> pd.Series:
     return series.apply(conv)
 
 def _find_open_positions_csv() -> str | None:
-    # Override wins
-    if HOLDINGS_CSV_OVERRIDE and os.path.exists(HOLDINGS_CSV_OVERRIDE):
-        return HOLDINGS_CSV_OVERRIDE
     for p in OPEN_POSITIONS_CSV_CANDIDATES:
         if os.path.exists(p): return p
     return None
 
 def _load_open_positions_local() -> pd.DataFrame | None:
     p = _find_open_positions_csv()
-    if not p: 
-        log("No holdings CSV found (override or candidates).", level="warn")
-        return None
+    if not p: return None
     try:
         df = pd.read_csv(p)
-        if df is None or df.empty: 
-            log(f"Holdings CSV exists but empty: {p}", level="warn")
-            return None
-        log(f"Using holdings CSV: {p} (rows={len(df)})", level="ok")
+        if df is None or df.empty: return None
         return df
-    except Exception as e:
-        log(f"Failed loading holdings CSV: {e}", level="warn")
+    except Exception:
         return None
 
 def _normalize_open_positions_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -407,10 +374,9 @@ def _merge_stage_and_recommend(positions: pd.DataFrame, weekly_df: pd.DataFrame)
     out["Recommendation"] = out.apply(recommend, axis=1)
     return out
 
-# ---- Summary HTML helpers ----
-def _money(x): return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
-
-def _pct(x):   return f"{x:.2f}%" if (x is not None and pd.notna(x)) else ""
+# ---- Summary HTML + Holdings table ----
+def _money(x): return f"${x:,.2f}" if (x is not None and pd.notna(x)) else "—"
+def _pct(x):   return f"{x:.2f}%" if (x is not None and pd.notna(x)) else "—"
 
 def _compute_portfolio_metrics(pos: pd.DataFrame) -> dict:
     cur = float(pos["Current Value"].fillna(0).sum())
@@ -436,34 +402,84 @@ def _colored_summary_html(m):
       .sumtbl td.pos { color:#0b6b2e; }
       .sumtbl td.neg { color:#a30a0a; }
       .sumtbl td.neu { color:#444; }
+      .num-pos { color:#106b21; font-weight:600; }
+      .num-neg { color:#8a1111; font-weight:600; }
+      .num-neu { color:#444; }
+      .rec-badge { display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid transparent;}
+      .rec-strong { background:#0a3d1a; color:#eaffea; border-color:#0a3d1a; }
+      .rec-hold   { background:#eaffea; color:#106b21; border-color:#b8e7b9; }
+      .rec-sell   { background:#ffe8e6; color:#8a1111; border-color:#f3b3ae; }
       .tab-holdings { border-collapse: collapse; width:100%; }
-      .tab-holdings th, .tab-holdings td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 12px; vertical-align: top; }
-      .tab-holdings th { text-align:left; background:#fafafa; }
+      .tab-holdings th, .tab-holdings td { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: top; }
+      .tab-holdings th { text-align:left; background:#fafafa; position:sticky; top:0; }
+      .badge { border-radius: 12px; padding: 2px 8px; font-weight:600; font-size:12px; border:1px solid rgba(0,0,0,0.06) }
     </style>
     """
     return css + f"""
     <div class="blk">
-      <h3>Holdings — Summary</h3>
+      <h3>Weinstein Weekly – Summary</h3>
       <table class="sumtbl">
-        <tbody>
-          {tr}
-        </tbody>
+        <tbody>{tr}</tbody>
       </table>
     </div>
     """
 
-def _render_holdings_table_html(df: pd.DataFrame) -> str:
-    show_cols = ["Symbol","Quantity","Last Price","Total Gain/Loss Percent","stage","Recommendation"]
-    for c in show_cols:
-        if c not in df.columns:
-            df[c] = np.nan
-    slim = df[show_cols].copy()
-    # Nice formatting
-    slim["Quantity"] = slim["Quantity"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
-    slim["Last Price"] = slim["Last Price"].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
-    slim["Total Gain/Loss Percent"] = slim["Total Gain/Loss Percent"].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "")
-    html = slim.to_html(index=False, classes="tab-holdings")
-    return f"<div class='blk'><h4>Holdings — Detail</h4>{html}</div>"
+def _rec_badge(rec: str) -> str:
+    r = (rec or "").upper()
+    if r.startswith("SELL"):
+        return '<span class="rec-sell rec-badge">SELL</span>'
+    if "STRONG" in r:
+        return '<span class="rec-strong rec-badge">HOLD (Strong)</span>'
+    return '<span class="rec-hold rec-badge">HOLD</span>'
+
+def _holdings_snapshot_html(merged: pd.DataFrame) -> str:
+    """Build a colored table (worst → best)."""
+    # Sort by worst -> best using % first, fallback to $ for ties
+    df = merged.copy()
+    df["Total Gain/Loss Percent"] = pd.to_numeric(df["Total Gain/Loss Percent"], errors="coerce")
+    df["Total Gain/Loss Dollar"]  = pd.to_numeric(df["Total Gain/Loss Dollar"], errors="coerce")
+    df = df.sort_values(["Total Gain/Loss Percent","Total Gain/Loss Dollar"], ascending=[True, True])
+
+    cols = ["Symbol","Description","industry","sector","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar",
+            "Total Gain/Loss Percent","Recommendation"]
+
+    # ensure all present
+    for c in cols:
+        if c not in df.columns: df[c] = np.nan
+
+    header = "".join(f"<th>{c}</th>" for c in cols)
+    rows_html = []
+    for _, r in df.iterrows():
+        gain_d = r["Total Gain/Loss Dollar"]
+        gain_p = r["Total Gain/Loss Percent"]
+        cls_d = "num-pos" if pd.notna(gain_d) and gain_d > 0 else ("num-neg" if pd.notna(gain_d) and gain_d < 0 else "num-neu")
+        cls_p = "num-pos" if pd.notna(gain_p) and gain_p > 0 else ("num-neg" if pd.notna(gain_p) and gain_p < 0 else "num-neu")
+        row = [
+            str(r.get("Symbol","")),
+            str(r.get("Description","")) if pd.notna(r.get("Description")) else "",
+            str(r.get("industry","")) if pd.notna(r.get("industry")) else "",
+            str(r.get("sector","")) if pd.notna(r.get("sector")) else "",
+            f"{float(r.get('Quantity',np.nan)):.3f}" if pd.notna(r.get("Quantity")) else "—",
+            _money(r.get("Last Price",np.nan)),
+            _money(r.get("Current Value",np.nan)),
+            _money(r.get("Cost Basis Total",np.nan)),
+            _money(r.get("Average Cost Basis",np.nan)),
+            f"<span class='{cls_d}'>{_money(gain_d)}</span>",
+            f"<span class='{cls_p}'>{_pct(gain_p)}</span>",
+            _rec_badge(str(r.get("Recommendation","")))
+        ]
+        rows_html.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
+    table = f"""
+      <h4>Per-position Snapshot (worst → best)</h4>
+      <table class="tab-holdings">
+        <thead><tr>{header}</tr></thead>
+        <tbody>
+          {''.join(rows_html)}
+        </tbody>
+      </table>
+    """
+    return table
 
 # ---------------- Tiny weekly-like charts (data-URI) ----------------
 def _fig_to_base64(fig) -> str:
@@ -481,11 +497,7 @@ NEAR_MA_BAND = 0.05
 
 # --- Diagnostics helpers ---
 def diag_record():
-    return {
-        "why": [],           # human-readable reasons
-        "cond": {},          # boolean gates we checked
-        "metrics": {},       # numeric values we used
-    }
+    return {"why": [], "cond": {}, "metrics": {}}
 
 # ---------------- Charting ----------------
 def make_tiny_chart_png(ticker, benchmark, daily_df):
@@ -757,10 +769,6 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
         trigger_state[ts_key] = st
 
-        # readable change logs
-        if state_now != prev_state or sell_state != prev_sell_state:
-            log(f"{t}: buy_state {prev_state} -> {state_now} | sell_state {prev_sell_state} -> {sell_state}", level="debug")
-
         # --- SELL risk (tracked positions.json) ---
         pos = held.get(t)
         if pos:
@@ -810,62 +818,50 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "weekly_rank": weekly_rank,
             "buy_state": st["state"], "sell_state": st["sell_state"],
         })
-        debug_rows.append({"ticker": t, **d["metrics"], **{f"cond_{k}": v for k,v in d["cond"].items()}, "state": st["state"], "sell_state": st["sell_state"]})
-        log(f"{t}: buy_state={st['state']} near_hits={sum(st.get('near_hits', []))} | sell_state={st['sell_state']} sell_hits={sum(st.get('sell_hits', []))}", level="debug")
+        debug_rows.append({"ticker": t, **d["metrics"],
+                           **{f"cond_{k}": v for k,v in d["cond"].items()},
+                           "state": st["state"], "sell_state": st["sell_state"]})
 
     log(f"Scan done. Raw counts → BUY:{len(buy_signals)} NEAR:{len(near_signals)} SELLTRIG:{len(sell_triggers)}", level="info")
 
     # ---------- SELL recommendations from holdings ----------
     holdings_block_html = ""
-    holdings_detail_html = ""
-    holdings_note_html = ""
-
     holdings_raw = _load_open_positions_local()
     if holdings_raw is not None and not holdings_raw.empty:
         pos_norm = _normalize_open_positions_columns(holdings_raw)
         merged = _merge_stage_and_recommend(pos_norm, weekly_df)
 
-        # Build SELL recs from positions (rule-based)
+        # build "Position SELL" list for email bullets (strategy rules)
         sell_from_positions_map = {}
         for _, r in merged.iterrows():
             rec = str(r.get("Recommendation", "")).upper()
+            if not rec.startswith("SELL"): continue
             sym = str(r.get("Symbol", "")).strip()
-            if not sym: 
-                continue
-            if not rec.startswith("SELL"):
-                continue
-            live_px = px_now(sym)
-            use_px = live_px if pd.notna(live_px) else float(r.get("Last Price", np.nan))
+            if not sym: continue
             reasons = []
             pct = r.get("Total Gain/Loss Percent", np.nan)
             stg = str(r.get("stage", ""))
             if pd.notna(pct) and pct <= -8.0: reasons.append("drawdown ≤ −8%")
             if stg.startswith("Stage 4") and (pd.notna(pct) and pct < 0): reasons.append("Stage 4 + negative P/L")
             if not reasons: reasons.append("strategy rule")
+            live_px = np.nan  # live price optional; we already show $/% in the table
             entry = sell_from_positions_map.get(sym)
             if entry is None:
                 sell_from_positions_map[sym] = {
-                    "ticker": sym, "price": use_px if pd.notna(use_px) else np.nan,
+                    "ticker": sym, "price": live_px,
                     "reasons": set(reasons), "stage": stg, "weekly_rank": np.nan, "source": "positions",
                 }
             else:
                 entry["reasons"].update(reasons)
-                if pd.isna(entry["price"]) and pd.notna(use_px):
-                    entry["price"] = use_px
 
         sell_from_positions = []
         for sym, entry in sell_from_positions_map.items():
             entry["reasons"] = "; ".join(sorted(entry["reasons"]))
             sell_from_positions.append(entry)
 
+        # Summary + colored snapshot (worst → best)
         metrics = _compute_portfolio_metrics(pos_norm)
-        holdings_block_html = _colored_summary_html(metrics)
-
-        # Compact holdings table for the email
-        holdings_detail_html = _render_holdings_table_html(merged)
-
-    else:
-        holdings_note_html = "<p style='color:#666;margin:6px 0;'>No holdings file found (set --holdings-csv or place Open_Positions.csv in ./output/).</p>"
+        holdings_block_html = _colored_summary_html(metrics) + _holdings_snapshot_html(merged)
 
     # -------- Ranking & charts --------
     buy_signals.sort(key=buy_sort_key); near_signals.sort(key=near_sort_key); sell_triggers.sort(key=sell_sort_key)
@@ -959,14 +955,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     {pd.DataFrame(info_rows).to_html(index=False)}
     """
 
-    # ----- Holdings section (always present, note if missing) -----
-    html += "<hr/>"
-    if holdings_block_html or holdings_detail_html:
-        html += holdings_block_html + holdings_detail_html
-    else:
-        html += holdings_note_html
+    if holdings_block_html:
+        html += "<hr/>" + holdings_block_html
 
-    # Plain text (concise)
+    # Plain text (no holdings table here; bullets suffice)
     def _lines(items, kind):
         out = []
         for i, it in enumerate(items, 1):
@@ -1039,15 +1031,10 @@ if __name__ == "__main__":
     ap.add_argument("--log-csv", type=str, default="", help="path to write per-ticker diagnostics CSV")
     ap.add_argument("--log-json", type=str, default="", help="path to write per-ticker diagnostics JSON")
     ap.add_argument("--dry-run", action="store_true", help="don’t send email")
-    ap.add_argument("--holdings-csv", type=str, default="", help="explicit path to holdings CSV (overrides default candidates)")
     args = ap.parse_args()
 
     VERBOSE = not args.quiet
     only = [s.strip().upper() for s in args.only.split(",") if s.strip()] if args.only else None
-
-    # set override for holdings file if provided
-    if args.holdings_csv:
-        globals()["HOLDINGS_CSV_OVERRIDE"] = args.holdings_csv
 
     log(f"Intraday watcher starting with config: {args.config}", level="step")
     try:
