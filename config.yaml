@@ -3,6 +3,12 @@ app:
   timezone: America/Chicago
   benchmark: SPY
   include_charts: true
+  ordering:
+    account_size: 5000        # used only for sizing; not sent anywhere
+    risk_per_trade_pct: 0.01  # 1% of account per trade
+    take_profit_R: [1.0, 2.0] # targets in R multiples
+    round_qty_to: 1           # equities: 1 share; crypto: set to 0.000001
+
 
 sheets:
   # Primary Google Sheet
