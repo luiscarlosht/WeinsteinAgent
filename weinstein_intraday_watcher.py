@@ -3,24 +3,20 @@
 """
 Weinstein Intraday Watcher — with trigger test mode + rich diagnostics
 
-What changed (compared to your last paste):
-- Test/Easing mode you can flip on via --test-ease or env INTRADAY_TEST=1
-  * Lowers confirmations (NEAR_HITS_MIN=1, SELL_NEAR_HITS_MIN=1)
-  * Removes intrabar elapsed & volume-pace gating in 60m
-  * Writes a CSV/JSON diagnostic snapshot if requested
-- Extra logging showing WHY a ticker did/didn’t promote to NEAR/ARMED/TRIGGERED
-- Optional ticker filter (e.g. --only MU,DDOG)
-- Optional --dry-run to skip email send
-- Saves the HTML body next to other outputs so you can grep it
+Additions in this version (diagnostics patch):
+- Precompute dist_bps = (pivot - price)/pivot * 1e4
+- Stamp scan_ts (ISO) and scan_epoch (seconds)
+- Log state machine counters (near_hits, sell_hits)
+- Include stage, weekly_rank, asset_class alongside cond_* and metrics
+- Retain existing behavior, email, HTML, and CSV/JSON logging
 
 Usage examples
   INTRADAY_TEST=1 python3 weinstein_intraday_watcher.py --config ./config.yaml --only MU,DDOG \
       --log-csv ./output/intraday_debug.csv --log-json ./output/intraday_debug.json --dry-run
 
   python3 weinstein_intraday_watcher.py --config ./config.yaml --test-ease
-
 """
-import os, io, json, math, time, base64, yaml, argparse, sys
+import os, io, json, math, base64, yaml, argparse
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -393,7 +389,6 @@ def _merge_stage_and_recommend(positions: pd.DataFrame, weekly_df: pd.DataFrame)
 
 # ---- Summary HTML helpers (unchanged) ----
 def _money(x): return f"${x:,.2f}" if (x is not None and pd.notna(x)) else ""
-
 def _pct(x):   return f"{x:.2f}%" if (x is not None and pd.notna(x)) else ""
 
 def _compute_portfolio_metrics(pos: pd.DataFrame) -> dict:
@@ -451,20 +446,9 @@ def _fig_to_base64(fig) -> str:
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-# ---------------- Stage / RS (weekly) for crypto section ----------------
-MA_WEEKS = 30
-MA10_WEEKS = 10
-RS_MA_WEEKS = 30
-SLOPE_WINDOW = 5
-NEAR_MA_BAND = 0.05
-
 # --- Diagnostics helpers ---
 def diag_record():
-    return {
-        "why": [],           # human-readable reasons
-        "cond": {},          # boolean gates we checked
-        "metrics": {},       # numeric values we used
-    }
+    return {"why": [], "cond": {}, "metrics": {}}
 
 # ---------------- Charting ----------------
 def make_tiny_chart_png(ticker, benchmark, daily_df):
@@ -602,6 +586,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
     log("Evaluating candidates...", level="step")
     debug_rows = []
+    scan_ts_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
+    scan_epoch = int(datetime.utcnow().timestamp())
 
     for _, row in focus.iterrows():
         t = row["ticker"]
@@ -614,6 +600,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         stage = str(row["stage"]); ma30 = float(row.get("ma30", np.nan))
         rs_above = bool(row.get("rs_above_ma", False))
         weekly_rank = float(row.get("weekly_rank", np.nan))
+        asset_class = str(row.get("asset_class", "")) if "asset_class" in row else ""
+
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
 
@@ -686,8 +674,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             sell_near_now = _near_sell_zone(px, ma30)
             if INTRADAY_INTERVAL == "60m":
                 sell_price_ok = _price_below_ma(px, ma30)
-                sell_vol_ok = (pd.isna(pace_intra) or (pace_intra >= _SELL_INTRABAR_VOLPACE_MIN))
-                sell_confirm = bool(sell_price_ok and (elapsed is not None and elapsed >= _SELL_INTRABAR_CONFIRM_MIN_ELAPSED) and sell_vol_ok)
+                sell_vol_ok = (pd.isna(pace_intra) or (pace_intra >= SELL_INTRABAR_VOLPACE_MIN))
+                sell_confirm = bool(sell_price_ok and (elapsed is not None and elapsed >= SELL_INTRABAR_CONFIRM_MIN_ELAPSED) and sell_vol_ok)
             else:
                 closes_n2 = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
                 if closes_n2:
@@ -726,7 +714,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         sell_state = st.get("sell_state", "IDLE")
         prev_sell_state = sell_state
         if sell_state == "IDLE" and sell_near_now: sell_state = "NEAR"
-        elif sell_state in ("IDLE","NEAR") and sell_hit_count >= _SELL_NEAR_HITS_MIN: sell_state = "ARMED"
+        elif sell_state in ("IDLE","NEAR") and sell_hit_count >= SELL_NEAR_HITS_MIN: sell_state = "ARMED"
         elif sell_state == "ARMED" and sell_confirm and sell_vol_ok:
             sell_state = "TRIGGERED"; st["sell_cooldown"] = SELL_COOLDOWN_SCANS
         elif sell_state == "TRIGGERED": pass
@@ -782,6 +770,26 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             })
             trigger_state[t]["sell_state"] = "COOLDOWN"
 
+        # ---------- CSV/JSON diagnostics row (PATCH ADDED HERE) ----------
+        # dist_bps is useful for ranking "how close" we are to pivot in basis points
+        dist_bps = float(((pivot - px) / pivot) * 1e4) if (pd.notna(pivot) and pivot) else np.nan
+        debug_rows.append({
+            "scan_ts": scan_ts_iso,
+            "scan_epoch": scan_epoch,
+            "ticker": t,
+            "stage": stage,
+            "weekly_rank": weekly_rank,
+            "asset_class": asset_class,
+            **d["metrics"],
+            "dist_bps": dist_bps,
+            **{f"cond_{k}": v for k, v in d["cond"].items()},
+            "state": st["state"],
+            "sell_state": st["sell_state"],
+            "near_hits": int(sum(st.get("near_hits", []))),
+            "sell_hits": int(sum(st.get("sell_hits", []))),
+        })
+        # ----------------------------------------------
+
         info_rows.append({
             "ticker": t, "stage": stage, "price": px, "ma30": ma30, "pivot10w": pivot,
             "vol_pace_vs50dma": None if pd.isna(pace) else round(float(pace), 2),
@@ -789,7 +797,6 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "weekly_rank": weekly_rank,
             "buy_state": st["state"], "sell_state": st["sell_state"],
         })
-        debug_rows.append({"ticker": t, **d["metrics"], **{f"cond_{k}": v for k,v in d["cond"].items()}, "state": st["state"], "sell_state": st["sell_state"]})
         log(f"{t}: buy_state={st['state']} near_hits={sum(st.get('near_hits', []))} | sell_state={st['sell_state']} sell_hits={sum(st.get('sell_hits', []))}", level="debug")
 
     log(f"Scan done. Raw counts → BUY:{len(buy_signals)} NEAR:{len(near_signals)} SELLTRIG:{len(sell_triggers)}", level="info")
