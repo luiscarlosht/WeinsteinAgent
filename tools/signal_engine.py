@@ -1,302 +1,436 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Signal Engine
--------------
-Single place to decide:
-- when a row is "armed" (all gates except price within BPS),
-- when to emit BUY / SELL,
-- log signals idempotently,
-- maintain rolling state for duplicates & cooldowns.
+tools/signal_engine.py
 
-This engine is intentionally dumb, pure-Python, no pandas dependency.
-It operates on dict-like "row" objects (e.g., from your intraday loop).
+Purpose
+-------
+Reconstruct and emit BUY/NEAR/SELL signals from intraday diagnostics rows
+(the same booleans you log in intraday_debug.csv) using the same promotion
+state machine as your intraday watcher:
 
-Compatible with diagnose_intraday.py output columns.
+  IDLE -> NEAR -> ARMED -> TRIGGERED -> COOLDOWN -> IDLE
+
+It also:
+- Computes “near-now” and “armed-now” from basis-point distance to pivot.
+- Tracks SELL near/armed/trigger on MA150 breaks.
+- Appends durable rows into --write-signals CSV (idempotent header).
+- Persists in-flight state in --state JSON (so running every 10m works).
+- Prints a concise summary and optional per-ticker “explain”.
+
+Inputs it expects
+-----------------
+A CSV with the columns you already write in intraday_debug.csv (or compatible):
+  ticker, price, pivot, ma30, elapsed_min, cond_weekly_stage_ok, cond_rs_ok,
+  cond_ma_ok, cond_pivot_ok, cond_buy_price_ok, cond_buy_vol_ok,
+  cond_pace_full_gate, cond_near_pace_gate,
+  (optional) cond_near_now, cond_sell_near_now, cond_sell_price_ok, cond_sell_vol_ok,
+  state, sell_state
+
+If some columns are missing, reasonable fallbacks are applied.
+
+Usage
+-----
+python3 tools/signal_engine.py \
+  --csv ./output/intraday_debug.csv \
+  --outdir ./output \
+  --state ./output/diag_state.json \
+  --write-signals ./output/signals_log.csv \
+  --bps-threshold 35 \
+  --window-min 120 \
+  --explain MU,DDOG
+
 """
 
-from __future__ import annotations
+import os
+import sys
 import csv
 import json
-import os
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Iterable, Tuple
-from datetime import datetime, timezone
+import math
+import argparse
+from datetime import datetime
+import pandas as pd
+import numpy as np
 
-# -----------------------------
-# Defaults (must match diagnose)
-# -----------------------------
-DEFAULT_BPS_THRESHOLD = 35        # “near pivot” window for ARMED
-DEFAULT_WINDOW_MIN     = 120      # lookback/cooldown window
-DEFAULT_MIN_SCANS      = 2        # require at least N scans before emitting BUY
-DEFAULT_TZ             = timezone.utc
+# ---------------- Defaults (mirrors your watcher) ----------------
+SCAN_INTERVAL_MIN = 10
+NEAR_HITS_WINDOW  = 6        # ~1 hour memory if every 10m
+NEAR_HITS_MIN     = 3
+COOLDOWN_SCANS    = 24       # 4 hours (10m cadence)
 
+SELL_NEAR_HITS_WINDOW = 6
+SELL_NEAR_HITS_MIN    = 3
+SELL_COOLDOWN_SCANS   = 24
 
-def now_iso() -> str:
-    return datetime.now(tz=DEFAULT_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
+# Buy confirmation & gates (should mirror weinstein_intraday_watcher.py)
+MIN_BREAKOUT_PCT = 0.004        # 0.4% above pivot
+BUY_DIST_ABOVE_MA_MIN = 0.00
+VOL_PACE_MIN = 1.30
+NEAR_VOL_PACE_MIN = 1.00
 
+# 60m easing equivalents (we can’t know bar size from CSV; we only honor the booleans)
+INTRABAR_CONFIRM_MIN_ELAPSED = 40
+INTRABAR_VOLPACE_MIN         = 1.20
 
-def bps(x: float) -> float:
-    return float(x) * 1e4
+# Sell rules (must match watcher)
+SELL_NEAR_ABOVE_MA_PCT = 0.005  # within +0.5% above MA is still “sell near”
+SELL_BREAK_PCT         = 0.005  # 0.5% confirmed break below MA
 
+# ---------------- Utilities ----------------
+def _ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-@dataclass
-class EngineConfig:
-    bps_threshold: int = DEFAULT_BPS_THRESHOLD
-    window_min: int    = DEFAULT_WINDOW_MIN
-    min_scans: int     = DEFAULT_MIN_SCANS
-    # optional: treat weekly stage "unknown" as pass?
-    weekly_required: bool = True
+def log(msg, level="info"):
+    prefix = {"info":"•", "ok":"✅", "step":"▶️", "warn":"⚠️", "err":"❌", "debug":"··"}.get(level, "•")
+    print(f"{prefix} [{_ts()}] {msg}", flush=True)
 
+def _safe_div(a, b):
+    try:
+        if b == 0 or (isinstance(b, float) and math.isclose(b, 0.0)):
+            return np.nan
+        return a / b
+    except Exception:
+        return np.nan
 
-@dataclass
-class RowView:
-    # Required columns used by the engine (strings for safety; caller converts if needed)
-    ticker: str
-    price: float
-    pivot: float
-    elapsed_min: int
+def _update_hits(window_arr, hit, window):
+    window_arr = (window_arr or [])
+    window_arr.append(1 if hit else 0)
+    if len(window_arr) > window:
+        window_arr = window_arr[-window:]
+    return window_arr, sum(window_arr)
 
-    # boolean “gate” flags produced by your intraday calc
-    cond_weekly_stage_ok: bool
-    cond_rs_ok: bool
-    cond_ma_ok: bool
-    cond_pivot_ok: bool
-    cond_buy_vol_ok: bool
-    cond_pace_full_gate: bool    # strict pace gate
-    cond_near_pace_gate: bool    # near pace gate
-    cond_buy_price_ok: bool      # price >= pivot (or your exact rule)
+def _price_below_ma(px, ma): 
+    return pd.notna(px) and pd.notna(ma) and px <= ma * (1.0 - SELL_BREAK_PCT)
 
-    # SELL gates (these mirror reasons you print in HTML)
-    cond_sell_stage4_negpl: bool = False      # e.g. Stage 4 + negative P/L
-    cond_sell_drawdown_8: bool   = False      # drawdown <= -8%
+def _near_sell_zone(px, ma):
+    if pd.isna(px) or pd.isna(ma): return False
+    return (px >= ma * (1.0 - SELL_BREAK_PCT)) and (px <= ma * (1.0 + SELL_NEAR_ABOVE_MA_PCT))
 
-    # Optional extra context:
-    scans_for_ticker: int = 1                # running count in current day/session
-    weekly_stage_label: Optional[str] = None # e.g. "Stage 2 (Uptrend)"
-    debug_ts: Optional[str] = None           # ISO time
-
-    @property
-    def dist_bps(self) -> float:
-        # positive → price below pivot (needs to travel up to hit pivot)
+# ---------------- State IO ----------------
+def load_state(path: str):
+    if not path:
+        return {}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
         try:
-            return (self.pivot - self.price) / self.pivot * 1e4
-        except ZeroDivisionError:
-            return 1e9
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
+def save_state(path: str, state: dict):
+    if not path: 
+        return
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
 
-@dataclass
-class Signal:
-    ts: str
-    ticker: str
-    side: str        # BUY or SELL
-    reason: str
-    price: float
-    pivot: float
-    dist_bps: float
-    elapsed_min: int
-    scans: int
+# ---------------- Signals log (append) ----------------
+SIGNALS_HEADER = [
+    "ts", "ticker", "type", "price",
+    "pivot", "ma30", "dist_bps",
+    "buy_state", "sell_state",
+    "why"
+]
 
+def append_signals_csv(path, rows: list[dict]):
+    if not path or not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = (not os.path.exists(path)) or os.path.getsize(path) == 0
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SIGNALS_HEADER, quoting=csv.QUOTE_MINIMAL)
+        if write_header:
+            w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in SIGNALS_HEADER})
 
-class SignalEngine:
+# ---------------- Core engine ----------------
+def compute_from_csv(
+    df: pd.DataFrame,
+    *,
+    bps_threshold: int = 35,
+    window_min: int = 60,
+    near_hits_min: int = NEAR_HITS_MIN,
+    sell_near_hits_min: int = SELL_NEAR_HITS_MIN,
+    cooldown_scans: int = COOLDOWN_SCANS,
+    sell_cooldown_scans: int = SELL_COOLDOWN_SCANS,
+    state: dict | None = None,
+    explain: set[str] | None = None
+):
     """
-    Stateless rules + lightweight state file to suppress duplicates within window.
+    Rehydrates signals from a CSV snapshot. Returns (summary, signals_to_append, state_out, explain_lines)
     """
+    if state is None:
+        state = {}
 
-    def __init__(self,
-                 cfg: EngineConfig = EngineConfig(),
-                 state_path: Optional[str] = None,
-                 signals_csv: Optional[str] = None) -> None:
-        self.cfg = cfg
-        self.state_path = state_path
-        self.signals_csv = signals_csv
+    # Basic column normalization
+    need_bool = [
+        "cond_weekly_stage_ok","cond_rs_ok","cond_ma_ok","cond_pivot_ok",
+        "cond_buy_price_ok","cond_buy_vol_ok","cond_pace_full_gate","cond_near_pace_gate",
+        "cond_sell_price_ok","cond_sell_vol_ok"
+    ]
+    for c in need_bool:
+        if c not in df.columns:
+            df[c] = False
 
-        self.state: Dict[str, Dict[str, int]] = {"last_buy_min": {}, "last_sell_min": {}}
-        if state_path and os.path.exists(state_path):
-            try:
-                with open(state_path, "r") as f:
-                    self.state = json.load(f)
-            except Exception:
-                pass
+    for c in ["ticker","price","pivot","ma30","elapsed_min"]:
+        if c not in df.columns: df[c] = np.nan
 
-        # ensure CSV header
-        if signals_csv and (not os.path.exists(signals_csv) or os.path.getsize(signals_csv) == 0):
-            with open(signals_csv, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["ts","ticker","side","reason","price","pivot","dist_bps","elapsed_min","scans"])
+    # Distance to pivot in bps (positive => below pivot)
+    with np.errstate(all='ignore'):
+        df["dist_bps"] = (df["pivot"] - df["price"]) / df["pivot"] * 1e4
 
-    # ---------- Core logic ----------
+    # We’ll label “near-now” ourselves if missing
+    if "cond_near_now" not in df.columns:
+        df["cond_near_now"] = False
+    if "cond_sell_near_now" not in df.columns:
+        df["cond_sell_near_now"] = False
 
-    def is_weekly_ok(self, row: RowView) -> bool:
-        if not self.cfg.weekly_required:
-            return True
-        return bool(row.cond_weekly_stage_ok)
-
-    def is_armed(self, row: RowView) -> bool:
-        """
-        “Armed” = all buy gates except price are satisfied AND within bps window.
-        This mirrors diagnose_intraday.py’s “Armed now”.
-        """
-        gates = [
-            self.is_weekly_ok(row),
-            row.cond_rs_ok,
-            row.cond_ma_ok,
-            row.cond_pivot_ok,
-            row.cond_buy_vol_ok,
-            row.cond_pace_full_gate,
-            row.cond_near_pace_gate,
-        ]
-        if not all(gates):
+    # Resolve near-now and sell-near-now from price if not present
+    def _resolve_near(row):
+        px, pv, ma = row["price"], row["pivot"], row["ma30"]
+        stage_ok = bool(row["cond_weekly_stage_ok"])
+        rs_ok    = bool(row["cond_rs_ok"])
+        if not (stage_ok and rs_ok and pd.notna(px) and pd.notna(pv) and pd.notna(ma)):
             return False
-        return (row.dist_bps >= 0) and (row.dist_bps <= self.cfg.bps_threshold)
+        # near, if within bps_threshold below pivot OR above pivot but not confirmed
+        dist_ok = pd.notna(row["dist_bps"]) and (row["dist_bps"] >= -bps_threshold)  # -ve bps => already > pivot; keep near if not confirmed
+        price_ok = bool(row["cond_buy_price_ok"])
+        return dist_ok or (not price_ok and px >= pv)
+    df["near_resolved"] = df.apply(_resolve_near, axis=1)
+    df["cond_near_now"] = df["cond_near_now"] | df["near_resolved"]
 
-    def should_buy(self, row: RowView) -> Tuple[bool, str]:
-        """
-        BUY when “armed” AND price gate flips true (your definition:
-        e.g., price ≥ pivot and pace_full_gate true).
-        Add a min scans guard and cooldown window to avoid spam.
-        """
-        if row.scans_for_ticker < self.cfg.min_scans:
-            return False, f"min_scans<{self.cfg.min_scans}"
+    def _resolve_sell_near(row):
+        px, ma = row["price"], row["ma30"]
+        if pd.isna(px) or pd.isna(ma): return False
+        return _near_sell_zone(px, ma)
+    df["sell_near_resolved"] = df.apply(_resolve_sell_near, axis=1)
+    df["cond_sell_near_now"] = df["cond_sell_near_now"] | df["sell_near_resolved"]
 
-        if not self.is_armed(row):
-            return False, "not_armed"
+    # Consolidate by the latest observation per ticker (assume csv is last-scan only OR we take last seen per ticker)
+    # If you pass a multi-scan stack, we’ll keep the last row per ticker.
+    if "elapsed_min" in df.columns:
+        # Keep the max elapsed_min per ticker (most recent bar end within the session)
+        df["_rank"] = df.groupby("ticker")["elapsed_min"].rank(method="first", ascending=False)
+        df = df[df["_rank"] == 1].drop(columns=["_rank"])
 
-        # final price gate
-        if not row.cond_buy_price_ok:
-            return False, "price_gate_false"
+    # State windows from params
+    scans_window = max(1, int(round(window_min / float(SCAN_INTERVAL_MIN))))  # e.g. 120m / 10m = 12 scans
+    if "near_hits_window_override" in df.columns:
+        scans_window = int(df["near_hits_window_override"].dropna().iloc[0])  # optional override
 
-        # cooldown (per ticker)
-        last = self.state["last_buy_min"].get(row.ticker, -10_000)
-        if row.elapsed_min - last < self.cfg.window_min:
-            return False, "cooldown"
+    buy_out, near_out, selltrig_out = [], [], []
+    signals_to_append = []
+    explain_lines = []
 
-        return True, "armed+price_gate"
+    for _, r in df.iterrows():
+        t = str(r.get("ticker","")).strip().upper()
+        if not t:
+            continue
+        px    = float(r.get("price", np.nan))
+        pv    = float(r.get("pivot", np.nan))
+        ma    = float(r.get("ma30", np.nan))
+        dist  = float(r.get("dist_bps", np.nan)) if pd.notna(r.get("dist_bps", np.nan)) else np.nan
 
-    def should_sell(self, row: RowView) -> Tuple[bool, str]:
-        """
-        SELL when Stage 4 + negative P/L OR drawdown ≤ -8% (or extend with your rules).
-        Cooldown applied per ticker.
-        """
-        if not (row.cond_sell_stage4_negpl or row.cond_sell_drawdown_8):
-            return False, "no_sell_gate"
+        stage_ok = bool(r.get("cond_weekly_stage_ok", False))
+        rs_ok    = bool(r.get("cond_rs_ok", False))
+        ma_ok    = bool(r.get("cond_ma_ok", False))
+        pv_ok    = bool(r.get("cond_pivot_ok", False))
+        price_ok = bool(r.get("cond_buy_price_ok", False))
+        vol_ok   = bool(r.get("cond_buy_vol_ok", False))
+        pace_full_gate = bool(r.get("cond_pace_full_gate", False))
+        near_pace_gate = bool(r.get("cond_near_pace_gate", False))
 
-        last = self.state["last_sell_min"].get(row.ticker, -10_000)
-        if row.elapsed_min - last < self.cfg.window_min:
-            return False, "cooldown"
+        sell_price_ok = bool(r.get("cond_sell_price_ok", False))
+        sell_vol_ok   = bool(r.get("cond_sell_vol_ok", False))
 
-        if row.cond_sell_stage4_negpl:
-            return True, "stage4_negpl"
-        else:
-            return True, "drawdown_8"
+        near_now      = bool(r.get("cond_near_now", False))
+        sell_near_now = bool(r.get("cond_sell_near_now", False))
 
-    # ---------- Emission helpers ----------
+        # BUY confirmation (we assume booleans already reflect intrabar timing/pace in the watcher logs)
+        buy_confirm = bool(price_ok and vol_ok)
 
-    def emit(self, sig: Signal) -> None:
-        if self.signals_csv:
-            with open(self.signals_csv, "a", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([sig.ts, sig.ticker, sig.side, sig.reason,
-                            f"{sig.price:.4f}", f"{sig.pivot:.4f}",
-                            f"{sig.dist_bps:.1f}", sig.elapsed_min, sig.scans])
+        # SELL confirmation
+        sell_confirm = bool(sell_price_ok and sell_vol_ok)
 
-    def save_state(self) -> None:
-        if not self.state_path:
-            return
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.state, f)
-        os.replace(tmp, self.state_path)
+        # Get or init state
+        st = state.get(t, {
+            "state":"IDLE", "near_hits":[], "cooldown":0,
+            "sell_state":"IDLE", "sell_hits":[], "sell_cooldown":0
+        })
 
-    # ---------- Public API ----------
+        # BUY track
+        st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, scans_window)
+        if st.get("cooldown", 0) > 0:
+            st["cooldown"] = int(st["cooldown"]) - 1
 
-    def process_row(self, row_dict: Dict) -> Optional[Signal]:
-        """
-        Feed one calc row (dict). Returns a Signal or None.
-        """
-        # normalize to RowView
-        row = RowView(
-            ticker=row_dict["ticker"],
-            price=float(row_dict["price"]),
-            pivot=float(row_dict["pivot"]),
-            elapsed_min=int(row_dict["elapsed_min"]),
+        prev_state = st.get("state","IDLE")
+        state_now  = prev_state
 
-            cond_weekly_stage_ok=bool(row_dict.get("cond_weekly_stage_ok", False)),
-            cond_rs_ok=bool(row_dict.get("cond_rs_ok", False)),
-            cond_ma_ok=bool(row_dict.get("cond_ma_ok", False)),
-            cond_pivot_ok=bool(row_dict.get("cond_pivot_ok", False)),
-            cond_buy_vol_ok=bool(row_dict.get("cond_buy_vol_ok", False)),
-            cond_pace_full_gate=bool(row_dict.get("cond_pace_full_gate", False)),
-            cond_near_pace_gate=bool(row_dict.get("cond_near_pace_gate", False)),
-            cond_buy_price_ok=bool(row_dict.get("cond_buy_price_ok", False)),
+        if state_now == "IDLE" and near_now:
+            state_now = "NEAR"
+        elif state_now in ("IDLE","NEAR") and near_count >= int(near_hits_min):
+            state_now = "ARMED"
+        elif state_now == "ARMED" and buy_confirm and pace_full_gate:
+            state_now = "TRIGGERED"
+            st["cooldown"] = int(cooldown_scans)
+        elif state_now == "TRIGGERED":
+            pass
+        elif st["cooldown"] > 0 and not near_now:
+            state_now = "COOLDOWN"
+        elif st["cooldown"] == 0 and not near_now and not buy_confirm:
+            state_now = "IDLE"
 
-            cond_sell_stage4_negpl=bool(row_dict.get("cond_sell_stage4_negpl", False)),
-            cond_sell_drawdown_8=bool(row_dict.get("cond_sell_drawdown_8", False)),
+        st["state"] = state_now
 
-            scans_for_ticker=int(row_dict.get("scans_for_ticker", 1)),
-            weekly_stage_label=row_dict.get("weekly_stage_label"),
-            debug_ts=row_dict.get("debug_ts"),
-        )
+        # SELL track
+        st["sell_hits"], sell_hit_count = _update_hits(st.get("sell_hits", []), sell_near_now, scans_window)
+        if st.get("sell_cooldown", 0) > 0:
+            st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
 
-        # BUY?
-        ok_buy, why_buy = self.should_buy(row)
-        if ok_buy:
-            sig = Signal(
-                ts=row.debug_ts or now_iso(),
-                ticker=row.ticker,
-                side="BUY",
-                reason=why_buy,
-                price=row.price,
-                pivot=row.pivot,
-                dist_bps=row.dist_bps,
-                elapsed_min=row.elapsed_min,
-                scans=row.scans_for_ticker,
-            )
-            self.emit(sig)
-            self.state["last_buy_min"][row.ticker] = row.elapsed_min
-            self.save_state()
-            return sig
+        prev_sell = st.get("sell_state","IDLE")
+        sell_now  = prev_sell
 
-        # SELL?
-        ok_sell, why_sell = self.should_sell(row)
-        if ok_sell:
-            sig = Signal(
-                ts=row.debug_ts or now_iso(),
-                ticker=row.ticker,
-                side="SELL",
-                reason=why_sell,
-                price=row.price,
-                pivot=row.pivot,
-                dist_bps=row.dist_bps,
-                elapsed_min=row.elapsed_min,
-                scans=row.scans_for_ticker,
-            )
-            self.emit(sig)
-            self.state["last_sell_min"][row.ticker] = row.elapsed_min
-            self.save_state()
-            return sig
+        if sell_now == "IDLE" and sell_near_now:
+            sell_now = "NEAR"
+        elif sell_now in ("IDLE","NEAR") and sell_hit_count >= int(sell_near_hits_min):
+            sell_now = "ARMED"
+        elif sell_now == "ARMED" and sell_confirm:
+            sell_now = "TRIGGERED"
+            st["sell_cooldown"] = int(sell_cooldown_scans)
+        elif sell_now == "TRIGGERED":
+            pass
+        elif st["sell_cooldown"] > 0 and not sell_near_now:
+            sell_now = "COOLDOWN"
+        elif st["sell_cooldown"] == 0 and not sell_near_now and not sell_confirm:
+            sell_now = "IDLE"
 
-        return None
+        st["sell_state"] = sell_now
+        state[t] = st  # persist local
 
+        # Emit
+        why = []
+        if state_now == "TRIGGERED" and pace_full_gate:
+            buy_out.append((t, px, pv, ma, dist))
+            signals_to_append.append({
+                "ts": _ts(), "ticker": t, "type": "BUY",
+                "price": f"{px:.4f}" if pd.notna(px) else "",
+                "pivot": f"{pv:.4f}" if pd.notna(pv) else "",
+                "ma30":  f"{ma:.4f}" if pd.notna(ma) else "",
+                "dist_bps": f"{dist:.1f}" if pd.notna(dist) else "",
+                "buy_state": state_now, "sell_state": sell_now,
+                "why": "confirm over pivot & MA with pace"
+            })
+            # move to cooldown
+            state[t]["state"] = "COOLDOWN"
 
-# ---------------- CLI demo (optional) ----------------
-if __name__ == "__main__":
-    # simple smoke test (no output expected)
-    eng = SignalEngine(
-        cfg=EngineConfig(),
-        state_path=None,
-        signals_csv=None,
-    )
-    demo = {
-        "ticker": "TEST",
-        "price": 100, "pivot": 100,
-        "elapsed_min": 500,
-        "cond_weekly_stage_ok": True,
-        "cond_rs_ok": True, "cond_ma_ok": True, "cond_pivot_ok": True,
-        "cond_buy_vol_ok": True, "cond_pace_full_gate": True, "cond_near_pace_gate": True,
-        "cond_buy_price_ok": True,
-        "scans_for_ticker": 3,
-        "debug_ts": now_iso(),
+        elif state_now in ("NEAR","ARMED") and near_pace_gate:
+            near_out.append((t, px, pv, ma, dist))
+
+        if sell_now == "TRIGGERED":
+            selltrig_out.append((t, px, pv, ma, dist))
+            signals_to_append.append({
+                "ts": _ts(), "ticker": t, "type": "SELL",
+                "price": f"{px:.4f}" if pd.notna(px) else "",
+                "pivot": f"{pv:.4f}" if pd.notna(pv) else "",
+                "ma30":  f"{ma:.4f}" if pd.notna(ma) else "",
+                "dist_bps": f"{dist:.1f}" if pd.notna(dist) else "",
+                "buy_state": state_now, "sell_state": sell_now,
+                "why": "confirmed crack below MA150"
+            })
+            state[t]["sell_state"] = "COOLDOWN"
+
+        # Explain block (best effort)
+        if explain and (t in explain):
+            line = (f"{t}: buy_state={prev_state}->{state_now} "
+                    f"(near_now={near_now}, near_hits={sum(st.get('near_hits',[]))}/{scans_window}, "
+                    f"confirm={buy_confirm}, pace_full={pace_full_gate}) | "
+                    f"sell_state={prev_sell}->{sell_now} "
+                    f"(sell_near_now={sell_near_now}, hits={sum(st.get('sell_hits',[]))}/{scans_window}, "
+                    f"confirm={sell_confirm}) "
+                    f"dist_bps={dist if pd.notna(dist) else '—'}")
+            explain_lines.append(line)
+
+    summary = {
+        "buy":   sorted(buy_out),
+        "near":  sorted(near_out),
+        "sell":  sorted(selltrig_out)
     }
-    sig = eng.process_row(demo)
-    print("DEMO signal:", sig)
+    return summary, signals_to_append, state, explain_lines
+
+# ---------------- CLI ----------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="intraday_debug.csv (latest scan or stacked scans)")
+    ap.add_argument("--outdir", default="./output")
+    ap.add_argument("--state", default="./output/diag_state.json", help="state file to persist NEAR/ARMED/COOLDOWN")
+    ap.add_argument("--write-signals", default="", help="append durable signals to this CSV (e.g. ./output/signals_log.csv)")
+    ap.add_argument("--bps-threshold", type=int, default=35, help="near-now window below pivot in bps")
+    ap.add_argument("--window-min", type=int, default=60, help="rolling memory window in minutes (for near hits)")
+    ap.add_argument("--near-hits-min", type=int, default=NEAR_HITS_MIN)
+    ap.add_argument("--sell-near-hits-min", type=int, default=SELL_NEAR_HITS_MIN)
+    ap.add_argument("--cooldown-scans", type=int, default=COOLDOWN_SCANS)
+    ap.add_argument("--sell-cooldown-scans", type=int, default=SELL_COOLDOWN_SCANS)
+    ap.add_argument("--explain", type=str, default="", help="comma tickers to explain (e.g. MU,DDOG)")
+    args = ap.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    try:
+        df = pd.read_csv(args.csv)
+    except Exception as e:
+        log(f"Failed to read CSV: {e}", level="err")
+        sys.exit(1)
+
+    # Lightweight scrub
+    if "ticker" not in df.columns:
+        log("CSV missing 'ticker' column.", level="err")
+        sys.exit(2)
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+
+    # Optional narrow to most recent scan if the file contains multiple ticks
+    # If you log a timestamp column (e.g. 'ts' or 'scan_ts'), you can adapt here.
+    # For now, we assume the file is "latest only" or we pick last row per ticker in compute().
+
+    state_in = load_state(args.state)
+    explain = set([s.strip().upper() for s in args.explain.split(",") if s.strip()]) if args.explain else set()
+
+    summary, sig_rows, state_out, explain_lines = compute_from_csv(
+        df,
+        bps_threshold=args.bps_threshold,
+        window_min=args.window_min,
+        near_hits_min=args.near_hits_min,
+        sell_near_hits_min=args.sell_near_hits_min,
+        cooldown_scans=args.cooldown_scans,
+        sell_cooldown_scans=args.sell_cooldown_scans,
+        state=state_in,
+        explain=explain
+    )
+
+    # Persist
+    save_state(args.state, state_out)
+    append_signals_csv(args.write_signals, sig_rows)
+
+    # Print summary
+    def _fmt(lst):
+        if not lst: return "(none)"
+        return ", ".join([f"{t}@{px:.2f}" if pd.notna(px) else t for (t,px,_,_,_) in lst])
+
+    log("Engine summary:", level="ok")
+    log(f"  BUY   : {_fmt(summary['buy'])}", level="info")
+    log(f"  NEAR  : {_fmt(summary['near'])}", level="info")
+    log(f"  SELL  : {_fmt(summary['sell'])}", level="info")
+
+    if sig_rows:
+        log(f"Appended {len(sig_rows)} rows to {args.write_signals}", level="ok")
+    else:
+        log("No new durable signals this run.", level="debug")
+
+    if explain_lines:
+        print("\nExplain:")
+        for ln in explain_lines:
+            print(" - " + ln)
+
+if __name__ == "__main__":
+    main()
