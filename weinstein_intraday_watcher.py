@@ -7,6 +7,7 @@ Adds:
 - Per-position Snapshot (sorted worst → best) with colored $/%, and badge pills
 - Keeps weekly summary card; holdings section now bundles both
 - Same trigger logic, diagnostics CSV/JSON, HTML save, optional dry run
+- NEW: "Order Block" proposing entries/stops for BUY/SELL (stocks + crypto)
 """
 
 import os, io, json, math, base64, yaml, argparse
@@ -40,10 +41,11 @@ INTRADAY_AVG_VOL_WINDOW = 20
 INTRADAY_LASTBAR_AVG_MULT = 1.20
 
 NEAR_BELOW_PIVOT_PCT = 0.003
-NEAR_VOL_PACE_MIN = 1.00   # <-- keep defined (used in HTML description)
+NEAR_VOL_PACE_MIN = 1.00
 
 HARD_STOP_PCT = 0.08
 TRAIL_ATR_MULT = 2.0
+PIVOT_ENTRY_BUFFER_PCT = 0.002   # +0.20% over pivot for limit-into-strength orders
 
 STATE_FILE = "./state/positions.json"
 CHART_DIR = "./output/charts"
@@ -434,7 +436,6 @@ def _rec_badge(rec: str) -> str:
 
 def _holdings_snapshot_html(merged: pd.DataFrame) -> str:
     """Build a colored table (worst → best)."""
-    # Sort by worst -> best using % first, fallback to $ for ties
     df = merged.copy()
     df["Total Gain/Loss Percent"] = pd.to_numeric(df["Total Gain/Loss Percent"], errors="coerce")
     df["Total Gain/Loss Dollar"]  = pd.to_numeric(df["Total Gain/Loss Dollar"], errors="coerce")
@@ -444,7 +445,6 @@ def _holdings_snapshot_html(merged: pd.DataFrame) -> str:
             "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar",
             "Total Gain/Loss Percent","Recommendation"]
 
-    # ensure all present
     for c in cols:
         if c not in df.columns: df[c] = np.nan
 
@@ -488,56 +488,6 @@ def _fig_to_base64(fig) -> str:
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-# ---------------- Stage / RS (weekly) for crypto section ----------------
-MA_WEEKS = 30
-MA10_WEEKS = 10
-RS_MA_WEEKS = 30
-SLOPE_WINDOW = 5
-NEAR_MA_BAND = 0.05
-
-# --- Diagnostics helpers ---
-def diag_record():
-    return {"why": [], "cond": {}, "metrics": {}}
-
-# ---------------- Charting ----------------
-def make_tiny_chart_png(ticker, benchmark, daily_df):
-    os.makedirs(CHART_DIR, exist_ok=True)
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            close_t = daily_df[("Close", ticker)].dropna()
-            close_b = daily_df[("Close", benchmark)].dropna()
-        except KeyError:
-            return None, None
-    else:
-        return None, None
-    close_t = close_t.tail(PRICE_WINDOW_DAYS)
-    close_b = close_b.reindex_like(close_t).dropna()
-    idx = close_t.index.intersection(close_b.index)
-    close_t, close_b = close_t.loc[idx], close_b.loc[idx]
-    if len(close_t) < 50 or len(close_b) < 50:
-        return None, None
-    sma = close_t.rolling(SMA_DAYS).mean()
-    rs = (close_t / close_b); rs_norm = rs / rs.iloc[0]
-    fig, ax1 = plt.subplots(figsize=(5.0, 2.4), dpi=150)
-    ax1.plot(close_t.index, close_t.values, label=f"{ticker}")
-    ax1.plot(sma.index, sma.values, label=f"SMA{SMA_DAYS}", linewidth=1.2)
-    ax1.set_ylabel("Price")
-    ax1.tick_params(axis='x', labelsize=8); ax1.tick_params(axis='y', labelsize=8)
-    ax2 = ax1.twinx()
-    ax2.plot(rs_norm.index, rs_norm.values, linestyle="--", alpha=0.7, label="RS (norm)")
-    ax2.set_ylabel("RS (norm)")
-    ax2.tick_params(axis='y', labelsize=8)
-    ax1.set_title(f"{ticker} — Price, SMA{SMA_DAYS}, RS/{benchmark}", fontsize=9)
-    ax1.grid(alpha=0.2)
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left", frameon=False)
-    chart_path = os.path.join(CHART_DIR, f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-    fig.tight_layout(pad=0.8); fig.savefig(chart_path, bbox_inches="tight"); plt.close(fig)
-    with open(chart_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("ascii")
-    return chart_path, f"data:image/png;base64,{b64}"
-
 # ---------------- Ranking helpers ----------------
 def stage_order(stage: str) -> int:
     if isinstance(stage, str):
@@ -570,12 +520,126 @@ def sell_sort_key(item):
     pace = item.get("pace", np.nan); pace = pace if pd.notna(pace) else -1e9
     return (wr, st, -dist_below, -pace)
 
-# ---------------- Logic helpers ----------------
+# ---------------- Logic checks ----------------
 def _price_below_ma(px, ma): return pd.notna(px) and pd.notna(ma) and px <= ma * (1.0 - SELL_BREAK_PCT)
-
 def _near_sell_zone(px, ma):
     if pd.isna(px) or pd.isna(ma): return False
     return (px >= ma * (1.0 - SELL_BREAK_PCT)) and (px <= ma * (1.0 + SELL_NEAR_ABOVE_MA_PCT))
+
+# ---------------- ORDER BLOCK HELPERS (NEW) ----------------
+def _fmt_num(x):
+    if x is None or pd.isna(x): return "—"
+    try: return f"{float(x):.2f}"
+    except Exception: return "—"
+
+def _propose_entry_stop_for_buy(ticker, px, pivot, ma30, atr):
+    """
+    Entry: pivot * (1 + PIVOT_ENTRY_BUFFER_PCT) if pivot exists, else current price
+    Stop:  max(HARD_STOP_PCT below entry, ATR trail, 3% under MA150 if available)
+    """
+    entry = None
+    if pd.notna(pivot):
+        entry = pivot * (1.0 + PIVOT_ENTRY_BUFFER_PCT)
+    elif pd.notna(px):
+        entry = float(px)
+
+    # candidates for stop
+    hard = entry * (1.0 - HARD_STOP_PCT) if entry else np.nan
+    atr_trail = (entry - TRAIL_ATR_MULT * atr) if (entry and pd.notna(atr)) else np.nan
+    ma_guard = (ma30 * 0.97) if pd.notna(ma30) else np.nan
+
+    cand = [v for v in [hard, atr_trail, ma_guard] if pd.notna(v)]
+    stop = min(cand) if cand else np.nan
+    return entry, stop
+
+def _propose_protective_stop_for_open(px, ma30, atr, hard_from_positions=None):
+    """
+    Protective stop for existing holding:
+    min(hard stop if provided, ATR trail vs px, 3% under MA150).
+    """
+    hard = float(hard_from_positions) if (hard_from_positions is not None and pd.notna(hard_from_positions)) else np.nan
+    atr_trail = (px - TRAIL_ATR_MULT * atr) if (pd.notna(px) and pd.notna(atr)) else np.nan
+    ma_guard = (ma30 * 0.97) if pd.notna(ma30) else np.nan
+    cand = [v for v in [hard, atr_trail, ma_guard] if pd.notna(v)]
+    return min(cand) if cand else np.nan
+
+def _build_order_block_html(buys, sell_trigs, pos_sells):
+    """
+    Renders three blocks:
+    - Entries (for BUY triggers)
+    - Stops for newly bought (same list)
+    - Protective exits (for active sell/position alerts)
+    """
+    if not buys and not sell_trigs and not pos_sells:
+        return ""
+
+    def _rows_for_buys(items):
+        out = []
+        for it in items:
+            t = it["ticker"]; px = it.get("price", np.nan)
+            pivot = it.get("pivot", np.nan); ma = it.get("ma30", np.nan)
+            atr = it.get("atr", np.nan)
+            entry, stop = _propose_entry_stop_for_buy(t, px, pivot, ma, atr)
+            out.append(f"<tr><td>{t}</td><td>{_fmt_num(px)}</td><td>{_fmt_num(pivot)}</td><td>{_fmt_num(entry)}</td><td>{_fmt_num(stop)}</td></tr>")
+        return "\n".join(out)
+
+    def _rows_for_stops(title, items):
+        out = []
+        for it in items:
+            t = it["ticker"]; px = it.get("price", np.nan); ma = it.get("ma30", np.nan)
+            atr = it.get("atr", np.nan)
+            stop = _propose_protective_stop_for_open(px, ma, atr)
+            out.append(f"<tr><td>{t}</td><td>{_fmt_num(px)}</td><td>{_fmt_num(ma)}</td><td>{_fmt_num(stop)}</td></tr>")
+        return "\n".join(out)
+
+    css = """
+    <style>
+      .ordtbl { border-collapse: collapse; width:100%; margin-top:6px; }
+      .ordtbl th, .ordtbl td { border-bottom:1px solid #eee; padding:6px 8px; font-size:13px; text-align:left; }
+      .ordtbl th { background:#fafafa; }
+    </style>
+    """
+    html = css + "<h4>Order Block (proposed)</h4>"
+
+    if buys:
+        html += """
+        <div><b>Prospective Entries (on BUY triggers)</b></div>
+        <table class="ordtbl">
+          <thead><tr><th>Ticker</th><th>Now</th><th>Pivot</th><th>Entry ≥</th><th>Initial Stop ≤</th></tr></thead>
+          <tbody>
+        """
+        html += _rows_for_buys(buys) + "</tbody></table>"
+
+    if sell_trigs or pos_sells:
+        html += """
+        <div style="margin-top:8px;"><b>Protective Stops (for open positions / sell alerts)</b></div>
+        <table class="ordtbl">
+          <thead><tr><th>Ticker</th><th>Now</th><th>MA150</th><th>Protective Stop ≤</th></tr></thead>
+          <tbody>
+        """
+        html += _rows_for_stops("Stops", sell_trigs + pos_sells) + "</tbody></table>"
+
+    html += "<div style='font-size:12px;color:#666;margin-top:6px;'>"
+    html += f"Rules: Entry ≈ pivot + {PIVOT_ENTRY_BUFFER_PCT*100:.2f}% buffer; Initial stop = min(hard {HARD_STOP_PCT*100:.1f}% below entry, ATR×{TRAIL_ATR_MULT:.1f} trail, 3% under MA150). Protective stop for existing longs uses the same min(). Crypto handled identically.</div>"
+    return html
+
+def _build_order_block_text(buys, sell_trigs, pos_sells):
+    lines = ["ORDER BLOCK (proposed)"]
+    if buys:
+        lines.append("Prospective Entries:")
+        for it in buys:
+            t = it["ticker"]; px = it.get("price", np.nan)
+            pivot = it.get("pivot", np.nan); ma = it.get("ma30", np.nan); atr = it.get("atr", np.nan)
+            entry, stop = _propose_entry_stop_for_buy(t, px, pivot, ma, atr)
+            lines.append(f"- {t}: now={_fmt_num(px)} pivot={_fmt_num(pivot)} entry≥{_fmt_num(entry)} stop≤{_fmt_num(stop)}")
+    if sell_trigs or pos_sells:
+        lines.append("Protective Stops (open positions / sell alerts):")
+        for it in (sell_trigs + pos_sells):
+            t = it["ticker"]; px = it.get("price", np.nan); ma = it.get("ma30", np.nan); atr = it.get("atr", np.nan)
+            stop = _propose_protective_stop_for_open(px, ma, atr)
+            lines.append(f"- {t}: now={_fmt_num(px)} MA150={_fmt_num(ma)} stop≤{_fmt_num(stop)}")
+    lines.append(f"Rules: entry≈pivot+{PIVOT_ENTRY_BUFFER_PCT*100:.2f}% | stop=min(hard {HARD_STOP_PCT*100:.1f}%, ATR×{TRAIL_ATR_MULT:.1f}, MA150−3%).")
+    return "\n".join(lines)
 
 # ---------------- Main logic ----------------
 def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log_csv=None, log_json=None, dry_run=False):
@@ -649,6 +713,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         weekly_rank = float(row.get("weekly_rank", np.nan))
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
+        atr = compute_atr(daily, t, n=14)
 
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
         ma_ok = pd.notna(ma30); pivot_ok = pd.notna(pivot); rs_ok = rs_above
@@ -656,9 +721,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         elapsed = _elapsed_in_current_bar_minutes(intraday, t) if INTRADAY_INTERVAL == "60m" else None
         pace_intra = intrabar_volume_pace(intraday, t, bar_minutes=60) if INTRADAY_INTERVAL == "60m" else None
 
-        d = diag_record()
+        d = {"why": [], "cond": {}, "metrics": {}}
         d["metrics"].update({
-            "price": px, "ma30": ma30, "pivot": pivot,
+            "price": px, "ma30": ma30, "pivot": pivot, "atr": atr,
             "pace_full_vs50dma": None if pd.isna(pace) else float(pace),
             "pace_intrabar": None if pd.isna(pace_intra) else float(pace_intra),
             "elapsed_min": elapsed,
@@ -743,12 +808,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, NEAR_HITS_WINDOW)
         if st.get("cooldown", 0) > 0: st["cooldown"] = int(st["cooldown"]) - 1
         state_now = st.get("state", "IDLE")
-        prev_state = state_now
         if state_now == "IDLE" and near_now: state_now = "NEAR"
         elif state_now in ("IDLE","NEAR") and near_count >= _NEAR_HITS_MIN: state_now = "ARMED"
         elif state_now == "ARMED" and confirm and vol_ok and (pd.isna(pace) or pace >= VOL_PACE_MIN):
             state_now = "TRIGGERED"; st["cooldown"] = COOLDOWN_SCANS
-        elif state_now == "TRIGGERED": pass
         elif st["cooldown"] > 0 and not near_now: state_now = "COOLDOWN"
         elif st["cooldown"] == 0 and not near_now and not confirm: state_now = "IDLE"
         st["state"] = state_now
@@ -757,12 +820,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         st["sell_hits"], sell_hit_count = _update_hits(st.get("sell_hits", []), sell_near_now, SELL_NEAR_HITS_WINDOW)
         if st.get("sell_cooldown", 0) > 0: st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
         sell_state = st.get("sell_state", "IDLE")
-        prev_sell_state = sell_state
         if sell_state == "IDLE" and sell_near_now: sell_state = "NEAR"
         elif sell_state in ("IDLE","NEAR") and sell_hit_count >= _SELL_NEAR_HITS_MIN: sell_state = "ARMED"
         elif sell_state == "ARMED" and sell_confirm and sell_vol_ok:
             sell_state = "TRIGGERED"; st["sell_cooldown"] = SELL_COOLDOWN_SCANS
-        elif sell_state == "TRIGGERED": pass
         elif st["sell_cooldown"] > 0 and not sell_near_now: sell_state = "COOLDOWN"
         elif st["sell_cooldown"] == 0 and not sell_near_now and not sell_confirm: sell_state = "IDLE"
         st["sell_state"] = sell_state
@@ -775,8 +836,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             entry = float(pos.get("entry", np.nan))
             hard_stop = float(pos.get("stop", np.nan)) if pd.notna(pos.get("stop", np.nan)) \
                         else (entry * (1 - HARD_STOP_PCT) if pd.notna(entry) else np.nan)
-            atr = compute_atr(daily, t, n=14)
-            trail = px - TRAIL_ATR_MULT * atr if pd.notna(atr) else None
+            atr_pos = atr
+            trail = px - TRAIL_ATR_MULT * atr_pos if pd.notna(atr_pos) else None
             breach_hard = (pd.notna(hard_stop) and px <= hard_stop)
             breach_ma = (pd.notna(ma30) and px <= ma30 * 0.97)
             breach_trail = (trail is not None and px <= trail)
@@ -787,27 +848,28 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                 if breach_trail: why.append(f"≤ ATR trail ({TRAIL_ATR_MULT}×)")
                 sell_signals.append({
                     "ticker": t, "price": px, "reasons": ", ".join(why),
-                    "stage": stage, "weekly_rank": weekly_rank, "source": "risk"
+                    "stage": stage, "weekly_rank": weekly_rank, "source": "risk",
+                    "atr": atr_pos, "ma30": ma30
                 })
 
         # --- EMIT by state ---
-        if st["state"] == "TRIGGERED" and d["cond"]["pace_full_gate"]:
+        if st["state"] == "TRIGGERED" and (pd.isna(pace) or pace >= VOL_PACE_MIN):
             buy_signals.append({
                 "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
-                "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank,
+                "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "atr": atr
             })
             trigger_state[t]["state"] = "COOLDOWN"
         elif st["state"] in ("NEAR","ARMED"):
-            if d["cond"]["near_pace_gate"]:
+            if (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN):
                 near_signals.append({
                     "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
-                    "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "reason": "near/armed"
+                    "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "reason": "near/armed", "atr": atr
                 })
 
         if st["sell_state"] == "TRIGGERED":
             sell_triggers.append({
                 "ticker": t, "price": px, "ma30": ma30, "stage": stage,
-                "weekly_rank": weekly_rank, "pace": None if pd.isna(pace) else float(pace)
+                "weekly_rank": weekly_rank, "pace": None if pd.isna(pace) else float(pace), "atr": atr
             })
             trigger_state[t]["sell_state"] = "COOLDOWN"
 
@@ -844,12 +906,12 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             if pd.notna(pct) and pct <= -8.0: reasons.append("drawdown ≤ −8%")
             if stg.startswith("Stage 4") and (pd.notna(pct) and pct < 0): reasons.append("Stage 4 + negative P/L")
             if not reasons: reasons.append("strategy rule")
-            live_px = np.nan  # live price optional; we already show $/% in the table
             entry = sell_from_positions_map.get(sym)
             if entry is None:
                 sell_from_positions_map[sym] = {
-                    "ticker": sym, "price": live_px,
+                    "ticker": sym, "price": np.nan,   # live not required
                     "reasons": set(reasons), "stage": stg, "weekly_rank": np.nan, "source": "positions",
+                    "ma30": r.get("ma30", np.nan), "atr": np.nan
                 }
             else:
                 entry["reasons"].update(reasons)
@@ -951,6 +1013,14 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     {charts_html}
     <h4>Sell / Risk Triggers (Tracked Positions & Position Recommendations)</h4>
     {bullets(sell_signals + sell_from_positions, "SELL")}
+    """
+
+    # ------ ORDER BLOCK (HTML + TEXT) ------
+    order_block_html = _build_order_block_html(buy_signals, sell_triggers, sell_from_positions)
+    if order_block_html:
+        html += order_block_html
+
+    html += f"""
     <h4>Snapshot (ordered by weekly rank & stage)</h4>
     {pd.DataFrame(info_rows).to_html(index=False)}
     """
@@ -958,7 +1028,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     if holdings_block_html:
         html += "<hr/>" + holdings_block_html
 
-    # Plain text (no holdings table here; bullets suffice)
+    # Plain text body
     def _lines(items, kind):
         out = []
         for i, it in enumerate(items, 1):
@@ -979,7 +1049,17 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                 out.append(f"{i}. {it['ticker']} @ {it['price']:.2f} (pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})")
         return "\n".join(out) if out else f"No {kind} signals."
 
-    text = f"Weinstein Intraday Watch — {now}\n\nBUY (ranked):\n{_lines(buy_signals,'BUY')}\n\nNEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\nSELL TRIGGERS (ranked):\n{_lines(sell_triggers,'SELLTRIG')}\n\nSELL / RISK:\n{_lines(sell_signals + sell_from_positions,'SELL')}\n"
+    text = (
+        f"Weinstein Intraday Watch — {now}\n\n"
+        f"BUY (ranked):\n{_lines(buy_signals,'BUY')}\n\n"
+        f"NEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\n"
+        f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers,'SELLTRIG')}\n\n"
+        f"SELL / RISK:\n{_lines(sell_signals + sell_from_positions,'SELL')}\n\n"
+    )
+
+    order_block_text = _build_order_block_text(buy_signals, sell_triggers, sell_from_positions)
+    if order_block_text:
+        text += "\n" + order_block_text + "\n"
 
     # Persist state & diagnostics
     _save_intraday_state(trigger_state)
@@ -1020,6 +1100,45 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             cfg_path=_config_path
         )
         log("Email sent.", level="ok")
+
+# ---------------- Charting (kept at bottom so helpers exist) ----------------
+def make_tiny_chart_png(ticker, benchmark, daily_df):
+    os.makedirs(CHART_DIR, exist_ok=True)
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            close_t = daily_df[("Close", ticker)].dropna()
+            close_b = daily_df[("Close", benchmark)].dropna()
+        except KeyError:
+            return None, None
+    else:
+        return None, None
+    close_t = close_t.tail(PRICE_WINDOW_DAYS)
+    close_b = close_b.reindex_like(close_t).dropna()
+    idx = close_t.index.intersection(close_b.index)
+    close_t, close_b = close_t.loc[idx], close_b.loc[idx]
+    if len(close_t) < 50 or len(close_b) < 50:
+        return None, None
+    sma = close_t.rolling(SMA_DAYS).mean()
+    rs = (close_t / close_b); rs_norm = rs / rs.iloc[0]
+    fig, ax1 = plt.subplots(figsize=(5.0, 2.4), dpi=150)
+    ax1.plot(close_t.index, close_t.values, label=f"{ticker}")
+    ax1.plot(sma.index, sma.values, label=f"SMA{SMA_DAYS}", linewidth=1.2)
+    ax1.set_ylabel("Price")
+    ax1.tick_params(axis='x', labelsize=8); ax1.tick_params(axis='y', labelsize=8)
+    ax2 = ax1.twinx()
+    ax2.plot(rs_norm.index, rs_norm.values, linestyle="--", alpha=0.7, label="RS (norm)")
+    ax2.set_ylabel("RS (norm)")
+    ax2.tick_params(axis='y', labelsize=8)
+    ax1.set_title(f"{ticker} — Price, SMA150, RS/{benchmark}", fontsize=9)
+    ax1.grid(alpha=0.2)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left", frameon=False)
+    chart_path = os.path.join(CHART_DIR, f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    fig.tight_layout(pad=0.8); fig.savefig(chart_path, bbox_inches="tight"); plt.close(fig)
+    with open(chart_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return chart_path, f"data:image/png;base64,{b64}"
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
