@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+Weinstein Intraday Diagnostics (integrated)
+
+What this does (safe to run anytime):
+- Reads a lightweight intraday_debug.csv (if present) and computes "near-miss" buy events
+  (all gates true except the actual buy-price cross), plus a "near-now" snapshot using
+  a basis-points (bps) distance to pivot.
+- Optionally scrapes your generated intraday_watch_*.html files to build a
+  "near-universe" of tickers that repeatedly appeared near/pivot.
+- Writes a human-readable summary file and a near_universe.txt. Optionally
+  appends a row-wise log (for time-series diagnostics) and persists state across runs.
+
+Examples:
+  python3 tools/diagnose_intraday.py \
+    --csv ./output/intraday_debug.csv \
+    --outdir ./output \
+    --html-glob "./output/intraday_watch_*.html" \
+    --state ./output/diag_state.json \
+    --explain MU,DDOG
+
+Outputs:
+  - <outdir>/diag_summary_YYYYmmdd_HHMMSS.txt
+  - <outdir>/near_universe.txt (if --html-glob provided)
+  - <outdir>/diag_state.json (if --state provided)
+  - optional: <outdir>/diag_log.csv (if --log-csv provided)
+
+CSV expected columns (missing ones are handled gracefully):
+  ticker, price, pivot, elapsed_min,
+  cond_weekly_stage_ok, cond_rs_ok, cond_ma_ok, cond_pivot_ok,
+  cond_buy_vol_ok, cond_pace_full_gate, cond_near_pace_gate, cond_buy_price_ok
 
 """
-Weinstein Intraday Diagnostics
-
-Features
-- Reads intraday_debug.csv and computes:
-  * "near-miss" buy candidates (all gates green except price)
-  * distances to pivot in basis points
-  * per-ticker aggregates (min distance, scans, last_seen)
-- Extracts "near-universe" tickers from intraday_watch_*.html
-- Writes a human-readable summary file with timestamp
-- Maintains a simple JSON state file (rolling per-ticker stats)
-- Optional: --explain T1,T2 prints gate-by-gate reasons a ticker didn’t trigger
-
-Exit code: 0 even if CSV is empty; summary still produced for HTML near-universe.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -26,22 +40,24 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass, asdict
 from glob import glob
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     import pandas as pd
-except Exception as e:
-    print("ERROR: pandas is required. pip install pandas", file=sys.stderr)
+except Exception as e:  # pragma: no cover
+    print("pandas is required. pip install pandas", file=sys.stderr)
     raise
 
-# -----------------------
-# Utils
-# -----------------------
+# ----------------------------
+# Helpers
+# ----------------------------
 
-TS_FMT = "%Y%m%d_%H%M%S"
+RE_HTML_NEAR_TICKER = re.compile(r"<ol><li><b>\\d+\.</b> <b>([A-Z\.]+)</b> @")
 
-COND_COLS_ORDER = [
+MANDATORY_NUMERIC = ["price", "pivot"]
+OPTIONAL_BOOL_COLS = [
     "cond_weekly_stage_ok",
     "cond_rs_ok",
     "cond_ma_ok",
@@ -51,337 +67,387 @@ COND_COLS_ORDER = [
     "cond_near_pace_gate",
     "cond_buy_price_ok",
 ]
+OPTIONAL_NUMERIC_COLS = ["elapsed_min", "dist_bps"]
 
-REQUIRED_NUMERIC = ["price", "pivot", "elapsed_min"]
-REQUIRED_KEY = ["ticker"]
 
-NEAR_TICKER_REGEX = re.compile(r"<ol><li><b>\d+\.</b>\s*<b>([A-Z]+)</b>\s*@")
+@dataclass
+class NearMissRec:
+    ticker: str
+    scans: int
+    min_dist_bps: float
+    weekly_ok: bool
+    last_seen: Optional[float]
 
-# -----------------------
-# HTML near-universe
-# -----------------------
 
-def extract_near_universe(html_glob: str, out_file: str) -> Set[str]:
-    tickers: Set[str] = set()
-    for path in sorted(glob(html_glob)):
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-            for m in NEAR_TICKER_REGEX.finditer(text):
-                tickers.add(m.group(1))
-        except Exception:
-            # skip unreadable file
-            pass
-    os.makedirs(os.path.dirname(out_file), exist_ok=True)
-    with open(out_file, "w", encoding="utf-8") as f:
-        for t in sorted(tickers):
-            f.write(f"{t}\n")
-    return tickers
+@dataclass
+class GateStats:
+    ticker: str
+    rows: int
+    gate_true_pct: Dict[str, float]
+    min_dist_bps: Optional[float]
 
-# -----------------------
-# CSV load / guards
-# -----------------------
 
-def safe_read_csv(path: str) -> Optional[pd.DataFrame]:
-    if not path or not os.path.exists(path) or os.path.getsize(path) < 3:
+# ----------------------------
+# Core logic
+# ----------------------------
+
+def read_csv_if_any(path: str) -> Optional[pd.DataFrame]:
+    if not path:
+        return None
+    if not os.path.exists(path) or os.path.getsize(path) <= 1:
         return None
     try:
         df = pd.read_csv(path)
-        if df.empty:
-            return None
-        return df
     except Exception:
         return None
 
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Create any missing boolean columns as False
-    for c in COND_COLS_ORDER:
+    # Basic sanitation
+    if "ticker" not in df.columns:
+        return None
+
+    # Drop rows missing the core numeric inputs
+    missing = [c for c in MANDATORY_NUMERIC if c not in df.columns]
+    for c in missing:
+        df[c] = None
+    df = df.dropna(subset=["ticker"])  # require a ticker
+
+    # Make sure expected columns exist
+    for c in OPTIONAL_BOOL_COLS:
         if c not in df.columns:
             df[c] = False
-
-    # Create required numerics if missing
-    for c in REQUIRED_NUMERIC:
+    for c in OPTIONAL_NUMERIC_COLS:
         if c not in df.columns:
-            df[c] = pd.NA
+            df[c] = None
 
-    # Create key columns if missing
-    for c in REQUIRED_KEY:
-        if c not in df.columns:
-            df[c] = ""
+    # coerce types (best-effort)
+    for c in ["price", "pivot", "elapsed_min", "dist_bps"]:
+        if c in df.columns:
+            with pd.option_context("mode.chained_assignment", None):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Drop rows without fundamental keys
-    df = df.dropna(subset=["ticker", "price", "pivot", "elapsed_min"])
+    # compute dist_bps if missing
+    if "dist_bps" not in df.columns or df["dist_bps"].isna().all():
+        with pd.option_context("mode.chained_assignment", None):
+            df["dist_bps"] = (df["pivot"] - df["price"]) / df["pivot"] * 1e4
+
     return df
 
-def add_computed_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # positive dist_bps => price below pivot; negative => above
-    df["dist_bps"] = (df["pivot"] - df["price"]) / df["pivot"] * 1e4
-    # keep a sortable timestamp column if not present
-    if "ts" not in df.columns:
-        # emulate using elapsed_min if provided
-        df["ts"] = df["elapsed_min"]
-    return df
 
-# -----------------------
-# Diagnostics
-# -----------------------
+def build_near_universe_from_html(html_glob: str) -> List[str]:
+    if not html_glob:
+        return []
+    tickers = set()
+    for path in glob(html_glob):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            for m in RE_HTML_NEAR_TICKER.finditer(content):
+                tickers.add(m.group(1))
+        except Exception:
+            continue
+    return sorted(tickers)
 
-def compute_near_misses(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+def compute_near_miss(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (near_miss_df, near_now_df)
+
+    near-miss = all gates true except cond_buy_price_ok == False
+    near-now  = within bps threshold AND gates satisfied except actual buy-price cross
+               (the final filtering by threshold happens later in the caller)
     """
-    near_miss: all gates green EXCEPT price (buy price not yet ok)
-    pass_rows: all gates green including price (for sanity / reference)
-    """
-    gate_all_but_price = (
-        df["cond_weekly_stage_ok"]
-        & df["cond_rs_ok"]
-        & df["cond_ma_ok"]
-        & df["cond_pivot_ok"]
-        & df["cond_buy_vol_ok"]
-        & df["cond_pace_full_gate"]
-        & df["cond_near_pace_gate"]
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Normalize booleans
+    for c in OPTIONAL_BOOL_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype(bool)
+
+    # Use best-effort elapsed_min
+    ts_col = "elapsed_min" if "elapsed_min" in df.columns else None
+
+    buy_gates_except_price = (
+        df.get("cond_weekly_stage_ok", False)
+        & df.get("cond_rs_ok", False)
+        & df.get("cond_ma_ok", False)
+        & df.get("cond_pivot_ok", False)
+        & df.get("cond_buy_vol_ok", False)
+        & df.get("cond_pace_full_gate", False)
+        & df.get("cond_near_pace_gate", False)
+        & (~df.get("cond_buy_price_ok", False))
     )
 
-    near_miss = gate_all_but_price & (df["cond_buy_price_ok"] == False)
-    passed    = gate_all_but_price & (df["cond_buy_price_ok"] == True)
+    near = df[buy_gates_except_price].copy()
+    if ts_col:
+        near["ts_min"] = df[ts_col]
+    else:
+        near["ts_min"] = None
 
-    return df[near_miss].copy(), df[passed].copy()
+    # near-now candidate set (same logical gates, just leaving threshold for caller)
+    near_now = near.copy()
 
-def aggregate_per_ticker(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["scans","min_dist_bps","weekly_ok","last_seen"])
-    agg = (
-        df.groupby("ticker")
-          .agg(scans=("ticker","count"),
-               min_dist_bps=("dist_bps","min"),
-               weekly_ok=("cond_weekly_stage_ok","max"),
-               last_seen=("elapsed_min","max"))
-          .sort_values(["min_dist_bps","scans"], ascending=[True, False])
+    return near, near_now
+
+
+def summarize_near_miss(near: pd.DataFrame) -> List[NearMissRec]:
+    if near is None or near.empty:
+        return []
+    g = (
+        near.groupby("ticker")
+        .agg(
+            scans=("ticker", "count"),
+            min_dist_bps=("dist_bps", "min"),
+            weekly_ok=("cond_weekly_stage_ok", "max"),
+            last_seen=("ts_min", "max"),
+        )
+        .sort_values(["min_dist_bps", "scans"], ascending=[True, False])
     )
-    return agg
+    out: List[NearMissRec] = []
+    for t, row in g.iterrows():
+        out.append(
+            NearMissRec(
+                ticker=str(t),
+                scans=int(row["scans"]) if pd.notna(row["scans"]) else 0,
+                min_dist_bps=float(row["min_dist_bps"]) if pd.notna(row["min_dist_bps"]) else float("inf"),
+                weekly_ok=bool(row["weekly_ok"]) if pd.notna(row["weekly_ok"]) else False,
+                last_seen=float(row["last_seen"]) if pd.notna(row["last_seen"]) else None,
+            )
+        )
+    return out
 
-def near_now_candidates(df: pd.DataFrame, bps_threshold: float) -> pd.DataFrame:
-    """Candidates where all gates green except price AND price within threshold below pivot."""
-    if df.empty:
-        return df
-    mask = (
-        (df["dist_bps"] >= 0) &
-        (df["dist_bps"] <= bps_threshold) &
-        df["cond_weekly_stage_ok"] &
-        df["cond_rs_ok"] &
-        df["cond_ma_ok"] &
-        df["cond_pivot_ok"] &
-        df["cond_buy_vol_ok"] &
-        df["cond_pace_full_gate"] &
-        df["cond_near_pace_gate"] &
-        (df["cond_buy_price_ok"] == False)
-    )
-    return df[mask].copy().sort_values(["dist_bps","elapsed_min"], ascending=[True, False])
 
-# -----------------------
-# State file
-# -----------------------
+def gate_explain(df: pd.DataFrame, tickers: List[str]) -> List[GateStats]:
+    if df is None or df.empty or not tickers:
+        return []
+    out: List[GateStats] = []
+    cols = [
+        "cond_weekly_stage_ok",
+        "cond_rs_ok",
+        "cond_ma_ok",
+        "cond_pivot_ok",
+        "cond_buy_vol_ok",
+        "cond_pace_full_gate",
+        "cond_near_pace_gate",
+        "cond_buy_price_ok",
+    ]
+    for t in tickers:
+        sdf = df[df["ticker"] == t]
+        if sdf.empty:
+            out.append(GateStats(ticker=t, rows=0, gate_true_pct={}, min_dist_bps=None))
+            continue
+        gate_pct: Dict[str, float] = {}
+        for c in cols:
+            if c in sdf.columns and len(sdf[c]) > 0:
+                gate_pct[c] = float(sdf[c].astype(bool).mean()) * 100.0
+        min_dist = None
+        if "dist_bps" in sdf.columns and not sdf["dist_bps"].isna().all():
+            try:
+                min_dist = float(sdf["dist_bps"].min())
+            except Exception:
+                min_dist = None
+        out.append(GateStats(ticker=t, rows=len(sdf), gate_true_pct=gate_pct, min_dist_bps=min_dist))
+    return out
 
-def load_state(path: str) -> Dict:
+
+# ----------------------------
+# State & logging
+# ----------------------------
+
+def load_state(path: Optional[str]) -> Dict:
     if not path or not os.path.exists(path):
-        return {"tickers": {}, "runs": []}
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"tickers": {}, "runs": []}
+        return {}
 
-def update_state(state: Dict, agg: pd.DataFrame, run_ts: str) -> Dict:
-    tickers = state.get("tickers", {})
-    for t, row in agg.reset_index().itertuples(index=False):
-        info = tickers.get(t, {})
-        info["min_dist_bps"] = float(row.min_dist_bps) if pd.notna(row.min_dist_bps) else None
-        info["scans"] = int(row.scans) if pd.notna(row.scans) else 0
-        info["weekly_ok"] = bool(row.weekly_ok) if pd.notna(row.weekly_ok) else False
-        info["last_seen"] = int(row.last_seen) if pd.notna(row.last_seen) else None
-        info["last_updated"] = run_ts
-        tickers[t] = info
-    state["tickers"] = tickers
-    state.setdefault("runs", []).append(run_ts)
-    # de-dup & keep last 50 run stamps
-    state["runs"] = list(dict.fromkeys(state["runs"]))[-50:]
-    return state
 
-def save_state(state: Dict, path: str) -> None:
+def save_state(path: Optional[str], state: Dict) -> None:
     if not path:
         return
+    tmp = path + ".tmp"
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
 
-# -----------------------
-# Explainer
-# -----------------------
 
-def first_failing_gates(row: pd.Series) -> List[str]:
-    """Return names of gates that are False (in order), excluding cond_buy_price_ok."""
-    failing = []
-    for c in COND_COLS_ORDER[:-1]:
-        v = row.get(c, False)
-        if not bool(v):
-            failing.append(c)
-    # handle price gate separately at the end
-    if not bool(row.get("cond_buy_price_ok", False)):
-        failing.append("cond_buy_price_ok")
-    return failing
+def append_log_csv(path: Optional[str], rows: List[Dict]):
+    if not path or not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+    fieldnames = sorted({k for r in rows for k in r.keys()})
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
 
-def explain_tickers(df: pd.DataFrame, tickers: Iterable[str], limit_rows: int = 8) -> str:
-    if df is None or df.empty:
-        return "No CSV rows available to explain."
-    lines: List[str] = []
-    cols_to_show = ["elapsed_min","price","pivot","dist_bps"] + COND_COLS_ORDER
-    for t in tickers:
-        sub = df[df["ticker"] == t].copy()
-        lines.append(f"\n--- Explanation for {t} ---")
-        if sub.empty:
-            lines.append("No rows found.")
-            continue
-        sub = sub.sort_values("elapsed_min").tail(limit_rows)
-        for _, r in sub.iterrows():
-            failing = first_failing_gates(r)
-            # compact gate string
-            gate_str = ", ".join([g.replace("cond_","") for g in failing]) or "ALL_PASS"
-            em = int(r["elapsed_min"]) if pd.notna(r["elapsed_min"]) else -1
-            price = float(r["price"]) if pd.notna(r["price"]) else float("nan")
-            pivot = float(r["pivot"]) if pd.notna(r["pivot"]) else float("nan")
-            dist = float(r["dist_bps"]) if pd.notna(r["dist_bps"]) else float("nan")
-            lines.append(
-                f"t+{em:>4}m  price={price:.2f}  pivot={pivot:.2f}  dist_bps={dist:>7.1f}  failing=[{gate_str}]"
-            )
-    return "\n".join(lines)
 
-# -----------------------
-# Summary writer
-# -----------------------
+# ----------------------------
+# Rendering
+# ----------------------------
 
-def write_summary(
-    outdir: str,
-    run_ts: str,
-    had_csv: bool,
-    near_universe_count: int,
-    near_agg: Optional[pd.DataFrame],
-    near_now: Optional[pd.DataFrame],
-    explained_text: Optional[str],
-    outfile_hint: Optional[str] = None,
-) -> str:
+def write_summary(outdir: str,
+                  ts: str,
+                  csv_ok: bool,
+                  near_universe: List[str],
+                  near_miss: List[NearMissRec],
+                  near_now_df: pd.DataFrame,
+                  explain_stats: List[GateStats]) -> str:
     os.makedirs(outdir, exist_ok=True)
-    fname = outfile_hint or f"diag_summary_{run_ts}.txt"
-    path = os.path.join(outdir, fname)
+    path = os.path.join(outdir, f"diag_summary_{ts}.txt")
 
-    def df_head(df: Optional[pd.DataFrame], n=20) -> str:
-        if df is None or df.empty:
-            return "(none)"
-        with pd.option_context("display.max_columns", 100, "display.width", 160):
-            return df.head(n).to_string()
-
-    lines = []
-    lines.append(f"=== Weinstein Intraday Diagnostics @ {run_ts} ===")
-    lines.append("CSV: " + ("OK" if had_csv else "No valid intraday_debug.csv found or file empty."))
-    lines.append(f"Near-universe tickers discovered in HTML: {near_universe_count} (saved: near_universe.txt)")
+    lines: List[str] = []
+    lines.append(f"=== Weinstein Intraday Diagnostics @ {ts} ===")
+    lines.append("CSV: " + ("OK" if csv_ok else "No valid intraday_debug.csv found or file empty."))
+    lines.append(f"Near-universe tickers discovered in HTML: {len(near_universe)} (saved: near_universe.txt)")
     lines.append("")
+
+    # Near-miss table
     lines.append("Top near-miss by ticker (min distance, scans, weekly_ok, last_seen):")
-    lines.append(df_head(near_agg))
+    if near_miss:
+        for r in near_miss[:30]:
+            last_seen = "-" if r.last_seen is None else f"{r.last_seen:.0f}m"
+            lines.append(
+                f"  {r.ticker:<6}  min_dist={r.min_dist_bps:>7.1f} bps  scans={r.scans:>3}  weekly_ok={str(r.weekly_ok):<5}  last_seen={last_seen}"
+            )
+    else:
+        lines.append("(none)")
     lines.append("")
+
+    # Near-NOW
     lines.append("Near-NOW (within bps threshold and all gates except price):")
-    lines.append(df_head(near_now))
-    if explained_text:
+    if near_now_df is not None and not near_now_df.empty:
+        show_cols = [c for c in ["ticker", "price", "pivot", "dist_bps", "elapsed_min"] if c in near_now_df.columns]
+        sample = near_now_df.sort_values("dist_bps").head(25)
+        for _, row in sample.iterrows():
+            t = row.get("ticker", "?")
+            dist = row.get("dist_bps", None)
+            em = row.get("elapsed_min", None)
+            price = row.get("price", None)
+            pivot = row.get("pivot", None)
+            lines.append(
+                f"  {t:<6} price={price!s:<8} pivot={pivot!s:<8} dist_bps={(dist if pd.notna(dist) else '?'):>7} elapsed_min={(int(em) if pd.notna(em) else '-'):<4}"
+            )
+    else:
+        lines.append("(none)")
+    lines.append("")
+
+    # Explainers
+    if explain_stats:
+        lines.append("Gate explainers:")
+        for st in explain_stats:
+            lines.append(f"  {st.ticker}: rows={st.rows}  min_dist_bps={st.min_dist_bps if st.min_dist_bps is not None else '-'}")
+            if st.gate_true_pct:
+                gates = ", ".join([f"{k}={v:.0f}%" for k, v in st.gate_true_pct.items()])
+                lines.append(f"    {gates}")
         lines.append("")
-        lines.append("=== Explain Results ===")
-        lines.append(explained_text)
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
+        f.write("\n".join(lines) + "\n")
     return path
 
-# -----------------------
+
+# ----------------------------
 # Main
-# -----------------------
+# ----------------------------
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Diagnose intraday 'near trigger' behavior.")
-    p.add_argument("--csv", required=False, default="./output/intraday_debug.csv",
-                   help="Path to intraday_debug.csv")
-    p.add_argument("--outdir", required=False, default="./output",
-                   help="Output directory for summary/near_universe/state")
-    p.add_argument("--html-glob", required=False, default="./output/intraday_watch_*.html",
-                   help="Glob for intraday_watch HTML snapshots")
-    p.add_argument("--state", required=False, default="./output/diag_state.json",
-                   help="JSON state file path (created/updated)")
-    p.add_argument("--bps-threshold", type=float, default=25.0,
-                   help="Max distance to pivot (in bps) to consider 'near-NOW'")
-    p.add_argument("--min-scans", type=int, default=2,
-                   help="Minimum scans for a ticker to appear in top near-miss aggregate")
-    p.add_argument("--explain", type=str, default="",
-                   help="Comma-separated tickers to explain (e.g. MU,DDOG)")
-    return p.parse_args(argv)
+def main():
+    ap = argparse.ArgumentParser(description="Diagnose Weinstein intraday near-misses and near-now candidates")
+    ap.add_argument("--csv", default="", help="Path to intraday_debug.csv")
+    ap.add_argument("--outdir", required=True, help="Output directory for summary and artifacts")
+    ap.add_argument("--html-glob", default="", help="Glob for intraday_watch_*.html to build near_universe.txt")
+    ap.add_argument("--state", default="", help="Path to JSON state for persistence across runs")
+    ap.add_argument("--log-csv", default="", help="Optional: append long-form diagnostics to this CSV")
+    ap.add_argument("--bps-thresh", type=float, default=25.0, help="Basis points from pivot to include in near-now")
+    ap.add_argument("--min-scans", type=int, default=1, help="Minimum scans to show a ticker in near-miss table")
+    ap.add_argument("--explain", default="", help="Comma-separated list of tickers to explain gates for")
+    ap.add_argument("--dump-candidates", default="", help="Optional path to dump raw near-now candidates CSV")
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    run_ts = dt.datetime.now().strftime(TS_FMT)
+    args = ap.parse_args()
 
-    # 1) Extract near-universe tickers from HTML
-    near_universe_path = os.path.join(args.outdir, "near_universe.txt")
-    tickers_set = extract_near_universe(args.html_glob, near_universe_path)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # 2) Load CSV (safe)
-    df = safe_read_csv(args.csv)
-    had_csv = df is not None and not df.empty
+    # 1) Build near-universe from HTML
+    near_universe: List[str] = []
+    if args.html_glob:
+        near_universe = build_near_universe_from_html(args.html_glob)
+        # write it
+        nu_path = os.path.join(args.outdir, "near_universe.txt")
+        with open(nu_path, "w", encoding="utf-8") as f:
+            for t in near_universe:
+                f.write(t + "\n")
 
-    near_miss_df = pd.DataFrame()
-    near_now_df  = pd.DataFrame()
-    agg_df       = pd.DataFrame()
-    explained_text = ""
+    # 2) Load CSV & compute near-miss + near-now
+    df = read_csv_if_any(args.csv)
+    csv_ok = df is not None and not df.empty
 
-    if had_csv:
-        # Ensure columns & compute fields
-        df = ensure_columns(df)
-        if not df.empty:
-            df = add_computed_columns(df)
+    near_miss_list: List[NearMissRec] = []
+    near_now_df = pd.DataFrame()
 
-            # Compute near-miss set
-            near_miss_df, passed_df = compute_near_misses(df)
+    if csv_ok:
+        near_miss_df, near_now_df_raw = compute_near_miss(df)
 
-            # Aggregate near-miss per ticker
-            agg_df = aggregate_per_ticker(near_miss_df)
-            if args.min_scans > 1 and not agg_df.empty:
-                agg_df = agg_df[agg_df["scans"] >= args.min_scans].copy()
+        # Filter near-now by threshold: price just under pivot is positive dist_bps
+        if not near_now_df_raw.empty:
+            near_now_df = near_now_df_raw.copy()
+            with pd.option_context("mode.chained_assignment", None):
+                near_now_df = near_now_df[(near_now_df["dist_bps"] >= 0) & (near_now_df["dist_bps"] <= args.bps_thresh)]
 
-            # Find near-NOW within threshold
-            near_now_df = near_now_candidates(near_miss_df, args.bps_threshold)
+        # Aggregate near-miss
+        near_miss_list = [r for r in summarize_near_miss(near_miss_df) if r.scans >= args.min_scans]
 
-            # Explain tickers if requested
-            if args.explain.strip():
-                to_explain = [t.strip().upper() for t in args.explain.split(",") if t.strip()]
-                explained_text = explain_tickers(df, to_explain, limit_rows=12)
+        # Optional: log rows
+        if args.log_csv:
+            log_rows: List[Dict] = []
+            if not near_miss_df.empty:
+                for _, r in near_miss_df.iterrows():
+                    log_rows.append({**{c: r.get(c) for c in df.columns}, "ts": ts, "kind": "near_miss"})
+            if not near_now_df.empty:
+                for _, r in near_now_df.iterrows():
+                    log_rows.append({**{c: r.get(c) for c in df.columns}, "ts": ts, "kind": "near_now"})
+            append_log_csv(args.log_csv, log_rows)
 
-            # Update state
-            state = load_state(args.state)
-            state = update_state(state, agg_df, run_ts)
-            save_state(state, args.state)
+        # Optional: dump raw near-now
+        if args.dump_candidates and not near_now_df.empty:
+            near_now_df.to_csv(args.dump_candidates, index=False)
 
-    # 3) Write summary
-    summary_name = f"diag_summary_{run_ts}.txt"
+    # 3) Explainers
+    explain_list = [t.strip().upper() for t in args.explain.split(",") if t.strip()] if args.explain else []
+    explain_stats: List[GateStats] = gate_explain(df, explain_list) if csv_ok and explain_list else []
+
+    # 4) Persist state (best-effort; we just store latest near_miss tickers + timestamp)
+    state = load_state(args.state)
+    if csv_ok:
+        state.setdefault("runs", []).append({
+            "ts": ts,
+            "near_miss": [asdict(r) for r in near_miss_list[:50]],
+            "near_universe_sample": near_universe[:50],
+        })
+        # keep last 50
+        state["runs"] = state["runs"][-50:]
+        save_state(args.state, state)
+
+    # 5) Write summary
     summary_path = write_summary(
         outdir=args.outdir,
-        run_ts=run_ts,
-        had_csv=had_csv,
-        near_universe_count=len(tickers_set),
-        near_agg=agg_df,
-        near_now=near_now_df,
-        explained_text=explained_text,
-        outfile_hint=summary_name,
+        ts=ts,
+        csv_ok=csv_ok,
+        near_universe=near_universe,
+        near_miss=near_miss_list,
+        near_now_df=near_now_df,
+        explain_stats=explain_stats,
     )
 
-    # 4) Print final pointers
     print("Diagnostics complete.")
-    print(f"- Near-universe: {near_universe_path}")
+    if near_universe:
+        print(f"- Near-universe: {os.path.join(args.outdir, 'near_universe.txt')}")
     print(f"- Summary:      {summary_path}")
-    return 0
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
