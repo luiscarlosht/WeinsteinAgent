@@ -3,6 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Activate virtual environment
+source /home/luiscarlosht/WeinsteinAgent/.venv/bin/activate
+
 echo "⚡ Intraday watcher using config: ./config.yaml"
 # Long-side intraday: keep this as test-only for now
 python3 weinstein_intraday_watcher.py \
