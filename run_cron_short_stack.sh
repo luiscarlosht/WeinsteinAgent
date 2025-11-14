@@ -8,8 +8,9 @@ echo "⚡ Intraday watcher using config: ./config.yaml"
 python3 weinstein_intraday_watcher.py \
   --config ./config.yaml \
   --test-ease \
-  --log-csv ./output/intraday_debug.csv \
-  --dry-run
+  --log-csv ./output/intraday_debug.csv 
+  #\
+  #--dry-run
 
 echo "✅ Intraday tick complete."
 echo "⚡ Signal Engine on: ./output/intraday_debug.csv"
