@@ -7,8 +7,8 @@ Adds:
 - Per-position Snapshot (sorted worst → best) with colored $/%, and badge pills
 - Keeps weekly summary card; holdings section now bundles both
 - Same trigger logic, diagnostics CSV/JSON, HTML save, optional dry run
-- NEW: "Order Block" proposing entries/stops for BUY/SELL (stocks + crypto)
-- NEW: SELL triggers only emitted for actual holdings (Open_Positions.csv)
+- "Order Block" proposing entries/stops for BUY/SELL (stocks + crypto)
+- NEW: Alert Levels for BUY triggers (low stop + 15% / 20% upside targets)
 """
 
 import os, io, json, math, base64, yaml, argparse
@@ -61,6 +61,13 @@ OPEN_POSITIONS_CSV_CANDIDATES = [
 ]
 
 VERBOSE = True
+
+# ---- NEW: Alert-level tunables ----
+# For each BUY trigger we will:
+# - compute entry & protective stop (Weinstein-style),
+# - and upside alerts at +15% and +20% off the entry.
+ALERT_TARGET_PCTS = [0.15, 0.20]   # 15% and 20% upside
+ALERT_CSV_PATH = "./output/alert_levels_latest.csv"
 
 # ---- Optional Google Sheets pull (Signals) ----
 try:
@@ -544,6 +551,7 @@ def _propose_entry_stop_for_buy(ticker, px, pivot, ma30, atr):
     elif pd.notna(px):
         entry = float(px)
 
+    # candidates for stop
     hard = entry * (1.0 - HARD_STOP_PCT) if entry else np.nan
     atr_trail = (entry - TRAIL_ATR_MULT * atr) if (entry and pd.notna(atr)) else np.nan
     ma_guard = (ma30 * 0.97) if pd.notna(ma30) else np.nan
@@ -641,6 +649,96 @@ def _build_order_block_text(buys, sell_trigs, pos_sells):
     lines.append(f"Rules: entry≈pivot+{PIVOT_ENTRY_BUFFER_PCT*100:.2f}% | stop=min(hard {HARD_STOP_PCT*100:.1f}%, ATR×{TRAIL_ATR_MULT:.1f}, MA150−3%).")
     return "\n".join(lines)
 
+# ---------------- NEW: Alert Levels helpers ----------------
+def _compute_alert_rows_for_buys(buy_signals):
+    """
+    For each BUY trigger, compute:
+      - entry (same as Order Block)
+      - Weinstein-style protective stop
+      - +15% / +20% upside alerts
+    Returns a list of dicts suitable for CSV and email.
+    """
+    rows = []
+    for it in buy_signals:
+        t = it["ticker"]
+        px = it.get("price", np.nan)
+        pivot = it.get("pivot", np.nan)
+        ma = it.get("ma30", np.nan)
+        atr = it.get("atr", np.nan)
+        entry, stop = _propose_entry_stop_for_buy(t, px, pivot, ma, atr)
+        if entry is None or pd.isna(entry):
+            continue
+        targets = []
+        for pt in ALERT_TARGET_PCTS:
+            targets.append(entry * (1.0 + pt))
+        row = {
+            "ticker": t,
+            "entry": float(entry),
+            "protective_stop": float(stop) if pd.notna(stop) else np.nan,
+        }
+        # label targets as target_15, target_20, etc.
+        for pt, val in zip(ALERT_TARGET_PCTS, targets):
+            key = f"target_{int(pt*100)}"
+            row[key] = float(val)
+        rows.append(row)
+    return rows
+
+def _build_alert_block_html(alert_rows):
+    if not alert_rows:
+        return ""
+    css = """
+    <style>
+      .alerttbl { border-collapse: collapse; width:100%; margin-top:10px; }
+      .alerttbl th, .alerttbl td { border-bottom:1px solid #eee; padding:6px 8px; font-size:13px; text-align:left; }
+      .alerttbl th { background:#fafafa; }
+    </style>
+    """
+    header_cols = ["Ticker","Entry (approx)","Protective Stop (Low Alert)"]
+    for pt in ALERT_TARGET_PCTS:
+        header_cols.append(f"High Alert +{int(pt*100)}%")
+    header_html = "".join(f"<th>{c}</th>" for c in header_cols)
+    body_rows = []
+    for r in alert_rows:
+        cells = [
+            r["ticker"],
+            _fmt_num(r.get("entry")),
+            _fmt_num(r.get("protective_stop")),
+        ]
+        for pt in ALERT_TARGET_PCTS:
+            key = f"target_{int(pt*100)}"
+            cells.append(_fmt_num(r.get(key)))
+        body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    html = css + """
+    <h4>Alert Levels for New BUY Triggers</h4>
+    <p style="font-size:12px;color:#555;">
+      Use these as <b>price alerts</b> in Fidelity (or your broker). Protective stop is based on Weinstein-style
+      support/MA + ATR; high alerts are simple +15% / +20% upside from the suggested entry.
+    </p>
+    <table class="alerttbl">
+      <thead><tr>{hdr}</tr></thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+    """.format(hdr=header_html, rows="".join(body_rows))
+    return html
+
+def _build_alert_block_text(alert_rows):
+    if not alert_rows:
+        return ""
+    lines = ["ALERT LEVELS for BUY triggers (for broker price alerts):"]
+    for r in alert_rows:
+        t = r["ticker"]
+        entry = _fmt_num(r.get("entry"))
+        stop = _fmt_num(r.get("protective_stop"))
+        ups = []
+        for pt in ALERT_TARGET_PCTS:
+            key = f"target_{int(pt*100)}"
+            ups.append(f"+{int(pt*100)}%={_fmt_num(r.get(key))}")
+        ups_str = ", ".join(ups)
+        lines.append(f"- {t}: entry≈{entry}, low alert (protective stop)≤{stop}, high alerts: {ups_str}")
+    return "\n".join(lines)
+
 # ---------------- Main logic ----------------
 def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log_csv=None, log_json=None, dry_run=False):
     log("Intraday watcher starting with config: {0}".format(_config_path), level="step")
@@ -662,30 +760,13 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
     log(f"Focus universe: {len(focus)} symbols (Stage 1/2).", level="info")
 
-    # Positions state (for ATR / hard stops) and holdings (for SELL gating)
     state = load_positions()
-    held_positions = state.get("positions", {})
-
-    holdings_for_gate = _load_open_positions_local()
-    if holdings_for_gate is not None and not holdings_for_gate.empty:
-        try:
-            held_symbols = sorted(
-                set(str(s).strip().upper() for s in holdings_for_gate["Symbol"].dropna().tolist())
-            )
-        except Exception:
-            held_symbols = []
-    else:
-        held_symbols = sorted(held_positions.keys())
-
-    if held_symbols:
-        log(f"Held symbols detected: {held_symbols}", level="debug")
-    else:
-        log("No held symbols detected (Open_Positions.csv and positions.json empty).", level="debug")
-
-    trigger_state = _load_intraday_state()
+    held = state.get("positions", {}) or {}
+    if held:
+        log(f"Held symbols detected: {sorted(held.keys())}", level="debug")
 
     # Benchmarks to ensure RS charts render: equity + crypto
-    needs = sorted(set(focus["ticker"].tolist() + [benchmark, CRYPTO_BENCHMARK] + held_symbols))
+    needs = sorted(set(focus["ticker"].tolist() + [benchmark, CRYPTO_BENCHMARK]))
 
     log("Downloading intraday + daily bars...", level="step")
     intraday, daily = get_intraday(needs)
@@ -701,6 +782,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             return float(last_closes.get(t, np.nan))
         vals = getattr(last_closes, "values", [])
         return float(vals[-1]) if len(vals) else np.nan
+
+    trigger_state = _load_intraday_state()
 
     buy_signals, near_signals, sell_signals = [], [], []
     sell_triggers, sell_from_positions, info_rows, chart_imgs = [], [], [], []
@@ -727,7 +810,6 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         if np.isnan(px):
             continue
 
-        is_held = t in held_symbols
         stage = str(row["stage"]); ma30 = float(row.get("ma30", np.nan))
         rs_above = bool(row.get("rs_above_ma", False))
         weekly_rank = float(row.get("weekly_rank", np.nan))
@@ -747,7 +829,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "pace_full_vs50dma": None if pd.isna(pace) else float(pace),
             "pace_intrabar": None if pd.isna(pace_intra) else float(pace_intra),
             "elapsed_min": elapsed,
-            "is_held": is_held,
+            "held": (t in held),
         })
         d["cond"]["weekly_stage_ok"] = stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
         d["cond"]["rs_ok"] = bool(rs_ok)
@@ -798,19 +880,15 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                     near_now = True
         d["cond"]["near_now"] = bool(near_now)
 
-        # --- SELL near/confirm (only meaningful if is_held) ---
+        # --- SELL near/confirm ---
         sell_near_now = False; sell_confirm = False; sell_vol_ok = True
         sell_price_ok = False
-        if is_held and ma_ok and pd.notna(px):
+        if ma_ok and pd.notna(px):
             sell_near_now = _near_sell_zone(px, ma30)
             if INTRADAY_INTERVAL == "60m":
                 sell_price_ok = _price_below_ma(px, ma30)
                 sell_vol_ok = (pd.isna(pace_intra) or (pace_intra >= _SELL_INTRABAR_VOLPACE_MIN))
-                sell_confirm = bool(
-                    sell_price_ok
-                    and (elapsed is not None and elapsed >= _SELL_INTRABAR_CONFIRM_MIN_ELAPSED)
-                    and sell_vol_ok
-                )
+                sell_confirm = bool(sell_price_ok and (elapsed is not None and elapsed >= _SELL_INTRABAR_CONFIRM_MIN_ELAPSED) and sell_vol_ok)
             else:
                 closes_n2 = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
                 if closes_n2:
@@ -829,7 +907,6 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "state":"IDLE", "near_hits":[], "cooldown":0,
             "sell_state":"IDLE", "sell_hits":[], "sell_cooldown":0
         })
-
         # BUY hits
         st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, NEAR_HITS_WINDOW)
         if st.get("cooldown", 0) > 0: st["cooldown"] = int(st["cooldown"]) - 1
@@ -842,26 +919,22 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         elif st["cooldown"] == 0 and not near_now and not confirm: state_now = "IDLE"
         st["state"] = state_now
 
-        # SELL hits — only if this is actually a held position
-        if is_held:
-            st["sell_hits"], sell_hit_count = _update_hits(st.get("sell_hits", []), sell_near_now, SELL_NEAR_HITS_WINDOW)
-            if st.get("sell_cooldown", 0) > 0: st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
-            sell_state = st.get("sell_state", "IDLE")
-            if sell_state == "IDLE" and sell_near_now: sell_state = "NEAR"
-            elif sell_state in ("IDLE","NEAR") and sell_hit_count >= _SELL_NEAR_HITS_MIN: sell_state = "ARMED"
-            elif sell_state == "ARMED" and sell_confirm and sell_vol_ok:
-                sell_state = "TRIGGERED"; st["sell_cooldown"] = SELL_COOLDOWN_SCANS
-            elif st["sell_cooldown"] > 0 and not sell_near_now: sell_state = "COOLDOWN"
-            elif st["sell_cooldown"] == 0 and not sell_near_now and not sell_confirm: sell_state = "IDLE"
-            st["sell_state"] = sell_state
-        else:
-            # Non-held symbols never progress the SELL state
-            st["sell_state"] = st.get("sell_state", "IDLE")
+        # SELL hits
+        st["sell_hits"], sell_hit_count = _update_hits(st.get("sell_hits", []), sell_near_now, SELL_NEAR_HITS_WINDOW)
+        if st.get("sell_cooldown", 0) > 0: st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
+        sell_state = st.get("sell_state", "IDLE")
+        if sell_state == "IDLE" and sell_near_now: sell_state = "NEAR"
+        elif sell_state in ("IDLE","NEAR") and sell_hit_count >= _SELL_NEAR_HITS_MIN: sell_state = "ARMED"
+        elif sell_state == "ARMED" and sell_confirm and sell_vol_ok:
+            sell_state = "TRIGGERED"; st["sell_cooldown"] = SELL_COOLDOWN_SCANS
+        elif st["sell_cooldown"] > 0 and not sell_near_now: sell_state = "COOLDOWN"
+        elif st["sell_cooldown"] == 0 and not sell_near_now and not sell_confirm: sell_state = "IDLE"
+        st["sell_state"] = sell_state
 
         trigger_state[ts_key] = st
 
-        # --- SELL risk (tracked positions.json, regardless of Stage) ---
-        pos = held_positions.get(t)
+        # --- SELL risk (tracked positions.json) ---
+        pos = held.get(t)
         if pos:
             entry = float(pos.get("entry", np.nan))
             hard_stop = float(pos.get("stop", np.nan)) if pd.notna(pos.get("stop", np.nan)) \
@@ -896,7 +969,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                     "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "reason": "near/armed", "atr": atr
                 })
 
-        if is_held and st["sell_state"] == "TRIGGERED":
+        if st["sell_state"] == "TRIGGERED":
             sell_triggers.append({
                 "ticker": t, "price": px, "ma30": ma30, "stage": stage,
                 "weekly_rank": weekly_rank, "pace": None if pd.isna(pace) else float(pace), "atr": atr
@@ -910,11 +983,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "weekly_rank": weekly_rank,
             "buy_state": st["state"], "sell_state": st["sell_state"],
         })
-        debug_rows.append({
-            "ticker": t, **d["metrics"],
-            **{f"cond_{k}": v for k,v in d["cond"].items()},
-            "state": st["state"], "sell_state": st["sell_state"],
-        })
+        debug_rows.append({"ticker": t, **d["metrics"],
+                           **{f"cond_{k}": v for k,v in d["cond"].items()},
+                           "state": st["state"], "sell_state": st["sell_state"]})
 
     log(f"Scan done. Raw counts → BUY:{len(buy_signals)} NEAR:{len(near_signals)} SELLTRIG:{len(sell_triggers)}", level="info")
 
@@ -956,8 +1027,6 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         # Summary + colored snapshot (worst → best)
         metrics = _compute_portfolio_metrics(pos_norm)
         holdings_block_html = _colored_summary_html(metrics) + _holdings_snapshot_html(merged)
-    else:
-        sell_from_positions = []
 
     # -------- Ranking & charts --------
     buy_signals.sort(key=buy_sort_key); near_signals.sort(key=near_sort_key); sell_triggers.sort(key=sell_sort_key)
@@ -981,6 +1050,17 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
     log(f"Charts prepared: {len(chart_imgs)}", level="debug")
 
+    # -------- Alert levels for BUY triggers (Topic 1) --------
+    alert_rows = _compute_alert_rows_for_buys(buy_signals)
+    # write dedicated CSV for quick input into Fidelity
+    if alert_rows:
+        try:
+            os.makedirs(os.path.dirname(ALERT_CSV_PATH), exist_ok=True)
+            pd.DataFrame(alert_rows).to_csv(ALERT_CSV_PATH, index=False)
+            log(f"Wrote alert levels CSV → {ALERT_CSV_PATH}", level="ok")
+        except Exception as e:
+            log(f"Failed writing alert levels CSV: {e}", level="warn")
+
     # -------- Build Email --------
     info_df = pd.DataFrame(info_rows)
     if not info_df.empty:
@@ -999,26 +1079,18 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             src_label = " (Position SELL)" if src == "positions" else ""
             if kind == "SELL":
                 price_str = f"{it['price']:.2f}" if pd.notna(it.get("price", np.nan)) else "—"
-                lis.append(
-                    f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {price_str} — {it.get('reasons','')} "
-                    f"({it.get('stage','')}, weekly {wr_str}){src_label}</li>"
-                )
+                lis.append(f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {price_str} — {it.get('reasons','')} (" \
+                           f"{it.get('stage','')}, weekly {wr_str}){src_label}</li>")
             elif kind == "SELLTRIG":
                 ma = it.get("ma30", np.nan)
                 ma_str = f"{ma:.2f}" if pd.notna(ma) else "—"
                 pace_val = it.get("pace", None)
                 pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
-                lis.append(
-                    f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} "
-                    f"(↓ MA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})</li>"
-                )
+                lis.append(f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} (↓ MA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})</li>")
             else:
                 pace_val = it.get("pace", None)
                 pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
-                lis.append(
-                    f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} "
-                    f"(pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
-                )
+                lis.append(f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} (pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>")
         return "<ol>" + "\n".join(lis) + "</ol>"
 
     charts_html = ""
@@ -1062,6 +1134,11 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     if order_block_html:
         html += order_block_html
 
+    # ------ ALERT BLOCK (HTML) ------
+    alert_block_html = _build_alert_block_html(alert_rows)
+    if alert_block_html:
+        html += alert_block_html
+
     html += f"""
     <h4>Snapshot (ordered by weekly rank & stage)</h4>
     {pd.DataFrame(info_rows).to_html(index=False)}
@@ -1081,23 +1158,14 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                 ma_str = f"{ma:.2f}" if pd.notna(ma) else "—"
                 pace_val = it.get("pace", None)
                 pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
-                out.append(
-                    f"{i}. {it['ticker']} @ {it['price']:.2f} "
-                    f"(below MA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})"
-                )
+                out.append(f"{i}. {it['ticker']} @ {it['price']:.2f} (below MA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})")
             elif kind == "SELL":
                 price_str = f"{it['price']:.2f}" if pd.notna(it.get("price", np.nan)) else "—"
-                out.append(
-                    f"{i}. {it['ticker']} @ {price_str} — {it.get('reasons','')} "
-                    f"({it.get('stage','')}, weekly {wr_str})"
-                )
+                out.append(f"{i}. {it['ticker']} @ {price_str} — {it.get('reasons','')} ({it.get('stage','')}, weekly {wr_str})")
             else:
                 pace_val = it.get("pace", None)
                 pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
-                out.append(
-                    f"{i}. {it['ticker']} @ {it['price']:.2f} "
-                    f"(pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})"
-                )
+                out.append(f"{i}. {it['ticker']} @ {it['price']:.2f} (pivot {it['pivot']:.2f}, pace {pace_str}, {it['stage']}, weekly {wr_str})")
         return "\n".join(out) if out else f"No {kind} signals."
 
     text = (
@@ -1111,6 +1179,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     order_block_text = _build_order_block_text(buy_signals, sell_triggers, sell_from_positions)
     if order_block_text:
         text += "\n" + order_block_text + "\n"
+
+    alert_block_text = _build_alert_block_text(alert_rows)
+    if alert_block_text:
+        text += "\n" + alert_block_text + "\n"
 
     # Persist state & diagnostics
     _save_intraday_state(trigger_state)
@@ -1139,10 +1211,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     except Exception as e:
         log(f"Cannot save HTML: {e}", level="warn")
 
-    subject_counts = (
-        f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / "
-        f"{len(sell_triggers)} SELL-TRIG / {len(sell_signals)} SELL"
-    )
+    subject_counts = f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_triggers)} SELL-TRIG / {len(sell_signals)} SELL"
     if dry_run:
         log("DRY-RUN set — skipping email send.", level="warn")
     else:
