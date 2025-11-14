@@ -1,32 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Default locations
-CSV="./output/short_debug.csv"
-OUTDIR="./output"
+# Defaults
+CSV_DEFAULT="./output/short_debug.csv"
+OUTDIR_DEFAULT="./output"
+BPS_DEFAULT=50          # basis points threshold for short signals
+WINDOW_DEFAULT=390      # minutes (full regular session)
 
-# Default thresholds (can be overridden via flags below)
-BPS_THRESHOLD=50      # 0.50% move
-WINDOW_MIN=390        # up to one full regular session in minutes
+CSV="$CSV_DEFAULT"
+OUTDIR="$OUTDIR_DEFAULT"
+BPS="$BPS_DEFAULT"
+WINDOW_MIN="$WINDOW_DEFAULT"
 
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") [options] [-- extra_args...]
-
-Options:
-  --csv PATH            Path to short debug CSV (default: ${CSV})
-  --outdir DIR          Output directory (default: ${OUTDIR})
-  --bps N               Basis-point threshold (default: ${BPS_THRESHOLD})
-  --window-min N        Max elapsed_min window in minutes (default: ${WINDOW_MIN})
-  -h, --help            Show this help
-
-Any arguments after '--' are passed directly to short_signal_engine.py
-(e.g. --explain CRM).
-EOF
-}
-
-# Parse our simple flags; stop at '--'
 EXTRA_ARGS=()
+
+# Simple CLI parsing for the wrapper
+# Known options: --csv, --outdir, --bps, --window-min
+# Everything else (e.g. --explain CRM) is forwarded to Python.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --csv)
@@ -38,40 +28,37 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --bps)
-      BPS_THRESHOLD="$2"
+      BPS="$2"
       shift 2
       ;;
     --window-min)
       WINDOW_MIN="$2"
       shift 2
       ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
     --)
+      # Explicit end of wrapper options; everything after this goes to Python
       shift
-      EXTRA_ARGS=("$@")
-      break
+      while [[ $# -gt 0 ]]; do
+        EXTRA_ARGS+=("$1")
+        shift
+      done
       ;;
     *)
-      # Unknown option; treat as extra arg for the Python tool
+      # Unknown flag/arg → pass through to Python (e.g. --explain CRM)
       EXTRA_ARGS+=("$1")
       shift
       ;;
   esac
 done
 
-echo "⚡ Short Signal Engine on: ${CSV}"
-echo "   → outdir:      ${OUTDIR}"
-echo "   → bps:         ${BPS_THRESHOLD}"
-echo "   → window-min:  ${WINDOW_MIN}"
+echo "⚡ Short Signal Engine on: $CSV"
+echo "   → outdir:      $OUTDIR"
+echo "   → bps:         $BPS"
+echo "   → window-min:  $WINDOW_MIN"
 
 python3 tools/short_signal_engine.py \
-  --csv "${CSV}" \
-  --outdir "${OUTDIR}" \
-  --bps-threshold "${BPS_THRESHOLD}" \
-  --window-min "${WINDOW_MIN}" \
-  "${EXTRA_ARGS[@]:-}"
-
-echo "✅ Short signal engine complete."
+  --csv "$CSV" \
+  --outdir "$OUTDIR" \
+  --window-min "$WINDOW_MIN" \
+  --bps-threshold "$BPS" \
+  "${EXTRA_ARGS[@]}"
