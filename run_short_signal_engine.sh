@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Defaults
+# Wrapper for tools/short_signal_engine.py
+
 CSV_DEFAULT="./output/short_debug.csv"
 OUTDIR_DEFAULT="./output"
-BPS_DEFAULT=50          # basis points threshold for short signals
+BPS_DEFAULT=50          # basis-point threshold placeholder (not used yet)
 WINDOW_DEFAULT=390      # minutes (full regular session)
 
 CSV="$CSV_DEFAULT"
@@ -14,7 +15,6 @@ WINDOW_MIN="$WINDOW_DEFAULT"
 
 EXTRA_ARGS=()
 
-# Simple CLI parsing for the wrapper
 # Known options: --csv, --outdir, --bps, --window-min
 # Everything else (e.g. --explain CRM) is forwarded to Python.
 while [[ $# -gt 0 ]]; do
@@ -36,7 +36,6 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --)
-      # Explicit end of wrapper options; everything after this goes to Python
       shift
       while [[ $# -gt 0 ]]; do
         EXTRA_ARGS+=("$1")
@@ -44,7 +43,6 @@ while [[ $# -gt 0 ]]; do
       done
       ;;
     *)
-      # Unknown flag/arg → pass through to Python (e.g. --explain CRM)
       EXTRA_ARGS+=("$1")
       shift
       ;;
@@ -60,5 +58,5 @@ python3 tools/short_signal_engine.py \
   --csv "$CSV" \
   --outdir "$OUTDIR" \
   --window-min "$WINDOW_MIN" \
-  --bps-threshold "$BPS" \
+  --bps "$BPS" \
   "${EXTRA_ARGS[@]}"
