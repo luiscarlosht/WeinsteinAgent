@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weinstein Short Intraday Watcher — Stage 4 short setups
+Weinstein Short Watcher — Stage 4 short setups
 
 - Uses weekly Weinstein scan (equities) to build a Stage 4 (Downtrend) universe
 - Intraday checks around 10-week pivot LOW and 30-week MA proxy (SMA150)
@@ -833,6 +833,17 @@ def run(
         level="info",
     )
 
+    # ---- TEST MODE SUMMARY (SHORTS) ----
+    if os.getenv("INTRADAY_TEST", "0") == "1":
+        print("=== SHORT TEST MODE SUMMARY ===")
+        print(f"Short TRIG signals: {len(trig_shorts)}")
+        print(f"Short NEAR signals: {len(near_shorts)}")
+        if trig_shorts or near_shorts:
+            print("Email gate (short): WOULD SEND (TRIG/NEAR present).")
+        else:
+            print("Email gate (short): SKIPPED (no TRIG/NEAR shorts).")
+        print("================================")
+
     # Ranking & charts
     near_shorts.sort(key=short_sort_key)
     trig_shorts.sort(key=short_sort_key)
@@ -1002,18 +1013,18 @@ def run(
     except Exception as e:
         log(f"Cannot save HTML: {e}", level="warn")
 
-    # -------- NEW: Email only when short signals exist --------
+    # -------- Email only when TRIG/NEAR shorts exist --------
     has_shorts = bool(trig_shorts or near_shorts)
 
     if not has_shorts:
-        log("No short triggers / near setups present — skipping email send.", level="info")
+        log("No short TRIG/NEAR setups present — skipping email send.", level="info")
         if dry_run:
             log("DRY-RUN set — no email would be sent anyway.", level="debug")
         return
 
     subject_counts = f"{len(trig_shorts)} TRIG / {len(near_shorts)} NEAR"
     if dry_run:
-        log("DRY-RUN set — skipping email send.", level="warn")
+        log("DRY-RUN set — would send email (short TRIG/NEAR present).", level="warn")
     else:
         log("Sending email...", level="step")
         send_email(
