@@ -6,16 +6,17 @@ Build Google Sheets dashboard tabs:
 - Realized_Trades
 - Open_Positions
 - Performance_By_Source
+- Performance_By_Month        (NEW)
 - OpenLots_Detail
 - Open_Positions_Snapshot
 - Weekly_Report
-- Options_Results               (NEW)
+- Options_Results             (NEW)
 
 Also writes local CSVs under ./output:
 - Open_Positions.csv
-- Options_Results.csv           (NEW)
+- Options_Results.csv         (NEW)
 
-What's new for options:
+Options:
 - Signals rows whose Ticker starts with "-" are parsed as option codes in the form:
     -<UNDERLYING><YY><MM><DD><C|P><STRIKE>
   Example: -PLTR251114C190 → underlying=PLTR, expiration=2025-11-14, right=C, strike=190
@@ -58,10 +59,11 @@ TAB_HOLDINGS     = "Holdings"
 TAB_REALIZED     = "Realized_Trades"
 TAB_OPEN         = "Open_Positions"
 TAB_PERF         = "Performance_By_Source"
+TAB_MONTHLY      = "Performance_By_Month"      # NEW
 TAB_OPEN_DETAIL  = "OpenLots_Detail"
 TAB_SNAPSHOT     = "Open_Positions_Snapshot"
 TAB_WEEKLY       = "Weekly_Report"
-TAB_OPTIONS      = "Options_Results"          # NEW
+TAB_OPTIONS      = "Options_Results"           # NEW
 
 DEFAULT_EXCHANGE_PREFIX = "NYSE: "
 ROW_CHUNK = 500
@@ -220,7 +222,6 @@ def parse_option_code(code: str) -> Optional[dict]:
 
 def occ_like_text_frag(opt: dict) -> str:
     """Text fragment to find the option in Transactions description."""
-    # Many brokers include strings like "AAPL 11/21/25 270 C" or "AAPL Nov 21 2025 270.00 Call"
     y, m, d = opt["Expiration"].split("-")
     return f"{opt['Underlying']} {int(m):02d}/{int(d):02d}/{y} {int(opt['Strike'])} {opt['Right']}"
 
@@ -680,12 +681,6 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
     rows = []
     for _, r in options_df.iterrows():
         code = r["Code"]
-        frag = occ_like_text_frag({
-            "Underlying": r["Underlying"],
-            "Expiration": r["Expiration"],
-            "Right": r["Right"],
-            "Strike": r["Strike"]
-        })
         mask = df["__desc"].str.upper().str.contains(r["Underlying"].upper(), na=False)
         mask &= df["__desc"].str.contains(r"\b" + re.escape(r["Right"]) + r"\b", flags=re.IGNORECASE, regex=True, na=False)
         # Match date in either 11/21/2025 or 11/21/25 style
@@ -724,7 +719,10 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
 
         # P/L approximation: sum of Amount (broker exports typically: buys negative, sells positive)
         pnl = float(np.nansum(cand["__amt"]))
-        net_qty = float(np.nansum(cand["__qty"] * np.where(_is_buy_row(cand["__type"]) | _is_buy_row(cand["__action"]), 1, -1)))
+        direction_factor = np.where(
+            _is_buy_row(cand["__type"]) | _is_buy_row(cand["__action"]), 1, -1
+        )
+        net_qty = float(np.nansum(cand["__qty"] * direction_factor))
 
         if abs(net_qty) > 1e-9:
             status = "OPEN"
@@ -747,7 +745,7 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
     return out
 
 # ─────────────────────────────
-# PERFORMANCE TABLE (unchanged)
+# PERFORMANCE TABLE (by Source)
 # ─────────────────────────────
 def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
     if realized_df.empty:
@@ -812,6 +810,76 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
 
     perf = pd.concat([totals_row, perf.sort_values(["Source"]).reset_index(drop=True)], ignore_index=True)
     return perf
+
+# ─────────────────────────────
+# PERFORMANCE TABLE (by Month) – NEW
+# ─────────────────────────────
+def build_perf_by_month(realized_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Monthly breakdown of realized trades across all sources.
+
+    Output columns:
+      Month (YYYY-MM), Trades, Wins, WinRate%, AvgReturn%, MedianReturn%, TotalPnL$
+    """
+    if realized_df is None or realized_df.empty:
+        return pd.DataFrame(columns=[
+            "Month","Trades","Wins","WinRate%","AvgReturn%","MedianReturn%","TotalPnL$"
+        ])
+
+    df = realized_df.copy()
+
+    # Ensure ExitTimeUTC is datetime
+    df["ExitTimeUTC"] = pd.to_datetime(df["ExitTimeUTC"], errors="coerce", utc=True)
+
+    # Month bucket (UTC, YYYY-MM)
+    df["Month"] = df["ExitTimeUTC"].dt.tz_convert("UTC").dt.to_period("M").astype(str)
+
+    # Numeric fields
+    df["ret"] = pd.to_numeric(df["Return%"], errors="coerce")
+    df["EntryPrice_num"] = pd.to_numeric(df["EntryPrice"], errors="coerce")
+    df["ExitPrice_num"] = pd.to_numeric(df["ExitPrice"], errors="coerce")
+    df["Qty_num"] = pd.to_numeric(df["Qty"], errors="coerce")
+
+    # PnL per row: Qty * (Exit - Entry)
+    df["PnL$"] = (df["ExitPrice_num"] - df["EntryPrice_num"]) * df["Qty_num"]
+
+    df["is_win"] = df["ret"] > 0
+
+    g = df.groupby("Month", dropna=True)
+
+    out = pd.DataFrame({
+        "Month": g.size().index,
+        "Trades": g.size().values,
+        "Wins": g["is_win"].sum().values,
+        "WinRate%": (g["is_win"].mean().fillna(0.0).values * 100).round(2),
+        "AvgReturn%": g["ret"].mean().round(2).values,
+        "MedianReturn%": g["ret"].median().round(2).values,
+        "TotalPnL$": g["PnL$"].sum().round(2).values,
+    })
+
+    # Sort chronologically by Month
+    out = out.sort_values("Month").reset_index(drop=True)
+
+    # Optional overall row
+    if len(out):
+        total_trades = int(out["Trades"].sum())
+        total_wins = int(out["Wins"].sum())
+        overall_winrate = round((total_wins / total_trades) * 100, 2) if total_trades else 0.0
+        overall_avg_ret = float(np.nanmean(df["ret"])) if len(df["ret"]) else 0.0
+        overall_median_ret = float(np.nanmedian(df["ret"])) if len(df["ret"]) else 0.0
+        total_pnl = float(np.nansum(df["PnL$"]))
+        totals_row = pd.DataFrame([{
+            "Month": "(ALL)",
+            "Trades": total_trades,
+            "Wins": total_wins,
+            "WinRate%": overall_winrate,
+            "AvgReturn%": round(overall_avg_ret, 2),
+            "MedianReturn%": round(overall_median_ret, 2),
+            "TotalPnL$": round(total_pnl, 2),
+        }])
+        out = pd.concat([totals_row, out], ignore_index=True)
+
+    return out
 
 # ─────────────────────────────
 # SNAPSHOT / WEEKLY (unchanged)
@@ -895,6 +963,7 @@ def main():
     tab_signals = resolve_tab_name(cfg, "signals_tab", TAB_SIGNALS)
     tab_openpos = resolve_tab_name(cfg, "open_positions_tab", TAB_OPEN)
     tab_perf    = TAB_PERF
+    tab_month   = TAB_MONTHLY
     tab_real    = TAB_REALIZED
     tab_open_det= TAB_OPEN_DETAIL
     tab_tx      = TAB_TRANSACTIONS
@@ -944,6 +1013,8 @@ def main():
     if (not args.no_live) and (not open_df.empty) and (price_source == "sheets"):
         mapping = read_mapping(gc, sheet_url)
         open_df = add_live_price_formulas(open_df, mapping)
+    else:
+        mapping = read_mapping(gc, sheet_url)
 
     # Column order
     if not realized_df.empty:
@@ -959,6 +1030,8 @@ def main():
 
     # Performance & OpenLots_Detail (equities)
     perf_df = build_perf_by_source(realized_df.copy(), open_df.copy())
+    monthly_df = build_perf_by_month(realized_df.copy())  # NEW
+
     open_detail_df = pd.DataFrame()
     if not open_df.empty:
         detail_cols = [c for c in ["Source","Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen","Timeframe","SignalTimeUTC","SignalPrice","PriceNow","Unrealized%"] if c in open_df.columns]
@@ -971,24 +1044,26 @@ def main():
     ws_real = open_ws(gc, sheet_url, tab_real)
     ws_open = open_ws(gc, sheet_url, tab_openpos)
     ws_perf = open_ws(gc, sheet_url, tab_perf)
+    ws_month = open_ws(gc, sheet_url, tab_month)       # NEW
     ws_open_detail = open_ws(gc, sheet_url, tab_open_det)
     ws_opts = open_ws(gc, sheet_url, TAB_OPTIONS)
 
     write_tab(ws_real, realized_df)
     write_tab(ws_open, open_df)
     write_tab(ws_perf, perf_df)
+    write_tab(ws_month, monthly_df)                    # NEW
     write_tab(ws_open_detail, open_detail_df)
     write_tab(ws_opts, options_results_df)
 
     print(f"✅ Wrote {tab_real}: {len(realized_df)} rows")
     print(f"✅ Wrote {tab_openpos}: {len(open_df)} rows")
     print(f"✅ Wrote {tab_perf}: {len(perf_df)} rows")
+    print(f"✅ Wrote {tab_month}: {len(monthly_df)} rows")
     print(f"✅ Wrote {tab_open_det}: {len(open_detail_df)} rows")
     print(f"✅ Wrote {TAB_OPTIONS}: {len(options_results_df)} rows")
 
     # Snapshot + Weekly + CSVs
     try:
-        mapping = read_mapping(gc, sheet_url)
         snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping=mapping, price_source=price_source)
         ws_snapshot = open_ws(gc, sheet_url, TAB_SNAPSHOT)
         write_tab(ws_snapshot, snapshot_df)
