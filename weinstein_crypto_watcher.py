@@ -97,7 +97,8 @@ def load_config(path):
     universe = crypto.get("universe") or [
         "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "AVAX-USD", "BCH-USD",
         "DOGE-USD", "LINK-USD", "LTC-USD", "MATIC-USD", "NEAR-USD",
-        "TON-USD", "TRX-USD", "XRP-USD", "ARB-USD"
+        "TON-USD", "TRX-USD", "XRP-USD"
+        # ARB-USD intentionally removed from default universe
     ]
     return cfg, sheet_url, svc_file, universe
 
@@ -358,6 +359,9 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
             .fillna(999999)
             .astype(int)
         )
+
+    # Explicitly drop ARB-USD from the crypto scan universe
+    focus = focus[focus["ticker"] != "ARB-USD"].copy()
 
     if only:
         filt = set([t.strip().upper() for t in only])
@@ -837,18 +841,23 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
     if dry_run:
         log("DRY-RUN set — skipping email send.", level="warn")
     else:
-        counts = (
-            f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / "
-            f"{len(sell_triggers)} SELL-TRIG"
-        )
-        log("Sending email...", level="step")
-        send_email(
-            subject=f"Crypto Watch — {counts}",
-            html_body=html,
-            text_body=text,
-            cfg_path=config_path,
-        )
-        log("Email sent.", level="ok")
+        # Only send email when there is at least one BUY or SELL trigger
+        triggers_present = (len(buy_signals) > 0) or (len(sell_triggers) > 0)
+        if not triggers_present:
+            log("No BUY/SELL triggers present — skipping email send.", level="info")
+        else:
+            counts = (
+                f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / "
+                f"{len(sell_triggers)} SELL-TRIG"
+            )
+            log("Sending email...", level="step")
+            send_email(
+                subject=f"Crypto Watch — {counts}",
+                html_body=html,
+                text_body=text,
+                cfg_path=config_path,
+            )
+            log("Email sent.", level="ok")
 
 
 # ---------------- CLI ----------------
