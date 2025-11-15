@@ -26,7 +26,7 @@ echo "⚡ Short-side intraday run using config: ./config.yaml"
 # SHORT-SIDE: TEST-EASE BUT LIVE EMAIL (NO --dry-run)
 python3 weinstein_short_watcher.py \
   --config ./config.yaml \
-  --test-ease \
+  #--test-ease \
   --log-csv ./output/short_debug.csv
 
 echo "⚡ Short Signal Engine on: ./output/short_debug.csv"
