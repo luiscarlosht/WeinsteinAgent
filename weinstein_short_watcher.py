@@ -797,4 +797,373 @@ def run(
                     "pivot_low": pivot_low,
                     "stage": stage,
                     "weekly_rank": weekly_rank,
-                    "pace": None if pd.isna(pace_full) e_
+                    "pace": None if pd.isna(pace_full) else float(pace_full),
+                    "atr": atr,
+                }
+            )
+            short_state[t]["short_state"] = "COOLDOWN"
+        elif st["short_state"] in ("NEAR", "ARMED"):
+            if cond["near_pace_gate"]:
+                near_shorts.append(
+                    {
+                        "ticker": t,
+                        "price": px,
+                        "ma30": ma30,
+                        "pivot_low": pivot_low,
+                        "stage": stage,
+                        "weekly_rank": weekly_rank,
+                        "pace": None if pd.isna(pace_full) else float(pace_full),
+                        "atr": atr,
+                    }
+                )
+
+        # Ready-to-close state (cover) — one-shot event with cooldown
+        cover_state = st.get("cover_state", "IDLE")
+        cover_cd = int(st.get("cover_cooldown", 0))
+
+        if short_cover_now and cover_state == "IDLE":
+            # Emit READY-CLOSE event once, then go into cooldown so we don't spam
+            cover_shorts.append(
+                {
+                    "ticker": t,
+                    "price": px,
+                    "ma30": ma30,
+                    "pivot_low": pivot_low,
+                    "stage": stage,
+                    "weekly_rank": weekly_rank,
+                    "pace": None if pd.isna(pace_full) else float(pace_full),
+                    "atr": atr,
+                }
+            )
+            cover_state = "COOLDOWN"
+            cover_cd = SHORT_COVER_COOLDOWN_SCANS
+        elif not short_cover_now and cover_state == "COOLDOWN":
+            if cover_cd > 0:
+                cover_cd -= 1
+            if cover_cd == 0:
+                cover_state = "IDLE"
+
+        st["cover_state"] = cover_state
+        st["cover_cooldown"] = cover_cd
+
+        short_state[t] = st
+
+        info_rows.append(
+            {
+                "ticker": t,
+                "stage": stage,
+                "price": px,
+                "ma30": ma30,
+                "pivot_low_10w": pivot_low,
+                "vol_pace_vs50dma": None
+                if pd.isna(pace_full)
+                else round(float(pace_full), 2),
+                "weekly_rank": weekly_rank,
+                "short_state": st["short_state"],
+                "short_cover_now": cond["short_cover_now"],
+            }
+        )
+
+        row_debug = {
+            "ticker": t,
+            **metrics,
+            **{f"cond_{k}": v for k, v in cond.items()},
+            "short_state": st["short_state"],
+            "short_hits": st.get("short_hits", []),
+            "short_cooldown": st.get("short_cooldown", 0),
+            "cover_state": st.get("cover_state", "IDLE"),
+            "cover_cooldown": st.get("cover_cooldown", 0),
+        }
+        debug_rows.append(row_debug)
+
+    log(
+        f"Scan done. Shorts → NEAR:{len(near_shorts)} TRIG:{len(trig_shorts)} READY:{len(cover_shorts)}",
+        level="info",
+    )
+
+    # ---- TEST MODE SUMMARY (SHORTS) ----
+    if os.getenv("INTRADAY_TEST", "0") == "1":
+        print("=== SHORT TEST MODE SUMMARY ===")
+        print(f"Short TRIG signals: {len(trig_shorts)}")
+        print(f"Short NEAR signals: {len(near_shorts)}")
+        print(f"Short READY-CLOSE signals: {len(cover_shorts)}")
+        if trig_shorts or near_shorts or cover_shorts:
+            print("Email gate (short): WOULD SEND (TRIG/NEAR/READY present).")
+        else:
+            print("Email gate (short): SKIPPED (no TRIG/NEAR/READY shorts).")
+        print("================================")
+
+    # Ranking & charts
+    near_shorts.sort(key=short_sort_key)
+    trig_shorts.sort(key=short_sort_key)
+    cover_shorts.sort(key=short_sort_key)
+
+    charts_added = 0
+    for item in trig_shorts:
+        if charts_added >= MAX_CHARTS_PER_EMAIL:
+            break
+        t = item["ticker"]
+        path, data_uri = make_tiny_chart_png(t, BENCHMARK_DEFAULT, daily)
+        if data_uri:
+            chart_imgs.append((t, data_uri))
+            charts_added += 1
+    if charts_added < MAX_CHARTS_PER_EMAIL:
+        for item in near_shorts:
+            if charts_added >= MAX_CHARTS_PER_EMAIL:
+                break
+            t = item["ticker"]
+            path, data_uri = make_tiny_chart_png(t, BENCHMARK_DEFAULT, daily)
+            if data_uri:
+                chart_imgs.append((t, data_uri))
+                charts_added += 1
+    if charts_added < MAX_CHARTS_PER_EMAIL:
+        for item in cover_shorts:
+            if charts_added >= MAX_CHARTS_PER_EMAIL:
+                break
+            t = item["ticker"]
+            path, data_uri = make_tiny_chart_png(t, BENCHMARK_DEFAULT, daily)
+            if data_uri:
+                chart_imgs.append((t, data_uri))
+                charts_added += 1
+
+    log(f"Charts prepared: {len(chart_imgs)}", level="debug")
+
+    # Build email
+    def bullets(items, kind):
+        if not items:
+            if kind == "TRIG":
+                return "<p>No TRIG shorts.</p>"
+            elif kind == "NEAR":
+                return "<p>No NEAR shorts.</p>"
+            else:
+                return "<p>No READY-CLOSE shorts.</p>"
+        lis = []
+        for i, it in enumerate(items, start=1):
+            wr = it.get("weekly_rank", None)
+            wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+            px = it.get("price", np.nan)
+            piv = it.get("pivot_low", np.nan)
+            ma = it.get("ma30", np.nan)
+            pace_val = it.get("pace", None)
+            pace_str = (
+                "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+            )
+            atr = it.get("atr", np.nan)
+            entry, stop, t1, t2 = _short_entry_stop_targets(px, ma, piv, atr)
+            if kind == "TRIG":
+                label = "TRIG short"
+            elif kind == "NEAR":
+                label = "NEAR short"
+            else:
+                label = "READY-CLOSE short"
+            lis.append(
+                f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {px:.2f} "
+                f"({label}, entry≈{_fmt_num(entry)}, stop≥{_fmt_num(stop)}, "
+                f"targets↓ [{_fmt_num(t1)}, {_fmt_num(t2)}], "
+                f"{it.get('stage','')}, weekly {wr_str}, pace {pace_str})</li>"
+            )
+        return "<ol>" + "\n".join(lis) + "</ol>"
+
+    charts_html = ""
+    if chart_imgs:
+        charts_html = "<h4>Charts (Price + SMA150, RS / benchmark)</h4>"
+        for t, data_uri in chart_imgs:
+            charts_html += f"""
+            <div style="display:inline-block;margin:6px 8px 10px 0;vertical-align:top;text-align:center;">
+              <img src="{data_uri}" alt="{t}" style="border:1px solid #eee;border-radius:6px;max-width:320px;">
+              <div style="font-size:12px;color:#555;margin-top:3px;">{t}</div>
+            </div>
+            """
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    html = f"""
+    <h3>Weinstein Short Intraday Watch — {now}</h3>
+    <p><i>
+      SHORT-TRIGGER: Weekly Stage 4 (Downtrend) + confirmed breakdown under ~10-week pivot low and/or 30-wk MA proxy (SMA150),
+      by ≈{SHORT_BREAK_PCT*100:.1f}% with volume pace ≥ {VOL_PACE_MIN:.1f}×. For 60m bars: ≥{INTRABAR_CONFIRM_MIN_ELAPSED} min
+      elapsed & intrabar pace ≥ {INTRABAR_VOLPACE_MIN:.1f}×.<br>
+      NEAR-SHORT: Stage 4 + RS not above its MA, price hanging just above the pivot/MA breakdown zone (within
+      +{NEAR_ABOVE_PIVOT_PCT*100:.1f}% over pivot or hugging MA150), volume pace ≥ {NEAR_VOL_PACE_MIN:.1f}×.<br>
+      READY-TO-CLOSE (SHORT): Stage 4 names where price has reclaimed MA150 by ≈{SHORT_COVER_RECOVER_PCT*100:.1f}% or more,
+      suggesting the short thesis is weakening and it's time to consider covering.
+    </i></p>
+    """
+
+    html += f"""
+    <h4>Short Triggers (ranked)</h4>
+    {bullets(trig_shorts, "TRIG")}
+    <h4>Near Short Setups (ranked)</h4>
+    {bullets(near_shorts, "NEAR")}
+    <h4>Ready-to-Close Shorts (ranked)</h4>
+    {bullets(cover_shorts, "COVER")}
+    {charts_html}
+    """
+
+    order_block_html = _build_order_block_html(trig_shorts, near_shorts, cover_shorts)
+    if order_block_html:
+        html += order_block_html
+
+    # Snapshot table
+    if info_rows:
+        info_df = pd.DataFrame(info_rows)
+        info_df["stage_rank"] = info_df["stage"].apply(stage_order)
+        info_df["weekly_rank"] = (
+            pd.to_numeric(info_df["weekly_rank"], errors="coerce")
+            .fillna(999999)
+            .astype(int)
+        )
+        info_df = info_df.sort_values(
+            ["weekly_rank", "stage_rank", "ticker"]
+        ).drop(columns=["stage_rank"])
+        html += "<h4>Snapshot</h4>" + info_df.to_html(index=False)
+
+    # Plain text
+    def _lines(items, kind):
+        out = []
+        for i, it in enumerate(items, 1):
+            wr = it.get("weekly_rank", None)
+            wr_str = f"#{int(wr)}" if (wr is not None and pd.notna(wr)) else "—"
+            px = it.get("price", np.nan)
+            piv = it.get("pivot_low", np.nan)
+            ma = it.get("ma30", np.nan)
+            pace_val = it.get("pace", None)
+            pace_str = (
+                "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+            )
+            atr = it.get("atr", np.nan)
+            entry, stop, t1, t2 = _short_entry_stop_targets(px, ma, piv, atr)
+            if kind == "TRIG":
+                label = "TRIG short"
+            elif kind == "NEAR":
+                label = "NEAR short"
+            else:
+                label = "READY-CLOSE short"
+            out.append(
+                f"{i}. {it['ticker']} @ {px:.2f} "
+                f"({label}, entry≈{_fmt_num(entry)}, stop≥{_fmt_num(stop)}, "
+                f"targets↓ [{_fmt_num(t1)}, {_fmt_num(t2)}], "
+                f"{it.get('stage','')}, weekly {wr_str}, pace {pace_str})"
+            )
+        return "\n".join(out) if out else (
+            "No TRIG shorts." if kind == "TRIG" else
+            "No NEAR shorts." if kind == "NEAR" else
+            "No READY-CLOSE shorts."
+        )
+
+    text = (
+        f"Weinstein Short Intraday Watch — {now}\n\n"
+        f"Short TRIGGERS (ranked):\n{_lines(trig_shorts, 'TRIG')}\n\n"
+        f"NEAR short setups (ranked):\n{_lines(near_shorts, 'NEAR')}\n\n"
+        f"Ready-to-close shorts (ranked):\n{_lines(cover_shorts, 'COVER')}\n\n"
+    )
+
+    order_block_text = _build_order_block_text(trig_shorts, near_shorts, cover_shorts)
+    if order_block_text:
+        text += "\n" + order_block_text + "\n"
+
+    # Persist state & diagnostics
+    _save_short_state(short_state)
+
+    if log_csv:
+        try:
+            pd.DataFrame(debug_rows).to_csv(log_csv, index=False)
+            log(f"Wrote diagnostics CSV → {log_csv}", level="ok")
+        except Exception as e:
+            log(f"Failed writing diagnostics CSV: {e}", level="warn")
+
+    if log_json:
+        try:
+            with open(log_json, "w") as f:
+                json.dump({"rows": debug_rows}, f, indent=2, default=str)
+            log(f"Wrote diagnostics JSON → {log_json}", level="ok")
+        except Exception as e:
+            log(f"Failed writing diagnostics JSON: {e}", level="warn")
+
+    # Save HTML
+    os.makedirs("./output", exist_ok=True)
+    html_path = os.path.join(
+        "./output", f"short_watch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    )
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        log(f"Saved HTML → {html_path}", level="ok")
+    except Exception as e:
+        log(f"Cannot save HTML: {e}", level="warn")
+
+    # -------- Email only when TRIG/NEAR/READY shorts exist --------
+    has_shorts = bool(trig_shorts or near_shorts or cover_shorts)
+
+    if not has_shorts:
+        log("No short TRIG/NEAR/READY setups present — skipping email send.", level="info")
+        if dry_run:
+            log("DRY-RUN set — no email would be sent anyway.", level="debug")
+        return
+
+    subject_counts = f"{len(trig_shorts)} TRIG / {len(near_shorts)} NEAR / {len(cover_shorts)} READY"
+    if dry_run:
+        log("DRY-RUN set — would send email (short TRIG/NEAR/READY present).", level="warn")
+    else:
+        log("Sending email...", level="step")
+        send_email(
+            subject=f"Short Intraday Watch — {subject_counts}",
+            html_body=html,
+            text_body=text,
+            cfg_path=_config_path,
+        )
+        log("Email sent.", level="ok")
+
+
+# ---------------- CLI ----------------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="./config.yaml")
+    ap.add_argument("--quiet", action="store_true", help="reduce console noise")
+    ap.add_argument(
+        "--only",
+        type=str,
+        default="",
+        help="comma list of tickers to restrict evaluation (e.g. CRM,FDS)",
+    )
+    ap.add_argument(
+        "--test-ease",
+        action="store_true",
+        help="enable trigger easing for testing (or set INTRADAY_TEST=1)",
+    )
+    ap.add_argument(
+        "--log-csv",
+        type=str,
+        default="",
+        help="path to write per-ticker diagnostics CSV",
+    )
+    ap.add_argument(
+        "--log-json",
+        type=str,
+        default="",
+        help="path to write per-ticker diagnostics JSON",
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true", help="don’t send email"
+    )
+    args = ap.parse_args()
+
+    VERBOSE = not args.quiet
+    only = (
+        [s.strip().upper() for s in args.only.split(",") if s.strip()]
+        if args.only
+        else None
+    )
+
+    try:
+        run(
+            _config_path=args.config,
+            only_tickers=only,
+            test_ease=args.test_ease,
+            log_csv=args.log_csv or None,
+            log_json=args.log_json or None,
+            dry_run=args.dry_run,
+        )
+        log("Short tick complete.", level="ok")
+    except Exception as e:
+        log(f"Error: {e}", level="err")
+        raise
