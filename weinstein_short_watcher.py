@@ -155,6 +155,7 @@ def load_weekly_report():
     df = pd.read_csv(path)
     return df, path
 
+
 def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
     """
     Load tickers from the Google Sheet Signals tab that should be treated as
@@ -190,20 +191,40 @@ def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
         log(f"READY filter: could not load Signals tab '{tab_name}': {e}", level="warn")
         return None
 
+    def _cell_to_str(v) -> str:
+        """Safely coerce any cell value (int/float/None/str) to a string."""
+        if v is None:
+            return ""
+        try:
+            return str(v)
+        except Exception:
+            return ""
+
     tickers = set()
     for r in rows:
-        t = (r.get("Ticker") or r.get("ticker") or "").strip().upper()
+        raw_t = r.get("Ticker", None)
+        if raw_t is None:
+            raw_t = r.get("ticker", None)
+        t = _cell_to_str(raw_t).strip().upper()
         if not t:
             continue
-        direction = str(r.get("Direction") or r.get("direction") or "").strip().upper()
+
+        raw_dir = r.get("Direction", None)
+        if raw_dir is None:
+            raw_dir = r.get("direction", None)
+        direction = _cell_to_str(raw_dir).strip().upper()
+
+        # Only care about shorts / sells
         if direction not in ("SELL", "SHORT"):
             continue
-        # Basic sanity: ignore very weird non-symbol strings; but in practice,
-        # options/crypto/etc. won't be in the Stage 4 universe anyway.
+
         tickers.add(t)
 
-    log(f"READY filter: loaded {len(tickers)} short tickers from Signals tab '{tab_name}'.", level="info")
-    return tickers
+    log(
+        f"READY filter: loaded {len(tickers)} short tickers from Signals tab '{tab_name}'.",
+        level="info",
+    )
+    return tickers or None
 
 # ---------------- State helpers ----------------
 def _load_short_state():
