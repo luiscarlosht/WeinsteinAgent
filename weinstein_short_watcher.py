@@ -77,13 +77,20 @@ VERBOSE = True
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
+
 def log(msg, *, level="info"):
     if not VERBOSE and level == "debug":
         return
     prefix = {
-        "info":"•","ok":"✅","step":"▶️","warn":"⚠️","err":"❌","debug":"··"
+        "info": "•",
+        "ok": "✅",
+        "step": "▶️",
+        "warn": "⚠️",
+        "err": "❌",
+        "debug": "··",
     }.get(level, "•")
     print(f"{prefix} [{_ts()}] {msg}", flush=True)
+
 
 def _safe_div(a, b):
     try:
@@ -92,6 +99,7 @@ def _safe_div(a, b):
         return a / b
     except Exception:
         return np.nan
+
 
 def _is_crypto(sym: str) -> bool:
     return (sym or "").upper().endswith("-USD")
@@ -109,9 +117,13 @@ def load_config(path):
     svc_file  = google.get("service_account_json")
     return cfg, benchmark, sheet_url, svc_file
 
+
 def newest_weekly_csv():
-    files = [f for f in os.listdir(WEEKLY_OUTPUT_DIR)
-             if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")]
+    files = [
+        f
+        for f in os.listdir(WEEKLY_OUTPUT_DIR)
+        if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
+    ]
     if not files:
         raise FileNotFoundError(
             f"No weekly CSV found in {WEEKLY_OUTPUT_DIR}. "
@@ -119,6 +131,7 @@ def newest_weekly_csv():
         )
     files.sort(reverse=True)
     return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
+
 
 def load_weekly_report():
     path = newest_weekly_csv()
@@ -134,9 +147,11 @@ def _load_short_state():
             return json.load(f)
     return {}
 
+
 def _save_short_state(st):
     with open(SHORT_STATE_FILE, "w") as f:
         json.dump(st, f, indent=2)
+
 
 def _update_hits(window_arr, hit, window):
     window_arr = (window_arr or [])
@@ -144,6 +159,7 @@ def _update_hits(window_arr, hit, window):
     if len(window_arr) > window:
         window_arr = window_arr[-window:]
     return window_arr, sum(window_arr)
+
 
 def _elapsed_in_current_bar_minutes(intraday_df, ticker):
     try:
@@ -153,6 +169,7 @@ def _elapsed_in_current_bar_minutes(intraday_df, ticker):
             ts = intraday_df["Close"].dropna().index[-1]
         last_bar_start = pd.Timestamp(ts).to_pydatetime()
         from datetime import datetime as _dt
+
         return max(0, int((_dt.utcnow() - last_bar_start).total_seconds() // 60))
     except Exception:
         return 0
@@ -161,14 +178,23 @@ def _elapsed_in_current_bar_minutes(intraday_df, ticker):
 def get_intraday(tickers):
     uniq = list(dict.fromkeys(tickers))
     intraday = yf.download(
-        uniq, period=f"{LOOKBACK_DAYS}d", interval=INTRADAY_INTERVAL,
-        auto_adjust=True, ignore_tz=True, progress=False
+        uniq,
+        period=f"{LOOKBACK_DAYS}d",
+        interval=INTRADAY_INTERVAL,
+        auto_adjust=True,
+        ignore_tz=True,
+        progress=False,
     )
     daily = yf.download(
-        uniq, period="24mo", interval="1d",
-        auto_adjust=True, ignore_tz=True, progress=False
+        uniq,
+        period="24mo",
+        interval="1d",
+        auto_adjust=True,
+        ignore_tz=True,
+        progress=False,
     )
     return intraday, daily
+
 
 def compute_atr(daily_df, t, n=14):
     if isinstance(daily_df.columns, pd.MultiIndex):
@@ -178,16 +204,17 @@ def compute_atr(daily_df, t, n=14):
             return np.nan
     else:
         sub = daily_df
-    if not {"High","Low","Close"}.issubset(set(sub.columns)):
+    if not {"High", "Low", "Close"}.issubset(set(sub.columns)):
         return np.nan
     h, l, c = sub["High"], sub["Low"], sub["Close"]
     prev_c = c.shift(1)
     tr = pd.concat(
         [(h - l), (h - prev_c).abs(), (l - prev_c).abs()],
-        axis=1
+        axis=1,
     ).max(axis=1)
     atr = tr.rolling(n).mean()
     return float(atr.dropna().iloc[-1]) if len(atr.dropna()) else np.nan
+
 
 def last_weekly_pivot_low(ticker, daily_df, weeks=PIVOT_LOOKBACK_WEEKS):
     bars = weeks * (7 if _is_crypto(ticker) else 5)
@@ -200,6 +227,7 @@ def last_weekly_pivot_low(ticker, daily_df, weeks=PIVOT_LOOKBACK_WEEKS):
         lows = daily_df["Low"]
     lows = lows.dropna().tail(bars)
     return float(lows.min()) if len(lows) else np.nan
+
 
 def volume_pace_today_vs_50dma(ticker, daily_df):
     """Projected full-day volume vs 50-day avg."""
@@ -219,21 +247,22 @@ def volume_pace_today_vs_50dma(ticker, daily_df):
     if _is_crypto(ticker):
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elapsed = max(0.0, (now - day_start).total_seconds())
-        fraction = min(1.0, max(0.05, elapsed / (24*3600.0)))
+        fraction = min(1.0, max(0.05, elapsed / (24 * 3600.0)))
     else:
         minutes = now.hour * 60 + now.minute
-        start = 13*60 + 30
-        end   = 20*60 + 0
+        start = 13 * 60 + 30
+        end = 20 * 60 + 0
         if minutes <= start:
             fraction = 0.05
         elif minutes >= end:
             fraction = 1.0
         else:
-            fraction = (minutes - start) / (6.5*60)
+            fraction = (minutes - start) / (6.5 * 60)
             fraction = min(1.0, max(0.05, fraction))
 
     est_full = today_vol / fraction if fraction > 0 else today_vol
     return float(_safe_div(est_full, v50)) if pd.notna(v50) and v50 > 0 else np.nan
+
 
 def get_last_n_intraday_closes(intraday_df, ticker, n=2):
     if isinstance(intraday_df.columns, pd.MultiIndex):
@@ -245,6 +274,7 @@ def get_last_n_intraday_closes(intraday_df, ticker, n=2):
         s = intraday_df["Close"].dropna()
     return list(map(float, s.tail(n).values))
 
+
 def get_last_n_intraday_volumes(intraday_df, ticker, n=2):
     if isinstance(intraday_df.columns, pd.MultiIndex):
         try:
@@ -254,6 +284,7 @@ def get_last_n_intraday_volumes(intraday_df, ticker, n=2):
     else:
         v = intraday_df["Volume"].dropna()
     return list(map(float, v.tail(n).values))
+
 
 def get_intraday_avg_volume(intraday_df, ticker, window=INTRADAY_AVG_VOL_WINDOW):
     if isinstance(intraday_df.columns, pd.MultiIndex):
@@ -267,7 +298,10 @@ def get_intraday_avg_volume(intraday_df, ticker, window=INTRADAY_AVG_VOL_WINDOW)
         return np.nan
     return float(v.tail(window).mean())
 
-def intrabar_volume_pace(intraday_df, ticker, avg_window=INTRADAY_AVG_VOL_WINDOW, bar_minutes=60):
+
+def intrabar_volume_pace(
+    intraday_df, ticker, avg_window=INTRADAY_AVG_VOL_WINDOW, bar_minutes=60
+):
     try:
         if isinstance(intraday_df.columns, pd.MultiIndex):
             v = intraday_df[("Volume", ticker)].dropna()
@@ -294,6 +328,7 @@ def _short_price_break(px, ma, pivot_low):
         conds.append(px <= ma * (1.0 - SHORT_BREAK_PCT))
     return any(conds) if conds else False
 
+
 def _short_near_zone(px, ma, pivot_low):
     """Near-breakdown zone: under MA150 but not yet breaking pivot/MA too hard."""
     if pd.isna(px) or (pd.isna(ma) and pd.isna(pivot_low)):
@@ -314,15 +349,20 @@ def _short_near_zone(px, ma, pivot_low):
             return True
     return False
 
+
 def stage_order(stage: str) -> int:
     if isinstance(stage, str):
-        if stage.startswith("Stage 4"): return 0
-        if stage.startswith("Stage 3"): return 1
+        if stage.startswith("Stage 4"):
+            return 0
+        if stage.startswith("Stage 3"):
+            return 1
     return 9
+
 
 def short_sort_key(item):
     wr = int(item.get("weekly_rank", 999999)) if pd.notna(
-        item.get("weekly_rank", np.nan)) else 999999
+        item.get("weekly_rank", np.nan)
+    ) else 999999
     st = stage_order(item.get("stage", ""))
     px = item.get("price", np.nan)
     ma = item.get("ma30", np.nan)
@@ -339,6 +379,7 @@ def _fmt_num(x):
         return f"{float(x):.2f}"
     except Exception:
         return "—"
+
 
 def _short_entry_stop_targets(px, ma30, pivot_low, atr):
     """
@@ -365,6 +406,7 @@ def _short_entry_stop_targets(px, ma30, pivot_low, atr):
     t1 = entry * (1.0 - SHORT_TARGET1_PCT)
     t2 = entry * (1.0 - SHORT_TARGET2_PCT)
     return entry, stop, t1, t2
+
 
 def _build_order_block_html(short_trigs, near_shorts):
     items = short_trigs + near_shorts
@@ -403,7 +445,9 @@ def _build_order_block_html(short_trigs, near_shorts):
             f"</tr>"
         )
 
-    html = css + """
+    html = (
+        css
+        + """
     <h4>Order Block (short-side, proposed)</h4>
     <table class="ordtbl">
       <thead>
@@ -413,16 +457,22 @@ def _build_order_block_html(short_trigs, near_shorts):
         </tr>
       </thead>
       <tbody>
-    """ + "\n".join(rows) + "</tbody></table>"
+    """
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
 
     html += (
         "<div style='font-size:12px;color:#666;margin-top:6px;'>"
-        f"Rules: entry≈current price; stop = max(entry+{SHORT_HARD_STOP_PCT*100:.0f}%, ATR×{SHORT_TRAIL_ATR_MULT:.1f} above, "
-        f"MA150+{SHORT_MA_GUARD_PCT*100:.0f}%). Targets at −{SHORT_TARGET1_PCT*100:.0f}% and −{SHORT_TARGET2_PCT*100:.0f}% "
-        "from entry as initial profit milestones (based on Weinstein risk discipline)."
+        f"Rules: entry≈current price; stop = max(entry+{SHORT_HARD_STOP_PCT*100:.0f}%, "
+        f"ATR×{SHORT_TRAIL_ATR_MULT:.1f} above, "
+        f"MA150+{SHORT_MA_GUARD_PCT*100:.0f}%). Targets at −{SHORT_TARGET1_PCT*100:.0f}% "
+        f"and −{SHORT_TARGET2_PCT*100:.0f}% from entry as initial profit milestones "
+        "(based on Weinstein risk discipline)."
         "</div>"
     )
     return html
+
 
 def _build_order_block_text(short_trigs, near_shorts):
     lines = ["ORDER BLOCK (short-side, proposed)"]
@@ -450,7 +500,10 @@ def _fig_to_base64(fig) -> str:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
     plt.close(fig)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(
+        "ascii"
+    )
+
 
 def make_tiny_chart_png(ticker, benchmark, daily_df):
     os.makedirs(CHART_DIR, exist_ok=True)
@@ -469,31 +522,37 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
     if len(close_t) < 50 or len(close_b) < 50:
         return None, None
     sma = close_t.rolling(SMA_DAYS).mean()
-    rs  = (close_t / close_b)
+    rs = (close_t / close_b)
     rs_norm = rs / rs.iloc[0]
 
     fig, ax1 = plt.subplots(figsize=(5.0, 2.4), dpi=150)
     ax1.plot(close_t.index, close_t.values, label=f"{ticker}")
     ax1.plot(sma.index, sma.values, label=f"SMA{SMA_DAYS}", linewidth=1.2)
     ax1.set_ylabel("Price")
-    ax1.tick_params(axis='x', labelsize=8)
-    ax1.tick_params(axis='y', labelsize=8)
+    ax1.tick_params(axis="x", labelsize=8)
+    ax1.tick_params(axis="y", labelsize=8)
 
     ax2 = ax1.twinx()
-    ax2.plot(rs_norm.index, rs_norm.values, linestyle="--", alpha=0.7, label="RS (norm)")
+    ax2.plot(
+        rs_norm.index, rs_norm.values, linestyle="--", alpha=0.7, label="RS (norm)"
+    )
     ax2.set_ylabel("RS (norm)")
-    ax2.tick_params(axis='y', labelsize=8)
+    ax2.tick_params(axis="y", labelsize=8)
 
     ax1.set_title(f"{ticker} — Price, SMA150, RS/{benchmark}", fontsize=9)
     ax1.grid(alpha=0.2)
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7,
-               loc="upper left", frameon=False)
+    ax1.legend(
+        lines1 + lines2,
+        labels1 + labels2,
+        fontsize=7,
+        loc="upper left",
+        frameon=False,
+    )
 
     chart_path = os.path.join(
-        CHART_DIR,
-        f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        CHART_DIR, f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
     )
     fig.tight_layout(pad=0.8)
     fig.savefig(chart_path, bbox_inches="tight")
@@ -503,12 +562,15 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
     return chart_path, f"data:image/png;base64,{b64}"
 
 # ---------------- Main logic ----------------
-def run(_config_path="./config.yaml", *,
-        only_tickers=None,
-        test_ease=False,
-        log_csv=None,
-        log_json=None,
-        dry_run=False):
+def run(
+    _config_path="./config.yaml",
+    *,
+    only_tickers=None,
+    test_ease=False,
+    log_csv=None,
+    log_json=None,
+    dry_run=False,
+):
 
     log(f"Short watcher starting with config: {_config_path}", level="step")
     cfg, benchmark, sheet_url, service_account_file = load_config(_config_path)
@@ -517,13 +579,14 @@ def run(_config_path="./config.yaml", *,
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
 
     w = weekly_df.rename(columns=str.lower)
-    for miss in ["ticker","stage","ma30","rs_above_ma"]:
+    for miss in ["ticker", "stage", "ma30", "rs_above_ma"]:
         if miss not in w.columns:
             w[miss] = np.nan
 
     # Stage 4 downtrend universe
-    short_universe = w[w["stage"].isin(["Stage 4 (Downtrend)"])] \
-                      [["ticker","stage","ma30","rs_above_ma"]].copy()
+    short_universe = w[w["stage"].isin(["Stage 4 (Downtrend)"])][
+        ["ticker", "stage", "ma30", "rs_above_ma"]
+    ].copy()
     if "rank" in w.columns:
         short_universe["weekly_rank"] = w["rank"]
     else:
@@ -560,13 +623,13 @@ def run(_config_path="./config.yaml", *,
     # Test-ease thresholds
     if test_ease or (os.getenv("INTRADAY_TEST", "0") == "1"):
         log("TEST-EASE: lowering thresholds for quick validation.", level="warn")
-        _SHORT_NEAR_HITS_MIN          = 1
+        _SHORT_NEAR_HITS_MIN = 1
         _INTRABAR_CONFIRM_MIN_ELAPSED = 0
-        _INTRABAR_VOLPACE_MIN         = 0.0
+        _INTRABAR_VOLPACE_MIN = 0.0
     else:
-        _SHORT_NEAR_HITS_MIN          = SHORT_NEAR_HITS_MIN
+        _SHORT_NEAR_HITS_MIN = SHORT_NEAR_HITS_MIN
         _INTRABAR_CONFIRM_MIN_ELAPSED = INTRABAR_CONFIRM_MIN_ELAPSED
-        _INTRABAR_VOLPACE_MIN         = INTRABAR_VOLPACE_MIN
+        _INTRABAR_VOLPACE_MIN = INTRABAR_VOLPACE_MIN
 
     log("Evaluating short candidates...", level="step")
 
@@ -577,9 +640,11 @@ def run(_config_path="./config.yaml", *,
             continue
 
         stage = str(row["stage"])
-        ma30  = float(row.get("ma30", np.nan))
+        ma30 = float(row.get("ma30", np.nan))
         rs_above = bool(row.get("rs_above_ma", False))
-        rs_ok = (not rs_above)  # for shorts, we prefer RS not above its MA
+        rs_ok = (
+            not rs_above
+        )  # for shorts, we prefer RS not above its MA
         weekly_rank = float(row.get("weekly_rank", np.nan))
 
         pivot_low = last_weekly_pivot_low(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
@@ -588,8 +653,16 @@ def run(_config_path="./config.yaml", *,
 
         closes_n = get_last_n_intraday_closes(intraday, t, n=2)
 
-        elapsed = _elapsed_in_current_bar_minutes(intraday, t) if INTRADAY_INTERVAL == "60m" else None
-        pace_intra = intrabar_volume_pace(intraday, t, bar_minutes=60) if INTRADAY_INTERVAL == "60m" else None
+        elapsed = (
+            _elapsed_in_current_bar_minutes(intraday, t)
+            if INTRADAY_INTERVAL == "60m"
+            else None
+        )
+        pace_intra = (
+            intrabar_volume_pace(intraday, t, bar_minutes=60)
+            if INTRADAY_INTERVAL == "60m"
+            else None
+        )
 
         metrics = {
             "price": px,
@@ -603,25 +676,32 @@ def run(_config_path="./config.yaml", *,
 
         cond = {}
         cond["weekly_stage_ok"] = stage.startswith("Stage 4")
-        cond["rs_ok"]           = rs_ok
-        cond["ma_ok"]           = pd.notna(ma30)
-        cond["pivot_ok"]        = pd.notna(pivot_low)
+        cond["rs_ok"] = rs_ok
+        cond["ma_ok"] = pd.notna(ma30)
+        cond["pivot_ok"] = pd.notna(pivot_low)
 
         # Short near / trigger
         short_near_now = False
         short_price_ok = False
-        short_vol_ok   = True
-        short_confirm  = False
+        short_vol_ok = True
+        short_confirm = False
 
         if cond["ma_ok"] and cond["pivot_ok"]:
             short_near_now = _short_near_zone(px, ma30, pivot_low)
 
             if INTRADAY_INTERVAL == "60m":
                 short_price_ok = _short_price_break(px, ma30, pivot_low)
-                short_vol_ok   = (pd.isna(pace_intra) or pace_intra >= _INTRABAR_VOLPACE_MIN)
-                short_confirm  = bool(short_price_ok and
-                                      (elapsed is not None and elapsed >= _INTRABAR_CONFIRM_MIN_ELAPSED) and
-                                      short_vol_ok)
+                short_vol_ok = (
+                    pd.isna(pace_intra) or pace_intra >= _INTRABAR_VOLPACE_MIN
+                )
+                short_confirm = bool(
+                    short_price_ok
+                    and (
+                        elapsed is not None
+                        and elapsed >= _INTRABAR_CONFIRM_MIN_ELAPSED
+                    )
+                    and short_vol_ok
+                )
             else:
                 closes_n2 = get_last_n_intraday_closes(intraday, t, n=2)
                 if closes_n2:
@@ -631,31 +711,38 @@ def run(_config_path="./config.yaml", *,
                     short_confirm = short_price_ok
                     if len(closes_n2) >= 2:
                         vols2 = get_last_n_intraday_volumes(intraday, t, n=2)
-                        vavg  = get_intraday_avg_volume(intraday, t, window=INTRADAY_AVG_VOL_WINDOW)
+                        vavg = get_intraday_avg_volume(
+                            intraday, t, window=INTRADAY_AVG_VOL_WINDOW
+                        )
                         if len(vols2) >= 2 and pd.notna(vavg) and vavg > 0:
-                            short_vol_ok = (vols2[-1] >= INTRADAY_LASTBAR_MULT * vavg)
+                            short_vol_ok = (
+                                vols2[-1] >= INTRADAY_LASTBAR_MULT * vavg
+                            )
                         else:
                             short_vol_ok = False
 
-        cond["short_near_now"]   = bool(short_near_now)
-        cond["short_price_ok"]   = bool(short_price_ok)
-        cond["short_vol_ok"]     = bool(short_vol_ok)
-        cond["short_confirm"]    = bool(short_confirm)
-        cond["pace_full_gate"]   = (pd.isna(pace_full) or pace_full >= VOL_PACE_MIN)
-        cond["near_pace_gate"]   = (pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN)
+        cond["short_near_now"] = bool(short_near_now)
+        cond["short_price_ok"] = bool(short_price_ok)
+        cond["short_vol_ok"] = bool(short_vol_ok)
+        cond["short_confirm"] = bool(short_confirm)
+        cond["pace_full_gate"] = pd.isna(pace_full) or pace_full >= VOL_PACE_MIN
+        cond["near_pace_gate"] = pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN
 
         # Stateful promotion (short_state)
-        st = short_state.get(t, {
-            "short_state":"IDLE",
-            "short_hits":[],
-            "short_cooldown":0,
-        })
+        st = short_state.get(
+            t,
+            {
+                "short_state": "IDLE",
+                "short_hits": [],
+                "short_cooldown": 0,
+            },
+        )
 
         # Short NEAR hits
         st["short_hits"], short_hit_count = _update_hits(
             st.get("short_hits", []),
             short_near_now,
-            SHORT_NEAR_HITS_WINDOW
+            SHORT_NEAR_HITS_WINDOW,
         )
         if st.get("short_cooldown", 0) > 0:
             st["short_cooldown"] = int(st["short_cooldown"]) - 1
@@ -663,9 +750,14 @@ def run(_config_path="./config.yaml", *,
         sstate = st.get("short_state", "IDLE")
         if sstate == "IDLE" and short_near_now:
             sstate = "NEAR"
-        elif sstate in ("IDLE","NEAR") and short_hit_count >= _SHORT_NEAR_HITS_MIN:
+        elif sstate in ("IDLE", "NEAR") and short_hit_count >= _SHORT_NEAR_HITS_MIN:
             sstate = "ARMED"
-        elif sstate == "ARMED" and short_confirm and short_vol_ok and cond["pace_full_gate"]:
+        elif (
+            sstate == "ARMED"
+            and short_confirm
+            and short_vol_ok
+            and cond["pace_full_gate"]
+        ):
             sstate = "TRIGGERED"
             st["short_cooldown"] = SHORT_COOLDOWN_SCANS
         elif st["short_cooldown"] > 0 and not short_near_now:
@@ -678,20 +770,8 @@ def run(_config_path="./config.yaml", *,
 
         # Emit short lists
         if st["short_state"] == "TRIGGERED" and cond["pace_full_gate"]:
-            trig_shorts.append({
-                "ticker": t,
-                "price": px,
-                "ma30": ma30,
-                "pivot_low": pivot_low,
-                "stage": stage,
-                "weekly_rank": weekly_rank,
-                "pace": None if pd.isna(pace_full) else float(pace_full),
-                "atr": atr,
-            })
-            short_state[t]["short_state"] = "COOLDOWN"
-        elif st["short_state"] in ("NEAR","ARMED"):
-            if cond["near_pace_gate"]:
-                near_shorts.append({
+            trig_shorts.append(
+                {
                     "ticker": t,
                     "price": px,
                     "ma30": ma30,
@@ -700,18 +780,38 @@ def run(_config_path="./config.yaml", *,
                     "weekly_rank": weekly_rank,
                     "pace": None if pd.isna(pace_full) else float(pace_full),
                     "atr": atr,
-                })
+                }
+            )
+            short_state[t]["short_state"] = "COOLDOWN"
+        elif st["short_state"] in ("NEAR", "ARMED"):
+            if cond["near_pace_gate"]:
+                near_shorts.append(
+                    {
+                        "ticker": t,
+                        "price": px,
+                        "ma30": ma30,
+                        "pivot_low": pivot_low,
+                        "stage": stage,
+                        "weekly_rank": weekly_rank,
+                        "pace": None if pd.isna(pace_full) else float(pace_full),
+                        "atr": atr,
+                    }
+                )
 
-        info_rows.append({
-            "ticker": t,
-            "stage": stage,
-            "price": px,
-            "ma30": ma30,
-            "pivot_low_10w": pivot_low,
-            "vol_pace_vs50dma": None if pd.isna(pace_full) else round(float(pace_full), 2),
-            "weekly_rank": weekly_rank,
-            "short_state": st["short_state"],
-        })
+        info_rows.append(
+            {
+                "ticker": t,
+                "stage": stage,
+                "price": px,
+                "ma30": ma30,
+                "pivot_low_10w": pivot_low,
+                "vol_pace_vs50dma": None
+                if pd.isna(pace_full)
+                else round(float(pace_full), 2),
+                "weekly_rank": weekly_rank,
+                "short_state": st["short_state"],
+            }
+        )
 
         row_debug = {
             "ticker": t,
@@ -723,7 +823,10 @@ def run(_config_path="./config.yaml", *,
         }
         debug_rows.append(row_debug)
 
-    log(f"Scan done. Shorts → NEAR:{len(near_shorts)} TRIG:{len(trig_shorts)}", level="info")
+    log(
+        f"Scan done. Shorts → NEAR:{len(near_shorts)} TRIG:{len(trig_shorts)}",
+        level="info",
+    )
 
     # Ranking & charts
     near_shorts.sort(key=short_sort_key)
@@ -762,7 +865,9 @@ def run(_config_path="./config.yaml", *,
             piv = it.get("pivot_low", np.nan)
             ma = it.get("ma30", np.nan)
             pace_val = it.get("pace", None)
-            pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+            pace_str = (
+                "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+            )
             atr = it.get("atr", np.nan)
             entry, stop, t1, t2 = _short_entry_stop_targets(px, ma, piv, atr)
             if kind == "TRIG":
@@ -814,12 +919,14 @@ def run(_config_path="./config.yaml", *,
     # Snapshot table
     if info_rows:
         info_df = pd.DataFrame(info_rows)
-        info_df["stage_rank"]  = info_df["stage"].apply(stage_order)
-        info_df["weekly_rank"] = pd.to_numeric(
-            info_df["weekly_rank"], errors="coerce"
-        ).fillna(999999).astype(int)
+        info_df["stage_rank"] = info_df["stage"].apply(stage_order)
+        info_df["weekly_rank"] = (
+            pd.to_numeric(info_df["weekly_rank"], errors="coerce")
+            .fillna(999999)
+            .astype(int)
+        )
         info_df = info_df.sort_values(
-            ["weekly_rank","stage_rank","ticker"]
+            ["weekly_rank", "stage_rank", "ticker"]
         ).drop(columns=["stage_rank"])
         html += "<h4>Snapshot</h4>" + info_df.to_html(index=False)
 
@@ -833,7 +940,9 @@ def run(_config_path="./config.yaml", *,
             piv = it.get("pivot_low", np.nan)
             ma = it.get("ma30", np.nan)
             pace_val = it.get("pace", None)
-            pace_str = "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+            pace_str = (
+                "—" if (pace_val is None or pd.isna(pace_val)) else f"{pace_val:.2f}x"
+            )
             atr = it.get("atr", np.nan)
             entry, stop, t1, t2 = _short_entry_stop_targets(px, ma, piv, atr)
             if kind == "TRIG":
@@ -879,8 +988,7 @@ def run(_config_path="./config.yaml", *,
     # Save HTML
     os.makedirs("./output", exist_ok=True)
     html_path = os.path.join(
-        "./output",
-        f"short_watch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        "./output", f"short_watch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
     )
     try:
         with open(html_path, "w", encoding="utf-8") as f:
@@ -898,30 +1006,51 @@ def run(_config_path="./config.yaml", *,
             subject=f"Short Intraday Watch — {subject_counts}",
             html_body=html,
             text_body=text,
-            cfg_path=_config_path
+            cfg_path=_config_path,
         )
         log("Email sent.", level="ok")
+
 
 # ---------------- CLI ----------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="./config.yaml")
     ap.add_argument("--quiet", action="store_true", help="reduce console noise")
-    ap.add_argument("--only", type=str, default="",
-                    help="comma list of tickers to restrict evaluation (e.g. CRM,FDS)")
-    ap.add_argument("--test-ease", action="store_true",
-                    help="enable trigger easing for testing (or set INTRADAY_TEST=1)")
-    ap.add_argument("--log-csv", type=str, default="",
-                    help="path to write per-ticker diagnostics CSV")
-    ap.add_argument("--log-json", type=str, default="",
-                    help="path to write per-ticker diagnostics JSON")
-    ap.add_argument("--dry-run", action="store_true", help="don’t send email")
+    ap.add_argument(
+        "--only",
+        type=str,
+        default="",
+        help="comma list of tickers to restrict evaluation (e.g. CRM,FDS)",
+    )
+    ap.add_argument(
+        "--test-ease",
+        action="store_true",
+        help="enable trigger easing for testing (or set INTRADAY_TEST=1)",
+    )
+    ap.add_argument(
+        "--log-csv",
+        type=str,
+        default="",
+        help="path to write per-ticker diagnostics CSV",
+    )
+    ap.add_argument(
+        "--log-json",
+        type=str,
+        default="",
+        help="path to write per-ticker diagnostics JSON",
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true", help="don’t send email"
+    )
     args = ap.parse_args()
 
     VERBOSE = not args.quiet
-    only = [s.strip().upper() for s in args.only.split(",") if s.strip()] if args.only else None
+    only = (
+        [s.strip().upper() for s in args.only.split(",") if s.strip()]
+        if args.only
+        else None
+    )
 
-    log(f"Short watcher starting with config: {args.config}", level="step")
     try:
         run(
             _config_path=args.config,
