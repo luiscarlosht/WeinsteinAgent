@@ -16,7 +16,6 @@ but focused on Stage 4 / short setups coming from weinstein_short_watcher.py.
 
 import argparse
 import sys
-import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -49,7 +48,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument(
         "--csv",
         required=True,
-        help="Input CSV file produced by weinstein_short_watcher.py (e.g. ./output/short_debug.csv)",
+        help=(
+            "Input CSV file produced by weinstein_short_watcher.py "
+            "(e.g. ./output/short_debug.csv)"
+        ),
     )
     p.add_argument(
         "--outdir",
@@ -102,7 +104,8 @@ def apply_window_filter(df: pd.DataFrame, window_min: int) -> Tuple[pd.DataFrame
 
     if "elapsed_min" not in df.columns:
         log_warn(
-            "elapsed_min column not present in CSV — unable to apply window filtering; using all rows."
+            "elapsed_min column not present in CSV — unable to apply window "
+            "filtering; using all rows."
         )
         return df, False
 
@@ -112,9 +115,7 @@ def apply_window_filter(df: pd.DataFrame, window_min: int) -> Tuple[pd.DataFrame
     return df_win, True
 
 
-def infer_hits_for_ticker(
-    df_t: pd.DataFrame,
-) -> Tuple[int, int, str, float]:
+def infer_hits_for_ticker(df_t: pd.DataFrame) -> Tuple[int, int, str, float]:
     """
     Given all rows for a single ticker (already filtered by window if applicable),
     compute:
@@ -149,12 +150,18 @@ def infer_hits_for_ticker(
 
     if has_near_flag or has_trig_flag:
         if has_near_flag:
-            near_hits = int(df_t["cond_short_near_now"].fillna(False).astype(bool).sum())
+            near_hits = int(
+                df_t["cond_short_near_now"].fillna(False).astype(bool).sum()
+            )
         else:
             # Fallback: treat rows with short_state == "NEAR" as near hits
             near_hits = int((df_t.get("short_state", "") == "NEAR").sum())
 
-        trig_col = "cond_short_confirm" if "cond_short_confirm" in df_t.columns else "cond_short_trig_now"
+        trig_col = (
+            "cond_short_confirm"
+            if "cond_short_confirm" in df_t.columns
+            else "cond_short_trig_now"
+        )
         if trig_col in df_t.columns:
             trig_hits = int(df_t[trig_col].fillna(False).astype(bool).sum())
         else:
@@ -202,9 +209,14 @@ def summarize(df: pd.DataFrame, outdir: Path, window_min: int) -> pd.DataFrame:
             }
         )
 
-    df_summary = pd.DataFrame(rows).sort_values(
-        by=["TrigHits", "NearHits", "ticker"], ascending=[False, False, True]
-    ).reset_index(drop=True)
+    df_summary = (
+        pd.DataFrame(rows)
+        .sort_values(
+            by=["TrigHits", "NearHits", "ticker"],
+            ascending=[False, False, True],
+        )
+        .reset_index(drop=True)
+    )
 
     outdir.mkdir(parents=True, exist_ok=True)
     suffix = f"_{window_min}min" if window_min > 0 else "_full"
@@ -254,7 +266,13 @@ def explain_ticker(df: pd.DataFrame, ticker: str) -> None:
     print("=" * (10 + len(ticker)))
 
     cols_to_show = [ticker_col]
-    for c in ("elapsed_min", "price", "short_state", "cond_short_near_now", "cond_short_confirm"):
+    for c in (
+        "elapsed_min",
+        "price",
+        "short_state",
+        "cond_short_near_now",
+        "cond_short_confirm",
+    ):
         if c in df_t.columns:
             cols_to_show.append(c)
 
@@ -304,7 +322,10 @@ def main(argv: Optional[list] = None) -> int:
     # Overall stats
     total_trig = int(df_summary["TrigHits"].sum())
     total_near = int(df_summary["NearHits"].sum())
-    log_ok(f"Done. Aggregated {len(df_summary)} tickers: {total_trig} TRIG hits, {total_near} NEAR hits.")
+    log_ok(
+        f"Done. Aggregated {len(df_summary)} tickers: "
+        f"{total_trig} TRIG hits, {total_near} NEAR hits."
+    )
 
     if args.explain:
         explain_ticker(df_win, args.explain)
