@@ -14,8 +14,7 @@ Weinstein Short Watcher — Stage 4 short setups
     * Tiny charts for top names
 - NEW:
     * --log-csv / --log-json diagnostics (per-symbol metrics + conditions + state)
-      similar to weinstein_intraday_watcher.py, so you can feed a future
-      short-side signal_engine.
+      similar to weinstein_intraday_watcher.py, so short_signal_engine.py can use it.
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
@@ -338,17 +337,14 @@ def _short_near_zone(px, ma, pivot_low):
     """Near-breakdown zone: under MA150 but not yet breaking pivot/MA too hard."""
     if pd.isna(px) or (pd.isna(ma) and pd.isna(pivot_low)):
         return False
-    # must be below MA150 (downtrend active)
     below_ma = (pd.notna(ma) and px < ma)
     if not below_ma:
         return False
-    # treat "near" as above pivot low but not crazy far
     if pd.notna(pivot_low):
-        if px <= pivot_low:  # already at/below pivot; let full trigger handle
+        if px <= pivot_low:
             return False
         if px <= pivot_low * (1.0 + NEAR_ABOVE_PIVOT_PCT):
             return True
-    # fallback: a mild cushion below MA150 but not full 0.4% break
     if pd.notna(ma):
         if (px <= ma) and (px >= ma * (1.0 - SHORT_BREAK_PCT)):
             return True
@@ -647,9 +643,7 @@ def run(
         stage = str(row["stage"])
         ma30 = float(row.get("ma30", np.nan))
         rs_above = bool(row.get("rs_above_ma", False))
-        rs_ok = (
-            not rs_above
-        )  # for shorts, we prefer RS not above its MA
+        rs_ok = not rs_above  # for shorts, we prefer RS not above its MA
         weekly_rank = float(row.get("weekly_rank", np.nan))
 
         pivot_low = last_weekly_pivot_low(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
@@ -720,9 +714,7 @@ def run(
                             intraday, t, window=INTRADAY_AVG_VOL_WINDOW
                         )
                         if len(vols2) >= 2 and pd.notna(vavg) and vavg > 0:
-                            short_vol_ok = (
-                                vols2[-1] >= INTRADAY_LASTBAR_MULT * vavg
-                            )
+                            short_vol_ok = vols2[-1] >= INTRADAY_LASTBAR_MULT * vavg
                         else:
                             short_vol_ok = False
 
@@ -886,10 +878,7 @@ def run(
             )
             atr = it.get("atr", np.nan)
             entry, stop, t1, t2 = _short_entry_stop_targets(px, ma, piv, atr)
-            if kind == "TRIG":
-                label = "TRIG short"
-            else:
-                label = "NEAR short"
+            label = "TRIG short" if kind == "TRIG" else "NEAR short"
             lis.append(
                 f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {px:.2f} "
                 f"({label}, entry≈{_fmt_num(entry)}, stop≥{_fmt_num(stop)}, "
@@ -961,10 +950,7 @@ def run(
             )
             atr = it.get("atr", np.nan)
             entry, stop, t1, t2 = _short_entry_stop_targets(px, ma, piv, atr)
-            if kind == "TRIG":
-                label = "TRIG short"
-            else:
-                label = "NEAR short"
+            label = "TRIG short" if kind == "TRIG" else "NEAR short"
             out.append(
                 f"{i}. {it['ticker']} @ {px:.2f} "
                 f"({label}, entry≈{_fmt_num(entry)}, stop≥{_fmt_num(stop)}, "
@@ -1024,7 +1010,10 @@ def run(
 
     subject_counts = f"{len(trig_shorts)} TRIG / {len(near_shorts)} NEAR"
     if dry_run:
-        log("DRY-RUN set — would send email (short TRIG/NEAR present).", level="warn")
+        log(
+            "DRY-RUN set — would send email (short TRIG/NEAR present).",
+            level="warn",
+        )
     else:
         log("Sending email...", level="step")
         send_email(
@@ -1065,7 +1054,9 @@ if __name__ == "__main__":
         help="path to write per-ticker diagnostics JSON",
     )
     ap.add_argument(
-        "--dry-run", action="store_true", help="don’t send email"
+        "--dry-run",
+        action="store_true",
+        help="don’t send email",
     )
     args = ap.parse_args()
 
