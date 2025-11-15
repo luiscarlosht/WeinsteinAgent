@@ -16,6 +16,11 @@ Weinstein Short Intraday Watcher — Stage 4 short setups
     * --log-csv / --log-json diagnostics (per-symbol metrics + conditions + state)
       similar to weinstein_intraday_watcher.py, so you can feed a future
       short-side signal_engine.
+
+Email behavior:
+- Email is sent ONLY when there is at least one of:
+  * Short Triggers (TRIG)
+  * Near Short Setups (NEAR)
 """
 
 import os, io, json, math, base64, argparse
@@ -996,6 +1001,15 @@ def run(
         log(f"Saved HTML → {html_path}", level="ok")
     except Exception as e:
         log(f"Cannot save HTML: {e}", level="warn")
+
+    # -------- NEW: Email only when short signals exist --------
+    has_shorts = bool(trig_shorts or near_shorts)
+
+    if not has_shorts:
+        log("No short triggers / near setups present — skipping email send.", level="info")
+        if dry_run:
+            log("DRY-RUN set — no email would be sent anyway.", level="debug")
+        return
 
     subject_counts = f"{len(trig_shorts)} TRIG / {len(near_shorts)} NEAR"
     if dry_run:
