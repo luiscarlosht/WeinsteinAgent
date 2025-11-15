@@ -8,15 +8,19 @@ Weinstein Short Watcher — Stage 4 short setups
 - Emits:
     * TRIG shorts: breakdown below pivot/MA with volume + intrabar confirmations
     * NEAR shorts: price hanging just above breakdown zone, with basic volume pacing
-    * READY-TO-CLOSE shorts: Stage 4 names that have reclaimed MA150 by ~0.5%+,
+    * READY-TO-CLOSE shorts: Stage 4 names that have reclaimed MA150 by ~0.5+%,
       suggesting the short thesis is weakening (time to consider covering).
+
 - Email contains:
     * Ranked list of short triggers + near shorts + ready-to-close shorts
     * Order block: entry≈now, protective stop, 15% & 20% downside targets
     * Tiny charts for top names
+
+- READY-TO-CLOSE shorts are filtered to tickers that appear in the Google Sheet
+  "Signals" tab with Direction = SELL / SHORT (case-insensitive),
+  so you only see shorts you explicitly mark there.
+
 - NEW:
-    * READY-TO-CLOSE shorts are filtered to tickers that appear in the Google Sheet
-      "Signals" tab with Direction = SELL/SHORT (so you only see shorts you actually track).
     * --log-csv / --log-json diagnostics (per-symbol metrics + conditions + state)
 
 Email behavior:
@@ -85,7 +89,7 @@ SHORT_MA_GUARD_PCT     = 0.03   # 3% over MA150
 SHORT_TARGET1_PCT      = 0.15   # 15% downside
 SHORT_TARGET2_PCT      = 0.20   # 20% downside
 
-CHART_DIR           = "./output/charts"
+CHART_DIR            = "./output/charts"
 MAX_CHARTS_PER_EMAIL = 12
 
 VERBOSE = True
@@ -120,6 +124,19 @@ def _safe_div(a, b):
 
 def _is_crypto(sym: str) -> bool:
     return (sym or "").upper().endswith("-USD")
+
+
+def _cell_to_str(v) -> str:
+    """
+    Safe cell → string helper for Signals tab.
+    Avoids 'int' object has no attribute 'strip' by always casting to str.
+    """
+    if v is None:
+        return ""
+    try:
+        return str(v)
+    except Exception:
+        return ""
 
 # ---------------- Config / IO ----------------
 def load_config(path):
@@ -163,7 +180,8 @@ def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
 
     We treat any row with:
       - non-empty Ticker
-      - Direction in {SELL, SHORT}  (case-insensitive)
+      - Direction in {SELL, SHORT} (case-insensitive)
+
     as a tracked short. This matches your Signals schema:
 
       TimestampUTC | Ticker | Source | Direction | Price | Timeframe
@@ -191,40 +209,25 @@ def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
         log(f"READY filter: could not load Signals tab '{tab_name}': {e}", level="warn")
         return None
 
-    def _cell_to_str(v) -> str:
-        """Safely coerce any cell value (int/float/None/str) to a string."""
-        if v is None:
-            return ""
-        try:
-            return str(v)
-        except Exception:
-            return ""
-
     tickers = set()
     for r in rows:
-        raw_t = r.get("Ticker", None)
-        if raw_t is None:
-            raw_t = r.get("ticker", None)
+        raw_t  = r.get("Ticker") or r.get("ticker")
+        raw_dir = r.get("Direction") or r.get("direction")
+
         t = _cell_to_str(raw_t).strip().upper()
         if not t:
             continue
 
-        raw_dir = r.get("Direction", None)
-        if raw_dir is None:
-            raw_dir = r.get("direction", None)
         direction = _cell_to_str(raw_dir).strip().upper()
-
-        # Only care about shorts / sells
+        # OPTION A: explicit tracking of open shorts
+        # Only rows explicitly marked as SELL/SHORT count as short positions
         if direction not in ("SELL", "SHORT"):
             continue
 
         tickers.add(t)
 
-    log(
-        f"READY filter: loaded {len(tickers)} short tickers from Signals tab '{tab_name}'.",
-        level="info",
-    )
-    return tickers or None
+    log(f"READY filter: loaded {len(tickers)} short tickers from Signals tab '{tab_name}'.", level="info")
+    return tickers
 
 # ---------------- State helpers ----------------
 def _load_short_state():
@@ -827,7 +830,7 @@ def run(
                         else:
                             short_vol_ok = False
 
-        # READY-to-close: reclaimed MA150 by ~0.5%+
+        # READY-to-close: reclaimed MA150 by ~0.5+%
         if cond["ma_ok"]:
             ready_close_now = _short_ready_to_close(px, ma30)
 
