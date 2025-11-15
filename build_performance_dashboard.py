@@ -6,22 +6,30 @@ Build Google Sheets dashboard tabs:
 - Realized_Trades
 - Open_Positions
 - Performance_By_Source
-- Performance_By_Month        (NEW)
+- Performance_By_Month
+- Performance_By_Month_Source      (NEW: by Month + Kind (Equity/Option) + Source)
 - OpenLots_Detail
 - Open_Positions_Snapshot
 - Weekly_Report
-- Options_Results             (NEW)
+- Options_Results                  (options PnL summary)
 
 Also writes local CSVs under ./output:
 - Open_Positions.csv
-- Options_Results.csv         (NEW)
+- Options_Results.csv
 
-Options:
+Options behaviour:
 - Signals rows whose Ticker starts with "-" are parsed as option codes in the form:
     -<UNDERLYING><YY><MM><DD><C|P><STRIKE>
   Example: -PLTR251114C190 → underlying=PLTR, expiration=2025-11-14, right=C, strike=190
 - We scan Transactions (raw rows) to find BUY/SELL activity for each option contract
-  and compute realized P/L, status (WIN/LOSS/OPEN), counts and first/last trade dates.
+  and compute realized P/L, status (WIN/LOSS/OPEN/NO_TRADES), counts and first/last trade dates.
+- Options_Results now also carries a Source column (from Signals), so we can
+  build a monthly-by-source breakdown that separates EQUITY vs OPTION.
+
+NOTE on shorts:
+- The current FIFO engine treats all realized trades as "equity" direction-agnostic.
+  To separate long vs short performance, we'd need to enhance build_realized_and_open
+  to be aware of short entries/exits; this file currently does NOT split longs vs shorts.
 """
 
 from __future__ import annotations
@@ -45,7 +53,7 @@ except Exception:
     yf = None
 
 # ─────────────────────────────
-# DEFAULTS
+# DEFAULTS / TAB NAMES
 # ─────────────────────────────
 DEFAULT_SERVICE_ACCOUNT_FILE = "creds/gcp_service_account.json"
 DEFAULT_SCOPES = [
@@ -59,11 +67,12 @@ TAB_HOLDINGS     = "Holdings"
 TAB_REALIZED     = "Realized_Trades"
 TAB_OPEN         = "Open_Positions"
 TAB_PERF         = "Performance_By_Source"
-TAB_MONTHLY      = "Performance_By_Month"      # NEW
+TAB_MONTHLY      = "Performance_By_Month"          # NEW
+TAB_MONTHLY_SRC  = "Performance_By_Month_Source"   # NEW (Month + Kind + Source)
 TAB_OPEN_DETAIL  = "OpenLots_Detail"
 TAB_SNAPSHOT     = "Open_Positions_Snapshot"
 TAB_WEEKLY       = "Weekly_Report"
-TAB_OPTIONS      = "Options_Results"           # NEW
+TAB_OPTIONS      = "Options_Results"
 
 DEFAULT_EXCHANGE_PREFIX = "NYSE: "
 ROW_CHUNK = 500
@@ -440,7 +449,7 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
     return df_tr[["When","Type","Symbol","Qty","Price"]], df  # second is raw df_tx for options scan
 
 # ─────────────────────────────
-# LIVE PRICE & SNAPSHOT (unchanged)
+# LIVE PRICE & SNAPSHOT
 # ─────────────────────────────
 def _fetch_last_prices_yf(tickers: list[str]) -> dict:
     if not tickers or yf is None:
@@ -641,15 +650,38 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
     """
     For each option code from Signals, search Transactions text columns for matches,
     compute net qty and net cashflow (P/L). Outputs:
-      Code, Underlying, Expiration, Right, Strike, Status, PnL$, Buys, Sells, NetQty, FirstTrade, LastTrade
-    Status ∈ {WIN, LOSS, OPEN, NO_TRADES}
-    """
-    if options_df is None or options_df.empty or tx_raw is None or tx_raw.empty:
-        return pd.DataFrame(columns=[
-            "Code","Underlying","Expiration","Right","Strike","Status","PnL$","Buys","Sells","NetQty","FirstTrade","LastTrade"
-        ])
+      Code, Underlying, Expiration, Right, Strike, Source, Status,
+      PnL$, Buys, Sells, NetQty, FirstTrade, LastTrade
 
-    # Find likely columns
+    Status ∈ {WIN, LOSS, OPEN, NO_TRADES}
+
+    We also attach a Source (from Signals). If multiple signals exist for the same
+    Code with different Sources, we pick the first non-empty Source.
+    """
+    base_cols = [
+        "Code","Underlying","Expiration","Right","Strike",
+        "Source","Status","PnL$","Buys","Sells","NetQty","FirstTrade","LastTrade"
+    ]
+
+    if options_df is None or options_df.empty or tx_raw is None or tx_raw.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    # Map Code -> Source (first non-empty Source wins)
+    src_map: Dict[str, str] = {}
+    if "Code" in options_df.columns:
+        for _, r in options_df.iterrows():
+            code = str(r.get("Code","")).strip()
+            if not code:
+                continue
+            src = str(r.get("Source","")).strip()
+            if not src:
+                src = "(unknown)"
+            # Prefer non-(unknown) sources
+            cur = src_map.get(code)
+            if cur is None or cur == "(unknown)":
+                src_map[code] = src
+
+    # Find likely columns in Transactions
     desc_col = next((c for c in tx_raw.columns if "description" in c.lower()), None)
     action_col = next((c for c in tx_raw.columns if "action" in c.lower()), None)
     type_col   = next((c for c in tx_raw.columns if c.lower() == "type"), None)
@@ -660,6 +692,7 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
     if not (desc_col and date_col and (action_col or type_col) and qty_col and amt_col):
         # Not enough columns to compute — return stubs
         out = options_df.copy()
+        out["Source"] = out["Code"].map(lambda c: src_map.get(str(c).strip(), "(unknown)"))
         out["Status"] = "NO_TRADES"
         out["PnL$"] = 0.0
         out["Buys"] = 0
@@ -667,7 +700,7 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
         out["NetQty"] = 0.0
         out["FirstTrade"] = ""
         out["LastTrade"] = ""
-        return out[["Code","Underlying","Expiration","Right","Strike","Status","PnL$","Buys","Sells","NetQty","FirstTrade","LastTrade"]]
+        return out[base_cols]
 
     # Pre-normalize
     df = tx_raw.copy()
@@ -680,7 +713,15 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
 
     rows = []
     for _, r in options_df.iterrows():
-        code = r["Code"]
+        code = str(r["Code"])
+        src  = src_map.get(code, "(unknown)")
+        frag = occ_like_text_frag({
+            "Underlying": r["Underlying"],
+            "Expiration": r["Expiration"],
+            "Right": r["Right"],
+            "Strike": r["Strike"]
+        })
+
         mask = df["__desc"].str.upper().str.contains(r["Underlying"].upper(), na=False)
         mask &= df["__desc"].str.contains(r"\b" + re.escape(r["Right"]) + r"\b", flags=re.IGNORECASE, regex=True, na=False)
         # Match date in either 11/21/2025 or 11/21/25 style
@@ -696,8 +737,10 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
         if cand.empty:
             rows.append({
                 "Code": code, "Underlying": r["Underlying"], "Expiration": r["Expiration"],
-                "Right": r["Right"], "Strike": r["Strike"], "Status": "NO_TRADES",
-                "PnL$": 0.0, "Buys": 0, "Sells": 0, "NetQty": 0.0, "FirstTrade": "", "LastTrade": ""
+                "Right": r["Right"], "Strike": r["Strike"], "Source": src,
+                "Status": "NO_TRADES",
+                "PnL$": 0.0, "Buys": 0, "Sells": 0, "NetQty": 0.0,
+                "FirstTrade": "", "LastTrade": ""
             })
             continue
 
@@ -719,10 +762,12 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
 
         # P/L approximation: sum of Amount (broker exports typically: buys negative, sells positive)
         pnl = float(np.nansum(cand["__amt"]))
-        direction_factor = np.where(
-            _is_buy_row(cand["__type"]) | _is_buy_row(cand["__action"]), 1, -1
-        )
-        net_qty = float(np.nansum(cand["__qty"] * direction_factor))
+        net_qty = float(np.nansum(
+            cand["__qty"] * np.where(
+                _is_buy_row(cand["__type"]) | _is_buy_row(cand["__action"]),
+                1, -1
+            )
+        ))
 
         if abs(net_qty) > 1e-9:
             status = "OPEN"
@@ -731,7 +776,8 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
 
         rows.append({
             "Code": code, "Underlying": r["Underlying"], "Expiration": r["Expiration"],
-            "Right": r["Right"], "Strike": r["Strike"], "Status": status,
+            "Right": r["Right"], "Strike": r["Strike"], "Source": src,
+            "Status": status,
             "PnL$": round(pnl, 2), "Buys": buys, "Sells": sells, "NetQty": round(net_qty, 4),
             "FirstTrade": first_ts, "LastTrade": last_ts
         })
@@ -742,10 +788,10 @@ def summarize_options_vs_transactions(options_df: pd.DataFrame, tx_raw: pd.DataF
     out["__rank"] = out["Status"].map(lambda s: status_rank.get(s, 9))
     out.sort_values(["__rank","Underlying","Expiration","Right","Strike","Code"], inplace=True, ignore_index=True)
     out.drop(columns="__rank", inplace=True)
-    return out
+    return out[base_cols]
 
 # ─────────────────────────────
-# PERFORMANCE TABLE (by Source)
+# PERFORMANCE TABLES
 # ─────────────────────────────
 def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
     if realized_df.empty:
@@ -811,14 +857,11 @@ def build_perf_by_source(realized_df: pd.DataFrame, open_df: pd.DataFrame) -> pd
     perf = pd.concat([totals_row, perf.sort_values(["Source"]).reset_index(drop=True)], ignore_index=True)
     return perf
 
-# ─────────────────────────────
-# PERFORMANCE TABLE (by Month) – NEW
-# ─────────────────────────────
 def build_perf_by_month(realized_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Monthly breakdown of realized trades across all sources.
+    Monthly performance (equities only, across all sources).
 
-    Output columns:
+    Columns:
       Month (YYYY-MM), Trades, Wins, WinRate%, AvgReturn%, MedianReturn%, TotalPnL$
     """
     if realized_df is None or realized_df.empty:
@@ -827,22 +870,14 @@ def build_perf_by_month(realized_df: pd.DataFrame) -> pd.DataFrame:
         ])
 
     df = realized_df.copy()
-
-    # Ensure ExitTimeUTC is datetime
     df["ExitTimeUTC"] = pd.to_datetime(df["ExitTimeUTC"], errors="coerce", utc=True)
+    df["Month"] = df["ExitTimeUTC"].dt.to_period("M").astype(str)
 
-    # Month bucket (UTC, YYYY-MM)
-    df["Month"] = df["ExitTimeUTC"].dt.tz_convert("UTC").dt.to_period("M").astype(str)
-
-    # Numeric fields
     df["ret"] = pd.to_numeric(df["Return%"], errors="coerce")
     df["EntryPrice_num"] = pd.to_numeric(df["EntryPrice"], errors="coerce")
     df["ExitPrice_num"] = pd.to_numeric(df["ExitPrice"], errors="coerce")
     df["Qty_num"] = pd.to_numeric(df["Qty"], errors="coerce")
-
-    # PnL per row: Qty * (Exit - Entry)
     df["PnL$"] = (df["ExitPrice_num"] - df["EntryPrice_num"]) * df["Qty_num"]
-
     df["is_win"] = df["ret"] > 0
 
     g = df.groupby("Month", dropna=True)
@@ -857,32 +892,139 @@ def build_perf_by_month(realized_df: pd.DataFrame) -> pd.DataFrame:
         "TotalPnL$": g["PnL$"].sum().round(2).values,
     })
 
-    # Sort chronologically by Month
     out = out.sort_values("Month").reset_index(drop=True)
 
-    # Optional overall row
-    if len(out):
-        total_trades = int(out["Trades"].sum())
-        total_wins = int(out["Wins"].sum())
-        overall_winrate = round((total_wins / total_trades) * 100, 2) if total_trades else 0.0
-        overall_avg_ret = float(np.nanmean(df["ret"])) if len(df["ret"]) else 0.0
-        overall_median_ret = float(np.nanmedian(df["ret"])) if len(df["ret"]) else 0.0
-        total_pnl = float(np.nansum(df["PnL$"]))
-        totals_row = pd.DataFrame([{
-            "Month": "(ALL)",
-            "Trades": total_trades,
-            "Wins": total_wins,
-            "WinRate%": overall_winrate,
-            "AvgReturn%": round(overall_avg_ret, 2),
-            "MedianReturn%": round(overall_median_ret, 2),
-            "TotalPnL$": round(total_pnl, 2),
-        }])
-        out = pd.concat([totals_row, out], ignore_index=True)
+    # Overall totals row
+    total_trades = int(out["Trades"].sum())
+    total_wins   = int(out["Wins"].sum())
+    winrate_all  = round((total_wins / total_trades) * 100, 2) if total_trades else 0.0
+    overall_avg_ret = float(np.nanmean(df["ret"])) if len(df["ret"]) else 0.0
+    overall_med_ret = float(np.nanmedian(df["ret"])) if len(df["ret"]) else 0.0
+    total_pnl = float(np.nansum(df["PnL$"]))
 
+    totals_row = pd.DataFrame([{
+        "Month": "(ALL)",
+        "Trades": total_trades,
+        "Wins": total_wins,
+        "WinRate%": winrate_all,
+        "AvgReturn%": round(overall_avg_ret, 2),
+        "MedianReturn%": round(overall_med_ret, 2),
+        "TotalPnL$": round(total_pnl, 2),
+    }])
+
+    out = pd.concat([totals_row, out], ignore_index=True)
+    return out
+
+def build_perf_by_month_source_kind(
+    realized_df: pd.DataFrame,
+    options_results_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Monthly breakdown by:
+      - Month (YYYY-MM)
+      - Kind: EQUITY or OPTION
+      - Source
+
+    Columns:
+      Month, Kind, Source, Trades, Wins, WinRate%, TotalPnL$
+
+    EQUITY side:
+      - Uses realized_df (Realized_Trades).
+      - PnL$ = Qty * (ExitPrice - EntryPrice)
+
+    OPTION side:
+      - Uses options_results_df (Options_Results).
+      - Treat each row as one trade.
+      - Wins = Status == 'WIN'
+      - PnL$ = PnL$ column
+      - Month = month of LastTrade (or FirstTrade fallback)
+    """
+    rows = []
+
+    # ---- EQUITY side ----
+    if realized_df is not None and not realized_df.empty:
+        df = realized_df.copy()
+        df["ExitTimeUTC"] = pd.to_datetime(df["ExitTimeUTC"], errors="coerce", utc=True)
+        df["Month"] = df["ExitTimeUTC"].dt.to_period("M").astype(str)
+
+        df["Source"] = df["Source"].fillna("").astype(str)
+        df["Source"] = df["Source"].replace("", "(unknown)")
+
+        df["EntryPrice_num"] = pd.to_numeric(df["EntryPrice"], errors="coerce")
+        df["ExitPrice_num"]  = pd.to_numeric(df["ExitPrice"], errors="coerce")
+        df["Qty_num"]        = pd.to_numeric(df["Qty"], errors="coerce")
+        df["PnL$"] = (df["ExitPrice_num"] - df["EntryPrice_num"]) * df["Qty_num"]
+        df["ret"] = pd.to_numeric(df["Return%"], errors="coerce")
+        df["is_win"] = df["ret"] > 0
+
+        g_eq = df.groupby(["Month","Source"], dropna=True)
+        eq_part = pd.DataFrame({
+            "Month": g_eq.size().index.get_level_values(0),
+            "Kind": "EQUITY",
+            "Source": g_eq.size().index.get_level_values(1),
+            "Trades": g_eq.size().values,
+            "Wins": g_eq["is_win"].sum().values,
+            "WinRate%": (g_eq["is_win"].mean().fillna(0.0).values * 100).round(2),
+            "TotalPnL$": g_eq["PnL$"].sum().round(2).values,
+        })
+        rows.append(eq_part)
+
+    # ---- OPTION side ----
+    if options_results_df is not None and not options_results_df.empty:
+        opt = options_results_df.copy()
+        opt["Source"] = opt["Source"].fillna("").astype(str)
+        opt["Source"] = opt["Source"].replace("", "(unknown)")
+
+        # Trade timestamp
+        opt["LastTrade"]  = pd.to_datetime(opt["LastTrade"], errors="coerce", utc=True)
+        opt["FirstTrade"] = pd.to_datetime(opt["FirstTrade"], errors="coerce", utc=True)
+        # Month: prefer LastTrade, fallback FirstTrade
+        ts = opt["LastTrade"].where(opt["LastTrade"].notna(), opt["FirstTrade"])
+        opt["Month"] = ts.dt.to_period("M").astype(str)
+
+        opt["PnL$"] = pd.to_numeric(opt["PnL$"], errors="coerce").fillna(0.0)
+        opt["Status"] = opt["Status"].fillna("").astype(str).str.upper()
+        opt["is_win"] = opt["Status"] == "WIN"
+
+        g_opt = opt.groupby(["Month","Source"], dropna=True)
+        opt_part = pd.DataFrame({
+            "Month": g_opt.size().index.get_level_values(0),
+            "Kind": "OPTION",
+            "Source": g_opt.size().index.get_level_values(1),
+            "Trades": g_opt.size().values,
+            "Wins": g_opt["is_win"].sum().values,
+            "WinRate%": (g_opt["is_win"].mean().fillna(0.0).values * 100).round(2),
+            "TotalPnL$": g_opt["PnL$"].sum().round(2).values,
+        })
+        rows.append(opt_part)
+
+    if not rows:
+        return pd.DataFrame(columns=["Month","Kind","Source","Trades","Wins","WinRate%","TotalPnL$"])
+
+    out = pd.concat(rows, ignore_index=True)
+    out = out.sort_values(["Month","Kind","Source"]).reset_index(drop=True)
+
+    # Overall totals across all months/kinds/sources
+    total_trades = int(out["Trades"].sum())
+    total_wins   = int(out["Wins"].sum())
+    winrate_all  = round((total_wins / total_trades) * 100, 2) if total_trades else 0.0
+    total_pnl    = float(np.nansum(out["TotalPnL$"]))
+
+    totals_row = pd.DataFrame([{
+        "Month": "(ALL)",
+        "Kind": "(ALL)",
+        "Source": "(ALL)",
+        "Trades": total_trades,
+        "Wins": total_wins,
+        "WinRate%": winrate_all,
+        "TotalPnL$": round(total_pnl, 2),
+    }])
+
+    out = pd.concat([totals_row, out], ignore_index=True)
     return out
 
 # ─────────────────────────────
-# SNAPSHOT / WEEKLY (unchanged)
+# SNAPSHOT / WEEKLY
 # ─────────────────────────────
 def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: dict | None = None, *, price_source: str = "sheets") -> pd.DataFrame:
     if open_detail_df is None or open_detail_df.empty:
@@ -960,14 +1102,15 @@ def main():
     sheet_url = resolve_sheet_url(cfg)
     service_account_file = resolve_service_account_file(cfg)
 
-    tab_signals = resolve_tab_name(cfg, "signals_tab", TAB_SIGNALS)
-    tab_openpos = resolve_tab_name(cfg, "open_positions_tab", TAB_OPEN)
-    tab_perf    = TAB_PERF
-    tab_month   = TAB_MONTHLY
-    tab_real    = TAB_REALIZED
-    tab_open_det= TAB_OPEN_DETAIL
-    tab_tx      = TAB_TRANSACTIONS
-    tab_hold    = TAB_HOLDINGS
+    tab_signals  = resolve_tab_name(cfg, "signals_tab", TAB_SIGNALS)
+    tab_openpos  = resolve_tab_name(cfg, "open_positions_tab", TAB_OPEN)
+    tab_perf     = TAB_PERF
+    tab_month    = TAB_MONTHLY
+    tab_month_src= TAB_MONTHLY_SRC
+    tab_real     = TAB_REALIZED
+    tab_open_det = TAB_OPEN_DETAIL
+    tab_tx       = TAB_TRANSACTIONS
+    tab_hold     = TAB_HOLDINGS
 
     price_source = args.price_source
 
@@ -1013,8 +1156,6 @@ def main():
     if (not args.no_live) and (not open_df.empty) and (price_source == "sheets"):
         mapping = read_mapping(gc, sheet_url)
         open_df = add_live_price_formulas(open_df, mapping)
-    else:
-        mapping = read_mapping(gc, sheet_url)
 
     # Column order
     if not realized_df.empty:
@@ -1030,8 +1171,7 @@ def main():
 
     # Performance & OpenLots_Detail (equities)
     perf_df = build_perf_by_source(realized_df.copy(), open_df.copy())
-    monthly_df = build_perf_by_month(realized_df.copy())  # NEW
-
+    monthly_df = build_perf_by_month(realized_df.copy())
     open_detail_df = pd.DataFrame()
     if not open_df.empty:
         detail_cols = [c for c in ["Source","Ticker","OpenQty","EntryPrice","EntryTimeUTC","DaysOpen","Timeframe","SignalTimeUTC","SignalPrice","PriceNow","Unrealized%"] if c in open_df.columns]
@@ -1040,18 +1180,23 @@ def main():
     # Options results (scan against Transactions raw)
     options_results_df = summarize_options_vs_transactions(sig_options, tx_raw)
 
+    # Monthly-by-kind-by-source (equity vs options)
+    monthly_src_df = build_perf_by_month_source_kind(realized_df.copy(), options_results_df.copy())
+
     # Write tabs
-    ws_real = open_ws(gc, sheet_url, tab_real)
-    ws_open = open_ws(gc, sheet_url, tab_openpos)
-    ws_perf = open_ws(gc, sheet_url, tab_perf)
-    ws_month = open_ws(gc, sheet_url, tab_month)       # NEW
+    ws_real        = open_ws(gc, sheet_url, tab_real)
+    ws_open        = open_ws(gc, sheet_url, tab_openpos)
+    ws_perf        = open_ws(gc, sheet_url, tab_perf)
+    ws_month       = open_ws(gc, sheet_url, tab_month)
+    ws_month_src   = open_ws(gc, sheet_url, tab_month_src)
     ws_open_detail = open_ws(gc, sheet_url, tab_open_det)
-    ws_opts = open_ws(gc, sheet_url, TAB_OPTIONS)
+    ws_opts        = open_ws(gc, sheet_url, TAB_OPTIONS)
 
     write_tab(ws_real, realized_df)
     write_tab(ws_open, open_df)
     write_tab(ws_perf, perf_df)
-    write_tab(ws_month, monthly_df)                    # NEW
+    write_tab(ws_month, monthly_df)
+    write_tab(ws_month_src, monthly_src_df)
     write_tab(ws_open_detail, open_detail_df)
     write_tab(ws_opts, options_results_df)
 
@@ -1059,11 +1204,13 @@ def main():
     print(f"✅ Wrote {tab_openpos}: {len(open_df)} rows")
     print(f"✅ Wrote {tab_perf}: {len(perf_df)} rows")
     print(f"✅ Wrote {tab_month}: {len(monthly_df)} rows")
+    print(f"✅ Wrote {tab_month_src}: {len(monthly_src_df)} rows")
     print(f"✅ Wrote {tab_open_det}: {len(open_detail_df)} rows")
     print(f"✅ Wrote {TAB_OPTIONS}: {len(options_results_df)} rows")
 
     # Snapshot + Weekly + CSVs
     try:
+        mapping = read_mapping(gc, sheet_url)
         snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping=mapping, price_source=price_source)
         ws_snapshot = open_ws(gc, sheet_url, TAB_SNAPSHOT)
         write_tab(ws_snapshot, snapshot_df)
