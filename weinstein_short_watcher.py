@@ -8,23 +8,22 @@ Weinstein Short Watcher — Stage 4 short setups
 - Emits:
     * TRIG shorts: breakdown below pivot/MA with volume + intrabar confirmations
     * NEAR shorts: price hanging just above breakdown zone, with basic volume pacing
-    * READY-CLOSE shorts: Stage 4 names where price has reclaimed MA150 by a cushion
-      (short thesis weakening / time to consider covering)
+    * READY-TO-CLOSE shorts: Stage 4 names that have reclaimed MA150 by ~0.5%+,
+      suggesting the short thesis is weakening (time to consider covering).
 - Email contains:
     * Ranked list of short triggers + near shorts + ready-to-close shorts
     * Order block: entry≈now, protective stop, 15% & 20% downside targets
     * Tiny charts for top names
 - NEW:
+    * READY-TO-CLOSE shorts are filtered to tickers that appear in the Google Sheet
+      "Signals" tab with Direction = SELL/SHORT (so you only see shorts you actually track).
     * --log-csv / --log-json diagnostics (per-symbol metrics + conditions + state)
-      similar to weinstein_intraday_watcher.py, so you can feed a future
-      short-side signal_engine.
-    * READY-CLOSE section in the same email (no separate email).
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
   * Short Triggers (TRIG)
   * Near Short Setups (NEAR)
-  * Ready-to-Close Shorts (COVER)
+  * Ready-to-close Shorts (READY)
 """
 
 import os, io, json, math, base64, argparse
@@ -39,6 +38,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
+
+# Optional: Google Sheets integration for READY filter
+try:
+    import gspread
+except ImportError:
+    gspread = None
 
 # ---------------- Tunables ----------------
 WEEKLY_OUTPUT_DIR = "./output"
@@ -63,17 +68,15 @@ INTRADAY_LASTBAR_MULT    = 1.20    # (used only for non-60m modes)
 INTRABAR_CONFIRM_MIN_ELAPSED  = 40    # minutes into bar
 INTRABAR_VOLPACE_MIN          = 1.20  # intrabar pace vs avg for confirm
 
+# READY-TO-CLOSE threshold
+READY_ABOVE_MA_PCT       = 0.005  # 0.5% above MA150 => consider short "ready to close"
+
 # Stateful short triggers
 SHORT_STATE_FILE       = "./state/short_triggers.json"
 SCAN_INTERVAL_MIN      = 10
 SHORT_NEAR_HITS_WINDOW = 6
 SHORT_NEAR_HITS_MIN    = 3
 SHORT_COOLDOWN_SCANS   = 24
-
-# Ready-to-close (short cover) logic
-# When price has reclaimed MA150 by this cushion, we consider the short thesis to be weakening.
-SHORT_COVER_RECOVER_PCT = 0.005  # 0.5% above MA150 → READY-CLOSE
-SHORT_COVER_COOLDOWN_SCANS = SHORT_COOLDOWN_SCANS
 
 # Short risk/profit mapping
 SHORT_HARD_STOP_PCT    = 0.20   # 20% above entry
@@ -151,6 +154,56 @@ def load_weekly_report():
     path = newest_weekly_csv()
     df = pd.read_csv(path)
     return df, path
+
+def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
+    """
+    Load tickers from the Google Sheet Signals tab that should be treated as
+    "held"/tracked shorts for READY-TO-CLOSE.
+
+    We treat any row with:
+      - non-empty Ticker
+      - Direction in {SELL, SHORT}  (case-insensitive)
+    as a tracked short. This matches your Signals schema:
+
+      TimestampUTC | Ticker | Source | Direction | Price | Timeframe
+
+    If anything fails (no gspread, bad creds, etc.), we return None and
+    skip filtering (READY list will behave as before, on full Stage 4 universe).
+    """
+    sheets_cfg = (cfg.get("sheets") or {})
+    tab_name = sheets_cfg.get("signals_tab", "Signals")
+
+    if not sheet_url or not service_account_file:
+        log("READY filter: missing sheet_url or service_account_json; disabled.", level="debug")
+        return None
+
+    if gspread is None:
+        log("READY filter: gspread not installed; disabled.", level="warn")
+        return None
+
+    try:
+        gc = gspread.service_account(filename=service_account_file)
+        sh = gc.open_by_url(sheet_url)
+        ws = sh.worksheet(tab_name)
+        rows = ws.get_all_records()
+    except Exception as e:
+        log(f"READY filter: could not load Signals tab '{tab_name}': {e}", level="warn")
+        return None
+
+    tickers = set()
+    for r in rows:
+        t = (r.get("Ticker") or r.get("ticker") or "").strip().upper()
+        if not t:
+            continue
+        direction = str(r.get("Direction") or r.get("direction") or "").strip().upper()
+        if direction not in ("SELL", "SHORT"):
+            continue
+        # Basic sanity: ignore very weird non-symbol strings; but in practice,
+        # options/crypto/etc. won't be in the Stage 4 universe anyway.
+        tickers.add(t)
+
+    log(f"READY filter: loaded {len(tickers)} short tickers from Signals tab '{tab_name}'.", level="info")
+    return tickers
 
 # ---------------- State helpers ----------------
 def _load_short_state():
@@ -364,6 +417,17 @@ def _short_near_zone(px, ma, pivot_low):
     return False
 
 
+def _short_ready_to_close(px, ma):
+    """
+    READY-TO-CLOSE short:
+      - price has reclaimed MA150 by READY_ABOVE_MA_PCT (e.g. 0.5%+ above MA150),
+        suggesting downtrend thesis is weakening.
+    """
+    if pd.isna(px) or pd.isna(ma):
+        return False
+    return px >= ma * (1.0 + READY_ABOVE_MA_PCT)
+
+
 def stage_order(stage: str) -> int:
     if isinstance(stage, str):
         if stage.startswith("Stage 4"):
@@ -502,11 +566,12 @@ def _build_order_block_text(short_trigs, near_shorts, cover_shorts):
             f"MA150={_fmt_num(ma)} entry≈{_fmt_num(entry)} stop≥{_fmt_num(stop)} "
             f"targets↓ [{_fmt_num(t1)}, {_fmt_num(t2)}]"
         )
-    lines.append(
-        f"Rules: entry≈price; stop=max(entry+{SHORT_HARD_STOP_PCT*100:.0f}%, "
-        f"ATR×{SHORT_TRAIL_ATR_MULT:.1f} above, MA150+{SHORT_MA_GUARD_PCT*100:.0f}%); "
-        f"targets at −{SHORT_TARGET1_PCT*100:.0f}% and −{SHORT_TARGET2_PCT*100:.0f}% from entry."
-    )
+    if lines:
+        lines.append(
+            f"Rules: entry≈price; stop=max(entry+{SHORT_HARD_STOP_PCT*100:.0f}%, "
+            f"ATR×{SHORT_TRAIL_ATR_MULT:.1f} above, MA150+{SHORT_MA_GUARD_PCT*100:.0f}%); "
+            f"targets at −{SHORT_TARGET1_PCT*100:.0f}% and −{SHORT_TARGET2_PCT*100:.0f}% from entry."
+        )
     return "\n".join(lines)
 
 # ---------------- Charting ----------------
@@ -591,6 +656,11 @@ def run(
 
     weekly_df, weekly_csv_path = load_weekly_report()
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
+
+    # Load tickers from Signals tab for READY-TO-CLOSE filtering
+    held_ready_tickers = load_ready_short_tickers_from_signals(
+        cfg, sheet_url, service_account_file
+    )
 
     w = weekly_df.rename(columns=str.lower)
     for miss in ["ticker", "stage", "ma30", "rs_above_ma"]:
@@ -694,11 +764,12 @@ def run(
         cond["ma_ok"] = pd.notna(ma30)
         cond["pivot_ok"] = pd.notna(pivot_low)
 
-        # Short near / trigger
+        # Short near / trigger / ready-close
         short_near_now = False
         short_price_ok = False
         short_vol_ok = True
         short_confirm = False
+        ready_close_now = False
 
         if cond["ma_ok"] and cond["pivot_ok"]:
             short_near_now = _short_near_zone(px, ma30, pivot_low)
@@ -735,10 +806,9 @@ def run(
                         else:
                             short_vol_ok = False
 
-        # Ready-to-close condition: price has reclaimed MA150 by a cushion
-        short_cover_now = False
+        # READY-to-close: reclaimed MA150 by ~0.5%+
         if cond["ma_ok"]:
-            short_cover_now = px >= ma30 * (1.0 + SHORT_COVER_RECOVER_PCT)
+            ready_close_now = _short_ready_to_close(px, ma30)
 
         cond["short_near_now"] = bool(short_near_now)
         cond["short_price_ok"] = bool(short_price_ok)
@@ -746,9 +816,9 @@ def run(
         cond["short_confirm"] = bool(short_confirm)
         cond["pace_full_gate"] = pd.isna(pace_full) or pace_full >= VOL_PACE_MIN
         cond["near_pace_gate"] = pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN
-        cond["short_cover_now"] = bool(short_cover_now)
+        cond["ready_close_now"] = bool(ready_close_now)
 
-        # Stateful promotion (short_state + cover state)
+        # Stateful promotion (short_state)
         st = short_state.get(
             t,
             {
@@ -786,8 +856,9 @@ def run(
             sstate = "IDLE"
 
         st["short_state"] = sstate
+        short_state[t] = st
 
-        # Emit short lists (TRIG / NEAR)
+        # Emit short lists
         if st["short_state"] == "TRIGGERED" and cond["pace_full_gate"]:
             trig_shorts.append(
                 {
@@ -817,12 +888,8 @@ def run(
                     }
                 )
 
-        # Ready-to-close state (cover) — one-shot event with cooldown
-        cover_state = st.get("cover_state", "IDLE")
-        cover_cd = int(st.get("cover_cooldown", 0))
-
-        if short_cover_now and cover_state == "IDLE":
-            # Emit READY-CLOSE event once, then go into cooldown so we don't spam
+        # READY-to-close list (pre-filter)
+        if ready_close_now:
             cover_shorts.append(
                 {
                     "ticker": t,
@@ -835,18 +902,6 @@ def run(
                     "atr": atr,
                 }
             )
-            cover_state = "COOLDOWN"
-            cover_cd = SHORT_COVER_COOLDOWN_SCANS
-        elif not short_cover_now and cover_state == "COOLDOWN":
-            if cover_cd > 0:
-                cover_cd -= 1
-            if cover_cd == 0:
-                cover_state = "IDLE"
-
-        st["cover_state"] = cover_state
-        st["cover_cooldown"] = cover_cd
-
-        short_state[t] = st
 
         info_rows.append(
             {
@@ -860,7 +915,6 @@ def run(
                 else round(float(pace_full), 2),
                 "weekly_rank": weekly_rank,
                 "short_state": st["short_state"],
-                "short_cover_now": cond["short_cover_now"],
             }
         )
 
@@ -871,8 +925,6 @@ def run(
             "short_state": st["short_state"],
             "short_hits": st.get("short_hits", []),
             "short_cooldown": st.get("short_cooldown", 0),
-            "cover_state": st.get("cover_state", "IDLE"),
-            "cover_cooldown": st.get("cover_cooldown", 0),
         }
         debug_rows.append(row_debug)
 
@@ -881,12 +933,21 @@ def run(
         level="info",
     )
 
+    # Restrict READY-TO-CLOSE list to tickers present in Signals tab (if available)
+    if held_ready_tickers:
+        before = len(cover_shorts)
+        cover_shorts = [it for it in cover_shorts if it["ticker"] in held_ready_tickers]
+        log(
+            f"READY filter: {before} candidates → {len(cover_shorts)} after restricting to Signals tab shorts.",
+            level="info",
+        )
+
     # ---- TEST MODE SUMMARY (SHORTS) ----
     if os.getenv("INTRADAY_TEST", "0") == "1":
         print("=== SHORT TEST MODE SUMMARY ===")
         print(f"Short TRIG signals: {len(trig_shorts)}")
         print(f"Short NEAR signals: {len(near_shorts)}")
-        print(f"Short READY-CLOSE signals: {len(cover_shorts)}")
+        print(f"Ready-to-close shorts: {len(cover_shorts)}")
         if trig_shorts or near_shorts or cover_shorts:
             print("Email gate (short): WOULD SEND (TRIG/NEAR/READY present).")
         else:
@@ -933,10 +994,12 @@ def run(
         if not items:
             if kind == "TRIG":
                 return "<p>No TRIG shorts.</p>"
-            elif kind == "NEAR":
+            if kind == "NEAR":
                 return "<p>No NEAR shorts.</p>"
-            else:
-                return "<p>No READY-CLOSE shorts.</p>"
+            if kind == "READY":
+                return "<p>No READY-TO-CLOSE shorts.</p>"
+            return "<p>None.</p>"
+
         lis = []
         for i, it in enumerate(items, start=1):
             wr = it.get("weekly_rank", None)
@@ -980,12 +1043,11 @@ def run(
     <h3>Weinstein Short Intraday Watch — {now}</h3>
     <p><i>
       SHORT-TRIGGER: Weekly Stage 4 (Downtrend) + confirmed breakdown under ~10-week pivot low and/or 30-wk MA proxy (SMA150),
-      by ≈{SHORT_BREAK_PCT*100:.1f}% with volume pace ≥ {VOL_PACE_MIN:.1f}×. For 60m bars: ≥{INTRABAR_CONFIRM_MIN_ELAPSED} min
-      elapsed & intrabar pace ≥ {INTRABAR_VOLPACE_MIN:.1f}×.<br>
-      NEAR-SHORT: Stage 4 + RS not above its MA, price hanging just above the pivot/MA breakdown zone (within
-      +{NEAR_ABOVE_PIVOT_PCT*100:.1f}% over pivot or hugging MA150), volume pace ≥ {NEAR_VOL_PACE_MIN:.1f}×.<br>
-      READY-TO-CLOSE (SHORT): Stage 4 names where price has reclaimed MA150 by ≈{SHORT_COVER_RECOVER_PCT*100:.1f}% or more,
-      suggesting the short thesis is weakening and it's time to consider covering.
+      by ≈{SHORT_BREAK_PCT*100:.1f}% with volume pace ≥ {VOL_PACE_MIN:.1f}×. For 60m bars: ≥{INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {INTRABAR_VOLPACE_MIN:.1f}×.<br>
+      NEAR-SHORT: Stage 4 + RS not above its MA, price hanging just above the pivot/MA breakdown zone (within +{NEAR_ABOVE_PIVOT_PCT*100:.1f}% over pivot or hugging MA150),
+      volume pace ≥ {NEAR_VOL_PACE_MIN:.1f}×.<br>
+      READY-TO-CLOSE (SHORT): Stage 4 names where price has reclaimed MA150 by ≈{READY_ABOVE_MA_PCT*100:.1f}% or more,
+      suggesting the short thesis is weakening and it's time to consider covering (restricted to shorts listed in your Signals tab).
     </i></p>
     """
 
@@ -995,7 +1057,7 @@ def run(
     <h4>Near Short Setups (ranked)</h4>
     {bullets(near_shorts, "NEAR")}
     <h4>Ready-to-Close Shorts (ranked)</h4>
-    {bullets(cover_shorts, "COVER")}
+    {bullets(cover_shorts, "READY")}
     {charts_html}
     """
 
@@ -1019,6 +1081,14 @@ def run(
 
     # Plain text
     def _lines(items, kind):
+        if not items:
+            if kind == "TRIG":
+                return "No TRIG shorts."
+            if kind == "NEAR":
+                return "No NEAR shorts."
+            if kind == "READY":
+                return "No READY-TO-CLOSE shorts."
+            return "None."
         out = []
         for i, it in enumerate(items, 1):
             wr = it.get("weekly_rank", None)
@@ -1044,17 +1114,13 @@ def run(
                 f"targets↓ [{_fmt_num(t1)}, {_fmt_num(t2)}], "
                 f"{it.get('stage','')}, weekly {wr_str}, pace {pace_str})"
             )
-        return "\n".join(out) if out else (
-            "No TRIG shorts." if kind == "TRIG" else
-            "No NEAR shorts." if kind == "NEAR" else
-            "No READY-CLOSE shorts."
-        )
+        return "\n".join(out)
 
     text = (
         f"Weinstein Short Intraday Watch — {now}\n\n"
         f"Short TRIGGERS (ranked):\n{_lines(trig_shorts, 'TRIG')}\n\n"
         f"NEAR short setups (ranked):\n{_lines(near_shorts, 'NEAR')}\n\n"
-        f"Ready-to-close shorts (ranked):\n{_lines(cover_shorts, 'COVER')}\n\n"
+        f"READY-TO-CLOSE shorts (ranked):\n{_lines(cover_shorts, 'READY')}\n\n"
     )
 
     order_block_text = _build_order_block_text(trig_shorts, near_shorts, cover_shorts)
@@ -1091,7 +1157,7 @@ def run(
     except Exception as e:
         log(f"Cannot save HTML: {e}", level="warn")
 
-    # -------- Email only when TRIG/NEAR/READY shorts exist --------
+    # -------- Email only when we actually have something --------
     has_shorts = bool(trig_shorts or near_shorts or cover_shorts)
 
     if not has_shorts:
