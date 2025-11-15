@@ -12,10 +12,12 @@ Adds:
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
-  * Buy Triggers
-  * Near-Triggers
-  * Sell Triggers
-  * SELL / Risk signals (from holdings / positions)
+  * Buy Triggers (ranked) → buy_signals
+  * Near-Triggers (ranked) → near_signals
+  * Sell Triggers (ranked) → sell_triggers
+
+- The email body can still include:
+  * SELL / Risk signals (from holdings / positions) → sell_signals, sell_from_positions
 """
 
 import os, io, json, math, base64, yaml, argparse
@@ -1217,13 +1219,11 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     except Exception as e:
         log(f"Cannot save HTML: {e}", level="warn")
 
-    # -------- NEW: Email only when we have signals --------
+    # -------- Email only when we have entry/exit TRIGGERS --------
     has_signals = bool(
-        buy_signals
-        or near_signals
-        or sell_triggers
-        or sell_signals
-        or sell_from_positions
+        buy_signals      # Buy Triggers (ranked)
+        or near_signals  # Near-Triggers (ranked)
+        or sell_triggers # Sell Triggers (ranked, MA150 breaks)
     )
 
     if not has_signals:
@@ -1232,7 +1232,11 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             log("DRY-RUN set — no email would be sent anyway.", level="debug")
         return
 
-    subject_counts = f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_triggers)} SELL-TRIG / {len(sell_signals)} SELL"
+    subject_counts = (
+        f"{len(buy_signals)} BUY / "
+        f"{len(near_signals)} NEAR / "
+        f"{len(sell_triggers)} SELL-TRIG"
+    )
     if dry_run:
         log("DRY-RUN set — skipping email send.", level="warn")
     else:
