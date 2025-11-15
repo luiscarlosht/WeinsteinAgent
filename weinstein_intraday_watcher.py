@@ -9,6 +9,13 @@ Adds:
 - Same trigger logic, diagnostics CSV/JSON, HTML save, optional dry run
 - "Order Block" proposing entries/stops for BUY/SELL (stocks + crypto)
 - NEW: Alert Levels for BUY triggers (low stop + 15% / 20% upside targets)
+
+Email behavior:
+- Email is sent ONLY when there is at least one of:
+  * Buy Triggers
+  * Near-Triggers
+  * Sell Triggers
+  * SELL / Risk signals (from holdings / positions)
 """
 
 import os, io, json, math, base64, yaml, argparse
@@ -1050,9 +1057,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
     log(f"Charts prepared: {len(chart_imgs)}", level="debug")
 
-    # -------- Alert levels for BUY triggers (Topic 1) --------
+    # -------- Alert levels for BUY triggers --------
     alert_rows = _compute_alert_rows_for_buys(buy_signals)
-    # write dedicated CSV for quick input into Fidelity
     if alert_rows:
         try:
             os.makedirs(os.path.dirname(ALERT_CSV_PATH), exist_ok=True)
@@ -1210,6 +1216,21 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         log(f"Saved HTML → {html_path}", level="ok")
     except Exception as e:
         log(f"Cannot save HTML: {e}", level="warn")
+
+    # -------- NEW: Email only when we have signals --------
+    has_signals = bool(
+        buy_signals
+        or near_signals
+        or sell_triggers
+        or sell_signals
+        or sell_from_positions
+    )
+
+    if not has_signals:
+        log("No BUY/NEAR/SELL triggers present — skipping email send.", level="info")
+        if dry_run:
+            log("DRY-RUN set — no email would be sent anyway.", level="debug")
+        return
 
     subject_counts = f"{len(buy_signals)} BUY / {len(near_signals)} NEAR / {len(sell_triggers)} SELL-TRIG / {len(sell_signals)} SELL"
     if dry_run:
