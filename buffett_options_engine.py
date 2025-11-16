@@ -21,9 +21,9 @@ CONFIG_PATH = "config.yaml"
 
 # Conservative Buffett-style parameters
 RISK_BUFFER = 0.10   # 10% below current price
-MIN_DTE = 7          # skip super-short weeklys
-MAX_DTE = 45         # 30–45 days out is the sweet spot
-MIN_YIELD = 0.008    # 0.8% over the DTE period annualized
+MIN_DTE = 7          # skip ultra-short expiries
+MAX_DTE = 45         # up to 45 DTE
+MIN_YIELD = 0.008    # 0.8% annualized minimum yield
 
 BUFFETT_TAB_NAME = "Buffett_Put_Signals"
 
@@ -69,7 +69,7 @@ def is_equity_ticker(raw: str) -> bool:
     """
     Heuristic filter to keep plain equities/ETFs and drop:
     - crypto (e.g., BTC-USD)
-    - options (start with '-' or long strings with date codes)
+    - options (start with '-' or long symbol+date)
     - cash placeholders (FCASH, SPAXX, PENDING ACTIVITY, etc.)
     """
     if not raw:
@@ -77,30 +77,30 @@ def is_equity_ticker(raw: str) -> bool:
 
     t = str(raw).strip().upper()
 
-    # Explicit junk / cash / crypto
-    blacklist_prefixes = (
-        "FCASH", "SPAXX", "PENDING", "PENDING ACTIVITY",
-        "BTC-", "ETH-", "SOL-",
-    )
-    if any(t.startswith(p) for p in blacklist_prefixes):
+    # Explicit junk / cash / placeholders
+    blacklist_exact = {
+        "FCASH", "SPAXX", "SPAXX**",
+        "PENDING ACTIVITY", "PENDING", "FCASH**",
+    }
+    if t in blacklist_exact:
         return False
 
+    # Crypto style tickers
     if t.endswith("-USD"):
         return False
 
-    # obvious options or synthetic IDs
+    # Obvious options from brokers (leading -)
     if t.startswith("-"):
         return False
 
-    # all digits (e.g., a CUSIP or account number)
+    # CUSIPs / all digits
     if t.replace(".", "").isdigit():
         return False
 
-    # Long symbol with digits in the middle is likely an option code
-    if len(t) > 6 and any(ch.isdigit() for ch in t):
+    # Long + digits: likely option codes
+    if len(t) > 8 and any(ch.isdigit() for ch in t):
         return False
 
-    # Otherwise treat as equity/ETF
     return True
 
 
@@ -128,9 +128,9 @@ def load_tickers_from_sheets(cfg: dict) -> list[str]:
         print(f"⚠️ Could not read Open_Positions tab '{open_pos_tab}': {e}")
         df_open = pd.DataFrame()
 
-    tickers = set()
+    tickers: set[str] = set()
 
-    # From Signals: Ticker column
+    # From Signals
     if not df_signals.empty:
         ticker_col_candidates = [c for c in df_signals.columns if c.lower() in ("ticker", "symbol")]
         if ticker_col_candidates:
@@ -139,7 +139,7 @@ def load_tickers_from_sheets(cfg: dict) -> list[str]:
                 if is_equity_ticker(t):
                     tickers.add(str(t).strip().upper())
 
-    # From Open_Positions: Symbol column
+    # From Open_Positions
     if not df_open.empty:
         sym_col_candidates = [c for c in df_open.columns if c.lower() in ("symbol", "ticker")]
         if sym_col_candidates:
@@ -157,10 +157,12 @@ def load_tickers_from_sheets(cfg: dict) -> list[str]:
 # Options scanning logic
 # ------------------------------
 
-def get_option_chain_for_ticker(ticker: str,
-                                risk_buffer: float = RISK_BUFFER,
-                                min_dte: int = MIN_DTE,
-                                max_dte: int = MAX_DTE) -> pd.DataFrame:
+def get_option_chain_for_ticker(
+    ticker: str,
+    risk_buffer: float = RISK_BUFFER,
+    min_dte: int = MIN_DTE,
+    max_dte: int = MAX_DTE,
+) -> pd.DataFrame:
     stock = yf.Ticker(ticker)
 
     try:
@@ -171,7 +173,8 @@ def get_option_chain_for_ticker(ticker: str,
         return pd.DataFrame()
 
     today = datetime.utcnow().date()
-    valid_dates = []
+    valid_dates: list[tuple[str, int]] = []
+
     for d in expiry_dates:
         try:
             d_date = datetime.strptime(d, "%Y-%m-%d").date()
@@ -210,14 +213,13 @@ def get_option_chain_for_ticker(ticker: str,
         if candidates.empty:
             continue
 
-        # Compute annualized yield: premium / underlying / DTE * 365
         candidates["ticker"] = ticker
         candidates["underlying_price"] = current_price
         candidates["dte"] = dte
         candidates["target_strike"] = buffer_price
         candidates["expiry"] = expiry_str
 
-        # Use bid as conservative premium
+        # Annualized yield: bid / underlying / DTE * 365
         candidates["yield_pct"] = (
             candidates["bid"].astype(float) /
             current_price /
@@ -263,17 +265,16 @@ def scan_all(tickers: list[str]) -> pd.DataFrame:
 
 
 # ------------------------------
-# Output: CSV + Google Sheet + Email
+# Output helpers
 # ------------------------------
 
 def get_output_dir(cfg: dict) -> str:
-    # Prefer reporting.output_dir, fall back to sheets.output_dir, then ./output
     reporting_cfg = cfg.get("reporting", {})
     sheets_cfg = cfg.get("sheets", {})
     return (
-        reporting_cfg.get("output_dir") or
-        sheets_cfg.get("output_dir") or
-        "./output"
+        reporting_cfg.get("output_dir")
+        or sheets_cfg.get("output_dir")
+        or "./output"
     )
 
 
@@ -287,6 +288,26 @@ def save_to_csv(df: pd.DataFrame, cfg: dict) -> str:
     return fpath
 
 
+def normalize_df_for_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all values to JSON/Sheets-safe Python types."""
+    from pandas import Timestamp
+
+    def conv(x):
+        if isinstance(x, Timestamp):
+            return x.isoformat()
+        if isinstance(x, datetime):
+            return x.isoformat()
+        if pd.isna(x):
+            return ""
+        if isinstance(x, (np.integer, int)):
+            return int(x)
+        if isinstance(x, (np.floating, float)):
+            return float(x)
+        return x
+
+    return df.applymap(conv)
+
+
 def upload_df_to_sheet(df: pd.DataFrame, cfg: dict, tab_name: str = BUFFETT_TAB_NAME):
     client = get_gspread_client(cfg)
     sh = open_trading_hub_sheet(client, cfg)
@@ -294,7 +315,6 @@ def upload_df_to_sheet(df: pd.DataFrame, cfg: dict, tab_name: str = BUFFETT_TAB_
     try:
         ws = sh.worksheet(tab_name)
     except gspread.WorksheetNotFound:
-        # Create the worksheet if it doesn't exist
         rows = max(len(df) + 10, 100)
         cols = max(len(df.columns) + 5, 20)
         ws = sh.add_worksheet(title=tab_name, rows=rows, cols=cols)
@@ -302,42 +322,50 @@ def upload_df_to_sheet(df: pd.DataFrame, cfg: dict, tab_name: str = BUFFETT_TAB_
     ws.clear()
 
     if df.empty:
-        ws.update("A1", [["No qualifying CSPs found."]])
+        ws.update(values=[["No qualifying CSPs found."]], range_name="A1")
         print(f"✅ Updated sheet tab '{tab_name}' (no rows).")
         return
 
-    header = df.columns.tolist()
-    values = df.astype(object).where(pd.notnull(df), "").values.tolist()
-    ws.update("A1", [header] + values)
+    df_norm = normalize_df_for_sheet(df)
+    header = df_norm.columns.tolist()
+    values = df_norm.values.tolist()
+
+    # New gspread signature: values first, then range_name (or named args)
+    ws.update(values=[header] + values, range_name="A1")
     print(f"✅ Updated sheet tab '{tab_name}' with {len(df)} rows.")
 
 
-def send_buffett_email(df: pd.DataFrame,
-                       cfg: dict,
-                       csv_path: str,
-                       universe_size: int):
+def send_buffett_email(
+    df: pd.DataFrame,
+    cfg: dict,
+    csv_path: str,
+    universe_size: int,
+):
     sheets_cfg = cfg["sheets"]
     sheet_url = sheets_cfg.get("sheet_url") or sheets_cfg["url"]
 
     total = len(df)
     top_n = min(15, total)
+
     if top_n > 0:
         top = df.head(top_n).copy()
-        # Small selection of columns for readability
         display_cols = [
             "ticker", "strike", "expiry",
             "underlying_price", "dte",
             "target_strike", "yield_pct",
         ]
         display_cols = [c for c in display_cols if c in top.columns]
-        top["yield_pct"] = (top["yield_pct"] * 100.0).round(2)
+
+        # Format yield as %
+        if "yield_pct" in top.columns:
+            top["yield_pct"] = (top["yield_pct"] * 100.0).round(2)
 
         html_rows = []
         for _, row in top.iterrows():
-            parts = []
+            cells = []
             for col in display_cols:
-                parts.append(f"<td>{row.get(col, '')}</td>")
-            html_rows.append("<tr>" + "".join(parts) + "</tr>")
+                cells.append(f"<td>{row.get(col, '')}</td>")
+            html_rows.append("<tr>" + "".join(cells) + "</tr>")
 
         html_table_header = "".join(f"<th>{c}</th>" for c in display_cols)
         html_table = (
@@ -397,9 +425,9 @@ def main(cfg_path: str = CONFIG_PATH):
         return
 
     df = scan_all(tickers)
+
     if df.empty:
         print("⚠️ No suitable options found (after yield / DTE filters).")
-        # Still upload a "no rows" message and send a short email
         csv_path = save_to_csv(df, cfg)
         upload_df_to_sheet(df, cfg, BUFFETT_TAB_NAME)
         send_buffett_email(df, cfg, csv_path, universe_size=len(tickers))
