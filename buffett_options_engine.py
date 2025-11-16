@@ -2,21 +2,37 @@
 #
 # Buffett-style Cash Secured Put (CSP) scanner for a "safe / moderate" universe.
 #
-# Features:
-# - Automatically loads tickers from Google Sheets (Signals + Open_Positions)
-#   using config.yaml (see GOOGLE SHEETS CONFIG section below).
-# - Applies Option B logic:
-#     * Buffett-core quality tickers
-#     * plus moderate-quality names you own / track
-#     * excludes crypto, ETFs, penny/microcaps & very speculative names
-# - Scans puts 7–45 DTE, 10% below current price, and filters by minimum yield.
+# Config integration:
+# - Uses config.yaml with sections:
+#     sheets:
+#       url: "https://docs.google.com/spreadsheets/d/....../edit"
+#       sheet_url: "..."
+#       open_positions_tab: "Open_Positions"
+#       signals_tab: "Signals"
+#       output_dir: "./output"
+#
+#     google:
+#       service_account_json: "/path/to/gcp_service_account.json"
+#
+#     reporting:
+#       output_dir: "/home/.../WeinsteinAgent/output"
+#
+# - Universe is built from:
+#     * Signals tab (long / BUY rows)
+#     * Open_Positions tab
+#     * plus a default Option B list
+#   and then filtered to remove banned / speculative names.
 #
 # Output:
-# - Writes ./output/Buffett_Put_Signals_YYYYMMDD_HHMMSS.csv
+# - Writes Buffett_Put_Signals_YYYYMMDD_HHMMSS.csv into:
+#     sheets.output_dir if present,
+#     else reporting.output_dir,
+#     else ./output
 
 import os
+import re
 from datetime import datetime
-from typing import List, Set
+from typing import List, Set, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -42,12 +58,11 @@ RISK_BUFFER = 0.10  # 10% below current price
 # Minimum annualized yield (premium / current_price, annualized by DTE)
 MIN_YIELD = 0.008  # 0.8% annualized minimum
 
-# Max days to expiration
+# DTE window
 MAX_DTE = 45
 MIN_DTE = 7
 
 # Default (fallback) Option B universe
-# If Google Sheets loading fails, we use this list.
 BUFFETT_UNIVERSE_DEFAULT: List[str] = [
     # Buffett-core style names
     "AAPL", "HCA", "APH", "PAYX", "OTIS",
@@ -73,24 +88,11 @@ BANNED_TICKERS: Set[str] = {
 
 
 # ============================
-#   GOOGLE SHEETS CONFIG
+#   CONFIG HELPERS
 # ============================
 
-# We assume a config.yaml in the repo root, with something like:
-#
-# google_sheets:
-#   spreadsheet_id: "your-spreadsheet-id"
-#   service_account_file: "service_account.json"
-#   signals_tab: "Signals"
-#   open_positions_tab: "Open_Positions"
-#
-# If any of this is missing or gspread/yaml are not installed,
-# we fall back to BUFFETT_UNIVERSE_DEFAULT.
-
-
-def _load_config(path: str = "config.yaml") -> dict:
-    if not HAS_SHEETS:
-        return {}
+def _load_config(path: str = "config.yaml") -> Dict[str, Any]:
+    """Load YAML config. Returns {} on failure."""
     if not os.path.exists(path):
         print(f"⚠️ config.yaml not found at {path}, using fallback universe.")
         return {}
@@ -102,14 +104,34 @@ def _load_config(path: str = "config.yaml") -> dict:
         return {}
 
 
-def _get_sheets_client(cfg: dict):
+def _extract_spreadsheet_id_from_url(url: str) -> str:
+    """
+    Extract the Google Sheet ID from:
+    https://docs.google.com/spreadsheets/d/<ID>/edit
+    """
+    if not url:
+        return ""
+    # Try regex first
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    if m:
+        return m.group(1)
+    # Fallback: naive split
+    parts = url.split("/d/")
+    if len(parts) > 1:
+        after = parts[1]
+        return after.split("/")[0]
+    return ""
+
+
+def _get_sheets_client(cfg: Dict[str, Any]):
+    """Create a gspread client from config.google.service_account_json."""
     if not HAS_SHEETS:
         return None
 
-    gs_cfg = (cfg or {}).get("google_sheets") or {}
-    creds_file = gs_cfg.get("service_account_file")
+    google_cfg = (cfg or {}).get("google") or {}
+    creds_file = google_cfg.get("service_account_json")
     if not creds_file:
-        print("⚠️ google_sheets.service_account_file missing in config.yaml")
+        print("⚠️ google.service_account_json missing in config.yaml")
         return None
     if not os.path.exists(creds_file):
         print(f"⚠️ Service account file not found: {creds_file}")
@@ -130,6 +152,8 @@ def _get_sheets_client(cfg: dict):
 
 def _load_tickers_from_tab(client, spreadsheet_id: str, tab_name: str) -> Set[str]:
     """Load a set of tickers from a given worksheet/tab."""
+    if not tab_name:
+        return set()
     try:
         sh = client.open_by_key(spreadsheet_id)
         ws = sh.worksheet(tab_name)
@@ -157,12 +181,11 @@ def _load_tickers_from_tab(client, spreadsheet_id: str, tab_name: str) -> Set[st
             .dropna()
         )
 
-        # Filter out obviously invalid or synthetic symbols (options, CUSIPs etc.)
-        # Option-style and weird synthetic symbols tend to have digits + letters + hyphens etc.
-        # We'll allow standard stock tickers: letters + dots + dashes.
+        # Filter out obviously invalid or synthetic symbols (options, CUSIPs, etc.)
+        # Allow standard stock tickers: letters + dots + dashes.
         tickers = tickers[tickers.str.match(r"^[A-Za-z.\-]+$")]
 
-        # If there's a "Side" / "Direction" column, keep only long if present.
+        # If there's a "Side"/"Direction"/"Position" column, keep only long/buy if present.
         side_col = None
         for cand in ["Side", "side", "Direction", "direction", "Position", "position"]:
             if cand in df.columns:
@@ -173,7 +196,6 @@ def _load_tickers_from_tab(client, spreadsheet_id: str, tab_name: str) -> Set[st
             long_mask = side_series.isin(["long", "buy", "bought"])
             tickers = tickers[long_mask]
 
-        # Final clean + dedupe
         out = {t.upper() for t in tickers}
         return out
 
@@ -183,16 +205,24 @@ def _load_tickers_from_tab(client, spreadsheet_id: str, tab_name: str) -> Set[st
 
 
 def load_universe_from_google_sheets() -> List[str]:
-    """Load Buffett CSP universe dynamically from Google Sheets."""
+    """
+    Build the Buffett CSP universe from config.yaml:
+      - sheets.url / sheets.sheet_url  -> spreadsheet_id
+      - sheets.signals_tab
+      - sheets.open_positions_tab
+    plus BUFFETT_UNIVERSE_DEFAULT, minus banned tickers.
+    """
     if not HAS_SHEETS:
         print("ℹ️ gspread/yaml not installed; using fallback universe.")
         return BUFFETT_UNIVERSE_DEFAULT
 
     cfg = _load_config()
-    gs_cfg = cfg.get("google_sheets") or {}
-    spreadsheet_id = gs_cfg.get("spreadsheet_id")
+
+    sheets_cfg = cfg.get("sheets") or {}
+    url = sheets_cfg.get("sheet_url") or sheets_cfg.get("url")
+    spreadsheet_id = _extract_spreadsheet_id_from_url(url)
     if not spreadsheet_id:
-        print("⚠️ google_sheets.spreadsheet_id missing in config.yaml, using fallback.")
+        print("⚠️ Could not extract spreadsheet_id from sheets.url/sheet_url; using fallback universe.")
         return BUFFETT_UNIVERSE_DEFAULT
 
     client = _get_sheets_client(cfg)
@@ -200,16 +230,17 @@ def load_universe_from_google_sheets() -> List[str]:
         print("⚠️ Could not create Sheets client, using fallback universe.")
         return BUFFETT_UNIVERSE_DEFAULT
 
-    signals_tab = gs_cfg.get("signals_tab", "Signals")
-    open_pos_tab = gs_cfg.get("open_positions_tab", "Open_Positions")
+    signals_tab = sheets_cfg.get("signals_tab", "Signals")
+    open_pos_tab = sheets_cfg.get("open_positions_tab", "Open_Positions")
 
     tickers: Set[str] = set()
 
     # Load from Signals
-    print(f"🔍 Loading tickers from tab '{signals_tab}'...")
-    tickers |= _load_tickers_from_tab(client, spreadsheet_id, signals_tab)
+    if signals_tab:
+        print(f"🔍 Loading tickers from tab '{signals_tab}'...")
+        tickers |= _load_tickers_from_tab(client, spreadsheet_id, signals_tab)
 
-    # Load from Open_Positions (if exists)
+    # Load from Open_Positions
     if open_pos_tab:
         print(f"🔍 Loading tickers from tab '{open_pos_tab}'...")
         tickers |= _load_tickers_from_tab(client, spreadsheet_id, open_pos_tab)
@@ -227,6 +258,24 @@ def load_universe_from_google_sheets() -> List[str]:
     final_list = sorted(tickers)
     print(f"✅ Using {len(final_list)} tickers in Buffett CSP universe.")
     return final_list
+
+
+def _get_output_dir_from_config() -> str:
+    """
+    Decide where to write the Buffett_Put_Signals CSV:
+      1) sheets.output_dir
+      2) reporting.output_dir
+      3) ./output
+    """
+    cfg = _load_config()
+    sheets_cfg = cfg.get("sheets") or {}
+    reporting_cfg = cfg.get("reporting") or {}
+
+    if "output_dir" in sheets_cfg and sheets_cfg["output_dir"]:
+        return sheets_cfg["output_dir"]
+    if "output_dir" in reporting_cfg and reporting_cfg["output_dir"]:
+        return reporting_cfg["output_dir"]
+    return "./output"
 
 
 # ============================
@@ -255,8 +304,6 @@ def get_option_chain(ticker: str, max_dte: int = MAX_DTE) -> pd.DataFrame:
     if not valid_dates:
         return pd.DataFrame()
 
-    results = []
-
     # Get last close price; use iloc to avoid FutureWarning
     try:
         hist = stock.history(period="1d")
@@ -267,6 +314,7 @@ def get_option_chain(ticker: str, max_dte: int = MAX_DTE) -> pd.DataFrame:
         return pd.DataFrame()
 
     buffer_price = round(current_price * (1 - RISK_BUFFER), 2)
+    results = []
 
     for expiry in valid_dates:
         try:
@@ -295,13 +343,12 @@ def get_option_chain(ticker: str, max_dte: int = MAX_DTE) -> pd.DataFrame:
 
         results.append(candidates)
 
-    if results:
-        df = pd.concat(results, ignore_index=True)
-        # Filter out NaN yields
-        df = df.dropna(subset=["yield_pct"])
-        return df
+    if not results:
+        return pd.DataFrame()
 
-    return pd.DataFrame()
+    df = pd.concat(results, ignore_index=True)
+    df = df.dropna(subset=["yield_pct"])
+    return df
 
 
 def scan_all() -> pd.DataFrame:
@@ -335,8 +382,9 @@ def scan_all() -> pd.DataFrame:
 
 def save_to_csv(df: pd.DataFrame):
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs("output", exist_ok=True)
-    fpath = f"./output/Buffett_Put_Signals_{now}.csv"
+    out_dir = _get_output_dir_from_config()
+    os.makedirs(out_dir, exist_ok=True)
+    fpath = os.path.join(out_dir, f"Buffett_Put_Signals_{now}.csv")
     df.to_csv(fpath, index=False)
     print(f"✅ Saved: {fpath}")
 
