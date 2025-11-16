@@ -9,7 +9,6 @@ app:
     take_profit_R: [1.0, 2.0] # targets in R multiples
     round_qty_to: 1           # equities: 1 share; crypto: set to 0.000001
 
-
 sheets:
   # Primary Google Sheet
   url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
@@ -67,6 +66,7 @@ universe:
   extra: ["NVDA","ANET","PANW","CRWD","RTX","VUG","SOXX"]
   min_price: 5
   min_avg_volume: 1000000
+  buffett_mode: "hybrid"   # options: "signals_only" | "hybrid" | "sp500_only"
 
 risk:
   max_position_pct: 10
