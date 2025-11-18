@@ -382,6 +382,41 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
     action = df.get(actioncol, "")
     typ    = df.get(typecol, "")
     desc   = df.get(desccol, "")
+
+    # --- TEMP FIX: drop explicit equity short-sale / short-cover trades ---
+    # These "SHORT SALE" / "SHORT COVER" rows would otherwise be interpreted by
+    # the long-only FIFO engine as normal BUY/SELLs, creating fake long lots
+    # (e.g. UNH) or unmatched sells.
+    combo = (
+        action.astype(str).str.upper() + " "
+        + typ.astype(str).str.upper() + " "
+        + desc.astype(str).str.upper()
+    )
+
+    is_short_sale  = combo.str.contains("SHORT SALE",  na=False)
+    is_short_cover = combo.str.contains("SHORT COVER", na=False)
+    short_mask = is_short_sale | is_short_cover
+
+    if short_mask.any() and debug:
+        short_rows = df.loc[short_mask].copy()
+        cols_to_show = [
+            c for c in [datecol, actioncol, typecol, desccol, symcol, qtycol, pricecol, amtcol]
+            if c is not None
+        ]
+        print("• load_transactions: dropping short trades (SHORT SALE / SHORT COVER rows):")
+        try:
+            print(short_rows[cols_to_show])
+        except Exception:
+            print(short_rows.head())
+
+    # Remove these rows before we classify BUY/SELL and run FIFO
+    df = df.loc[~short_mask].copy()
+
+    # Rebuild views after filtering
+    action = df.get(actioncol, "")
+    typ    = df.get(typecol, "")
+    desc   = df.get(desccol, "")
+
     mask_tr = _looks_like_trade_mask(action, typ, desc)
 
     df_tr = df.loc[mask_tr].copy()
