@@ -27,9 +27,11 @@ Options behaviour:
   build a monthly-by-source breakdown that separates EQUITY vs OPTION.
 
 NOTE on shorts:
-- The current FIFO engine treats all realized trades as "equity" direction-agnostic.
-  To separate long vs short performance, we'd need to enhance build_realized_and_open
-  to be aware of short entries/exits; this file currently does NOT split longs vs shorts.
+- The FIFO engine for equities is still long-oriented (BUY→SELL). We do NOT attempt
+  to compute full realized P/L by separating long vs short behavior inside FIFO.
+- However, we now add **open short positions** into Open_Positions by reading
+  negative-quantity rows from the Holdings tab, so Open_Positions and Snapshot
+  reflect both longs and shorts that exist in the broker account.
 """
 
 from __future__ import annotations
@@ -259,11 +261,7 @@ def googlefinance_formula_for(ticker: str, row_idx: int, mapping: Dict[str, Dict
     base = base_symbol_from_string(ticker)
     mapped = mapping.get(ticker, {}) or mapping.get(base, {}) or {}
     sym = mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
-    # Fallback now uses column A (ticker), not column B
-    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(A{row_idx},"price"), ""))'
-
-def googlefinance_formula_for_snapshot(tkr: str, row_index: int, mapping: dict) -> str:
-    return googlefinance_formula_for(tkr, row_index, mapping)
+    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_idx},"price"), ""))'
 
 # ─────────────────────────────
 # LOAD SIGNALS (+ options)
@@ -390,7 +388,7 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
     # --- TEMP FIX: drop explicit equity short-sale / short-cover trades ---
     # These "SHORT SALE" / "SHORT COVER" rows would otherwise be interpreted by
     # the long-only FIFO engine as normal BUY/SELLs, creating fake long lots
-    # (e.g. UNH) or unmatched sells.
+    # or unmatched sells. We still represent open shorts later from Holdings.
     combo = (
         action.astype(str).str.upper() + " "
         + typ.astype(str).str.upper() + " "
@@ -485,7 +483,7 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
     if debug:
         print(f"• load_transactions: after cleaning → {len(df_tr)} trades")
 
-    return df_tr[["When","Type","Symbol","Qty","Price"]], df  # second is raw df_tx for options scan
+    return df_tr[["When","Type","Symbol","Qty","Price"]], df  # second is raw df_tx (short rows removed)
 
 # ─────────────────────────────
 # LIVE PRICE & SNAPSHOT
@@ -525,6 +523,9 @@ def _fetch_last_prices_yf(tickers: list[str]) -> dict:
                 t = uniq[0]
                 out[t] = float(ser.iloc[-1])
     return out
+
+def googlefinance_formula_for_snapshot(tkr: str, row_index: int, mapping: dict) -> str:
+    return googlefinance_formula_for(tkr, row_index, mapping)
 
 def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
     if open_df.empty:
@@ -676,7 +677,7 @@ def build_realized_and_open(
 # ─────────────────────────────
 def to_float_any(x):
     if isinstance(x, str):
-        x = x.replace("$","").replace(",","").replace("%","").strip()
+        x = x.replace("$","").replace(",","").strip()
     try:
         return float(x)
     except Exception:
@@ -1060,110 +1061,51 @@ def build_perf_by_month_source_kind(
     return out
 
 # ─────────────────────────────
-# SNAPSHOT / WEEKLY
+# SNAPSHOT / WEEKLY + SHORTS FROM HOLDINGS
 # ─────────────────────────────
-def build_snapshot_from_open_detail(
-    open_detail_df: pd.DataFrame,
-    mapping: dict | None = None,
-    *,
-    price_source: str = "sheets",
-    holdings_df: pd.DataFrame | None = None
-) -> pd.DataFrame:
-    """
-    Build Open_Positions_Snapshot from:
-      - open_detail_df (long equity lots from FIFO)
-      - holdings_df (to append live SHORT equity positions)
-    """
-    cols = [
-        "Symbol","Description","Quantity","Last Price","Current Value",
-        "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"
-    ]
+def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: dict | None = None, *, price_source: str = "sheets") -> pd.DataFrame:
+    if open_detail_df is None or open_detail_df.empty:
+        return pd.DataFrame(columns=[
+            "Symbol","Description","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"
+        ])
 
-    frames: List[pd.DataFrame] = []
+    df = open_detail_df.copy()
+    df["Symbol"] = df["Ticker"].astype(str)
+    df["Quantity"] = pd.to_numeric(df.get("OpenQty", np.nan), errors="coerce")
+    df["Average Cost Basis"] = pd.to_numeric(df.get("EntryPrice", np.nan), errors="coerce")
+    df["Description"] = ""
 
-    # ---- From FIFO open lots (longs) ----
-    if open_detail_df is not None and not open_detail_df.empty:
-        df = open_detail_df.copy()
-        df["Symbol"] = df["Ticker"].astype(str)
-        df["Quantity"] = pd.to_numeric(df.get("OpenQty", np.nan), errors="coerce")
-        df["Average Cost Basis"] = pd.to_numeric(df.get("EntryPrice", np.nan), errors="coerce")
-        df["Description"] = ""
+    if price_source == "sheets":
+        last_price = []
+        for i, r in df.iterrows():
+            row_index = i + 2
+            tkr = str(r["Symbol"])
+            formula = googlefinance_formula_for_snapshot(tkr, row_index, mapping or {})
+            last_price.append(formula)
+        df["Last Price"] = last_price
+        df["Current Value"] = ""
+        df["Cost Basis Total"] = ""
+        df["Total Gain/Loss Dollar"] = ""
+        df["Total Gain/Loss Percent"] = ""
+    else:
+        prices = _fetch_last_prices_yf(df["Symbol"].dropna().unique().tolist())
+        df["Last Price"] = df["Symbol"].map(prices).astype(float)
+        df["Cost Basis Total"] = (df["Quantity"] * df["Average Cost Basis"]).astype(float)
+        df["Current Value"] = (df["Quantity"] * df["Last Price"]).astype(float)
+        df["Total Gain/Loss Dollar"] = (df["Current Value"] - df["Cost Basis Total"]).astype(float)
+        df["Total Gain/Loss Percent"] = np.where(
+            df["Average Cost Basis"].fillna(0) > 0,
+            (df["Last Price"] / df["Average Cost Basis"] - 1) * 100.0,
+            np.nan
+        )
 
-        if price_source == "sheets":
-            last_price = []
-            for i, r in df.iterrows():
-                row_index = i + 2  # Snapshot sheet row index
-                tkr = str(r["Symbol"])
-                formula = googlefinance_formula_for_snapshot(tkr, row_index, mapping or {})
-                last_price.append(formula)
-            df["Last Price"] = last_price
-            df["Current Value"] = ""
-            df["Cost Basis Total"] = ""
-            df["Total Gain/Loss Dollar"] = ""
-            df["Total Gain/Loss Percent"] = ""
-        else:
-            prices = _fetch_last_prices_yf(df["Symbol"].dropna().unique().tolist())
-            df["Last Price"] = df["Symbol"].map(prices).astype(float)
-            df["Cost Basis Total"] = (df["Quantity"] * df["Average Cost Basis"]).astype(float)
-            df["Current Value"] = (df["Quantity"] * df["Last Price"]).astype(float)
-            df["Total Gain/Loss Dollar"] = (df["Current Value"] - df["Cost Basis Total"]).astype(float)
-            df["Total Gain/Loss Percent"] = np.where(
-                df["Average Cost Basis"].fillna(0) > 0,
-                (df["Last Price"] / df["Average Cost Basis"] - 1) * 100.0,
-                np.nan
-            )
-
-        for c in cols:
-            if c not in df.columns:
-                df[c] = ""
-        frames.append(df[cols].copy())
-
-    # ---- From Holdings: SHORT equity positions ----
-    if holdings_df is not None and not holdings_df.empty:
-        h = holdings_df.copy()
-
-        def _find_col(sub: str) -> Optional[str]:
-            sub = sub.lower()
-            for c in h.columns:
-                if sub in c.lower():
-                    return c
-            return None
-
-        type_col = _find_col("type")
-        if type_col is not None:
-            mask_short = h[type_col].astype(str).str.upper().str.contains("SHORT")
-            h = h.loc[mask_short].copy()
-        else:
-            h = h.iloc[0:0]
-
-        if not h.empty:
-            sym_col  = _find_col("symbol") or _find_col("ticker") or _find_col("security")
-            desc_col = _find_col("description")
-            qty_col  = _find_col("quantity")
-            lp_col   = _find_col("last price")
-            cv_col   = _find_col("current value")
-            cb_col   = _find_col("cost basis total")
-            acb_col  = _find_col("average cost basis")
-            gl_d_col = _find_col("total gain/loss dollar")
-            gl_p_col = _find_col("total gain/loss percent")
-
-            shorts = pd.DataFrame()
-            shorts["Symbol"] = h[sym_col].astype(str) if sym_col else ""
-            shorts["Description"] = h[desc_col].astype(str) if desc_col else ""
-            shorts["Quantity"] = h[qty_col].map(to_float_any) if qty_col else np.nan
-            shorts["Last Price"] = h[lp_col].map(to_float_any) if lp_col else np.nan
-            shorts["Current Value"] = h[cv_col].map(to_float_any) if cv_col else np.nan
-            shorts["Cost Basis Total"] = h[cb_col].map(to_float_any) if cb_col else np.nan
-            shorts["Average Cost Basis"] = h[acb_col].map(to_float_any) if acb_col else np.nan
-            shorts["Total Gain/Loss Dollar"] = h[gl_d_col].map(to_float_any) if gl_d_col else np.nan
-            shorts["Total Gain/Loss Percent"] = h[gl_p_col].map(to_float_any) if gl_p_col else np.nan
-
-            frames.append(shorts[cols].copy())
-
-    if not frames:
-        return pd.DataFrame(columns=cols)
-
-    snap = pd.concat(frames, ignore_index=True)
+    cols = ["Symbol","Description","Quantity","Last Price","Current Value",
+            "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    snap = df[cols].copy()
     return snap
 
 def write_weekly_report_tab(ws_weekly, snapshot_tab_name: str = TAB_SNAPSHOT):
@@ -1178,6 +1120,103 @@ def write_weekly_report_tab(ws_weekly, snapshot_tab_name: str = TAB_SNAPSHOT):
     header = ["Metric","Value"]
     data = [header] + metrics.values.tolist()
     ws_weekly.update(data, range_name=f"A1:B{len(data)}", value_input_option="USER_ENTERED")
+
+def append_shorts_from_holdings_to_open(open_df: pd.DataFrame, holdings_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Append open short positions from Holdings into open_df.
+
+    We detect shorts as rows where Quantity < 0 in the Holdings tab.
+    We try to use:
+      - Symbol/Ticker/Security column for Ticker
+      - Quantity/Shares/Qty column for position size
+      - Average Cost / Cost Basis per share as EntryPrice (if present)
+
+    These synthetic rows are marked:
+      Source = "(short)"
+      Timeframe = ""
+      SignalTimeUTC, SignalPrice left blank
+      EntryTimeUTC / DaysOpen left blank (unknown)
+    """
+    if holdings_df is None or holdings_df.empty:
+        return open_df
+
+    df = holdings_df.copy()
+
+    symcol = next(
+        (c for c in df.columns
+         if c.lower() in ("symbol", "ticker", "security", "symbol/cusip")),
+        None
+    )
+    qtycol = next(
+        (c for c in df.columns
+         if "quantity" in c.lower()
+         or "shares" in c.lower()
+         or c.lower().startswith("qty")),
+        None
+    )
+
+    if not symcol or not qtycol:
+        return open_df
+
+    df["_qty"] = pd.to_numeric(df[qtycol], errors="coerce")
+    shorts = df[df["_qty"] < 0].copy()
+    if shorts.empty:
+        return open_df
+
+    avgcol = next(
+        (c for c in df.columns
+         if "average cost" in c.lower()
+         or "avg cost" in c.lower()
+         or "cost basis per share" in c.lower()),
+        None
+    )
+
+    rows = []
+    for _, r in shorts.iterrows():
+        tkr = base_symbol_from_string(r[symcol])
+        if not tkr:
+            continue
+        qty = float(r["_qty"])
+        entry_price = np.nan
+        if avgcol:
+            entry_price = to_float_any(r[avgcol])
+
+        rows.append({
+            "Ticker": tkr,
+            "OpenQty": qty,  # keep negative to reflect short
+            "EntryPrice": round(entry_price, 6) if not np.isnan(entry_price) else "",
+            "EntryTimeUTC": pd.NaT,
+            "DaysOpen": "",
+            "Source": "(short)",
+            "Timeframe": "",
+            "SignalTimeUTC": pd.NaT,
+            "SignalPrice": "",
+        })
+
+    if not rows:
+        return open_df
+
+    shorts_df = pd.DataFrame(rows)
+
+    combined = open_df.copy()
+    # Ensure all columns in shorts_df exist in combined
+    for c in shorts_df.columns:
+        if c not in combined.columns:
+            combined[c] = "" if c not in ("OpenQty","EntryPrice","EntryTimeUTC","SignalTimeUTC") else np.nan
+
+    # Reorder shorts_df to combined columns so concat is aligned
+    shorts_df_reindexed = shorts_df.reindex(columns=combined.columns, fill_value="")
+    combined = pd.concat([combined, shorts_df_reindexed], ignore_index=True)
+
+    if "EntryTimeUTC" in combined.columns:
+        try:
+            combined.sort_values(["Ticker","EntryTimeUTC"], inplace=True, ignore_index=True)
+        except Exception:
+            combined.sort_values(["Ticker"], inplace=True, ignore_index=True)
+    else:
+        combined.sort_values(["Ticker"], inplace=True, ignore_index=True)
+
+    return combined
 
 # ─────────────────────────────
 # MAIN
@@ -1247,12 +1286,13 @@ def main():
         tx, sig_equities, sell_cutoff=sell_cutoff_ts, strict_signals=args.strict_signals, debug=DEBUG
     )
 
-    # Live price formulas to Open_Positions (equities)
+    # Add open shorts from Holdings (negative quantity rows) into Open_Positions
+    open_df = append_shorts_from_holdings_to_open(open_df, df_h)
+
+    # Live price formulas to Open_Positions (equities + shorts)
     if (not args.no_live) and (not open_df.empty) and (price_source == "sheets"):
         mapping = read_mapping(gc, sheet_url)
         open_df = add_live_price_formulas(open_df, mapping)
-    else:
-        mapping = read_mapping(gc, sheet_url)
 
     # Column order
     if not realized_df.empty:
@@ -1266,7 +1306,7 @@ def main():
             cols = ["Ticker","OpenQty","EntryPrice","PriceNow","Unrealized%","EntryTimeUTC","DaysOpen","Source","Timeframe","SignalTimeUTC","SignalPrice"]
         open_df = open_df[cols]
 
-    # Performance & OpenLots_Detail (equities)
+    # Performance & OpenLots_Detail (equities + shorts)
     perf_df = build_perf_by_source(realized_df.copy(), open_df.copy())
     monthly_df = build_perf_by_month(realized_df.copy())
     open_detail_df = pd.DataFrame()
@@ -1307,12 +1347,8 @@ def main():
 
     # Snapshot + Weekly + CSVs
     try:
-        snapshot_df = build_snapshot_from_open_detail(
-            open_detail_df,
-            mapping=mapping,
-            price_source=price_source,
-            holdings_df=df_h
-        )
+        mapping = read_mapping(gc, sheet_url)
+        snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping=mapping, price_source=price_source)
         ws_snapshot = open_ws(gc, sheet_url, TAB_SNAPSHOT)
         write_tab(ws_snapshot, snapshot_df)
 
@@ -1332,31 +1368,12 @@ def main():
             csv_df["Quantity"] = pd.to_numeric(csv_df["Quantity"], errors="coerce")
             csv_df["Average Cost Basis"] = pd.to_numeric(csv_df["Average Cost Basis"], errors="coerce")
             csv_df["Last Price"] = csv_df["Symbol"].map(prices).astype(float)
-
-            qty = csv_df["Quantity"]
-            avg = csv_df["Average Cost Basis"]
-            last = csv_df["Last Price"]
-            is_short = qty < 0
-
-            cost_basis = qty.abs() * avg
-            csv_df["Cost Basis Total"] = cost_basis
-
-            pnl = np.where(
-                is_short,
-                (avg - last) * qty.abs(),          # short: profit if price < entry
-                (last - avg) * qty                 # long
-            )
-            current_value = np.where(
-                is_short,
-                -qty.abs() * last,                 # negative market value for short
-                qty * last
-            )
-
-            csv_df["Current Value"] = current_value
-            csv_df["Total Gain/Loss Dollar"] = pnl
+            csv_df["Cost Basis Total"] = (csv_df["Quantity"] * csv_df["Average Cost Basis"]).astype(float)
+            csv_df["Current Value"] = (csv_df["Quantity"] * csv_df["Last Price"]).astype(float)
+            csv_df["Total Gain/Loss Dollar"] = (csv_df["Current Value"] - csv_df["Cost Basis Total"]).astype(float)
             csv_df["Total Gain/Loss Percent"] = np.where(
-                cost_basis > 0,
-                pnl / cost_basis * 100.0,
+                csv_df["Average Cost Basis"].fillna(0) > 0,
+                (csv_df["Last Price"] / csv_df["Average Cost Basis"] - 1) * 100.0,
                 np.nan
             )
         csv_df.to_csv(csv_path, index=False)
