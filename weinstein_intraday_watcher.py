@@ -153,50 +153,38 @@ def load_positions():
             return json.load(f)
     return {"positions": {}}
 
-# ---------- PATCHED: robust state loader ----------
 def _load_intraday_state():
     """
-    Load intraday trigger state from JSON.
+    Load intraday trigger state, but be robust against a corrupted JSON file.
 
-    If the file is missing → return {}.
-    If the file is corrupted (JSONDecodeError) → rename it with a .corrupt_YYYYMMDD_HHMMSS
-    suffix, log a warning, and return {} so cron does not die.
-    Any other unexpected error also results in an empty {} with a warning.
+    If the JSON is invalid (e.g. truncated, multiple JSON objects, etc.), we:
+      - move the bad file to intraday_triggers.json.bak_YYYYMMDD_HHMMSS
+      - log a warning
+      - return an empty dict so the run can continue
     """
     path = INTRADAY_STATE_FILE
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    if not os.path.exists(path):
-        return {}
-
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        # Backup the corrupted file and start fresh
+    if os.path.exists(path):
         try:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = f"{path}.corrupt_{ts}"
-            os.rename(path, backup_path)
-            log(
-                f"Intraday state file '{path}' is corrupted (JSONDecodeError: {e}). "
-                f"Backed up to '{backup_path}' and starting with empty state.",
-                level="warn",
-            )
-        except Exception as e2:
-            log(
-                f"Intraday state file '{path}' is corrupted and backup failed ({e2}). "
-                "Starting with empty state anyway.",
-                level="err",
-            )
-        return {}
-    except Exception as e:
-        log(
-            f"Unexpected error loading intraday state from '{path}': {e}. "
-            "Starting with empty state.",
-            level="warn",
-        )
-        return {}
+            with open(path, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            # Backup corrupted file and reset
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup = f"{path}.bak_{ts}"
+                os.replace(path, backup)
+                log(
+                    f"Corrupted intraday state JSON ({e}); backed up to {backup} and resetting to empty.",
+                    level="warn",
+                )
+            except Exception as e2:
+                log(
+                    f"Corrupted intraday state JSON and failed to backup ({e2}); resetting to empty in-memory only.",
+                    level="err",
+                )
+            return {}
+    return {}
 
 def _save_intraday_state(st):
     with open(INTRADAY_STATE_FILE, "w") as f:
