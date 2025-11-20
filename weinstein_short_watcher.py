@@ -219,7 +219,6 @@ def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
             continue
 
         direction = _cell_to_str(raw_dir).strip().upper()
-        # OPTION A: explicit tracking of open shorts
         # Only rows explicitly marked as SELL/SHORT count as short positions
         if direction not in ("SELL", "SHORT"):
             continue
@@ -231,12 +230,49 @@ def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
 
 # ---------------- State helpers ----------------
 def _load_short_state():
+    """
+    Robust loader for short_triggers.json.
+
+    - Ensures ./state exists
+    - On success: returns parsed JSON (dict)
+    - On JSON corruption: backs up the bad file with a timestamp suffix,
+      logs a warning, and returns {} (clean reset)
+    - On any other error: logs and returns {}
+    """
     path = SHORT_STATE_FILE
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.exists(path):
+
+    if not os.path.exists(path):
+        return {}
+
+    try:
         with open(path, "r") as f:
             return json.load(f)
-    return {}
+    except json.JSONDecodeError as e:
+        # Corrupted JSON — back it up and reset
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{path}.corrupt_{ts}"
+            os.replace(path, backup_path)
+            log(
+                f"Short state file corrupted (JSONDecodeError: {e}). "
+                f"Backed up to {backup_path} and resetting short state to empty.",
+                level="warn",
+            )
+        except Exception as e2:
+            log(
+                f"Short state file corrupted and backup failed ({e2}). "
+                f"Resetting short state in-memory only.",
+                level="err",
+            )
+        return {}
+    except Exception as e:
+        log(
+            f"Failed to load short state file {path}: {e}. "
+            f"Resetting short state to empty.",
+            level="warn",
+        )
+        return {}
 
 
 def _save_short_state(st):
@@ -373,7 +409,7 @@ def get_last_n_intraday_volumes(intraday_df, ticker, n=2):
         except KeyError:
             return []
     else:
-        v = intraday_df["Volume"].dropna()
+            v = intraday_df["Volume"].dropna()
     return list(map(float, v.tail(n).values))
 
 
