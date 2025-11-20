@@ -530,19 +530,33 @@ def googlefinance_formula_for_snapshot(tkr: str, row_index: int, mapping: dict) 
 def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
     if open_df.empty:
         return open_df
+
     out = open_df.copy()
     price_now, unreal = [], []
+
     for idx, r in out.iterrows():
         tkr = r["Ticker"]
         ep  = r.get("EntryPrice")
-        row_index = idx + 2
+        row_index = idx + 2  # sheet row (1-based) including header
+
+        # Full formula (with leading '=') for PriceNow cell
         formula = googlefinance_formula_for_snapshot(tkr, row_index, mapping)
         price_now.append(formula)
+
         try:
             epf = float(ep)
-            unreal.append(f'=IFERROR(( {formula} / {epf} - 1 ) * 100,"")' if epf > 0 else "")
+            if epf > 0:
+                # Strip leading '=' when embedding inside another formula
+                inner = formula.lstrip("=").strip()
+                unreal.append(
+                    f'=IFERROR(( {inner} / {epf} - 1 ) * 100,"")'
+                )
+            else:
+                unreal.append("")
         except Exception:
             unreal.append("")
+
+    # Insert columns right after EntryPrice
     out.insert(out.columns.get_loc("EntryPrice") + 1, "PriceNow", price_now)
     out.insert(out.columns.get_loc("PriceNow") + 1, "Unrealized%", unreal)
     return out
