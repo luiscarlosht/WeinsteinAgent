@@ -188,11 +188,37 @@ BLACKLIST_TOKENS = {
     "SPAXX**","FCASH**"
 }
 
+# Simple crypto detection: ignore BTC/ETH/SOL tickers and common -USD / /USD forms
+def is_crypto_ticker(s: str) -> bool:
+    if s is None or (isinstance(s, float) and math.isnan(s)):
+        return False
+    u = str(s).strip().upper()
+    if not u:
+        return False
+    # Common explicit forms
+    crypto_exact = {
+        "BTC-USD","ETH-USD","SOL-USD",
+        "BTC/USD","ETH/USD","SOL/USD",
+        "BTC","ETH","SOL",
+        "BTCUSD","ETHUSD","SOLUSD",
+    }
+    if u in crypto_exact:
+        return True
+    # Catch variants like "BTC-USD " etc.
+    if "BTC-USD" in u or "ETH-USD" in u or "SOL-USD" in u:
+        return True
+    if "BTC/USD" in u or "ETH/USD" in u or "SOL/USD" in u:
+        return True
+    return False
+
 def base_symbol_from_string(s) -> str:
     if s is None or (isinstance(s, float) and math.isnan(s)):
         return ""
     s = str(s).strip()
     if not s:
+        return ""
+    # Drop obvious crypto upfront
+    if is_crypto_ticker(s):
         return ""
     token = s.split()[0]
     token = token.split("-")[0]
@@ -291,6 +317,22 @@ def load_signals(df_sig: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df["Price"]     = df.get("Price", "").fillna("").astype(str)
     df["TimestampUTC"] = pd.to_datetime(df[tscol], errors="coerce", utc=True) if tscol else pd.NaT
 
+    # --- Filter signals ---
+    # 1) Ignore cryptos
+    df["__is_crypto"] = df[tcol].map(is_crypto_ticker)
+    # 2) Require BOTH timestamp and source (drop rows without either)
+    df = df[
+        (~df["__is_crypto"])
+        & df["TimestampUTC"].notna()
+        & df["Source"].str.strip().ne("")
+    ].copy()
+    df.drop(columns=["__is_crypto"], inplace=True, errors="ignore")
+
+    if df.empty:
+        empty_e = pd.DataFrame(columns=["TimestampUTC","Ticker","Source","Direction","Price","Timeframe"])
+        empty_o = pd.DataFrame(columns=["TimestampUTC","Code","Underlying","Expiration","Right","Strike","Source","Direction","Price","Timeframe"])
+        return empty_e, empty_o
+
     # Split → options vs equities
     tickers = df[tcol].astype(str).fillna("")
     is_option_mask = tickers.str.startswith("-")
@@ -386,9 +428,6 @@ def load_transactions(df_tx: pd.DataFrame, debug: bool = False) -> Tuple[pd.Data
     desc   = df.get(desccol, "")
 
     # --- TEMP FIX: drop explicit equity short-sale / short-cover trades ---
-    # These "SHORT SALE" / "SHORT COVER" rows would otherwise be interpreted by
-    # the long-only FIFO engine as normal BUY/SELLs, creating fake long lots
-    # or unmatched sells. We still represent open shorts later from Holdings.
     combo = (
         action.astype(str).str.upper() + " "
         + typ.astype(str).str.upper() + " "
@@ -1218,7 +1257,7 @@ def append_shorts_from_holdings_to_open(open_df: pd.DataFrame, holdings_df: pd.D
         if c not in combined.columns:
             combined[c] = "" if c not in ("OpenQty","EntryPrice","EntryTimeUTC","SignalTimeUTC") else np.nan
 
-    # Reorder shorts_df to combined columns so concat is aligned
+    # Reindex shorts_df to combined columns so concat is aligned
     shorts_df_reindexed = shorts_df.reindex(columns=combined.columns, fill_value="")
     combined = pd.concat([combined, shorts_df_reindexed], ignore_index=True)
 
