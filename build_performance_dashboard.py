@@ -259,7 +259,11 @@ def googlefinance_formula_for(ticker: str, row_idx: int, mapping: Dict[str, Dict
     base = base_symbol_from_string(ticker)
     mapped = mapping.get(ticker, {}) or mapping.get(base, {}) or {}
     sym = mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
-    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_idx},"price"), ""))'
+    # Fallback now uses column A (ticker), not column B
+    return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(A{row_idx},"price"), ""))'
+
+def googlefinance_formula_for_snapshot(tkr: str, row_index: int, mapping: dict) -> str:
+    return googlefinance_formula_for(tkr, row_index, mapping)
 
 # ─────────────────────────────
 # LOAD SIGNALS (+ options)
@@ -522,9 +526,6 @@ def _fetch_last_prices_yf(tickers: list[str]) -> dict:
                 out[t] = float(ser.iloc[-1])
     return out
 
-def googlefinance_formula_for_snapshot(tkr: str, row_index: int, mapping: dict) -> str:
-    return googlefinance_formula_for(tkr, row_index, mapping)
-
 def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
     if open_df.empty:
         return open_df
@@ -675,7 +676,7 @@ def build_realized_and_open(
 # ─────────────────────────────
 def to_float_any(x):
     if isinstance(x, str):
-        x = x.replace("$","").replace(",","").strip()
+        x = x.replace("$","").replace(",","").replace("%","").strip()
     try:
         return float(x)
     except Exception:
@@ -1061,49 +1062,108 @@ def build_perf_by_month_source_kind(
 # ─────────────────────────────
 # SNAPSHOT / WEEKLY
 # ─────────────────────────────
-def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: dict | None = None, *, price_source: str = "sheets") -> pd.DataFrame:
-    if open_detail_df is None or open_detail_df.empty:
-        return pd.DataFrame(columns=[
-            "Symbol","Description","Quantity","Last Price","Current Value",
-            "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"
-        ])
+def build_snapshot_from_open_detail(
+    open_detail_df: pd.DataFrame,
+    mapping: dict | None = None,
+    *,
+    price_source: str = "sheets",
+    holdings_df: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """
+    Build Open_Positions_Snapshot from:
+      - open_detail_df (long equity lots from FIFO)
+      - holdings_df (to append live SHORT equity positions)
+    """
+    cols = [
+        "Symbol","Description","Quantity","Last Price","Current Value",
+        "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"
+    ]
 
-    df = open_detail_df.copy()
-    df["Symbol"] = df["Ticker"].astype(str)
-    df["Quantity"] = pd.to_numeric(df.get("OpenQty", np.nan), errors="coerce")
-    df["Average Cost Basis"] = pd.to_numeric(df.get("EntryPrice", np.nan), errors="coerce")
-    df["Description"] = ""
+    frames: List[pd.DataFrame] = []
 
-    if price_source == "sheets":
-        last_price = []
-        for i, r in df.iterrows():
-            row_index = i + 2
-            tkr = str(r["Symbol"])
-            formula = googlefinance_formula_for_snapshot(tkr, row_index, mapping or {})
-            last_price.append(formula)
-        df["Last Price"] = last_price
-        df["Current Value"] = ""
-        df["Cost Basis Total"] = ""
-        df["Total Gain/Loss Dollar"] = ""
-        df["Total Gain/Loss Percent"] = ""
-    else:
-        prices = _fetch_last_prices_yf(df["Symbol"].dropna().unique().tolist())
-        df["Last Price"] = df["Symbol"].map(prices).astype(float)
-        df["Cost Basis Total"] = (df["Quantity"] * df["Average Cost Basis"]).astype(float)
-        df["Current Value"] = (df["Quantity"] * df["Last Price"]).astype(float)
-        df["Total Gain/Loss Dollar"] = (df["Current Value"] - df["Cost Basis Total"]).astype(float)
-        df["Total Gain/Loss Percent"] = np.where(
-            df["Average Cost Basis"].fillna(0) > 0,
-            (df["Last Price"] / df["Average Cost Basis"] - 1) * 100.0,
-            np.nan
-        )
+    # ---- From FIFO open lots (longs) ----
+    if open_detail_df is not None and not open_detail_df.empty:
+        df = open_detail_df.copy()
+        df["Symbol"] = df["Ticker"].astype(str)
+        df["Quantity"] = pd.to_numeric(df.get("OpenQty", np.nan), errors="coerce")
+        df["Average Cost Basis"] = pd.to_numeric(df.get("EntryPrice", np.nan), errors="coerce")
+        df["Description"] = ""
 
-    cols = ["Symbol","Description","Quantity","Last Price","Current Value",
-            "Cost Basis Total","Average Cost Basis","Total Gain/Loss Dollar","Total Gain/Loss Percent"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    snap = df[cols].copy()
+        if price_source == "sheets":
+            last_price = []
+            for i, r in df.iterrows():
+                row_index = i + 2  # Snapshot sheet row index
+                tkr = str(r["Symbol"])
+                formula = googlefinance_formula_for_snapshot(tkr, row_index, mapping or {})
+                last_price.append(formula)
+            df["Last Price"] = last_price
+            df["Current Value"] = ""
+            df["Cost Basis Total"] = ""
+            df["Total Gain/Loss Dollar"] = ""
+            df["Total Gain/Loss Percent"] = ""
+        else:
+            prices = _fetch_last_prices_yf(df["Symbol"].dropna().unique().tolist())
+            df["Last Price"] = df["Symbol"].map(prices).astype(float)
+            df["Cost Basis Total"] = (df["Quantity"] * df["Average Cost Basis"]).astype(float)
+            df["Current Value"] = (df["Quantity"] * df["Last Price"]).astype(float)
+            df["Total Gain/Loss Dollar"] = (df["Current Value"] - df["Cost Basis Total"]).astype(float)
+            df["Total Gain/Loss Percent"] = np.where(
+                df["Average Cost Basis"].fillna(0) > 0,
+                (df["Last Price"] / df["Average Cost Basis"] - 1) * 100.0,
+                np.nan
+            )
+
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        frames.append(df[cols].copy())
+
+    # ---- From Holdings: SHORT equity positions ----
+    if holdings_df is not None and not holdings_df.empty:
+        h = holdings_df.copy()
+
+        def _find_col(sub: str) -> Optional[str]:
+            sub = sub.lower()
+            for c in h.columns:
+                if sub in c.lower():
+                    return c
+            return None
+
+        type_col = _find_col("type")
+        if type_col is not None:
+            mask_short = h[type_col].astype(str).str.upper().str.contains("SHORT")
+            h = h.loc[mask_short].copy()
+        else:
+            h = h.iloc[0:0]
+
+        if not h.empty:
+            sym_col  = _find_col("symbol") or _find_col("ticker") or _find_col("security")
+            desc_col = _find_col("description")
+            qty_col  = _find_col("quantity")
+            lp_col   = _find_col("last price")
+            cv_col   = _find_col("current value")
+            cb_col   = _find_col("cost basis total")
+            acb_col  = _find_col("average cost basis")
+            gl_d_col = _find_col("total gain/loss dollar")
+            gl_p_col = _find_col("total gain/loss percent")
+
+            shorts = pd.DataFrame()
+            shorts["Symbol"] = h[sym_col].astype(str) if sym_col else ""
+            shorts["Description"] = h[desc_col].astype(str) if desc_col else ""
+            shorts["Quantity"] = h[qty_col].map(to_float_any) if qty_col else np.nan
+            shorts["Last Price"] = h[lp_col].map(to_float_any) if lp_col else np.nan
+            shorts["Current Value"] = h[cv_col].map(to_float_any) if cv_col else np.nan
+            shorts["Cost Basis Total"] = h[cb_col].map(to_float_any) if cb_col else np.nan
+            shorts["Average Cost Basis"] = h[acb_col].map(to_float_any) if acb_col else np.nan
+            shorts["Total Gain/Loss Dollar"] = h[gl_d_col].map(to_float_any) if gl_d_col else np.nan
+            shorts["Total Gain/Loss Percent"] = h[gl_p_col].map(to_float_any) if gl_p_col else np.nan
+
+            frames.append(shorts[cols].copy())
+
+    if not frames:
+        return pd.DataFrame(columns=cols)
+
+    snap = pd.concat(frames, ignore_index=True)
     return snap
 
 def write_weekly_report_tab(ws_weekly, snapshot_tab_name: str = TAB_SNAPSHOT):
@@ -1191,6 +1251,8 @@ def main():
     if (not args.no_live) and (not open_df.empty) and (price_source == "sheets"):
         mapping = read_mapping(gc, sheet_url)
         open_df = add_live_price_formulas(open_df, mapping)
+    else:
+        mapping = read_mapping(gc, sheet_url)
 
     # Column order
     if not realized_df.empty:
@@ -1245,8 +1307,12 @@ def main():
 
     # Snapshot + Weekly + CSVs
     try:
-        mapping = read_mapping(gc, sheet_url)
-        snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping=mapping, price_source=price_source)
+        snapshot_df = build_snapshot_from_open_detail(
+            open_detail_df,
+            mapping=mapping,
+            price_source=price_source,
+            holdings_df=df_h
+        )
         ws_snapshot = open_ws(gc, sheet_url, TAB_SNAPSHOT)
         write_tab(ws_snapshot, snapshot_df)
 
@@ -1258,7 +1324,7 @@ def main():
                    or "./output")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Open positions CSV (equities)
+        # Open positions CSV (equities + shorts)
         csv_path = os.path.join(out_dir, "Open_Positions.csv")
         csv_df = snapshot_df.copy()
         if price_source == "sheets":
@@ -1266,12 +1332,31 @@ def main():
             csv_df["Quantity"] = pd.to_numeric(csv_df["Quantity"], errors="coerce")
             csv_df["Average Cost Basis"] = pd.to_numeric(csv_df["Average Cost Basis"], errors="coerce")
             csv_df["Last Price"] = csv_df["Symbol"].map(prices).astype(float)
-            csv_df["Cost Basis Total"] = (csv_df["Quantity"] * csv_df["Average Cost Basis"]).astype(float)
-            csv_df["Current Value"] = (csv_df["Quantity"] * csv_df["Last Price"]).astype(float)
-            csv_df["Total Gain/Loss Dollar"] = (csv_df["Current Value"] - csv_df["Cost Basis Total"]).astype(float)
+
+            qty = csv_df["Quantity"]
+            avg = csv_df["Average Cost Basis"]
+            last = csv_df["Last Price"]
+            is_short = qty < 0
+
+            cost_basis = qty.abs() * avg
+            csv_df["Cost Basis Total"] = cost_basis
+
+            pnl = np.where(
+                is_short,
+                (avg - last) * qty.abs(),          # short: profit if price < entry
+                (last - avg) * qty                 # long
+            )
+            current_value = np.where(
+                is_short,
+                -qty.abs() * last,                 # negative market value for short
+                qty * last
+            )
+
+            csv_df["Current Value"] = current_value
+            csv_df["Total Gain/Loss Dollar"] = pnl
             csv_df["Total Gain/Loss Percent"] = np.where(
-                csv_df["Average Cost Basis"].fillna(0) > 0,
-                (csv_df["Last Price"] / csv_df["Average Cost Basis"] - 1) * 100.0,
+                cost_basis > 0,
+                pnl / cost_basis * 100.0,
                 np.nan
             )
         csv_df.to_csv(csv_path, index=False)
