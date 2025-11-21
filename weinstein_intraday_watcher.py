@@ -9,6 +9,7 @@ Adds:
 - Same trigger logic, diagnostics CSV/JSON, HTML save, optional dry run
 - "Order Block" proposing entries/stops for BUY/SELL (stocks + crypto)
 - NEW: Alert Levels for BUY triggers (low stop + 15% / 20% upside targets)
+- NEW: Market Regime filter (Weinstein Chapter 8) via market_regime.compute_market_regime()
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
@@ -31,6 +32,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
+
+# NEW: market regime (Weinstein Chapter 8)
+try:
+    from market_regime import compute_market_regime
+except ImportError:
+    def compute_market_regime(daily_df, benchmark="SPY"):
+        """
+        Fallback stub if market_regime.py is not present.
+        Returns a neutral regime that does not block signals.
+        """
+        return {
+            "label": "NEUTRAL (no market_regime.py)",
+            "long_ok": True,
+            "short_ok": True,
+        }
 
 # ---------------- Tunables ----------------
 WEEKLY_OUTPUT_DIR = "./output"
@@ -806,6 +822,17 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     intraday, daily = get_intraday(needs)
     log("Price data downloaded.", level="ok")
 
+    # ---- Market regime filter (Weinstein Chapter 8) ----
+    try:
+        regime = compute_market_regime(daily, benchmark=benchmark)
+    except Exception as e:
+        log(f"Market regime evaluation failed ({e}); defaulting to neutral (no filter).", level="warn")
+        regime = {"label": "NEUTRAL (error)", "long_ok": True, "short_ok": True}
+    market_long_ok = bool(regime.get("long_ok", True))
+    market_short_ok = bool(regime.get("short_ok", True))
+    regime_label = str(regime.get("label", "NEUTRAL"))
+    log(f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}", level="info")
+
     if isinstance(intraday.columns, pd.MultiIndex):
         last_closes = intraday["Close"].ffill().iloc[-1]
     else:
@@ -869,10 +896,13 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         d["cond"]["rs_ok"] = bool(rs_ok)
         d["cond"]["ma_ok"] = bool(ma_ok)
         d["cond"]["pivot_ok"] = bool(pivot_ok)
+        d["cond"]["market_long_ok"] = bool(market_long_ok)
+        if not market_long_ok:
+            d["why"].append("Market regime not favorable for LONG (Chapter 8)")
 
         # --- BUY confirm ---
         confirm = False; vol_ok = True; price_ok = False
-        if ma_ok and pivot_ok and closes_n:
+        if market_long_ok and ma_ok and pivot_ok and closes_n:
             def _price_ok(c):
                 return (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
             if INTRADAY_INTERVAL == "60m":
@@ -905,7 +935,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
         # --- BUY near flag ---
         near_now = False
-        if d["cond"]["weekly_stage_ok"] and rs_ok and pivot_ok and ma_ok and pd.notna(px):
+        if market_long_ok and d["cond"]["weekly_stage_ok"] and rs_ok and pivot_ok and ma_ok and pd.notna(px):
             above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
             if above_ma:
                 if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (px < pivot * (1.0 + MIN_BREAKOUT_PCT)):
@@ -941,6 +971,13 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "state":"IDLE", "near_hits":[], "cooldown":0,
             "sell_state":"IDLE", "sell_hits":[], "sell_cooldown":0
         })
+
+        # If market regime not favorable for LONGs (Ch. 8), reset BUY state to avoid stale triggers
+        if not market_long_ok:
+            st["state"] = "IDLE"
+            st["near_hits"] = []
+            st["cooldown"] = 0
+
         # BUY hits
         st["near_hits"], near_count = _update_hits(st.get("near_hits", []), near_now, NEAR_HITS_WINDOW)
         if st.get("cooldown", 0) > 0: st["cooldown"] = int(st["cooldown"]) - 1
@@ -990,13 +1027,13 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                 })
 
         # --- EMIT by state ---
-        if st["state"] == "TRIGGERED" and (pd.isna(pace) or pace >= VOL_PACE_MIN):
+        if st["state"] == "TRIGGERED" and market_long_ok and (pd.isna(pace) or pace >= VOL_PACE_MIN):
             buy_signals.append({
                 "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
                 "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "atr": atr
             })
             trigger_state[t]["state"] = "COOLDOWN"
-        elif st["state"] in ("NEAR","ARMED"):
+        elif st["state"] in ("NEAR","ARMED") and market_long_ok:
             if (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN):
                 near_signals.append({
                     "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
@@ -1148,6 +1185,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
       volume pace ≥ {NEAR_VOL_PACE_MIN}×.<br>
       SELL-TRIGGER: Confirmed crack below MA150 by {SELL_BREAK_PCT*100:.1f}% with persistence; for 60m bars, ≥{SELL_INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {SELL_INTRABAR_VOLPACE_MIN}×.
     </i></p>
+    <p style="font-size:13px;color:#555;">
+      <b>Market Regime (Chapter 8 filter):</b> {regime_label} — LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}.
+    </p>
     """
 
     html += f"""
@@ -1202,7 +1242,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         return "\n".join(out) if out else f"No {kind} signals."
 
     text = (
-        f"Weinstein Intraday Watch — {now}\n\n"
+        f"Weinstein Intraday Watch — {now}\n"
+        f"Market Regime (Ch8): {regime_label} | LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}\n\n"
         f"BUY (ranked):\n{_lines(buy_signals,'BUY')}\n\n"
         f"NEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\n"
         f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers,'SELLTRIG')}\n\n"
