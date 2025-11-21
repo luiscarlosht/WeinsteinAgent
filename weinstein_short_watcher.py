@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weinstein Short Watcher — Stage 4 short setups
+Weinstein Short Watcher — Stage 4 short setups (with Chapter 8 market regime filter)
 
 - Uses weekly Weinstein scan (equities) to build a Stage 4 (Downtrend) universe
 - Intraday checks around 10-week pivot LOW and 30-week MA proxy (SMA150)
@@ -22,6 +22,8 @@ Weinstein Short Watcher — Stage 4 short setups
 
 - NEW:
     * --log-csv / --log-json diagnostics (per-symbol metrics + conditions + state)
+    * Chapter 8 market regime integration via market_regime.py:
+        - If market_regime.short_ok is False, the short scan is skipped.
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
@@ -409,7 +411,7 @@ def get_last_n_intraday_volumes(intraday_df, ticker, n=2):
         except KeyError:
             return []
     else:
-            v = intraday_df["Volume"].dropna()
+        v = intraday_df["Volume"].dropna()
     return list(map(float, v.tail(n).values))
 
 
@@ -700,6 +702,68 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
         b64 = base64.b64encode(f.read()).decode("ascii")
     return chart_path, f"data:image/png;base64,{b64}"
 
+# ---------------- Market Regime (Chapter 8) helper ----------------
+def _compute_market_regime_flags(weekly_df, benchmark):
+    """
+    Wrapper around market_regime.py so this file is robust even if that module
+    is missing or its API changes slightly.
+
+    Returns:
+      (label, long_ok, short_ok)
+    """
+    try:
+        import market_regime as mr
+    except ImportError:
+        label = "NEUTRAL (no market_regime.py)"
+        return label, True, True
+
+    # Try common function names
+    candidates = [
+        "get_market_regime",
+        "compute_market_regime",
+        "evaluate_market_regime",
+        "market_regime",
+    ]
+    regime = None
+    last_err = None
+    for name in candidates:
+        fn = getattr(mr, name, None)
+        if not callable(fn):
+            continue
+        for args in (
+            (weekly_df, benchmark),
+            (weekly_df,),
+        ):
+            try:
+                regime = fn(*args)
+                break
+            except TypeError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                last_err = e
+                regime = None
+                break
+        if regime is not None:
+            break
+
+    if regime is None:
+        if last_err is not None:
+            log(f"Market regime (Ch8): fallback to NEUTRAL due to error: {last_err}", level="warn")
+        return "NEUTRAL (market_regime API not recognized)", True, True
+
+    # Normalize regime into label/flags
+    if isinstance(regime, dict):
+        label = regime.get("label") or regime.get("name") or regime.get("regime") or "UNKNOWN"
+        long_ok = bool(regime.get("long_ok", True))
+        short_ok = bool(regime.get("short_ok", True))
+    else:
+        label = getattr(regime, "label", None) or getattr(regime, "name", None) or str(regime)
+        long_ok = bool(getattr(regime, "long_ok", True))
+        short_ok = bool(getattr(regime, "short_ok", True))
+
+    return label, long_ok, short_ok
+
 # ---------------- Main logic ----------------
 def run(
     _config_path="./config.yaml",
@@ -716,6 +780,28 @@ def run(
 
     weekly_df, weekly_csv_path = load_weekly_report()
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
+
+    # ---- Chapter 8 market regime filter (short side) ----
+    regime_label, long_ok, short_ok = _compute_market_regime_flags(weekly_df, benchmark)
+    log(
+        f"Market regime (Ch8): {regime_label} | long_ok={long_ok} short_ok={short_ok}",
+        level="info",
+    )
+
+    # If regime says "no shorts", exit early (optionally writing empty CSV)
+    if not short_ok:
+        log(
+            "Chapter 8 regime filter: short side is DISABLED in current regime — "
+            "skipping short scan.",
+            level="warn",
+        )
+        if log_csv:
+            try:
+                pd.DataFrame([]).to_csv(log_csv, index=False)
+                log(f"Wrote empty diagnostics CSV (shorts disabled) → {log_csv}", level="ok")
+            except Exception as e:
+                log(f"Failed writing empty diagnostics CSV: {e}", level="warn")
+        return
 
     # Load tickers from Signals tab for READY-TO-CLOSE filtering
     held_ready_tickers = load_ready_short_tickers_from_signals(
