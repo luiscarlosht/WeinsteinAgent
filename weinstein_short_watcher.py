@@ -482,7 +482,7 @@ def _short_near_zone(px, ma, pivot_low):
 def _short_ready_to_close(px, ma):
     """
     READY-TO-CLOSE short:
-      - price has reclaimed MA150 by READY_ABOVE_MA_PCT (e.g. 0.5%+ above MA150),
+      - price has reclaimed MA150 by READY_ABOVE_MA_PCT (e.g. 0.5+% above MA150),
         suggesting downtrend thesis is weakening.
     """
     if pd.isna(px) or pd.isna(ma):
@@ -1350,7 +1350,7 @@ if __name__ == "__main__":
     )
     ap.add_argument(
         "--log-json",
-        type=str,
+        type:str,
         default="",
         help="path to write per-ticker diagnostics JSON",
     )
