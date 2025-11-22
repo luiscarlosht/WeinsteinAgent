@@ -1350,7 +1350,7 @@ if __name__ == "__main__":
     )
     ap.add_argument(
         "--log-json",
-        type:str,
+        type=str,
         default="",
         help="path to write per-ticker diagnostics JSON",
     )
