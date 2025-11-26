@@ -8,7 +8,7 @@ Weinstein Chapter 8 style market regime filter.
 
 Goal:
   - Use the behavior of the major indices vs. their 200-day moving averages
-    to decide whether the overall environment is favorable for new LONG (and later SHORT) entries.
+    to decide whether the overall environment is favorable for new LONG / SHORT entries.
   - This is a coarse "market is in gear or not" filter, not a stock-selection tool.
 
 Core Weinstein-style ideas (Chapter 8, adapted for automation):
@@ -25,17 +25,35 @@ We implement:
   - Classify each index as BULLISH / BEARISH / NEUTRAL.
   - Aggregate to a single market regime: BULL, BEAR, NEUTRAL, UNKNOWN.
 
-This module is independent from intraday logic. The intraday watcher can do e.g.:
+Tiny helper for intraday / short watchers
+-----------------------------------------
+We expose a very small API that your watchers can call without having to know
+about all the internals:
 
-  from market_regime import detect_market_regime, MarketRegime
+    from market_regime import inspect
 
-  snapshot = detect_market_regime()
-  if snapshot.regime is MarketRegime.BULL:
-      # allow new LONG entries
-  else:
-      # block or reduce size for new LONG entries
+    label, long_ok, short_ok = inspect()
+    # label:  "BULL", "BEAR", "NEUTRAL", "UNKNOWN"
+    # long_ok:  True if environment ok for *new longs*
+    # short_ok: True if environment ok for *new shorts*
 
-Later we can define separate rules for SHORT entries (e.g. only in BEAR or NEUTRAL regimes).
+BASIC POLICY (Chapter 8 style):
+
+  - LONGS:
+      * Allowed in BULL and NEUTRAL regimes (Weinstein: favor new longs when
+        the major indices are in an uptrend; NEUTRAL is treated as "ok but
+        cautious" here so we don't choke your system completely).
+
+  - SHORTS:
+      * Allowed ONLY in BEAR regimes.
+        This matches your requirement: "do not have short signals trigger
+        unless it's during bearish markets."
+
+  - UNKNOWN:
+      * Treat as NEUTRAL for longs (long_ok = True), but block new shorts
+        (short_ok = False).
+
+This tiny wrapper is what intraday and short watchers should be using.
 """
 
 from __future__ import annotations
@@ -43,7 +61,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, asdict
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -278,7 +296,7 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
       - overall regime (BULL / BEAR / NEUTRAL / UNKNOWN)
       - per-index metrics (state, last_close, MA, slope, etc.)
 
-    This is what we will call from weinstein_intraday_watcher.py to gate new LONGs.
+    This is what we will call from intraday / short watchers to gate new entries.
     """
     if cfg is None:
         cfg = MarketRegimeConfig()
@@ -333,6 +351,63 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
         as_of=as_of,
         index_metrics=metrics,
     )
+
+
+# ─────────────────────────────
+# TINY INSPECT WRAPPER FOR WATCHERS
+# ─────────────────────────────
+
+def _compute_long_short_flags(regime: MarketRegime) -> Tuple[bool, bool]:
+    """
+    Map a MarketRegime → (long_ok, short_ok) according to your Chapter 8 rules.
+
+    - LONGS:
+        * Allowed in BULL and NEUTRAL.
+    - SHORTS:
+        * Allowed ONLY in BEAR.
+    - UNKNOWN:
+        * Treat as NEUTRAL for longs, but block shorts.
+    """
+    if regime is MarketRegime.BEAR:
+        long_ok = False
+        short_ok = True
+    elif regime is MarketRegime.BULL:
+        long_ok = True
+        short_ok = False
+    else:
+        # NEUTRAL or UNKNOWN
+        long_ok = True
+        short_ok = False
+    return long_ok, short_ok
+
+
+def inspect() -> Tuple[str, bool, bool]:
+    """
+    Tiny helper for intraday / short watchers.
+
+    Returns:
+        (label, long_ok, short_ok)
+
+        label:     "BULL", "BEAR", "NEUTRAL", "UNKNOWN"
+        long_ok:   bool → whether new LONG entries are allowed
+        short_ok:  bool → whether new SHORT entries are allowed
+    """
+    snap = detect_market_regime()
+    regime = snap.regime
+    long_ok, short_ok = _compute_long_short_flags(regime)
+    label = regime.name.upper()  # BULL / BEAR / NEUTRAL / UNKNOWN
+    return label, long_ok, short_ok
+
+
+# Backwards-compatible aliases in case watchers look for a specific name
+def inspect_for_intraday() -> Tuple[str, bool, bool]:
+    """Alias for inspect()."""
+    return inspect()
+
+
+def inspect_market_regime() -> Tuple[str, bool, bool]:
+    """Alias for inspect()."""
+    return inspect()
 
 
 # ─────────────────────────────
@@ -410,6 +485,11 @@ def main() -> None:
     else:
         print()
         print("Final regime:", snap.regime.value.upper())
+        print()
+
+        # Also show how the tiny inspect wrapper would see it
+        label, long_ok, short_ok = _compute_long_short_flags(snap.regime)
+        print(f"inspect() → label={snap.regime.name.upper()}, long_ok={long_ok}, short_ok={short_ok}")
         print()
 
 
