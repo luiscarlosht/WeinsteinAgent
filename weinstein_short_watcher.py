@@ -710,14 +710,57 @@ def _compute_market_regime_flags(weekly_df, benchmark):
 
     Returns:
       (label, long_ok, short_ok)
+
+    Chapter 8 semantics here (STRICT short side):
+      - Shorts are ONLY allowed in BEAR regimes.
+      - In BULL or NEUTRAL: short_ok = False.
     """
     try:
         import market_regime as mr
     except ImportError:
         label = "NEUTRAL (no market_regime.py)"
-        return label, True, True
+        return label, True, True  # fail-open so system still runs
 
-    # Try common function names
+    # Preferred path: use detect_market_regime() from the new module
+    snap = None
+    if hasattr(mr, "detect_market_regime"):
+        try:
+            snap = mr.detect_market_regime()
+        except Exception as e:
+            log(f"Market regime (Ch8): detect_market_regime() failed: {e}", level="warn")
+            snap = None
+
+    if snap is not None:
+        reg_obj = getattr(snap, "regime", None)
+        # normalize to string
+        if reg_obj is None:
+            reg_str = "unknown"
+        else:
+            reg_str = str(
+                getattr(reg_obj, "value", getattr(reg_obj, "name", reg_obj))
+            ).lower()
+
+        if "bear" in reg_str:
+            # Strict Ch.8: shorts only in BEAR
+            label = "BEAR"
+            long_ok = False
+            short_ok = True
+        elif "bull" in reg_str:
+            label = "BULL"
+            long_ok = True
+            short_ok = False
+        elif "neutral" in reg_str:
+            label = "NEUTRAL"
+            long_ok = True
+            short_ok = False  # no new shorts in neutral, per your comment
+        else:
+            label = "UNKNOWN"
+            long_ok = True
+            short_ok = True  # fail-open on unknown regimes
+
+        return f"{label} (Ch8)", long_ok, short_ok
+
+    # Fallback to older-style APIs if detect_market_regime is not available
     candidates = [
         "get_market_regime",
         "compute_market_regime",
@@ -1350,7 +1393,7 @@ if __name__ == "__main__":
     )
     ap.add_argument(
         "--log-json",
-        type:str,
+        type=str,
         default="",
         help="path to write per-ticker diagnostics JSON",
     )
