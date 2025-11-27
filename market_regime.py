@@ -233,8 +233,13 @@ def _classify_index(symbol: str, close: pd.Series, cfg: MarketRegimeConfig) -> I
     last_close = float(close.iloc[-1])
 
     # Compare MA vs MA from N days ago
-    past_ma = float(ma.iloc[-1 - cfg.ma_slope_days])
-    if past_ma > 0:
+    past_ma_index = -1 - cfg.ma_slope_days
+    try:
+        past_ma = float(ma.iloc[past_ma_index])
+    except IndexError:
+        past_ma = float("nan")
+
+    if past_ma > 0 and not np.isnan(past_ma):
         ma_slope_pct = (last_ma / past_ma - 1.0) * 100.0
     else:
         ma_slope_pct = float("nan")
@@ -410,29 +415,6 @@ def inspect_market_regime() -> Tuple[str, bool, bool]:
     return inspect()
 
 
-def get_market_regime(*args, **kwargs) -> Dict[str, object]:
-    """
-    Backwards-compatible wrapper for short/intraday watchers.
-
-    Ignores arguments and just returns a dict:
-      { "label": "BULL/BEAR/NEUTRAL/UNKNOWN",
-        "long_ok": bool,
-        "short_ok": bool }
-    """
-    label, long_ok, short_ok = inspect()
-    return {"label": label, "long_ok": long_ok, "short_ok": short_ok}
-
-
-def compute_market_regime(*args, **kwargs) -> Dict[str, object]:
-    """Alias for get_market_regime()."""
-    return get_market_regime(*args, **kwargs)
-
-
-def evaluate_market_regime(*args, **kwargs) -> Dict[str, object]:
-    """Alias for get_market_regime()."""
-    return get_market_regime(*args, **kwargs)
-
-
 # ─────────────────────────────
 # SIMPLE CLI FOR MANUAL CHECKS
 # ─────────────────────────────
@@ -511,7 +493,7 @@ def main() -> None:
         print()
 
         # Also show how the tiny inspect wrapper would see it
-        label, long_ok, short_ok = _compute_long_short_flags(snap.regime)
+        long_ok, short_ok = _compute_long_short_flags(snap.regime)
         print(f"inspect() → label={snap.regime.name.upper()}, long_ok={long_ok}, short_ok={short_ok}")
         print()
 
