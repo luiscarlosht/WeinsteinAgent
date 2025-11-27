@@ -303,7 +303,7 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
 
     if yf is None:
         # yfinance missing → we can't compute regime properly
-        now = pd.Timestamp.utcnow().tz_localize("UTC")
+        now = pd.Timestamp.now(tz="UTC")
         return MarketRegimeSnapshot(
             regime=MarketRegime.UNKNOWN,
             as_of=now,
@@ -333,7 +333,7 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
         metrics.append(m)
 
     regime = _aggregate_market_regime(metrics, cfg)
-    as_of = pd.Timestamp.utcnow().tz_localize("UTC")
+    as_of = pd.Timestamp.now(tz="UTC")
 
     if cfg.verbose:
         print("Market regime snapshot as of", as_of.isoformat())
@@ -472,7 +472,8 @@ def main() -> None:
         index_symbols=args.indices,
         ma_window=args.ma_window,
         ma_slope_days=args.ma_slope_days,
-        ma_slope_min_pct=args.ma_slope_min_pct,
+        ma_slope_min_pct=args.ma_slope_min_p
+        ct=args.ma_slope_min_pct,
         min_bullish_fraction=args.min_bullish_fraction,
         min_bearish_fraction=args.min_bearish_fraction,
         history_days=args.history_days,
