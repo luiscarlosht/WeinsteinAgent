@@ -410,6 +410,29 @@ def inspect_market_regime() -> Tuple[str, bool, bool]:
     return inspect()
 
 
+def get_market_regime(*args, **kwargs) -> Dict[str, object]:
+    """
+    Backwards-compatible wrapper for short/intraday watchers.
+
+    Ignores arguments and just returns a dict:
+      { "label": "BULL/BEAR/NEUTRAL/UNKNOWN",
+        "long_ok": bool,
+        "short_ok": bool }
+    """
+    label, long_ok, short_ok = inspect()
+    return {"label": label, "long_ok": long_ok, "short_ok": short_ok}
+
+
+def compute_market_regime(*args, **kwargs) -> Dict[str, object]:
+    """Alias for get_market_regime()."""
+    return get_market_regime(*args, **kwargs)
+
+
+def evaluate_market_regime(*args, **kwargs) -> Dict[str, object]:
+    """Alias for get_market_regime()."""
+    return get_market_regime(*args, **kwargs)
+
+
 # ─────────────────────────────
 # SIMPLE CLI FOR MANUAL CHECKS
 # ─────────────────────────────
@@ -472,8 +495,7 @@ def main() -> None:
         index_symbols=args.indices,
         ma_window=args.ma_window,
         ma_slope_days=args.ma_slope_days,
-        ma_slope_min_pct=args.ma_slope_min_p
-        ct=args.ma_slope_min_pct,
+        ma_slope_min_pct=args.ma_slope_min_pct,
         min_bullish_fraction=args.min_bullish_fraction,
         min_bearish_fraction=args.min_bearish_fraction,
         history_days=args.history_days,
