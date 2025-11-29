@@ -26,6 +26,7 @@ import math
 
 import numpy as np
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 
 # ----------------------------
@@ -34,11 +35,14 @@ import pandas as pd
 def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
 def log_info(msg: str) -> None:
     print(f"• [{_now_str()}] {msg}")
 
+
 def log_ok(msg: str) -> None:
     print(f"✅ [{_now_str()}] {msg}")
+
 
 def log_warn(msg: str) -> None:
     print(f"⚠️ [{_now_str()}] {msg}")
@@ -47,11 +51,11 @@ def log_warn(msg: str) -> None:
 # ----------------------------
 # Short-exit tunables
 # ----------------------------
-SHORT_HARD_STOP_PCT   = 0.20   # 20% above entry
-SHORT_TRAIL_ATR_MULT  = 2.0
-SHORT_MA_GUARD_PCT    = 0.03   # 3% above MA150
-SHORT_TARGET1_PCT     = 0.15   # 15% downside
-SHORT_TARGET2_PCT     = 0.20   # 20% downside
+SHORT_HARD_STOP_PCT = 0.20   # 20% above entry
+SHORT_TRAIL_ATR_MULT = 2.0
+SHORT_MA_GUARD_PCT = 0.03    # 3% above MA150
+SHORT_TARGET1_PCT = 0.15     # 15% downside
+SHORT_TARGET2_PCT = 0.20     # 20% downside
 
 
 # ----------------------------
@@ -83,14 +87,32 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 # ----------------------------
-# CSV loading
+# CSV loading (robust)
 # ----------------------------
 def load_csv(path: Path) -> pd.DataFrame:
+    """
+    Robust CSV loader:
+    - If file missing → warn and return empty df
+    - If file is empty / has no columns → warn and return empty df
+    - Any other read error → warn and return empty df
+
+    This keeps the engine safe to run every scan without hard failures.
+    """
     if not path.exists():
-        raise FileNotFoundError(f"CSV not found: {path}")
-    df = pd.read_csv(path)
+        log_warn(f"CSV not found: {path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path)
+    except EmptyDataError:
+        log_warn(f"CSV {path} exists but has no columns (empty file).")
+        return pd.DataFrame()
+    except Exception as e:
+        log_warn(f"Failed to load CSV {path}: {e}")
+        return pd.DataFrame()
+
     if df.empty:
-        log_warn(f"CSV {path} is empty.")
+        log_warn(f"CSV {path} is empty (no rows).")
     return df
 
 
@@ -202,10 +224,12 @@ def load_exit_state(path: Path) -> dict:
             return {}
     return {}
 
+
 def save_exit_state(path: Path, st: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(st, f, indent=2)
+
 
 def append_exit_event(path: Path, row: dict):
     header = [
@@ -442,18 +466,17 @@ def main(argv=None) -> int:
     outdir = Path(args.outdir)
 
     log_info(f"Loading short debug CSV: {csv_path}")
-    try:
-        df_all = load_csv(csv_path)
-    except Exception as e:
-        log_warn(f"Failed to load CSV: {e}")
-        return 1
+    df_all = load_csv(csv_path)
 
+    # If missing / empty / unreadable, we just exit gracefully.
     if df_all.empty:
-        log_warn("Aborting: CSV empty.")
+        log_warn("Aborting: short_debug CSV is missing, empty, or unreadable. Nothing to do.")
         return 0
 
     df_win = apply_window(df_all, args.window_min)
     if df_win.empty:
+        # Nothing in the time window; not an error.
+        log_warn("No rows within the requested window; nothing to summarize.")
         return 0
 
     df_sum = summarize(df_win, outdir, args.window_min)
