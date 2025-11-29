@@ -235,24 +235,40 @@ def compute_atr(daily_df, ticker, n=14):
     return float(atr.iloc[-1])
 
 
-def last_weekly_pivot_high(daily_df, ticker, weeks=PIVOT_LOOKBACK_WEEKS, upto_date=None):
+def last_weekly_pivot_high(daily_df, ticker, weeks=10, upto_date=None):
     """
-    Approximate last 10-week pivot high as the max daily High of the last N weeks up to upto_date.
-    """
-    sub = _get_daily_sub(daily_df, ticker)
-    if sub is None or "High" not in sub.columns:
-        return np.nan
+    Compute a "10-week pivot high" for a given ticker, restricted to data
+    up to (and including) upto_date if provided.
 
-    highs = sub["High"].dropna()
-    if upto_date is not None:
-        highs = highs.loc[highs.index <= upto_date]
+    - daily_df: full daily OHLCV DataFrame (MultiIndex columns or single-ticker)
+    - ticker:   symbol string
+    - weeks:    lookback window in weeks (~5 trading days each)
+    - upto_date: either a pandas.Timestamp, datetime.date, or None
+    """
+    # Select the High series for this ticker
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            highs = daily_df[("High", ticker)].dropna().copy()
+        except KeyError:
+            return np.nan
+    else:
+        highs = daily_df["High"].dropna().copy()
 
     if highs.empty:
         return np.nan
 
-    # For 10 "weeks", use ~50 trading days for equities, ~70 calendar for crypto
-    bars = weeks * (7 if _is_crypto(ticker) else 5)
+    # If we were given an upto_date (date or Timestamp), restrict the series
+    if upto_date is not None:
+        # Key fix: make sure we compare Timestamp to Timestamp
+        cutoff = pd.Timestamp(upto_date)
+        highs = highs.loc[highs.index <= cutoff]
+        if highs.empty:
+            return np.nan
+
+    # Use ~10 weeks of history before upto_date (or end) as the pivot window
+    bars = weeks * 5  # ~5 trading days per week
     highs = highs.tail(bars)
+
     return float(highs.max()) if len(highs) else np.nan
 
 
