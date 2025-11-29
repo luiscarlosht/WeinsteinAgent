@@ -1,39 +1,87 @@
 #!/usr/bin/env bash
+# ============================================================
+# run_cron_short_stack.sh – Full intraday + short stack
+# ------------------------------------------------------------
+# Runs:
+#   1) Long-side intraday watcher (+ Signal Engine + Diagnostics)
+#   2) Short-side intraday watcher (Chapter 8 aware)
+#   3) Short Signal Engine (intraday window + full history)
+#
+# Safe to call from cron every N minutes.
+# Chapter 8:
+#   - Long/short regime is enforced *inside* the watchers.
+#   - If short_ok=False, short watcher writes an empty CSV and
+#     short_signal_engine exits cleanly with "nothing to do".
+# ============================================================
+
 set -euo pipefail
 
+# Move to repo root
 cd "$(dirname "$0")"
 
-# Activate virtual environment
-source /home/luiscarlosht/WeinsteinAgent/.venv/bin/activate
+bold()  { printf "\033[1m%s\033[0m\n" "$*"; }
+green() { printf "\033[32m%s\033[0m\n" "$*"; }
+yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
+red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 
-echo "⚡ Intraday watcher using config: ./config.yaml"
-# Long-side intraday: currently with test-ease
-python3 weinstein_intraday_watcher.py \
-  --config ./config.yaml \
+CONFIG_PATH="${CONFIG_FILE:-./config.yaml}"
+
+if [[ ! -r "$CONFIG_PATH" ]]; then
+  red "Config file not found or unreadable: $CONFIG_PATH"
+  red "Set CONFIG_FILE=./config.yaml or create ./config.yaml"
+  exit 2
+fi
+
+# Activate virtual environment if present
+if [[ -d ".venv" ]]; then
+  # shellcheck disable=SC1091
+  source .venv/bin/activate 2>/dev/null || true
+fi
+
+# ---------------------------------------------
+# 1) LONG-SIDE STACK (intraday + signals + diag)
+# ---------------------------------------------
+bold "⚡ Long-side intraday + Signal Engine + Diagnostics"
+# We force test-ease + explicit log-csv; everything else is handled
+# by weinstein_intraday_watcher.py and the run_ helpers.
+./run_intraday.sh \
   --test-ease \
   --log-csv ./output/intraday_debug.csv
-  # --dry-run    # uncomment if you want to suppress email
 
-echo "✅ Intraday tick complete."
+# run_intraday.sh already calls:
+#   - ./run_signal_engine.sh
+#   - ./run_diag_intraday.sh
+# so we don't re-run them here.
 
-echo "⚡ Signal Engine on: ./output/intraday_debug.csv"
-./run_signal_engine.sh
+# ---------------------------------------------
+# 2) SHORT-SIDE INTRADAY (Chapter 8 aware)
+# ---------------------------------------------
+bold "⚡ Short-side intraday run using config: $CONFIG_PATH"
 
-echo "🔎 Diagnostics on: ./output/intraday_debug.csv"
-./run_diag_intraday.sh
-
-echo "⚡ Short-side intraday run using config: ./config.yaml"
-# SHORT-SIDE: TEST-EASE BUT LIVE EMAIL (no --dry-run)
 python3 weinstein_short_watcher.py \
-  --config ./config.yaml \
+  --config "$CONFIG_PATH" \
   --test-ease \
   --log-csv ./output/short_debug.csv
 
-echo "⚡ Short Signal Engine on: ./output/short_debug.csv"
-# 1) Intraday-window summary (e.g. 3 hours = 180 min)
-./run_short_signal_engine.sh --bps 40 --window-min 180
+# Note:
+#   - If Chapter 8 says short_ok=False, this will log:
+#       "short side is DISABLED in current regime — skipping short scan."
+#     and write an empty ./output/short_debug.csv.
+#   - That’s expected; the engine below will then no-op cleanly.
 
-# 2) Full-history summary (effectively “no window”)
-./run_short_signal_engine.sh --bps 0 --window-min 10000
+# ---------------------------------------------
+# 3) SHORT SIGNAL ENGINE (two windows)
+# ---------------------------------------------
+bold "⚡ Short Signal Engine on: ./output/short_debug.csv (intraday window 180m)"
+./run_short_signal_engine.sh --bps 40 --window-min 180 || {
+  red "❌ Short Signal Engine (window 180) error."
+  exit 1
+}
 
-echo "✅ Short stack complete."
+bold "⚡ Short Signal Engine on: ./output/short_debug.csv (full history)"
+./run_short_signal_engine.sh --bps 0 --window-min 10000 || {
+  red "❌ Short Signal Engine (full history) error."
+  exit 1
+}
+
+green "✅ Short stack complete."
