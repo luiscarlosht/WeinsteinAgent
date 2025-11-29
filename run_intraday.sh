@@ -5,6 +5,7 @@
 # ------------------------------------------------------------
 # Example:
 #   ./run_intraday.sh --dry-run
+#   ./run_intraday.sh --test-ease
 # ============================================================
 
 set -euo pipefail
@@ -24,6 +25,7 @@ fi
 
 # Activate virtual environment if it exists
 if [[ -d ".venv" ]]; then
+  # best-effort; don't crash if activation fails
   source .venv/bin/activate 2>/dev/null || true
 fi
 
