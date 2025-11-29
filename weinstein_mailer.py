@@ -6,27 +6,30 @@ weinstein_mailer.py
 Central email helper for all Weinstein tools (weekly, intraday, crypto, shorts).
 
 Goals:
-- Read SMTP settings from config.yaml (under notifications.email)
-- Use 'app_password' field from config.yaml (Gmail App Password)
-- Support a subject_prefix in config.yaml
-- Support an optional subject_tag kwarg for callers (e.g. "[INTRADAY]")
-- Work with both older callers (no subject_tag) and newer ones (with subject_tag)
+- Read SMTP settings from config.yaml (under notifications.email).
+- Use 'app_password' field from config.yaml (Gmail App Password).
+- Support a subject_prefix in config.yaml.
+- Support optional subject_tag kwarg (e.g. "INTRADAY" → "[INTRADAY]").
+- Support optional regime_header kwarg (can be ignored or used by caller).
+- Be tolerant of extra keyword arguments so new callers don't break.
 """
 
 import os
 import ssl
 import smtplib
 from email.message import EmailMessage
-from typing import Optional, Sequence
+from typing import Optional
 
 import yaml
 
+
+# ---------------- Config helpers ----------------
 
 def _load_email_cfg(cfg_path: str) -> dict:
     """
     Load config.yaml and return the email configuration block.
 
-    Expected structure (which you already have):
+    Expected structure:
 
     notifications:
       email:
@@ -48,7 +51,7 @@ def _load_email_cfg(cfg_path: str) -> dict:
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
-    # Prefer nested notifications.email; fall back to top-level 'email' for backwards compat
+    # Prefer nested notifications.email; fall back to top-level 'email'
     email_cfg = (cfg.get("notifications") or {}).get("email") or cfg.get("email")
     if not email_cfg:
         raise KeyError(
@@ -61,7 +64,11 @@ def _normalize_addresses(email_cfg: dict):
     """
     Decide From and To addresses from config.
     """
-    sender = email_cfg.get("sender") or email_cfg.get("from_email") or email_cfg.get("from_addr")
+    sender = (
+        email_cfg.get("sender")
+        or email_cfg.get("from_email")
+        or email_cfg.get("from_addr")
+    )
     if not sender:
         raise ValueError("Email sender not specified (sender/from_email).")
 
@@ -87,14 +94,17 @@ def _smtp_params(email_cfg: dict):
     """
     provider = (email_cfg.get("provider") or "smtp").lower()
     if provider != "smtp":
-        # For now we only implement 'smtp'; other providers can be added later.
         raise ValueError(f"Unsupported email provider '{provider}'. Only 'smtp' is implemented.")
 
     smtp_cfg = email_cfg.get("smtp") or {}
 
     host = smtp_cfg.get("host") or "smtp.gmail.com"
-    # Port may be called 'port', 'port_ssl', or 'port_tls'
-    port = smtp_cfg.get("port_ssl") or smtp_cfg.get("port_tls") or smtp_cfg.get("port") or 587
+    port = (
+        smtp_cfg.get("port_ssl")
+        or smtp_cfg.get("port_tls")
+        or smtp_cfg.get("port")
+        or 587
+    )
 
     username = smtp_cfg.get("username") or email_cfg.get("smtp_username") or email_cfg.get("user")
     if not username:
@@ -123,31 +133,32 @@ def _build_subject(
       - config subject_prefix
       - subject_tag (e.g. 'INTRADAY' → '[INTRADAY]')
       - raw_subject (e.g. 'Intraday Watch — 2 BUY / 3 NEAR / 1 SELL')
-    into a single string, handling missing pieces gracefully.
+    into a single string.
     """
     prefix = (email_cfg.get("subject_prefix") or "").strip()
 
     tag_part = ""
     if subject_tag:
-        # Avoid double brackets if caller accidentally passes "[INTRADAY]"
         clean_tag = subject_tag.strip()
+        # Avoid double brackets
         if not (clean_tag.startswith("[") and clean_tag.endswith("]")):
             clean_tag = f"[{clean_tag}]"
         tag_part = clean_tag
 
-    # If caller passes no subject at all, fall back to something generic
     base_subj = (raw_subject or "").strip() or "Weinstein Report"
 
     parts = [p for p in [prefix, tag_part, base_subj] if p]
     return " ".join(parts)
 
 
+# ---------------- Main send_email ----------------
+
 def send_email(
     subject: Optional[str] = None,
     html_body: str = "",
     text_body: Optional[str] = None,
     cfg_path: str = "config.yaml",
-    subject_tag: Optional[str] = None,
+    **kwargs,
 ):
     """
     Main send_email entry point used by:
@@ -157,11 +168,23 @@ def send_email(
       - weinstein_crypto_watcher.py
       - etc.
 
-    NEW:
-    - cfg_path: path to config.yaml
-    - subject_tag: optional string used to tag subject (e.g. 'INTRADAY', 'WEEKLY', 'SHORT')
-                   The caller can pass either 'INTRADAY' or '[INTRADAY]'; we normalize to brackets.
+    Recognized kwargs:
+      - subject_tag: optional string used to tag subject (e.g. 'INTRADAY', 'WEEKLY', 'SHORT')
+                     The caller can pass either 'INTRADAY' or '[INTRADAY]'; we normalize.
+      - regime_header: optional string the caller may use for regime summary in body.
+                       We don't need it here; intraday watcher already includes regime
+                       in html_body/text_body, but we accept it to avoid breaking.
+
+    Any other kwargs are safely ignored (forward compatibility).
     """
+    subject_tag = kwargs.pop("subject_tag", None)
+    regime_header = kwargs.pop("regime_header", None)  # accepted but not required
+
+    # Ignore any unexpected extra kwargs to keep API future-proof
+    if kwargs:
+        # If you ever want, you could log them here.
+        pass
+
     email_cfg = _load_email_cfg(cfg_path)
 
     if not bool(email_cfg.get("enabled", True)):
@@ -173,22 +196,26 @@ def send_email(
 
     final_subject = _build_subject(subject, email_cfg, subject_tag=subject_tag)
 
-    # Create the message
+    # If regime_header is provided and text_body is empty, we could prepend it.
+    # But in your intraday/weekly scripts, regime is already baked into text_body/html_body.
+    if regime_header and text_body:
+        # Make regime line clearly visible at the top of the text version
+        text_body = f"{regime_header}\n\n{text_body}"
+
+    # Build message
     msg = EmailMessage()
     msg["Subject"] = final_subject
     msg["From"] = f"{from_name} <{sender}>"
     msg["To"] = ", ".join(recipients)
 
     if text_body is None:
-        # Fallback text if only HTML was given
         text_body = "Your Weinstein report is attached in HTML format."
 
-    # multipart/alternative: plain text and HTML
     msg.set_content(text_body)
     if html_body:
         msg.add_alternative(html_body, subtype="html")
 
-    # Connect via SMTP (STARTTLS).
+    # Send via SMTP/STARTTLS
     context = ssl.create_default_context()
     print(
         f"Connecting to SMTP server {host}:{port} as {username} "
@@ -200,16 +227,17 @@ def send_email(
             server.starttls(context=context)
             server.ehlo()
         except smtplib.SMTPException:
-            # Some providers might not need/allow STARTTLS (but Gmail does).
+            # Some servers might not support STARTTLS, but Gmail does.
             pass
 
         server.login(username, password)
         server.send_message(msg)
 
-    print("Email sent successfully via SMTP.")
+    print("Email sent.")
 
 
-# Convenience helper if you ever want a simple CLI test:
+# ---------------- CLI test helper ----------------
+
 if __name__ == "__main__":
     import argparse
 
@@ -217,6 +245,7 @@ if __name__ == "__main__":
     ap.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     ap.add_argument("--subject", default="Weinstein Mailer Test")
     ap.add_argument("--tag", default="", help="Optional subject tag, e.g. INTRADAY")
+    ap.add_argument("--regime", default="", help="Optional regime header line")
     ap.add_argument("--text", default="This is a test email from weinstein_mailer.py")
     args = ap.parse_args()
 
@@ -226,4 +255,5 @@ if __name__ == "__main__":
         html_body=f"<h3>{args.subject}</h3><p>{args.text}</p>",
         cfg_path=args.config,
         subject_tag=args.tag or None,
+        regime_header=args.regime or None,
     )
