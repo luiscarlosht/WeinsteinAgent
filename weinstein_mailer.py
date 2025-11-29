@@ -3,285 +3,227 @@
 """
 weinstein_mailer.py
 
-Thin email helper used by:
-- weinstein_report_weekly.py
-- weinstein_intraday_watcher.py
-- weinstein_short_watcher.py
-- etc.
+Central email helper for all Weinstein tools (weekly, intraday, crypto, shorts).
 
-Goal: be flexible with config.yaml, so we support BOTH:
-
-1) New flat style:
-
-notifications:
-  email:
-    enabled: true
-    sender: "you@gmail.com"
-    from_name: "Weinstein Bot"
-    from_email: "you@gmail.com"
-    recipients: ["a@example.com","b@example.com"]
-    subject_prefix: "Weinstein Report READY"
-    provider: "smtp"
-    host: "smtp.gmail.com"
-    port: 587
-    use_tls: true
-    username: "you@gmail.com"
-    password: "APP_PASSWORD_HERE"
-
-2) Your existing nested style (what you pasted):
-
-notifications:
-  email:
-    enabled: true
-    sender: "luiscarlosht@gmail.com"
-    recipients:
-      - "luiscarloshernandez@hotmail.com"
-      - "luiscarlosht@gmail.com"
-    subject_prefix: "Weinstein Report READY"
-    provider: "smtp"
-    smtp:
-      host: "smtp.gmail.com"
-      port_ssl: 587
-      username: "luiscarlosht@gmail.com"
-      app_password: "qnamoxtmakhnvlml"
-
-This file will look for BOTH `password` and `app_password`, and will
-pull host/port/username from either the flat keys or the nested `smtp` dict.
+Goals:
+- Read SMTP settings from config.yaml (under notifications.email)
+- Use 'app_password' field from config.yaml (Gmail App Password)
+- Support a subject_prefix in config.yaml
+- Support an optional subject_tag kwarg for callers (e.g. "[INTRADAY]")
+- Work with both older callers (no subject_tag) and newer ones (with subject_tag)
 """
 
+import os
 import ssl
 import smtplib
 from email.message import EmailMessage
-from typing import Any, Dict, Tuple, List, Optional
+from typing import Optional, Sequence
 
 import yaml
 
 
-def _load_yaml(path: str) -> Dict[str, Any]:
-    with open(path, "r") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _resolve_email_config(cfg_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _load_email_cfg(cfg_path: str) -> dict:
     """
-    Returns (email_cfg, smtp_cfg) where:
+    Load config.yaml and return the email configuration block.
 
-    email_cfg = cfg["notifications"]["email"] or cfg["email"]
-    smtp_cfg  = email_cfg.get("smtp", {})
+    Expected structure (which you already have):
+
+    notifications:
+      email:
+        enabled: true
+        sender: "you@gmail.com"
+        recipients:
+          - "you@gmail.com"
+        subject_prefix: "Weinstein Report READY"
+        provider: "smtp"
+        smtp:
+          host: "smtp.gmail.com"
+          port_ssl: 587
+          username: "you@gmail.com"
+          app_password: "your-app-password"
     """
-    cfg = _load_yaml(cfg_path)
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"Config file not found: {cfg_path}")
 
-    notifications = cfg.get("notifications", {}) or {}
-    email_cfg = notifications.get("email") or cfg.get("email") or {}
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
 
+    # Prefer nested notifications.email; fall back to top-level 'email' for backwards compat
+    email_cfg = (cfg.get("notifications") or {}).get("email") or cfg.get("email")
     if not email_cfg:
-        raise KeyError("Email configuration not found under 'notifications.email' or top-level 'email'")
+        raise KeyError(
+            "email configuration not found. Expected under 'notifications.email' or top-level 'email'."
+        )
+    return email_cfg
 
-    smtp_cfg = email_cfg.get("smtp", {}) or {}
-    return email_cfg, smtp_cfg
 
-
-def _extract_smtp_settings(email_cfg: Dict[str, Any], smtp_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_addresses(email_cfg: dict):
     """
-    Merge flat + nested smtp config into a single dict with keys:
-
-    {
-      "provider": "smtp" | "console" | ...
-      "host": str,
-      "port": int,
-      "use_tls": bool,
-      "use_ssl": bool,
-      "username": str,
-      "password": str
-    }
-
-    - prefers flat keys in email_cfg (host/port/username/password)
-    - falls back to smtp_cfg["host"], smtp_cfg["port"], smtp_cfg["port_ssl"], smtp_cfg["username"], smtp_cfg["password"], smtp_cfg["app_password"]
+    Decide From and To addresses from config.
     """
-    provider = (email_cfg.get("provider") or "smtp").lower().strip()
+    sender = email_cfg.get("sender") or email_cfg.get("from_email") or email_cfg.get("from_addr")
+    if not sender:
+        raise ValueError("Email sender not specified (sender/from_email).")
 
-    # Host
-    host = (
-        email_cfg.get("host")
-        or smtp_cfg.get("host")
-        or "smtp.gmail.com"
-    )
-
-    # Port
-    port = (
-        email_cfg.get("port")
-        or smtp_cfg.get("port")
-        or smtp_cfg.get("port_ssl")
-        or 587
-    )
-    try:
-        port = int(port)
-    except Exception:
-        port = 587
-
-    # Username
-    username = (
-        email_cfg.get("username")
-        or smtp_cfg.get("username")
-        or email_cfg.get("sender")
-        or email_cfg.get("from_email")
-    )
-
-    # Password: accept several names for compatibility
-    password = (
-        email_cfg.get("password")
-        or email_cfg.get("app_password")
-        or smtp_cfg.get("password")
-        or smtp_cfg.get("app_password")
-    )
-
-    # TLS/SSL flags (reasonable defaults: STARTTLS on 587)
-    use_ssl = bool(email_cfg.get("use_ssl", False))
-    use_tls = bool(email_cfg.get("use_tls", True))
-    if port == 465:
-        use_ssl = True
-        use_tls = False
-
-    return {
-        "provider": provider,
-        "host": host,
-        "port": port,
-        "use_tls": use_tls,
-        "use_ssl": use_ssl,
-        "username": username,
-        "password": password,
-    }
-
-
-def _build_message(
-    subject: str,
-    html_body: str,
-    text_body: Optional[str],
-    email_cfg: Dict[str, Any],
-) -> EmailMessage:
-    """
-    Build a multipart/alternative message (text + HTML).
-    """
-
-    # Sender / from / recipients
-    sender_name = email_cfg.get("from_name") or email_cfg.get("sender", "")
-    from_addr = (
-        email_cfg.get("from_email")
-        or email_cfg.get("sender")
-        or email_cfg.get("username")
-    )
-    raw_recipients = (
+    recipients = (
         email_cfg.get("recipients")
         or email_cfg.get("to")
+        or email_cfg.get("emails")
         or []
     )
+    if isinstance(recipients, str):
+        recipients = [r.strip() for r in recipients.split(",") if r.strip()]
 
-    if isinstance(raw_recipients, str):
-        recipients: List[str] = [raw_recipients]
-    else:
-        recipients = list(raw_recipients or [])
-
-    if not from_addr:
-        raise ValueError("Missing sender email (from_email/sender) in email configuration.")
     if not recipients:
-        raise ValueError("Missing recipients list in email configuration (recipients/to).")
+        raise ValueError("No recipient emails specified in config.yaml (recipients/to).")
 
-    subj_prefix = str(email_cfg.get("subject_prefix") or "").strip()
-    final_subject = f"{subj_prefix} {subject}".strip() if subj_prefix else subject
+    from_name = email_cfg.get("from_name") or email_cfg.get("display_name") or sender
+    return sender, from_name, recipients
 
-    msg = EmailMessage()
-    if sender_name:
-        msg["From"] = f"{sender_name} <{from_addr}>"
-    else:
-        msg["From"] = from_addr
 
-    msg["To"] = ", ".join(recipients)
-    msg["Subject"] = final_subject
+def _smtp_params(email_cfg: dict):
+    """
+    Extract SMTP provider settings (host, port, username, password/app_password).
+    """
+    provider = (email_cfg.get("provider") or "smtp").lower()
+    if provider != "smtp":
+        # For now we only implement 'smtp'; other providers can be added later.
+        raise ValueError(f"Unsupported email provider '{provider}'. Only 'smtp' is implemented.")
 
-    # Text + HTML parts
-    if text_body:
-        msg.set_content(text_body)
-        msg.add_alternative(html_body, subtype="html")
-    else:
-        # Derive a plain text body from HTML in a simple way
-        stripped = (
-            html_body.replace("<br>", "\n")
-            .replace("<br/>", "\n")
-            .replace("</p>", "\n\n")
-        )
-        msg.set_content(stripped)
-        msg.add_alternative(html_body, subtype="html")
+    smtp_cfg = email_cfg.get("smtp") or {}
 
-    return msg
+    host = smtp_cfg.get("host") or "smtp.gmail.com"
+    # Port may be called 'port', 'port_ssl', or 'port_tls'
+    port = smtp_cfg.get("port_ssl") or smtp_cfg.get("port_tls") or smtp_cfg.get("port") or 587
+
+    username = smtp_cfg.get("username") or email_cfg.get("smtp_username") or email_cfg.get("user")
+    if not username:
+        raise ValueError("SMTP username not found in email configuration (smtp.username).")
+
+    # Your config.yaml uses 'app_password'
+    password = (
+        smtp_cfg.get("app_password")
+        or smtp_cfg.get("password")
+        or email_cfg.get("app_password")
+        or email_cfg.get("password")
+    )
+    if not password:
+        raise ValueError("SMTP password not found in email configuration (app_password/password).")
+
+    return host, int(port), username, password
+
+
+def _build_subject(
+    raw_subject: Optional[str],
+    email_cfg: dict,
+    subject_tag: Optional[str] = None,
+) -> str:
+    """
+    Combine:
+      - config subject_prefix
+      - subject_tag (e.g. 'INTRADAY' → '[INTRADAY]')
+      - raw_subject (e.g. 'Intraday Watch — 2 BUY / 3 NEAR / 1 SELL')
+    into a single string, handling missing pieces gracefully.
+    """
+    prefix = (email_cfg.get("subject_prefix") or "").strip()
+
+    tag_part = ""
+    if subject_tag:
+        # Avoid double brackets if caller accidentally passes "[INTRADAY]"
+        clean_tag = subject_tag.strip()
+        if not (clean_tag.startswith("[") and clean_tag.endswith("]")):
+            clean_tag = f"[{clean_tag}]"
+        tag_part = clean_tag
+
+    # If caller passes no subject at all, fall back to something generic
+    base_subj = (raw_subject or "").strip() or "Weinstein Report"
+
+    parts = [p for p in [prefix, tag_part, base_subj] if p]
+    return " ".join(parts)
 
 
 def send_email(
-    subject: str,
-    html_body: str,
+    subject: Optional[str] = None,
+    html_body: str = "",
     text_body: Optional[str] = None,
     cfg_path: str = "config.yaml",
-) -> None:
+    subject_tag: Optional[str] = None,
+):
     """
-    Main entry point used by the rest of the app.
+    Main send_email entry point used by:
+      - weinstein_report_weekly.py
+      - weinstein_intraday_watcher.py
+      - weinstein_short_watcher.py
+      - weinstein_crypto_watcher.py
+      - etc.
 
-    - Reads email config from cfg_path
-    - Handles both flat + nested smtp configs
-    - Sends via SMTP (default) or prints to console if provider="console"
+    NEW:
+    - cfg_path: path to config.yaml
+    - subject_tag: optional string used to tag subject (e.g. 'INTRADAY', 'WEEKLY', 'SHORT')
+                   The caller can pass either 'INTRADAY' or '[INTRADAY]'; we normalize to brackets.
     """
+    email_cfg = _load_email_cfg(cfg_path)
 
-    # 1) Load base config
-    email_cfg, smtp_cfg = _resolve_email_config(cfg_path)
-
-    # If disabled, just exit quietly
-    if not email_cfg.get("enabled", True):
-        print("Email notifications are disabled in config.")
+    if not bool(email_cfg.get("enabled", True)):
+        print("Email notifications are disabled in config.yaml (notifications.email.enabled = false).")
         return
 
-    # 2) Build message
-    msg = _build_message(subject, html_body, text_body, email_cfg)
+    sender, from_name, recipients = _normalize_addresses(email_cfg)
+    host, port, username, password = _smtp_params(email_cfg)
 
-    # 3) Resolve provider + SMTP settings
-    smtp_settings = _extract_smtp_settings(email_cfg, smtp_cfg)
-    provider = smtp_settings["provider"]
+    final_subject = _build_subject(subject, email_cfg, subject_tag=subject_tag)
 
-    if provider == "console":
-        # Debug mode: just print the subject + "to" and don't send anything
-        print("✉️ [console] Would send email:")
-        print(f"  Subject: {msg['Subject']}")
-        print(f"  To:      {msg['To']}")
-        return
+    # Create the message
+    msg = EmailMessage()
+    msg["Subject"] = final_subject
+    msg["From"] = f"{from_name} <{sender}>"
+    msg["To"] = ", ".join(recipients)
 
-    if provider != "smtp":
-        raise ValueError(f"Unsupported email provider: {provider}. Only 'smtp' and 'console' are supported.")
+    if text_body is None:
+        # Fallback text if only HTML was given
+        text_body = "Your Weinstein report is attached in HTML format."
 
-    host = smtp_settings["host"]
-    port = smtp_settings["port"]
-    username = smtp_settings["username"]
-    password = smtp_settings["password"]
-    use_tls = smtp_settings["use_tls"]
-    use_ssl = smtp_settings["use_ssl"]
+    # multipart/alternative: plain text and HTML
+    msg.set_content(text_body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
 
-    if not username:
-        raise ValueError("SMTP username not found in email configuration (username/sender/from_email/smtp.username).")
-    if not password:
-        raise ValueError("SMTP password not found in email configuration (password/app_password/smtp.app_password).")
-
-    # 4) Actually send
+    # Connect via SMTP (STARTTLS).
     context = ssl.create_default_context()
-
-    if use_ssl:
-        # Implicit SSL (port 465 typically)
-        with smtplib.SMTP_SSL(host, port, context=context) as server:
-            server.login(username, password)
-            server.send_message(msg)
-        print(f"✅ Email sent via SMTP_SSL: {host}:{port}")
-    else:
-        # STARTTLS (port 587 typically)
-        with smtplib.SMTP(host, port) as server:
+    print(
+        f"Connecting to SMTP server {host}:{port} as {username} "
+        f"(subject: {final_subject!r})..."
+    )
+    with smtplib.SMTP(host, port) as server:
+        server.ehlo()
+        try:
+            server.starttls(context=context)
             server.ehlo()
-            if use_tls:
-                server.starttls(context=context)
-                server.ehlo()
-            server.login(username, password)
-            server.send_message(msg)
-        print(f"✅ Email sent via STARTTLS: {host}:{port}")
+        except smtplib.SMTPException:
+            # Some providers might not need/allow STARTTLS (but Gmail does).
+            pass
+
+        server.login(username, password)
+        server.send_message(msg)
+
+    print("Email sent successfully via SMTP.")
+
+
+# Convenience helper if you ever want a simple CLI test:
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Test WeinsteinMailer send_email")
+    ap.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    ap.add_argument("--subject", default="Weinstein Mailer Test")
+    ap.add_argument("--tag", default="", help="Optional subject tag, e.g. INTRADAY")
+    ap.add_argument("--text", default="This is a test email from weinstein_mailer.py")
+    args = ap.parse_args()
+
+    send_email(
+        subject=args.subject,
+        text_body=args.text,
+        html_body=f"<h3>{args.subject}</h3><p>{args.text}</p>",
+        cfg_path=args.config,
+        subject_tag=args.tag or None,
+    )
