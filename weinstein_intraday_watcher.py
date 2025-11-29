@@ -836,6 +836,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         level="info",
     )
 
+    # NEW: strings for subject + email header
+    regime_header = f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}"
+    subject_tag   = f"INTRADAY {regime_label} L={market_long_ok} S={market_short_ok}"
+
     if isinstance(intraday.columns, pd.MultiIndex):
         last_closes = intraday["Close"].ffill().iloc[-1]
     else:
@@ -1314,7 +1318,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             subject=f"Intraday Watch — {subject_counts}",
             html_body=html,
             text_body=text,
-            cfg_path=_config_path
+            cfg_path=_config_path,
+            subject_tag=subject_tag,
+            regime_header=regime_header,
         )
         log("Email sent.", level="ok")
 
