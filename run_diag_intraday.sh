@@ -26,6 +26,7 @@ HTML_GLOB="${HTML_GLOB:-./output/intraday_watch_*.html}"
 SIGNALS_CSV="${SIGNALS_CSV:-./output/signals_log.csv}"
 
 bold "🔎 Diagnostics on: $CSV"
+
 python3 tools/diagnose_intraday.py \
   --csv "$CSV" \
   --outdir "$OUTDIR" \
@@ -33,6 +34,6 @@ python3 tools/diagnose_intraday.py \
   --html-glob "$HTML_GLOB" \
   --signals-csv "$SIGNALS_CSV" \
   "$@" && green "✅ Diagnostics complete." || {
-  red "❌ Diagnostics error."
-  exit 1
-}
+    red "❌ Diagnostics error."
+    exit 1
+  }
