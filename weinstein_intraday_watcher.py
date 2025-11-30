@@ -785,61 +785,52 @@ def _build_alert_block_text(alert_rows):
         lines.append(f"- {t}: entry≈{entry}, low alert (protective stop)≤{stop}, high alerts: {ups_str}")
     return "\n".join(lines)
 
-# ---------------- Main logic ----------------
-def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log_csv=None, log_json=None, dry_run=False):
-    log("Intraday watcher starting with config: {0}".format(_config_path), level="step")
-    cfg, benchmark, sheet_url, service_account_file = load_config(_config_path)
-    weekly_df, weekly_csv_path = load_weekly_report()
-    log(f"Weekly CSV: {weekly_csv_path}", level="debug")
+# ---------------- Core signal computation (NEW helper for live + backtest) ----------------
+def compute_signals_for_snapshot(
+    *,
+    focus: pd.DataFrame,
+    intraday: pd.DataFrame,
+    daily: pd.DataFrame,
+    held_positions: dict,
+    trigger_state: dict | None,
+    market_long_ok: bool,
+    market_short_ok: bool,
+    test_ease: bool = False,
+):
+    """
+    Core intraday signal engine, extracted so it can be reused by:
+      - this script's run()
+      - a live-logic backtester (weinstein_live_logic_backtest.py)
 
-    # Normalize expected columns
-    w = weekly_df.rename(columns=str.lower)
-    for miss in ["ticker","stage","ma30","rs_above_ma","asset_class"]:
-        if miss not in w.columns: w[miss] = np.nan
-    focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])][["ticker","stage","ma30","rs_above_ma","asset_class"]].copy()
-    if "rank" in w.columns: focus["weekly_rank"] = w["rank"]
-    else: focus["weekly_rank"] = 999999
+    Inputs:
+      focus          : DataFrame with at least ['ticker','stage','ma30','rs_above_ma','asset_class','weekly_rank']
+      intraday       : intraday OHLCV DataFrame (yfinance-style)
+      daily          : daily OHLCV DataFrame (yfinance-style)
+      held_positions : dict from state/positions.json: {ticker: {...}}
+      trigger_state  : dict with per-ticker state machine (near_hits, cooldown, etc.)
+      market_long_ok : bool (from market_regime.inspect)
+      market_short_ok: bool (from market_regime.inspect)  # currently only surfaced, not used for shorts yet
+      test_ease      : bool; if True, relax thresholds for easier testing
 
-    if only_tickers:
-        filt = set([t.strip().upper() for t in only_tickers])
-        focus = focus[focus["ticker"].isin(filt)].copy()
+    Returns dict:
+      {
+        "buy_signals": [...],
+        "near_signals": [...],
+        "sell_triggers": [...],
+        "sell_signals": [...],         # risk-based from positions.json
+        "info_rows": [...],            # for snapshot table
+        "debug_rows": [...],           # for CSV/JSON diagnostics
+        "trigger_state": trigger_state # updated state (for persistence)
+      }
 
-    log(f"Focus universe: {len(focus)} symbols (Stage 1/2).", level="info")
+    NOTE: This currently produces LONG buy/sell logic only.
+          To add SHORT entries, you would respect market_short_ok and add a
+          separate short-state machine (TODO hook).
+    """
+    held = held_positions or {}
+    trigger_state = trigger_state or {}
 
-    state = load_positions()
-    held = state.get("positions", {}) or {}
-    if held:
-        log(f"Held symbols detected: {sorted(held.keys())}", level="debug")
-
-    # Benchmarks to ensure RS charts render: equity + crypto
-    needs = sorted(set(focus["ticker"].tolist() + [benchmark, CRYPTO_BENCHMARK]))
-
-    log("Downloading intraday + daily bars...", level="step")
-    intraday, daily = get_intraday(needs)
-    log("Price data downloaded.", level="ok")
-
-    # ---- Market regime filter (Weinstein Chapter 8) ----
-    try:
-        # market_regime.inspect() ignores our daily prices and pulls its own index data
-        label, long_ok, short_ok = inspect_market_regime()
-        regime_label = label
-        market_long_ok = bool(long_ok)
-        market_short_ok = bool(short_ok)
-    except Exception as e:
-        log(f"Market regime evaluation failed ({e}); defaulting to neutral (no filter).", level="warn")
-        regime_label = "NEUTRAL (error)"
-        market_long_ok = True
-        market_short_ok = True
-
-    log(
-        f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}",
-        level="info",
-    )
-
-    # NEW: strings for subject + email header
-    regime_header = f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}"
-    subject_tag   = f"INTRADAY {regime_label} L={market_long_ok} S={market_short_ok}"
-
+    # last close snapshot, same as live run()
     if isinstance(intraday.columns, pd.MultiIndex):
         last_closes = intraday["Close"].ffill().iloc[-1]
     else:
@@ -851,10 +842,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         vals = getattr(last_closes, "values", [])
         return float(vals[-1]) if len(vals) else np.nan
 
-    trigger_state = _load_intraday_state()
+    trigger_state = trigger_state.copy()
 
     buy_signals, near_signals, sell_signals = [], [], []
-    sell_triggers, sell_from_positions, info_rows, chart_imgs = [], [], [], []
+    sell_triggers, info_rows, debug_rows = [], [], []
 
     # Test easing via flag or environment
     ease = test_ease or (os.getenv("INTRADAY_TEST", "0") == "1")
@@ -868,17 +859,17 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     _SELL_INTRABAR_VOLPACE_MIN = 0.0 if ease else SELL_INTRABAR_VOLPACE_MIN
 
     log("Evaluating candidates...", level="step")
-    debug_rows = []
 
     for _, row in focus.iterrows():
         t = row["ticker"]
-        if t in (benchmark, CRYPTO_BENCHMARK):
+        if t in (BENCHMARK_DEFAULT, CRYPTO_BENCHMARK):
             continue
         px = px_now(t)
         if np.isnan(px):
             continue
 
-        stage = str(row["stage"]); ma30 = float(row.get("ma30", np.nan))
+        stage = str(row["stage"])
+        ma30 = float(row.get("ma30", np.nan))
         rs_above = bool(row.get("rs_above_ma", False))
         weekly_rank = float(row.get("weekly_rank", np.nan))
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
@@ -886,7 +877,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         atr = compute_atr(daily, t, n=14)
 
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
-        ma_ok = pd.notna(ma30); pivot_ok = pd.notna(pivot); rs_ok = rs_above
+        ma_ok = pd.notna(ma30)
+        pivot_ok = pd.notna(pivot)
+        rs_ok = rs_above
 
         elapsed = _elapsed_in_current_bar_minutes(intraday, t) if INTRADAY_INTERVAL == "60m" else None
         pace_intra = intrabar_volume_pace(intraday, t, bar_minutes=60) if INTRADAY_INTERVAL == "60m" else None
@@ -904,16 +897,21 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         d["cond"]["ma_ok"] = bool(ma_ok)
         d["cond"]["pivot_ok"] = bool(pivot_ok)
         d["cond"]["market_long_ok"] = bool(market_long_ok)
+        d["cond"]["market_short_ok"] = bool(market_short_ok)
+
         if not market_long_ok:
             d["why"].append("Market regime not favorable for LONG (Chapter 8)")
 
         # --- BUY confirm ---
-        confirm = False; vol_ok = True; price_ok = False
+        confirm = False
+        vol_ok = True
+        price_ok = False
         if market_long_ok and ma_ok and pivot_ok and closes_n:
             def _price_ok(c):
                 return (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
             if INTRADAY_INTERVAL == "60m":
-                last_c = closes_n[-1]; price_ok = _price_ok(last_c)
+                last_c = closes_n[-1]
+                price_ok = _price_ok(last_c)
                 vol_ok = (pd.isna(pace_intra) or pace_intra >= _INTRABAR_VOLPACE_MIN)
                 confirm = price_ok and (elapsed is not None and elapsed >= _INTRABAR_CONFIRM_MIN_ELAPSED) and vol_ok
             else:
@@ -952,7 +950,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         d["cond"]["near_now"] = bool(near_now)
 
         # --- SELL near/confirm ---
-        sell_near_now = False; sell_confirm = False; sell_vol_ok = True
+        sell_near_now = False
+        sell_confirm = False
+        sell_vol_ok = True
         sell_price_ok = False
         if ma_ok and pd.notna(px):
             sell_near_now = _near_sell_zone(px, ma30)
@@ -1067,8 +1067,96 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
     log(f"Scan done. Raw counts → BUY:{len(buy_signals)} NEAR:{len(near_signals)} SELLTRIG:{len(sell_triggers)}", level="info")
 
+    return {
+        "buy_signals": buy_signals,
+        "near_signals": near_signals,
+        "sell_triggers": sell_triggers,
+        "sell_signals": sell_signals,
+        "info_rows": info_rows,
+        "debug_rows": debug_rows,
+        "trigger_state": trigger_state,
+    }
+
+# ---------------- Main logic (wraps core helper) ----------------
+def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log_csv=None, log_json=None, dry_run=False):
+    log("Intraday watcher starting with config: {0}".format(_config_path), level="step")
+    cfg, benchmark, sheet_url, service_account_file = load_config(_config_path)
+    weekly_df, weekly_csv_path = load_weekly_report()
+    log(f"Weekly CSV: {weekly_csv_path}", level="debug")
+
+    # Normalize expected columns
+    w = weekly_df.rename(columns=str.lower)
+    for miss in ["ticker","stage","ma30","rs_above_ma","asset_class"]:
+        if miss not in w.columns: w[miss] = np.nan
+    focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])][["ticker","stage","ma30","rs_above_ma","asset_class"]].copy()
+    if "rank" in w.columns: focus["weekly_rank"] = w["rank"]
+    else: focus["weekly_rank"] = 999999
+
+    if only_tickers:
+        filt = set([t.strip().upper() for t in only_tickers])
+        focus = focus[focus["ticker"].isin(filt)].copy()
+
+    log(f"Focus universe: {len(focus)} symbols (Stage 1/2).", level="info")
+
+    state = load_positions()
+    held = state.get("positions", {}) or {}
+    if held:
+        log(f"Held symbols detected: {sorted(held.keys())}", level="debug")
+
+    # Benchmarks to ensure RS charts render: equity + crypto
+    needs = sorted(set(focus["ticker"].tolist() + [benchmark, CRYPTO_BENCHMARK]))
+
+    log("Downloading intraday + daily bars...", level="step")
+    intraday, daily = get_intraday(needs)
+    log("Price data downloaded.", level="ok")
+
+    # ---- Market regime filter (Weinstein Chapter 8) ----
+    try:
+        # market_regime.inspect() ignores our daily prices and pulls its own index data
+        label, long_ok, short_ok = inspect_market_regime()
+        regime_label = label
+        market_long_ok = bool(long_ok)
+        market_short_ok = bool(short_ok)
+    except Exception as e:
+        log(f"Market regime evaluation failed ({e}); defaulting to neutral (no filter).", level="warn")
+        regime_label = "NEUTRAL (error)"
+        market_long_ok = True
+        market_short_ok = True
+
+    log(
+        f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}",
+        level="info",
+    )
+
+    # NEW: strings for subject + email header
+    regime_header = f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}"
+    subject_tag   = f"INTRADAY {regime_label} L={market_long_ok} S={market_short_ok}"
+
+    # Load state machine and compute signals using the extracted helper
+    trigger_state = _load_intraday_state()
+    core = compute_signals_for_snapshot(
+        focus=focus,
+        intraday=intraday,
+        daily=daily,
+        held_positions=held,
+        trigger_state=trigger_state,
+        market_long_ok=market_long_ok,
+        market_short_ok=market_short_ok,
+        test_ease=test_ease,
+    )
+
+    buy_signals      = core["buy_signals"]
+    near_signals     = core["near_signals"]
+    sell_triggers    = core["sell_triggers"]
+    sell_signals     = core["sell_signals"]
+    info_rows        = core["info_rows"]
+    debug_rows       = core["debug_rows"]
+    trigger_state    = core["trigger_state"]
+
     # ---------- SELL recommendations from holdings ----------
     holdings_block_html = ""
+    sell_from_positions = []
+
     holdings_raw = _load_open_positions_local()
     if holdings_raw is not None and not holdings_raw.empty:
         pos_norm = _normalize_open_positions_columns(holdings_raw)
@@ -1107,9 +1195,12 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         holdings_block_html = _colored_summary_html(metrics) + _holdings_snapshot_html(merged)
 
     # -------- Ranking & charts --------
-    buy_signals.sort(key=buy_sort_key); near_signals.sort(key=near_sort_key); sell_triggers.sort(key=sell_sort_key)
+    buy_signals.sort(key=buy_sort_key)
+    near_signals.sort(key=near_sort_key)
+    sell_triggers.sort(key=sell_sort_key)
 
-    charts_added = 0; chart_imgs = []
+    charts_added = 0
+    chart_imgs = []
     for item in buy_signals:
         if charts_added >= MAX_CHARTS_PER_EMAIL: break
         t = item["ticker"]
