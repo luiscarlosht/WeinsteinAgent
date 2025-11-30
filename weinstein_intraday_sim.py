@@ -73,7 +73,8 @@ WEEKLY_FILE_PREFIX = "weinstein_weekly_"
 INTRADAY_INTERVAL = "60m"
 
 # Data window padding around target year
-LOOKBACK_START_MONTH = 11  # start downloads in Nov previous year
+# We use ~6 months of extra history before Jan 1 so SMA150 is "real" early in the year.
+LOOKBACK_START_MONTH = 7   # start downloads in July of previous year (was 11 = November)
 LOOKAHEAD_END_MONTH = 2    # end downloads in Feb following year
 
 PIVOT_LOOKBACK_WEEKS = 10
@@ -586,9 +587,22 @@ def simulate_year(sim_cfg: SimConfig, config_path: str) -> Dict[str, float]:
     else:
         log("No trades executed; regime P/L breakdown is empty.", level="warn")
 
-    # --- Save trade log CSV ---
+    # --- Save trade log CSV (always with header) ---
     os.makedirs("./output", exist_ok=True)
-    trades_df = pd.DataFrame([t.__dict__ for t in trades])
+    trades_cols = [
+        "ticker",
+        "direction",
+        "entry_ts",
+        "exit_ts",
+        "entry_price",
+        "exit_price",
+        "qty",
+        "pnl_dollar",
+        "pnl_pct",
+        "regime_at_entry",
+        "regime_at_exit",
+    ]
+    trades_df = pd.DataFrame([t.__dict__ for t in trades], columns=trades_cols)
     out_path = f"./output/intraday_sim_{sim_cfg.year}_{sim_cfg.mode}.csv"
     trades_df.to_csv(out_path, index=False)
     log(f"Wrote trade log → {out_path}", level="ok")
