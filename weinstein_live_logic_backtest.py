@@ -1,101 +1,61 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weinstein Live Logic Backtest — long + short using PRODUCTION intraday cores
+Weinstein Live Logic Backtest (self-contained daily version)
 
-Goal
-----
-Use the *same* intraday logic as your production watchers to simulate a
-simple portfolio and build an equity curve.
+Goal:
+- Approximate your *production* Weinstein long + short logic
+  (Stage 2 breakouts / Stage 4 breakdowns) in a backtest so you can
+  inspect monthly returns, equity curve, and trade behavior.
 
-- Long side: uses weinstein_intraday_core.eval_long_bar(...)
-- Short side: uses weinstein_short_core.eval_short_bar(...)
-- Universe: Stage 2 (uptrend) for longs, Stage 4 (downtrend) for shorts,
-  from the newest weekly scan CSV under ./output.
-- Data: yfinance 60m bars + daily bars.
-- Stops/targets: use the same param mapping as your intraday watcher cores.
-
-Notes / Simplifications
------------------------
-- Chapter 8 market regime: **NOT** dynamically simulated here. We treat
-  long_ok = short_ok = True across the whole backtest.
-  (Production watcher may skip shorts in BULL, etc.)
-- Volume pace (pace_full) for backtest is simplified to:
-    full_day_volume / 50dma_volume
-  and applied uniformly across that day's intraday bars.
-- Intrabar pace is approximated as:
-    bar_volume / mean(bar_volume, last 20 bars)
-- Position sizing:
-    * risk_per_trade = capital * risk_per_trade_pct
-    * shares = floor(risk_per_trade / per-share risk)
-    * per-share risk = |stop - entry|
-- Targets are tracked for diagnostics, but exits are stop-based only
-  (no automatic profit-taking). You can extend this if you want.
-
-CLI
----
-Example:
-
-  python3 weinstein_live_logic_backtest.py \
-      --start 2024-01-01 --end 2024-10-31 \
-      --capital 100000 \
-      --risk-per-trade 0.01 \
-      --max-long 10 --max-short 10 \
-      --mode both
-
-Outputs
--------
-- ./output/live_logic_trades.csv      (all fills)
-- ./output/live_logic_equity_curve.csv
-- ./output/live_logic_equity_curve.png
+Key points:
+- Uses the latest weekly scan CSV: ./output/weinstein_weekly_equities_*.csv
+- Stage 2 (Uptrend) universe for LONG side
+- Stage 4 (Downtrend) universe for SHORT side
+- Uses DAILY bars (yfinance, auto_adjust=True) for simplicity
+- Simple ATR-based risk sizing & stops
+- Optional: long-only, short-only, or both
 """
 
+import argparse
 import os
 import math
-import argparse
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
-
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ----- LONG core (ASSUMED API — adjust if needed) -----
-from weinstein_intraday_core import (
-    eval_long_bar,
-    LONG_HARD_STOP_PCT,
-    LONG_TRAIL_ATR_MULT,
-    LONG_MA_GUARD_PCT,
-    LONG_TARGET1_PCT,
-    LONG_TARGET2_PCT,
-)
+# ---------------- Logging helpers ----------------
 
-# ----- SHORT core (new) -----
-from weinstein_short_core import (
-    eval_short_bar,
-    SHORT_HARD_STOP_PCT,
-    SHORT_TRAIL_ATR_MULT,
-    SHORT_MA_GUARD_PCT,
-    SHORT_TARGET1_PCT,
-    SHORT_TARGET2_PCT,
-    PIVOT_LOOKBACK_WEEKS,
-    INTRADAY_AVG_VOL_WINDOW,
-)
+VERBOSE = True
+
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+def log(msg: str, *, level: str = "info"):
+    if not VERBOSE and level == "debug":
+        return
+    prefix = {
+        "info": "•",
+        "ok": "✅",
+        "step": "▶️",
+        "warn": "⚠️",
+        "err": "❌",
+        "debug": "··",
+    }.get(level, "•")
+    print(f"{prefix} [{_ts()}] {msg}", flush=True)
+
+# ---------------- File / data helpers ----------------
 
 WEEKLY_OUTPUT_DIR = "./output"
 WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
-BENCHMARK_DEFAULT = "SPY"
-
-INTRADAY_INTERVAL = "60m"
-DAILY_LOOKBACK_YEARS = 3  # enough to get MA150 & 50dma for most sims
-
-
-# ========= helpers =========
 
 def newest_weekly_csv() -> str:
     files = [
@@ -110,598 +70,620 @@ def newest_weekly_csv() -> str:
     files.sort(reverse=True)
     return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
 
+def load_weekly_report() -> pd.DataFrame:
+    path = newest_weekly_csv()
+    log(f"Using weekly CSV: {path}", level="info")
+    df = pd.read_csv(path)
+    df = df.rename(columns=str.lower)
+    return df
 
-def _fmt_ts(ts) -> str:
-    if isinstance(ts, str):
-        return ts
-    try:
-        return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return str(ts)
-
-
-def _safe_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-
-def _compute_ma150_and_pivots(daily_df: pd.DataFrame):
+def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
-    daily_df: must have columns ["Open","High","Low","Close","Volume"] and DatetimeIndex.
-    Returns:
-      ma150: pd.Series
-      pivot_low: pd.Series (rolling N-bar min of Low, ~10 weeks)
-      pivot_high: pd.Series (rolling N-bar max of High, ~10 weeks)
-      atr14: pd.Series
-      vol50: pd.Series
+    Download DAILY OHLCV for tickers via yfinance, with a bit of padding
+    before start to compute ATR and MAs.
     """
-    low = daily_df["Low"]
-    high = daily_df["High"]
-    close = daily_df["Close"]
-    vol = daily_df["Volume"]
+    start_dt = datetime.fromisoformat(start)
+    pad_start = (start_dt - timedelta(days=120)).strftime("%Y-%m-%d")
+    log(
+        f"Downloading daily bars for {len(tickers)} symbols "
+        f"({pad_start} → {end})...",
+        level="step",
+    )
+    data = yf.download(
+        tickers,
+        start=pad_start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+    if data.empty:
+        raise RuntimeError("No daily data returned from yfinance.")
+    log("Download complete.", level="ok")
+    return data
 
-    ma150 = close.rolling(150).mean()
-
-    # 10 weeks * 5 trading days
-    win = PIVOT_LOOKBACK_WEEKS * 5
-    pivot_low = low.rolling(win).min()
-    pivot_high = high.rolling(win).max()
-
-    prev_c = close.shift(1)
+def compute_atr_from_df(daily_df: pd.DataFrame, ticker: str, n: int = 14) -> float:
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            sub = daily_df.xs(ticker, axis=1, level=1)
+        except KeyError:
+            return np.nan
+    else:
+        sub = daily_df
+    needed = {"High", "Low", "Close"}
+    if not needed.issubset(set(sub.columns)):
+        return np.nan
+    h, l, c = sub["High"], sub["Low"], sub["Close"]
+    prev_c = c.shift(1)
     tr = pd.concat(
-        [(high - low), (high - prev_c).abs(), (low - prev_c).abs()],
+        [(h - l), (h - prev_c).abs(), (l - prev_c).abs()],
         axis=1,
     ).max(axis=1)
-    atr14 = tr.rolling(14).mean()
+    atr = tr.rolling(n).mean()
+    return float(atr.iloc[-1]) if len(atr.dropna()) else np.nan
 
-    vol50 = vol.rolling(50).mean()
+# ---------------- Weinstein-universe helpers ----------------
 
-    return ma150, pivot_low, pivot_high, atr14, vol50
-
-
-def _compute_intraday_vol_pace(intraday_vol: pd.Series) -> pd.Series:
+def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     """
-    Approx intrabar volume pace vs avg over INTRADAY_AVG_VOL_WINDOW bars.
+    side = "long" -> Stage 2 universe
+    side = "short" -> Stage 4 universe
     """
-    vavg = intraday_vol.rolling(INTRADAY_AVG_VOL_WINDOW).mean()
-    return intraday_vol / vavg
+    for miss in ["ticker", "stage", "rs_above_ma", "ma30"]:
+        if miss not in weekly_df.columns:
+            weekly_df[miss] = np.nan
 
+    if "rank" in weekly_df.columns:
+        weekly_df["weekly_rank"] = weekly_df["rank"]
+    else:
+        weekly_df["weekly_rank"] = 999999
 
-def _plot_equity_curve(eq_df: pd.DataFrame, out_path: str):
-    plt.figure(figsize=(10, 5))
-    plt.plot(eq_df["timestamp"], eq_df["equity"])
-    plt.xlabel("Time")
-    plt.ylabel("Equity ($)")
-    plt.title("Weinstein Live Logic Backtest — Equity Curve")
-    plt.grid(True)
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    plt.savefig(out_path)
-    plt.close()
+    if side == "long":
+        df = weekly_df[weekly_df["stage"].isin(["Stage 2 (Uptrend)"])].copy()
+    elif side == "short":
+        df = weekly_df[weekly_df["stage"].isin(["Stage 4 (Downtrend)"])].copy()
+    else:
+        raise ValueError("side must be 'long' or 'short'")
 
+    df["rs_above_ma"] = df["rs_above_ma"].fillna(False).astype(bool)
+    df["weekly_rank"] = pd.to_numeric(df["weekly_rank"], errors="coerce").fillna(999999)
+    df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
+    df = df.sort_values(["weekly_rank", "ticker"])
+    log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
+    return df
 
-# ========= position / portfolio structures =========
+# ---------------- Backtest data structures ----------------
 
 @dataclass
 class Position:
     ticker: str
-    side: str        # "LONG" or "SHORT"
-    entry_ts: pd.Timestamp
+    side: str      # "long" or "short"
+    qty: float
     entry_price: float
-    shares: float
     stop: float
-    target1: float
-    target2: float
-    max_favorable_px: float = field(default_factory=float)
-
+    atr: float
+    opened: datetime
 
 @dataclass
-class TradeFill:
-    timestamp: pd.Timestamp
+class Trade:
     ticker: str
     side: str
-    action: str      # "OPEN" or "CLOSE"
-    price: float
-    shares: float
+    entry_date: datetime
+    exit_date: datetime
+    entry_price: float
+    exit_price: float
+    qty: float
     pnl: float
-    equity_after: float
-    reason: str
+    pnl_pct: float
 
+# ---------------- Trading logic parameters ----------------
 
-# ========= main backtest engine =========
+# Long side
+LONG_BREAK_PCT = 0.01   # 1% above pivot breakout
+LONG_STOP_HARD = 0.20   # 20% below entry (hard)
+LONG_TRAIL_ATR = 2.0
+LONG_MA_GUARD = 0.03    # stop if price under MA30 by ~3%
 
-def run_backtest(
-    start_date: str,
-    end_date: str,
+# Short side (mirrored)
+SHORT_BREAK_PCT = 0.01
+SHORT_STOP_HARD = 0.20
+SHORT_TRAIL_ATR = 2.0
+SHORT_MA_GUARD = 0.03   # stop if price above MA30 by ~3%
+
+PIVOT_LOOKBACK_DAYS = 50
+
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+def get_close_series(daily_df: pd.DataFrame, ticker: str) -> pd.Series:
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            s = daily_df[("Close", ticker)].dropna()
+        except KeyError:
+            return pd.Series(dtype=float)
+    else:
+        s = daily_df["Close"].dropna()
+    return s
+
+def get_ma_series(daily_df: pd.DataFrame, ticker: str, window: int = 30) -> pd.Series:
+    c = get_close_series(daily_df, ticker)
+    return c.rolling(window).mean()
+
+def get_pivot_high(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp) -> float:
+    """
+    Last 50-day high BEFORE as_of_date (exclusive).
+    """
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            high = daily_df[("High", ticker)]
+        except KeyError:
+            return np.nan
+    else:
+        high = daily_df["High"]
+    sub = high.loc[:as_of_date].iloc[:-1]  # exclude current bar
+    sub = sub.dropna().tail(PIVOT_LOOKBACK_DAYS)
+    return float(sub.max()) if len(sub) else np.nan
+
+def get_pivot_low(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp) -> float:
+    """
+    Last 50-day low BEFORE as_of_date (exclusive).
+    """
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            low = daily_df[("Low", ticker)]
+        except KeyError:
+            return np.nan
+    else:
+        low = daily_df["Low"]
+    sub = low.loc[:as_of_date].iloc[:-1]
+    sub = sub.dropna().tail(PIVOT_LOOKBACK_DAYS)
+    return float(sub.min()) if len(sub) else np.nan
+
+# ---------------- Entry / exit rules ----------------
+
+def should_enter_long(
+    price: float,
+    ma30_val: float,
+    pivot_high: float,
+    rs_above_ma: bool,
+) -> bool:
+    if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_high):
+        return False
+    # Weinstein-ish: above MA30, strong RS, and break above pivot
+    if not rs_above_ma:
+        return False
+    if price < ma30_val:
+        return False
+    if price < pivot_high * (1.0 + LONG_BREAK_PCT):
+        return False
+    return True
+
+def long_stop_level(entry: float, atr: float, ma30_val: float) -> float:
+    if np.isnan(entry):
+        return np.nan
+    hard = entry * (1.0 - LONG_STOP_HARD)
+    atr_stop = entry - LONG_TRAIL_ATR * atr if not np.isnan(atr) else np.nan
+    ma_guard = ma30_val * (1.0 - LONG_MA_GUARD) if not np.isnan(ma30_val) else np.nan
+    cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
+    return max(cands) if cands else hard
+
+def should_exit_long(price: float, stop: float, ma30_val: float) -> bool:
+    if np.isnan(price):
+        return False
+    # 1) Stop violation
+    if not np.isnan(stop) and price <= stop:
+        return True
+    # 2) Extra guard: under MA30 by ~3%
+    if not np.isnan(ma30_val) and price <= ma30_val * (1.0 - LONG_MA_GUARD):
+        return True
+    return False
+
+def should_enter_short(
+    price: float,
+    ma30_val: float,
+    pivot_low: float,
+    rs_above_ma: bool,
+) -> bool:
+    if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_low):
+        return False
+    # Stage 4 style: below MA30, RS weak (not above its MA),
+    # and break under pivot low
+    if rs_above_ma:
+        return False
+    if price > ma30_val:
+        return False
+    if price > pivot_low * (1.0 - SHORT_BREAK_PCT):
+        return False
+    return True
+
+def short_stop_level(entry: float, atr: float, ma30_val: float) -> float:
+    if np.isnan(entry):
+        return np.nan
+    hard = entry * (1.0 + SHORT_STOP_HARD)
+    atr_stop = entry + SHORT_TRAIL_ATR * atr if not np.isnan(atr) else np.nan
+    ma_guard = ma30_val * (1.0 + SHORT_MA_GUARD) if not np.isnan(ma30_val) else np.nan
+    cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
+    return min(cands) if cands else hard
+
+def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
+    if np.isnan(price):
+        return False
+    # 1) Stop violation
+    if not np.isnan(stop) and price >= stop:
+        return True
+    # 2) Extra guard: reclaimed MA30 by ~3%
+    if not np.isnan(ma30_val) and price >= ma30_val * (1.0 + SHORT_MA_GUARD):
+        return True
+    return False
+
+# ---------------- Backtest engine ----------------
+
+@dataclass
+class Portfolio:
+    cash: float
+    positions: Dict[str, Position]
+    equity: float
+
+def backtest(
+    daily_df: pd.DataFrame,
+    weekly_df: pd.DataFrame,
+    start: str,
+    end: str,
     capital: float,
-    risk_per_trade_pct: float,
-    max_long_positions: int,
-    max_short_positions: int,
-    mode: str = "both",
-    max_long_universe: int = 40,
-    max_short_universe: int = 40,
-    benchmark: str = BENCHMARK_DEFAULT,
-):
+    risk_per_trade: float,
+    max_long: int,
+    max_short: int,
+    mode: str,
+) -> Dict[str, object]:
+    """
+    mode: "long", "short", or "both"
+    """
+    long_universe = build_universe(weekly_df, side="long")
+    short_universe = build_universe(weekly_df, side="short")
 
-    mode = mode.lower()
-    use_long = mode in ("long", "both")
-    use_short = mode in ("short", "both")
+    long_tickers = set(long_universe["ticker"].astype(str).str.upper())
+    short_tickers = set(short_universe["ticker"].astype(str).str.upper())
 
-    print(f"⭐ Backtest from {start_date} to {end_date}")
-    print(f"   Capital: ${capital:,.2f} | Risk per trade: {risk_per_trade_pct*100:.1f}%")
-    print(f"   Max positions: long={max_long_positions}, short={max_short_positions}")
-    print(f"   Mode: {mode}")
+    all_dates = daily_df.index
+    all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
+    all_dates = [pd.Timestamp(d) for d in all_dates]
 
-    # ---- Load weekly universe ----
-    weekly_path = newest_weekly_csv()
-    print(f"   Weekly universe from: {weekly_path}")
-    w = pd.read_csv(weekly_path)
-    wl = w.rename(columns=str.lower)
+    start_dt = pd.Timestamp(start)
+    end_dt = pd.Timestamp(end)
 
-    for col in ["ticker", "stage", "rank", "ma30", "rs_above_ma"]:
-        if col not in wl.columns:
-            wl[col] = np.nan
+    trade_log: List[Trade] = []
+    portfolio = Portfolio(cash=capital, positions={}, equity=capital)
+    equity_curve = []
 
-    wl["rank"] = pd.to_numeric(wl["rank"], errors="coerce").fillna(999999).astype(int)
+    # Precompute MA30 & ATR for each ticker for speed
+    ma_cache: Dict[str, pd.Series] = {}
+    for t in long_tickers | short_tickers:
+        ma_cache[t] = get_ma_series(daily_df, t, window=30)
 
-    long_universe = []
-    short_universe = []
+    atr_cache: Dict[str, float] = {}
+    for t in long_tickers | short_tickers:
+        atr_cache[t] = compute_atr_from_df(daily_df, t, n=14)
 
-    if use_long:
-        # Stage 2 uptrend names
-        cand = wl[wl["stage"].str.startswith("Stage 2")].copy()
-        cand = cand.sort_values("rank").head(max_long_universe)
-        long_universe = cand["ticker"].dropna().astype(str).str.upper().tolist()
-
-    if use_short:
-        cand = wl[wl["stage"] == "Stage 4 (Downtrend)"].copy()
-        cand = cand.sort_values("rank").head(max_short_universe)
-        short_universe = cand["ticker"].dropna().astype(str).str.upper().tolist()
-
-    tickers = sorted(set(long_universe + short_universe + [benchmark]))
-    print(f"   Long universe:  {len(long_universe)} symbols")
-    print(f"   Short universe: {len(short_universe)} symbols")
-    print(f"   Total (incl. benchmark): {len(tickers)} symbols")
-
-    # ---- Download data ----
-    intraday = yf.download(
-        tickers,
-        start=start_date,
-        end=end_date,
-        interval=INTRADAY_INTERVAL,
-        auto_adjust=True,
-        ignore_tz=True,
-        progress=False,
-    )
-    daily = yf.download(
-        tickers,
-        period=f"{DAILY_LOOKBACK_YEARS}y",
-        interval="1d",
-        auto_adjust=True,
-        ignore_tz=True,
-        progress=False,
-    )
-
-    if intraday.empty:
-        raise RuntimeError("No intraday data downloaded; check dates / tickers.")
-
-    if not isinstance(intraday.columns, pd.MultiIndex):
-        raise RuntimeError("Expected MultiIndex columns from yfinance intraday (OHLCV, ticker).")
-
-    if not isinstance(daily.columns, pd.MultiIndex):
-        raise RuntimeError("Expected MultiIndex columns from yfinance daily (OHLCV, ticker).")
-
-    all_times = intraday.index
-    print(f"   Intraday bars: {len(all_times)} (interval={INTRADAY_INTERVAL})")
-
-    # ---- Precompute per-symbol daily features ----
-    daily_feats = {}  # ticker -> DataFrame of daily features
-
-    for t in tickers:
-        try:
-            dsub = daily.xs(t, axis=1, level=1).dropna()
-        except KeyError:
-            continue
-        if dsub.empty or not {"High", "Low", "Close", "Volume"}.issubset(dsub.columns):
+    # Main daily loop
+    for i, dt in enumerate(all_dates):
+        if dt < start_dt or dt > end_dt:
             continue
 
-        ma150, pivot_low, pivot_high, atr14, vol50 = _compute_ma150_and_pivots(dsub)
-        feats = pd.DataFrame(
-            {
-                "Open": dsub["Open"],
-                "High": dsub["High"],
-                "Low": dsub["Low"],
-                "Close": dsub["Close"],
-                "Volume": dsub["Volume"],
-                "MA150": ma150,
-                "PivotLow": pivot_low,
-                "PivotHigh": pivot_high,
-                "ATR14": atr14,
-                "Vol50": vol50,
-            }
-        )
-        daily_feats[t] = feats
+        # Build price snapshot for this day
+        price_today: Dict[str, float] = {}
+        if isinstance(daily_df.columns, pd.MultiIndex):
+            if "Close" not in daily_df.columns.levels[0]:
+                continue
+            closes = daily_df["Close"]
+            for t in closes.columns:
+                price_today[t] = _safe_float(closes.loc[dt, t]) if dt in closes.index else np.nan
+        else:
+            # Single ticker case (unlikely here)
+            price_today["SINGLE"] = _safe_float(daily_df["Close"].loc[dt])
 
-    # ---- Precompute intraday features (volume pace etc) ----
-    intraday_feats = {}  # ticker -> DataFrame with Close, Volume, pace_intra
+        # Mark-to-market holdings
+        eq = portfolio.cash
+        for pos in list(portfolio.positions.values()):
+            t = pos.ticker
+            p = price_today.get(t, np.nan)
+            if np.isnan(p):
+                continue
+            if pos.side == "long":
+                eq += pos.qty * p
+            else:
+                # For short, profit when price drops
+                eq += pos.qty * (pos.entry_price - p)
+        portfolio.equity = eq
+        equity_curve.append({"date": dt, "equity": eq})
 
-    for t in tickers:
-        try:
-            isub = intraday.xs(t, axis=1, level=1)[["Close", "Volume"]].dropna()
-        except KeyError:
-            continue
-        if isub.empty:
-            continue
-        pace_intra = _compute_intraday_vol_pace(isub["Volume"])
-        feats = isub.copy()
-        feats["pace_intra"] = pace_intra
-        intraday_feats[t] = feats
+        # First exits, then entries (so freed capital can be reused)
+        # ------ Exits ------
+        to_remove = []
+        for key, pos in portfolio.positions.items():
+            p = price_today.get(pos.ticker, np.nan)
+            ma_series = ma_cache.get(pos.ticker)
+            ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
 
-    # ---- Simulation state ----
-    positions: Dict[str, Position] = {}
-    equity_curve: List[Dict] = []
-    trades: List[TradeFill] = []
+            if pos.side == "long":
+                if should_exit_long(p, pos.stop, ma_val):
+                    exit_price = p
+                else:
+                    continue
+            else:
+                if should_exit_short(p, pos.stop, ma_val):
+                    exit_price = p
+                else:
+                    continue
 
-    cash = capital
+            # Realize P&L
+            if pos.side == "long":
+                pnl = pos.qty * (exit_price - pos.entry_price)
+            else:
+                pnl = pos.qty * (pos.entry_price - exit_price)
+            pnl_pct = pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
+            portfolio.cash += (pos.qty * exit_price if pos.side == "long"
+                                else pos.qty * (2 * pos.entry_price - exit_price))
 
-    # state dicts for long/short cores (per ticker)
-    long_states: Dict[str, dict] = {}
-    short_states: Dict[str, dict] = {}
-
-    # convenience to know if ticker is allowed long/short
-    is_long_candidate = {t: (t in long_universe) for t in tickers}
-    is_short_candidate = {t: (t in short_universe) for t in tickers}
-
-    # ---- helper for long & short stop/targets, mirroring cores ----
-    def _long_entry_stop_targets(px, ma30, pivot_high, atr):
-        if px is None or math.isnan(px):
-            return math.nan, math.nan, math.nan, math.nan
-
-        entry = float(px)
-        hard = entry * (1.0 - LONG_HARD_STOP_PCT)
-        atr_stop = (entry - LONG_TRAIL_ATR_MULT * atr) if not math.isnan(atr) else math.nan
-        ma_guard = (ma30 * (1.0 - LONG_MA_GUARD_PCT)) if not math.isnan(ma30) else math.nan
-
-        candidates = [c for c in (hard, atr_stop, ma_guard) if not math.isnan(c)]
-        stop = min(candidates) if candidates else hard
-
-        t1 = entry * (1.0 + LONG_TARGET1_PCT)
-        t2 = entry * (1.0 + LONG_TARGET2_PCT)
-        return entry, stop, t1, t2
-
-    from weinstein_short_core import _short_entry_stop_targets  # reuse exact function
-
-    # ---- main intraday loop ----
-    for ts in all_times:
-        ts_date = pd.Timestamp(ts).normalize()
-
-        # 1) price marking + exits on stops
-        total_mtm = 0.0
-        for t, pos in list(positions.items()):
-            # find current price for this ticker at this timestamp
-            try:
-                px = float(intraday_feats[t].loc[ts, "Close"])
-            except Exception:
-                # no bar for this ticker at this time; skip marking
-                px = pos.entry_price
-
-            if pos.side == "LONG":
-                mtm = (px - pos.entry_price) * pos.shares
-                hit_stop = px <= pos.stop
-            else:  # SHORT
-                mtm = (pos.entry_price - px) * pos.shares
-                hit_stop = px >= pos.stop
-
-            total_mtm += mtm
-
-            if hit_stop:
-                # close position at px
-                pnl = mtm
-                cash += pos.entry_price * pos.shares + pnl
-                trades.append(
-                    TradeFill(
-                        timestamp=ts,
-                        ticker=t,
-                        side=pos.side,
-                        action="CLOSE",
-                        price=px,
-                        shares=pos.shares,
-                        pnl=pnl,
-                        equity_after=cash + total_mtm - pnl,  # this bar pre-close eq
-                        reason="STOP",
-                    )
+            trade_log.append(
+                Trade(
+                    ticker=pos.ticker,
+                    side=pos.side,
+                    entry_date=pos.opened,
+                    exit_date=dt,
+                    entry_price=pos.entry_price,
+                    exit_price=exit_price,
+                    qty=pos.qty,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
                 )
-                del positions[t]
+            )
+            to_remove.append(key)
 
-        equity = cash + total_mtm
-        equity_curve.append({"timestamp": ts, "equity": equity})
+        for key in to_remove:
+            del portfolio.positions[key]
 
-        # 2) signal evaluation & entries
-        # NOTE: We only open new positions after updating equity for this bar.
+        # ------ Entries ------
+        # Determine how many new slots are available
+        n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
+        n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # current risk-per-trade in dollars
-        risk_dollars = cash * risk_per_trade_pct if cash > 0 else 0.0
+        # LONG entries
+        if mode in ("long", "both") and n_long_now < max_long:
+            for _, row in long_universe.iterrows():
+                t = str(row["ticker"]).upper()
+                if t in portfolio.positions:
+                    continue
+                price = price_today.get(t, np.nan)
+                if np.isnan(price):
+                    continue
 
-        # count open positions per side
-        open_longs = sum(1 for p in positions.values() if p.side == "LONG")
-        open_shorts = sum(1 for p in positions.values() if p.side == "SHORT")
+                ma_series = ma_cache.get(t)
+                ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
+                pivot_high = get_pivot_high(daily_df, t, dt)
+                rs_above_ma = bool(row.get("rs_above_ma", False))
+                if not should_enter_long(price, ma_val, pivot_high, rs_above_ma):
+                    continue
 
-        # skip new entries if we don't have cash or risk budget
-        if risk_dollars <= 0:
-            continue
+                atr = atr_cache.get(t, np.nan)
+                stop = long_stop_level(price, atr, ma_val)
+                if np.isnan(stop) or stop >= price:
+                    continue  # invalid or non-risking stop
 
-        for t in tickers:
-            # skip if no intraday bar
-            if t not in intraday_feats:
-                continue
-            if ts not in intraday_feats[t].index:
-                continue
+                # Position sizing: risk_per_trade * equity / (entry - stop)
+                risk_per_pos = portfolio.equity * risk_per_trade
+                per_share_risk = price - stop
+                if per_share_risk <= 0:
+                    continue
+                qty = math.floor(risk_per_pos / per_share_risk)
+                if qty <= 0:
+                    continue
 
-            px = float(intraday_feats[t].loc[ts, "Close"])
-            vol_bar = float(intraday_feats[t].loc[ts, "Volume"])
-            pace_intra = float(intraday_feats[t].loc[ts, "pace_intra"])
+                # Capital check
+                cost = qty * price
+                if cost > portfolio.cash:
+                    continue
 
-            # map to daily features as of this date
-            if t not in daily_feats:
-                continue
-            dfeats = daily_feats[t]
-            if ts_date not in dfeats.index:
-                # before symbol started trading or before enough history
-                continue
+                portfolio.cash -= cost
+                portfolio.positions[f"{t}_long"] = Position(
+                    ticker=t,
+                    side="long",
+                    qty=qty,
+                    entry_price=price,
+                    stop=stop,
+                    atr=atr,
+                    opened=dt,
+                )
+                n_long_now += 1
+                if n_long_now >= max_long:
+                    break
 
-            row = dfeats.loc[ts_date]
-            ma30 = float(row["MA150"]) if not math.isnan(row["MA150"]) else math.nan
-            pivot_low = float(row["PivotLow"]) if not math.isnan(row["PivotLow"]) else math.nan
-            pivot_high = float(row["PivotHigh"]) if not math.isnan(row["PivotHigh"]) else math.nan
-            atr = float(row["ATR14"]) if not math.isnan(row["ATR14"]) else math.nan
-            vol50 = float(row["Vol50"]) if not math.isnan(row["Vol50"]) else math.nan
+        # SHORT entries
+        if mode in ("short", "both") and n_short_now < max_short:
+            for _, row in short_universe.iterrows():
+                t = str(row["ticker"]).upper()
+                if t in portfolio.positions:
+                    continue
+                price = price_today.get(t, np.nan)
+                if np.isnan(price):
+                    continue
 
-            # full-day volume vs 50dma (simplified)
-            vol_today = float(row["Volume"])
-            pace_full = (vol_today / vol50) if vol50 > 0 else math.nan
+                ma_series = ma_cache.get(t)
+                ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
+                pivot_low = get_pivot_low(daily_df, t, dt)
+                rs_above_ma = bool(row.get("rs_above_ma", False))
+                if not should_enter_short(price, ma_val, pivot_low, rs_above_ma):
+                    continue
 
-            # recent intraday closes (for non-60m cores; here 60m but we keep consistent)
-            # we use last 2 closes up to this timestamp
-            closes_tail = (
-                intraday_feats[t].loc[:ts, "Close"].tail(2).tolist()
-                if ts in intraday_feats[t].index
-                else []
+                atr = atr_cache.get(t, np.nan)
+                stop = short_stop_level(price, atr, ma_val)
+                if np.isnan(stop) or stop <= price:
+                    continue  # invalid stop
+
+                risk_per_pos = portfolio.equity * risk_per_trade
+                per_share_risk = stop - price
+                if per_share_risk <= 0:
+                    continue
+                qty = math.floor(risk_per_pos / per_share_risk)
+                if qty <= 0:
+                    continue
+
+                # Short: assume we receive proceeds of qty * price
+                proceeds = qty * price
+                portfolio.cash += proceeds  # short sale credit
+                portfolio.positions[f"{t}_short"] = Position(
+                    ticker=t,
+                    side="short",
+                    qty=qty,
+                    entry_price=price,
+                    stop=stop,
+                    atr=atr,
+                    opened=dt,
+                )
+                n_short_now += 1
+                if n_short_now >= max_short:
+                    break
+
+        if (i + 1) % 20 == 0:
+            log(
+                f"Progress: {dt.date()} — equity ${portfolio.equity:,.2f}, "
+                f"positions: {len(portfolio.positions)}, trades so far: {len(trade_log)}",
+                level="debug",
             )
 
-            # LONG SIDE ------------------------------------------------------
-            if use_long and is_long_candidate.get(t, False):
-                ls = long_states.get(t, None)
-                ls, flags_long = eval_long_bar(
-                    price=px,
-                    ma30=ma30,
-                    pivot_high=pivot_high,
-                    pace_full=pace_full,
-                    pace_intra=pace_intra,
-                    elapsed_min=60,       # backtest bar is full 60 min
-                    closes_tail=closes_tail,
-                    state=ls,
-                    intraday_interval=INTRADAY_INTERVAL,
-                    test_ease=False,
-                )
-                long_states[t] = ls
+    return {
+        "portfolio": portfolio,
+        "trades": trade_log,
+        "equity_curve": equity_curve,
+    }
 
-                long_trigger = flags_long.get("long_trigger_now", False)
+# ---------------- Plotting & CSV helpers ----------------
 
-                if long_trigger and t not in positions and open_longs < max_long_positions:
-                    # compute entry/stop/targets from long core-mirroring helper
-                    entry, stop, t1, t2 = _long_entry_stop_targets(px, ma30, pivot_high, atr)
-                    if math.isnan(stop) or stop >= entry:
-                        # invalid stop => skip
-                        pass
-                    else:
-                        per_share_risk = entry - stop
-                        if per_share_risk > 0:
-                            shares = math.floor(risk_dollars / per_share_risk)
-                        else:
-                            shares = 0
-                        if shares > 0:
-                            # commit capital
-                            cost = entry * shares
-                            if cost <= cash:
-                                cash -= cost
-                                pos = Position(
-                                    ticker=t,
-                                    side="LONG",
-                                    entry_ts=ts,
-                                    entry_price=entry,
-                                    shares=shares,
-                                    stop=stop,
-                                    target1=t1,
-                                    target2=t2,
-                                    max_favorable_px=entry,
-                                )
-                                positions[t] = pos
-                                open_longs += 1
-                                trades.append(
-                                    TradeFill(
-                                        timestamp=ts,
-                                        ticker=t,
-                                        side="LONG",
-                                        action="OPEN",
-                                        price=entry,
-                                        shares=shares,
-                                        pnl=0.0,
-                                        equity_after=cash + total_mtm,
-                                        reason="LONG_TRIGGER",
-                                    )
-                                )
+def save_trade_log(trades: List[Trade], path: str):
+    if not trades:
+        log("No trades to save.", level="warn")
+        return
+    rows = []
+    for t in trades:
+        rows.append(
+            {
+                "Ticker": t.ticker,
+                "Side": t.side,
+                "EntryDate": t.entry_date.strftime("%Y-%m-%d"),
+                "ExitDate": t.exit_date.strftime("%Y-%m-%d"),
+                "EntryPrice": t.entry_price,
+                "ExitPrice": t.exit_price,
+                "Qty": t.qty,
+                "PnL": t.pnl,
+                "PnL_pct": t.pnl_pct,
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False)
+    log(f"Wrote trade log → {path}", level="ok")
 
-            # SHORT SIDE -----------------------------------------------------
-            if use_short and is_short_candidate.get(t, False):
-                ss = short_states.get(t, None)
-                ss, flags_short = eval_short_bar(
-                    price=px,
-                    ma30=ma30,
-                    pivot_low=pivot_low,
-                    pace_full=pace_full,
-                    pace_intra=pace_intra,
-                    elapsed_min=60,       # full bar
-                    closes_tail=closes_tail,
-                    state=ss,
-                    intraday_interval=INTRADAY_INTERVAL,
-                    test_ease=False,
-                )
-                short_states[t] = ss
+def save_equity_curve(equity_curve: List[Dict[str, object]], path: str):
+    if not equity_curve:
+        log("No equity curve to plot.", level="warn")
+        return
+    df = pd.DataFrame(equity_curve)
+    df = df.sort_values("date")
+    plt.figure(figsize=(10, 4))
+    plt.plot(df["date"], df["equity"])
+    plt.xlabel("Date")
+    plt.ylabel("Equity ($)")
+    plt.title("Weinstein Live Logic Backtest — Equity Curve")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close()
+    log(f"Wrote equity curve PNG → {path}", level="ok")
 
-                short_trigger = flags_short.get("short_trigger_now", False)
-
-                if short_trigger and t not in positions and open_shorts < max_short_positions:
-                    entry, stop, t1, t2 = _short_entry_stop_targets(px, ma30, pivot_low, atr)
-                    if math.isnan(stop) or stop <= entry:
-                        # invalid stop => skip
-                        pass
-                    else:
-                        per_share_risk = stop - entry
-                        if per_share_risk > 0:
-                            shares = math.floor(risk_dollars / per_share_risk)
-                        else:
-                            shares = 0
-                        if shares > 0:
-                            # for shorts, we assume same capital usage (margin abstracted)
-                            cost = entry * shares
-                            if cost <= cash:
-                                cash -= cost
-                                pos = Position(
-                                    ticker=t,
-                                    side="SHORT",
-                                    entry_ts=ts,
-                                    entry_price=entry,
-                                    shares=shares,
-                                    stop=stop,
-                                    target1=t1,
-                                    target2=t2,
-                                    max_favorable_px=entry,
-                                )
-                                positions[t] = pos
-                                open_shorts += 1
-                                trades.append(
-                                    TradeFill(
-                                        timestamp=ts,
-                                        ticker=t,
-                                        side="SHORT",
-                                        action="OPEN",
-                                        price=entry,
-                                        shares=shares,
-                                        pnl=0.0,
-                                        equity_after=cash + total_mtm,
-                                        reason="SHORT_TRIGGER",
-                                    )
-                                )
-
-    # ---- finalize outputs ----
-    eq_df = pd.DataFrame(equity_curve)
-    trades_df = pd.DataFrame([
-        {
-            "timestamp": _fmt_ts(t.timestamp),
-            "ticker": t.ticker,
-            "side": t.side,
-            "action": t.action,
-            "price": t.price,
-            "shares": t.shares,
-            "pnl": t.pnl,
-            "equity_after": t.equity_after,
-            "reason": t.reason,
-        }
-        for t in trades
-    ])
-
-    os.makedirs("./output", exist_ok=True)
-    eq_path = "./output/live_logic_equity_curve.csv"
-    trades_path = "./output/live_logic_trades.csv"
-    png_path = "./output/live_logic_equity_curve.png"
-
-    eq_df.to_csv(eq_path, index=False)
-    trades_df.to_csv(trades_path, index=False)
-    _plot_equity_curve(eq_df, png_path)
-
-    print(f"\n✅ Backtest complete.")
-    if not eq_df.empty:
-        start_eq = float(eq_df["equity"].iloc[0])
-        end_eq = float(eq_df["equity"].iloc[-1])
-        ret_pct = (end_eq / start_eq - 1.0) * 100.0
-        print(f"   Start equity: ${start_eq:,.2f}")
-        print(f"   End equity:   ${end_eq:,.2f}")
-        print(f"   Total return: {ret_pct:.2f}%")
-    print(f"   Equity curve CSV:  {eq_path}")
-    print(f"   Trades CSV:        {trades_path}")
-    print(f"   Equity curve PNG:  {png_path}")
-
-
-# ========= CLI =========
+# ---------------- CLI ----------------
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Backtest Weinstein intraday live logic (long + short)."
-    )
-    ap.add_argument("--start", type=str, required=True, help="Start date (YYYY-MM-DD)")
-    ap.add_argument("--end", type=str, required=True, help="End date (YYYY-MM-DD)")
-    ap.add_argument("--capital", type=float, default=100000.0, help="Initial capital")
-    ap.add_argument(
-        "--risk-per-trade",
-        type=float,
-        default=0.01,
-        help="Fraction of current cash risked per trade (e.g. 0.01 = 1%%)",
-    )
-    ap.add_argument(
-        "--max-long",
-        type=int,
-        default=10,
-        help="Max simultaneous long positions",
-    )
-    ap.add_argument(
-        "--max-short",
-        type=int,
-        default=10,
-        help="Max simultaneous short positions",
-    )
+    global VERBOSE
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
+    ap.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
+    ap.add_argument("--year", type=int, help="Backtest full calendar year")
+    ap.add_argument("--capital", type=float, default=100000.0)
+    ap.add_argument("--risk-per-trade", type=float, default=0.01)
+    ap.add_argument("--max-long", type=int, default=10)
+    ap.add_argument("--max-short", type=int, default=10)
     ap.add_argument(
         "--mode",
         type=str,
         default="both",
         choices=["long", "short", "both"],
-        help="Run long-only, short-only, or both.",
+        help="Enable long-only, short-only, or both",
     )
-    ap.add_argument(
-        "--max-long-universe",
-        type=int,
-        default=40,
-        help="Max Stage 2 names from weekly scan.",
-    )
-    ap.add_argument(
-        "--max-short-universe",
-        type=int,
-        default=40,
-        help="Max Stage 4 names from weekly scan.",
-    )
-    ap.add_argument(
-        "--benchmark",
-        type=str,
-        default=BENCHMARK_DEFAULT,
-        help="Benchmark ticker (included for RS, not traded).",
-    )
-
+    ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    run_backtest(
-        start_date=args.start,
-        end_date=args.end,
-        capital=args.capital,
-        risk_per_trade_pct=args.risk_per_trade,
-        max_long_positions=args.max_long,
-        max_short_positions=args.max_short,
-        mode=args.mode,
-        max_long_universe=args.max_long_universe,
-        max_short_universe=args.max_short_universe,
-        benchmark=args.benchmark,
+    VERBOSE = not args.quiet
+
+    # Resolve start/end range
+    if args.year and (args.start or args.end):
+        raise SystemExit("Use either --year OR --start/--end, not both.")
+
+    if args.year:
+        start = f"{args.year}-01-01"
+        end = f"{args.year}-12-31"
+    else:
+        if not args.start or not args.end:
+            raise SystemExit("Provide both --start and --end if not using --year.")
+        start, end = args.start, args.end
+
+    log(
+        f"Backtest range: {start} → {end} | mode={args.mode}, capital={args.capital:,.2f}, "
+        f"risk_per_trade={args.risk_per_trade:.3f}, max_long={args.max_long}, max_short={args.max_short}",
+        level="info",
     )
 
+    weekly_df = load_weekly_report()
+
+    all_tickers = set(
+        weekly_df["ticker"].astype(str).str.upper().tolist()
+    )
+    daily_df = download_daily_bars(sorted(all_tickers), start, end)
+
+    result = backtest(
+        daily_df=daily_df,
+        weekly_df=weekly_df,
+        start=start,
+        end=end,
+        capital=args.capital,
+        risk_per_trade=args.risk_per_trade,
+        max_long=args.max_long,
+        max_short=args.max_short,
+        mode=args.mode,
+    )
+
+    portfolio: Portfolio = result["portfolio"]  # type: ignore
+    trades: List[Trade] = result["trades"]      # type: ignore
+    equity_curve = result["equity_curve"]       # type: ignore
+
+    # Summary
+    final_eq = portfolio.equity
+    pnl = final_eq - args.capital
+    pnl_pct = (final_eq / args.capital - 1.0) * 100.0
+    log(
+        f"Backtest complete. Final equity: ${final_eq:,.2f} (P/L ${pnl:,.2f}, {pnl_pct:.2f}%) "
+        f"— Trades: {len(trades)}",
+        level="ok",
+    )
+
+    os.makedirs("./output", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    trades_path = os.path.join("./output", f"live_logic_bt_trades_{ts}.csv")
+    eq_path = os.path.join("./output", f"live_logic_bt_equity_{ts}.png")
+
+    save_trade_log(trades, trades_path)
+    save_equity_curve(equity_curve, eq_path)
 
 if __name__ == "__main__":
     main()
