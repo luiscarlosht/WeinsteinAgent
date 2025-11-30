@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weinstein Live Logic Backtest (self-contained daily version)
+Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-Goal:
+Goals:
 - Approximate your *production* Weinstein long + short logic
-  (Stage 2 breakouts / Stage 4 breakdowns) in a backtest so you can
-  inspect monthly returns, equity curve, and trade behavior.
+  (Stage 2 breakouts / Stage 4 breakdowns with volume gates)
+  in a backtest so you can inspect:
+    * Monthly returns & win-rate
+    * Equity curve
+    * Behavior of long + short sides
 
 Key points:
 - Uses the latest weekly scan CSV: ./output/weinstein_weekly_equities_*.csv
 - Stage 2 (Uptrend) universe for LONG side
 - Stage 4 (Downtrend) universe for SHORT side
-- Uses DAILY bars (yfinance, auto_adjust=True) for simplicity
-- Simple ATR-based risk sizing & stops
-- Optional: long-only, short-only, or both
+- Uses DAILY bars (yfinance, auto_adjust=True)
+- Entry rules:
+    * Long: price above MA30, RS strong, breakout > prior 50-day high,
+      daily volume ≥ ~1.3× 50-day avg
+    * Short: price below MA30, RS weak, breakdown < prior 50-day low,
+      daily volume ≥ ~1.3× 50-day avg
+- Risk sizing:
+    * Risk per trade = equity * risk_per_trade / per-share-risk
+    * Stops use ATR and MA30 guard, similar to your intraday logic
+- Outputs:
+    * Trade log CSV
+    * Equity curve PNG
+    * Monthly P/L CSV + printed summary
 """
 
 import argparse
@@ -122,6 +135,32 @@ def compute_atr_from_df(daily_df: pd.DataFrame, ticker: str, n: int = 14) -> flo
     atr = tr.rolling(n).mean()
     return float(atr.iloc[-1]) if len(atr.dropna()) else np.nan
 
+# ------ volume vs 50dma helper (daily approximation of intraday pace) ------
+
+def volume_vs_50dma(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp) -> float:
+    """
+    daily_vol / 50-day average volume, using only data BEFORE as_of_date
+    for the 50-day window.
+    """
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            v = daily_df[("Volume", ticker)]
+        except KeyError:
+            return np.nan
+    else:
+        v = daily_df["Volume"]
+    if as_of_date not in v.index:
+        return np.nan
+    # up to and including today
+    sub = v.loc[:as_of_date].dropna()
+    if len(sub) < 51:
+        return np.nan
+    today_vol = sub.iloc[-1]
+    vol50 = sub.iloc[:-1].tail(50).mean()
+    if vol50 <= 0:
+        return np.nan
+    return float(today_vol / vol50)
+
 # ---------------- Weinstein-universe helpers ----------------
 
 def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -178,19 +217,23 @@ class Trade:
 
 # ---------------- Trading logic parameters ----------------
 
-# Long side
-LONG_BREAK_PCT = 0.01   # 1% above pivot breakout
-LONG_STOP_HARD = 0.20   # 20% below entry (hard)
-LONG_TRAIL_ATR = 2.0
-LONG_MA_GUARD = 0.03    # stop if price under MA30 by ~3%
+# Long side — tuned more closely to production intraday thresholds
+LONG_BREAK_PCT = 0.004      # ≈0.4% above pivot breakout, matching short break magnitude
+LONG_STOP_HARD = 0.20       # 20% hard stop (Weinstein-style disaster stop)
+LONG_TRAIL_ATR = 2.0        # ATR-based cushion
+LONG_MA_GUARD = 0.03        # extra guard vs MA30 (≈3% under)
 
 # Short side (mirrored)
-SHORT_BREAK_PCT = 0.01
+SHORT_BREAK_PCT = 0.004     # ≈0.4% below pivot breakdown
 SHORT_STOP_HARD = 0.20
 SHORT_TRAIL_ATR = 2.0
-SHORT_MA_GUARD = 0.03   # stop if price above MA30 by ~3%
+SHORT_MA_GUARD = 0.03       # extra guard above MA30 (≈3% over)
 
-PIVOT_LOOKBACK_DAYS = 50
+# Volume filters (approximate your intraday VOL_PACE_MIN 1.3×)
+LONG_VOL_MIN = 1.30
+SHORT_VOL_MIN = 1.30
+
+PIVOT_LOOKBACK_DAYS = 50    # pivot highs/lows over last ~10 weeks
 
 def _safe_float(x):
     try:
@@ -249,15 +292,21 @@ def should_enter_long(
     ma30_val: float,
     pivot_high: float,
     rs_above_ma: bool,
+    vol_mult: float,
 ) -> bool:
     if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_high):
         return False
-    # Weinstein-ish: above MA30, strong RS, and break above pivot
+    # RS must be strong (above its MA)
     if not rs_above_ma:
         return False
+    # Price must be above MA30
     if price < ma30_val:
         return False
+    # Breakout above pivot high by ≈0.4%
     if price < pivot_high * (1.0 + LONG_BREAK_PCT):
+        return False
+    # Volume pace gate ~1.3× 50dma, like intraday VOL_PACE_MIN
+    if not np.isnan(vol_mult) and vol_mult < LONG_VOL_MIN:
         return False
     return True
 
@@ -286,16 +335,21 @@ def should_enter_short(
     ma30_val: float,
     pivot_low: float,
     rs_above_ma: bool,
+    vol_mult: float,
 ) -> bool:
     if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_low):
         return False
-    # Stage 4 style: below MA30, RS weak (not above its MA),
-    # and break under pivot low
+    # RS must be weak (NOT above its MA)
     if rs_above_ma:
         return False
+    # Price must be below MA30
     if price > ma30_val:
         return False
+    # Breakdown under pivot low by ≈0.4%
     if price > pivot_low * (1.0 - SHORT_BREAK_PCT):
+        return False
+    # Volume pace gate ~1.3× 50dma, like intraday VOL_PACE_MIN
+    if not np.isnan(vol_mult) and vol_mult < SHORT_VOL_MIN:
         return False
     return True
 
@@ -323,9 +377,9 @@ def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
 
 @dataclass
 class Portfolio:
-    cash: float
+    cash: float          # realized P&L + unallocated capital
     positions: Dict[str, Position]
-    equity: float
+    equity: float        # cash + open P&L
 
 def backtest(
     daily_df: pd.DataFrame,
@@ -379,12 +433,14 @@ def backtest(
                 continue
             closes = daily_df["Close"]
             for t in closes.columns:
-                price_today[t] = _safe_float(closes.loc[dt, t]) if dt in closes.index else np.nan
+                if dt in closes.index:
+                    price_today[t] = _safe_float(closes.loc[dt, t])
         else:
-            # Single ticker case (unlikely here)
-            price_today["SINGLE"] = _safe_float(daily_df["Close"].loc[dt])
+            # Single ticker case (unlikely in your universe)
+            if dt in daily_df.index:
+                price_today["SINGLE"] = _safe_float(daily_df["Close"].loc[dt])
 
-        # Mark-to-market holdings
+        # Mark-to-market holdings: equity = cash + open P&L
         eq = portfolio.cash
         for pos in list(portfolio.positions.values()):
             t = pos.ticker
@@ -392,40 +448,35 @@ def backtest(
             if np.isnan(p):
                 continue
             if pos.side == "long":
-                eq += pos.qty * p
+                eq += pos.qty * (p - pos.entry_price)
             else:
-                # For short, profit when price drops
                 eq += pos.qty * (pos.entry_price - p)
         portfolio.equity = eq
         equity_curve.append({"date": dt, "equity": eq})
 
-        # First exits, then entries (so freed capital can be reused)
+        # First exits, then entries (so freed risk can be reused)
         # ------ Exits ------
         to_remove = []
-        for key, pos in portfolio.positions.items():
+        for key, pos in list(portfolio.positions.items()):
             p = price_today.get(pos.ticker, np.nan)
+            if np.isnan(p):
+                continue
             ma_series = ma_cache.get(pos.ticker)
             ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
 
             if pos.side == "long":
-                if should_exit_long(p, pos.stop, ma_val):
-                    exit_price = p
-                else:
+                if not should_exit_long(p, pos.stop, ma_val):
                     continue
-            else:
-                if should_exit_short(p, pos.stop, ma_val):
-                    exit_price = p
-                else:
-                    continue
-
-            # Realize P&L
-            if pos.side == "long":
+                exit_price = p
                 pnl = pos.qty * (exit_price - pos.entry_price)
             else:
+                if not should_exit_short(p, pos.stop, ma_val):
+                    continue
+                exit_price = p
                 pnl = pos.qty * (pos.entry_price - exit_price)
+
             pnl_pct = pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
-            portfolio.cash += (pos.qty * exit_price if pos.side == "long"
-                                else pos.qty * (2 * pos.entry_price - exit_price))
+            portfolio.cash += pnl  # realize P&L into cash
 
             trade_log.append(
                 Trade(
@@ -454,7 +505,8 @@ def backtest(
         if mode in ("long", "both") and n_long_now < max_long:
             for _, row in long_universe.iterrows():
                 t = str(row["ticker"]).upper()
-                if t in portfolio.positions:
+                pos_key = f"{t}_long"
+                if pos_key in portfolio.positions:
                     continue
                 price = price_today.get(t, np.nan)
                 if np.isnan(price):
@@ -464,7 +516,9 @@ def backtest(
                 ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
                 pivot_high = get_pivot_high(daily_df, t, dt)
                 rs_above_ma = bool(row.get("rs_above_ma", False))
-                if not should_enter_long(price, ma_val, pivot_high, rs_above_ma):
+                vol_mult = volume_vs_50dma(daily_df, t, dt)
+
+                if not should_enter_long(price, ma_val, pivot_high, rs_above_ma, vol_mult):
                     continue
 
                 atr = atr_cache.get(t, np.nan)
@@ -481,13 +535,7 @@ def backtest(
                 if qty <= 0:
                     continue
 
-                # Capital check
-                cost = qty * price
-                if cost > portfolio.cash:
-                    continue
-
-                portfolio.cash -= cost
-                portfolio.positions[f"{t}_long"] = Position(
+                portfolio.positions[pos_key] = Position(
                     ticker=t,
                     side="long",
                     qty=qty,
@@ -504,7 +552,8 @@ def backtest(
         if mode in ("short", "both") and n_short_now < max_short:
             for _, row in short_universe.iterrows():
                 t = str(row["ticker"]).upper()
-                if t in portfolio.positions:
+                pos_key = f"{t}_short"
+                if pos_key in portfolio.positions:
                     continue
                 price = price_today.get(t, np.nan)
                 if np.isnan(price):
@@ -514,7 +563,9 @@ def backtest(
                 ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
                 pivot_low = get_pivot_low(daily_df, t, dt)
                 rs_above_ma = bool(row.get("rs_above_ma", False))
-                if not should_enter_short(price, ma_val, pivot_low, rs_above_ma):
+                vol_mult = volume_vs_50dma(daily_df, t, dt)
+
+                if not should_enter_short(price, ma_val, pivot_low, rs_above_ma, vol_mult):
                     continue
 
                 atr = atr_cache.get(t, np.nan)
@@ -530,10 +581,7 @@ def backtest(
                 if qty <= 0:
                     continue
 
-                # Short: assume we receive proceeds of qty * price
-                proceeds = qty * price
-                portfolio.cash += proceeds  # short sale credit
-                portfolio.positions[f"{t}_short"] = Position(
+                portfolio.positions[pos_key] = Position(
                     ticker=t,
                     side="short",
                     qty=qty,
@@ -600,6 +648,67 @@ def save_equity_curve(equity_curve: List[Dict[str, object]], path: str):
     plt.savefig(path, dpi=120, bbox_inches="tight")
     plt.close()
     log(f"Wrote equity curve PNG → {path}", level="ok")
+
+def save_monthly_pnl(
+    trades: List[Trade],
+    equity_curve: List[Dict[str, object]],
+    initial_capital: float,
+    path: str,
+):
+    if not trades:
+        log("No trades for monthly P/L.", level="warn")
+        return
+    # Build trades DF
+    rows = []
+    for t in trades:
+        rows.append(
+            {
+                "Ticker": t.ticker,
+                "Side": t.side,
+                "EntryDate": t.entry_date,
+                "ExitDate": t.exit_date,
+                "PnL": t.pnl,
+            }
+        )
+    df_tr = pd.DataFrame(rows)
+    df_tr["ExitDate"] = pd.to_datetime(df_tr["ExitDate"])
+    df_tr["Month"] = df_tr["ExitDate"].dt.to_period("M").dt.to_timestamp()
+
+    monthly = df_tr.groupby("Month").agg(
+        PnL=("PnL", "sum"),
+        Trades=("PnL", "count"),
+        Wins=("PnL", lambda x: (x > 0).sum()),
+    )
+    monthly["WinRate"] = monthly["Wins"] / monthly["Trades"]
+
+    # Equity month-end
+    eq_df = pd.DataFrame(equity_curve)
+    eq_df["date"] = pd.to_datetime(eq_df["date"])
+    eq_df = eq_df.set_index("date").sort_index()
+    eq_monthly = eq_df.resample("M").last().rename(columns={"equity": "Equity"})
+
+    monthly = monthly.join(eq_monthly["Equity"], how="left")
+    monthly = monthly.reset_index().rename(columns={"Month": "MonthEnd"})
+
+    # Simple % PnL vs initial capital (not path-dependent)
+    monthly["PnL_pct_of_initial"] = monthly["PnL"] / initial_capital * 100.0
+
+    monthly.to_csv(path, index=False)
+    log(f"Wrote monthly P/L breakdown → {path}", level="ok")
+
+    # Console summary
+    log("Monthly P/L summary:", level="info")
+    for _, r in monthly.iterrows():
+        month_str = r["MonthEnd"].strftime("%Y-%m")
+        pnl = r["PnL"]
+        trades_n = int(r["Trades"])
+        winrate = r["WinRate"] * 100.0 if not np.isnan(r["WinRate"]) else 0.0
+        eq = r["Equity"]
+        log(
+            f"  {month_str}: PnL=${pnl:,.2f} | Trades={trades_n} | "
+            f"WinRate={winrate:5.1f}% | Equity=${eq:,.2f}",
+            level="info",
+        )
 
 # ---------------- CLI ----------------
 
@@ -681,9 +790,11 @@ def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     trades_path = os.path.join("./output", f"live_logic_bt_trades_{ts}.csv")
     eq_path = os.path.join("./output", f"live_logic_bt_equity_{ts}.png")
+    monthly_path = os.path.join("./output", f"live_logic_bt_monthly_{ts}.csv")
 
     save_trade_log(trades, trades_path)
     save_equity_curve(equity_curve, eq_path)
+    save_monthly_pnl(trades, equity_curve, args.capital, monthly_path)
 
 if __name__ == "__main__":
     main()
