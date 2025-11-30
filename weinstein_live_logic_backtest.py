@@ -3,498 +3,648 @@
 """
 weinstein_live_logic_backtest.py
 
-Replays historical intraday data through your *actual* production logic.
+Backtest the *live intraday trigger logic* (long + short) over historical
+60-minute bars, using the same tunables as weinstein_intraday_watcher.py.
 
-What it does
-------------
-- Loads config.yaml to get account sizing / risk_per_trade_pct.
-- Loads your latest weekly CSV to build the universe (Stage 1/2 + benchmark).
-- Downloads daily + intraday bars from Yahoo for:
-    [year-1 Nov 1]  →  [year+1 Feb 1]
-- For each intraday bar in the target year:
-    - Builds a price snapshot {ticker: last_price}.
-    - Calls your real `compute_signals_for_snapshot(...)`.
-    - Applies BUY / SELL signals to a simulated portfolio
-      (cash + positions, R-based sizing using your config).
-- Writes out:
-    - ./output/live_logic_bt_<year>.csv  (per-trade log)
-    - ./output/live_logic_bt_<year>_equity.png  (equity curve)
+- Universe: Stage 1/2 from latest weekly CSV (+ benchmark)
+- Signals: same state machine (NEAR → ARMED → TRIGGERED + cooldown)
+- Entries:
+    * LONG:  when buy_state == TRIGGERED and long_ok == True
+    * SHORT: when sell_state == TRIGGERED and short_ok == True
+- Exits:
+    * LONG:  when sell_state == TRIGGERED
+    * SHORT: when buy_state == TRIGGERED
 
-Usage
------
-  python3 weinstein_live_logic_backtest.py --year 2025 --config ./config.yaml
+This is intentionally simplified on volume pacing (no intrabar/pace), but
+reuses the same price/pivot/MA/near/confirm logic and the same trigger states.
 """
 
-import argparse
-import math
 import os
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+import math
+import argparse
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import yaml
 import yfinance as yf
 
-# ---- IMPORT YOUR REAL STRATEGY HERE ----
-# Adjust this import to wherever you put compute_signals_for_snapshot + LiveSignal
-# from weinstein_intraday import compute_signals_for_snapshot, LiveSignal
+# --- Reuse config, weekly loader, regime + tunables from the intraday watcher ---
+from weinstein_intraday_watcher import (
+    load_config,
+    load_weekly_report,
+    inspect_market_regime,
+    compute_atr,
+    last_weekly_pivot_high,
+    _update_hits,
+    _price_below_ma,
+    _near_sell_zone,
+    MIN_BREAKOUT_PCT,
+    BUY_DIST_ABOVE_MA_MIN,
+    CONFIRM_BARS,
+    NEAR_BELOW_PIVOT_PCT,
+    SELL_BREAK_PCT,
+    NEAR_HITS_WINDOW,
+    NEAR_HITS_MIN,
+    COOLDOWN_SCANS,
+    SELL_NEAR_HITS_WINDOW,
+    SELL_NEAR_HITS_MIN,
+    SELL_COOLDOWN_SCANS,
+    BENCHMARK_DEFAULT,
+    log,
+)
 
-# For now I'll re-declare a compatible LiveSignal so the file is self-contained.
-# In your repo, delete this and import from your real module.
-@dataclass
-class LiveSignal:
-    ticker: str
-    action: str       # "BUY" or "SELL"
-    side: str         # "long" or "short"
-    price: float      # signal reference price
-    stop_price: float # desired stop (if your logic has it)
-    reason: str = ""
+INTRADAY_INTERVAL = "60m"
+
+# --- Backtest-specific tunables (you can tweak) ---
+INITIAL_EQUITY_DEFAULT = 5000.0
+MAX_POSITION_FRACTION = 0.10   # max 10% of equity per trade
+RISK_FRACTION = 0.01           # risk budget per trade (~1% of equity)
 
 
-# ========== Small logging helpers ==========
-
-def _ts() -> str:
+def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
 
-def log(msg: str) -> None:
-    print(f"• [{_ts()}] {msg}", flush=True)
+def _safe_float(x, default=np.nan):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 
-# ========== Global tunables (same as your sim) ==========
-
-BENCHMARK_DEFAULT = "SPY"
-WEEKLY_OUTPUT_DIR = "./output"
-WEEKLY_FILE_PREFIX = "weinstein_weekly_"
-INTRADAY_INTERVAL = "60m"
-
-LOOKBACK_START_MONTH = 11
-LOOKAHEAD_END_MONTH = 2
-SMA_DAYS = 150
+def _stage_ok(stage: str) -> bool:
+    s = str(stage or "")
+    return s.startswith("Stage 1") or s.startswith("Stage 2")
 
 
-# ========== Config + weekly universe ==========
+def _get_universe(config_path: str):
+    """
+    Load latest weekly CSV and build Stage 1/2 focus universe + benchmark.
+    """
+    cfg, benchmark, _, _ = load_config(config_path)
+    weekly_df, weekly_path = load_weekly_report()
+    log(f"Using weekly CSV: {weekly_path}", level="info")
 
-def load_config(path: str) -> Tuple[dict, str, float, float]:
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f) or {}
-
-    app = cfg.get("app", {}) or {}
-    ordering = app.get("ordering") or {}
-
-    benchmark = app.get("benchmark", BENCHMARK_DEFAULT)
-    account_size = float(ordering.get("account_size", 5000.0))
-    risk_pct = float(ordering.get("risk_per_trade_pct", 0.01))
-
-    return cfg, benchmark, account_size, risk_pct
-
-
-def newest_weekly_csv() -> str:
-    files = [
-        f for f in os.listdir(WEEKLY_OUTPUT_DIR)
-        if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
-    ]
-    if not files:
-        raise FileNotFoundError(
-            f"No weekly CSV found in {WEEKLY_OUTPUT_DIR}. "
-            f"Run weinstein_report_weekly.py first."
-        )
-    files.sort(reverse=True)
-    return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
-
-
-def load_weekly_report() -> Tuple[pd.DataFrame, str]:
-    path = newest_weekly_csv()
-    df = pd.read_csv(path)
-    return df, path
-
-
-def build_universe(weekly_df: pd.DataFrame, benchmark: str) -> List[str]:
     w = weekly_df.rename(columns=str.lower)
-    if "ticker" not in w.columns or "stage" not in w.columns:
-        raise ValueError("Weekly CSV missing 'ticker' or 'stage' columns.")
+    for col in ["ticker", "stage", "ma30", "rs_above_ma"]:
+        if col not in w.columns:
+            w[col] = np.nan
 
-    focus = w[w["stage"].isin(["Stage 1 (Basing)", "Stage 2 (Uptrend)"])]
-    tickers = sorted(set(focus["ticker"].dropna().str.upper().tolist()))
+    focus = w[w["stage"].apply(_stage_ok)].copy()
+    if "rank" in w.columns:
+        focus["weekly_rank"] = w["rank"]
+    else:
+        focus["weekly_rank"] = 999999
 
-    bmk = benchmark.upper()
-    if bmk not in tickers:
-        tickers.append(bmk)
+    tickers = sorted(set(focus["ticker"].tolist()))
+    bench = benchmark or BENCHMARK_DEFAULT
 
-    return tickers
-
-
-# ========== Data download ==========
-
-def download_data(universe: List[str], year: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    start_all = datetime(year - 1, LOOKBACK_START_MONTH, 1)
-    end_all = datetime(year + 1, LOOKAHEAD_END_MONTH, 1)
+    if bench not in tickers:
+        tickers.append(bench)
 
     log(
-        f"Downloading daily + intraday for {len(universe)} tickers "
-        f"({start_all.date()} → {end_all.date()})..."
+        f"Focus universe: {len(focus)} Stage 1/2 + benchmark {bench}",
+        level="info",
+    )
+    return focus, bench, weekly_df
+
+
+def _download_data(tickers, year: int):
+    """
+    Download daily + intraday 60m bars for a window around the given year.
+    We pad a bit before/after to have enough context for pivots/ATR.
+    """
+    start = datetime(year - 1, 11, 1)
+    end = datetime(year + 1, 2, 1)
+
+    log(
+        f"Downloading daily + intraday for {len(tickers)} tickers "
+        f"({start.date()} → {end.date()})...",
+        level="step",
     )
 
+    intraday = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        interval=INTRADAY_INTERVAL,
+        auto_adjust=True,
+        ignore_tz=True,
+        progress=False,
+    )
     daily = yf.download(
-        universe,
-        start=start_all.strftime("%Y-%m-%d"),
-        end=end_all.strftime("%Y-%m-%d"),
+        tickers,
+        start=start.date() - timedelta(days=200),
+        end=end.date(),
         interval="1d",
         auto_adjust=True,
         ignore_tz=True,
         progress=False,
     )
 
-    intraday = yf.download(
-        universe,
-        start=start_all.strftime("%Y-%m-%d"),
-        end=end_all.strftime("%Y-%m-%d"),
-        interval=INTRADAY_INTERVAL,
-        auto_adjust=True,
-        ignore_tz=True,
-        progress=False,
-    )
-
-    log("Download complete.")
-    return daily, intraday
+    log("Download complete.", level="ok")
+    return intraday, daily
 
 
-# ========== Portfolio model for the sim ==========
-
-@dataclass
-class SimPosition:
-    ticker: str
-    side: str       # "long" or "short"
-    entry_ts: pd.Timestamp
-    entry_price: float
-    qty: float
-    stop_price: float
-
-
-@dataclass
-class SimTrade:
-    ticker: str
-    side: str
-    action: str     # "OPEN" or "CLOSE"
-    entry_ts: pd.Timestamp
-    exit_ts: pd.Timestamp
-    entry_price: float
-    exit_price: float
-    qty: float
-    pnl_dollar: float
-    pnl_pct: float
-    reason: str
-
-
-def apply_signals_to_portfolio(
-    ts_bar: pd.Timestamp,
-    prices: Dict[str, float],
-    signals: List[LiveSignal],
-    positions: Dict[str, SimPosition],
-    equity: float,
-    risk_pct: float,
-) -> Tuple[float, List[SimTrade]]:
+def _slice_year_intraday(intraday: pd.DataFrame, year: int) -> pd.DataFrame:
     """
-    - Sells: close existing positions at current price.
-    - Buys: open new positions sized by account risk_pct; if signal has stop_price,
-      use that for position sizing; otherwise use a fixed 8% stop.
+    Restrict intraday to bars within the requested year.
     """
-    trades: List[SimTrade] = []
-    HARD_STOP_PCT = 0.08
-
-    # 1) Handle SELL first
-    for sig in [s for s in signals if s.action.upper() == "SELL"]:
-        key = f"{sig.ticker}_{sig.side.lower()}"
-        pos = positions.get(key)
-        px = prices.get(sig.ticker)
-        if pos is None or px is None or px <= 0:
-            continue
-
-        if pos.side == "long":
-            pnl = (px - pos.entry_price) * pos.qty
-        else:
-            pnl = (pos.entry_price - px) * pos.qty
-
-        pnl_pct = (
-            pnl / (pos.entry_price * pos.qty) * 100.0
-            if pos.entry_price * pos.qty != 0
-            else 0.0
-        )
-
-        equity += pnl
-        trades.append(
-            SimTrade(
-                ticker=pos.ticker,
-                side=pos.side,
-                action="CLOSE",
-                entry_ts=pos.entry_ts,
-                exit_ts=ts_bar,
-                entry_price=pos.entry_price,
-                exit_price=px,
-                qty=pos.qty,
-                pnl_dollar=pnl,
-                pnl_pct=pnl_pct,
-                reason=f"SELL: {sig.reason}",
-            )
-        )
-        del positions[key]
-
-    # 2) Handle BUY
-    risk_dollar = equity * risk_pct
-
-    for sig in [s for s in signals if s.action.upper() == "BUY"]:
-        t = sig.ticker
-        side = sig.side.lower()
-        key = f"{t}_{side}"
-        if key in positions:
-            continue  # already in
-
-        px = prices.get(t)
-        if px is None or px <= 0:
-            continue
-
-        if sig.stop_price and sig.stop_price > 0:
-            stop = sig.stop_price
-        else:
-            # fallback: simple % stop
-            if side == "long":
-                stop = px * (1.0 - HARD_STOP_PCT)
-            else:
-                stop = px * (1.0 + HARD_STOP_PCT)
-
-        if side == "long":
-            risk_per_share = px - stop
-        else:
-            risk_per_share = stop - px
-
-        if risk_per_share <= 0:
-            continue
-
-        qty = max(0, int(risk_dollar / risk_per_share))
-        if qty <= 0:
-            continue
-
-        positions[key] = SimPosition(
-            ticker=t,
-            side=side,
-            entry_ts=ts_bar,
-            entry_price=px,
-            qty=qty,
-            stop_price=stop,
-        )
-
-        trades.append(
-            SimTrade(
-                ticker=t,
-                side=side,
-                action="OPEN",
-                entry_ts=ts_bar,
-                exit_ts=ts_bar,
-                entry_price=px,
-                exit_price=px,
-                qty=qty,
-                pnl_dollar=0.0,
-                pnl_pct=0.0,
-                reason=f"BUY: {sig.reason}",
-            )
-        )
-
-    return equity, trades
+    if intraday.empty:
+        return intraday
+    # yfinance intraday index is a DatetimeIndex
+    return intraday.loc[str(year)]
 
 
-# ========== Stub that calls YOUR real logic ==========
-
-def compute_signals_with_production_logic(
-    ts_bar: pd.Timestamp,
-    row: pd.Series,
-    cfg: dict,
-    holdings_snapshot: Dict[str, dict],
-) -> List[LiveSignal]:
+def _get_close_series(intraday_year: pd.DataFrame, ticker: str) -> pd.Series:
     """
-    Build the same kind of inputs your live code uses, then delegate to
-    `compute_signals_for_snapshot(...)` from your production module.
-
-    - ts_bar: current intraday timestamp being simulated.
-    - row: intraday row (multi-index columns: ('Close', 'AAPL'), etc.).
-    - cfg: config.yaml dict.
-    - holdings_snapshot: simulated holdings (you can map from positions dict).
-
-    You MUST replace the body of this function with a call to your real logic.
+    Returns the close series for a ticker within intraday_year.
     """
+    if intraday_year.empty:
+        return pd.Series(dtype=float)
 
-    # 1) Build a prices dict similar to what your live code uses
-    prices: Dict[str, float] = {}
-    if isinstance(row.index, pd.MultiIndex):
-        close_cols = [c for c in row.index if c[0] == "Close"]
-        for _, ticker in close_cols:
-            px = float(row[("Close", ticker)])
-            if px > 0:
-                prices[ticker] = px
-    else:
-        # single-ticker case
-        prices["TICKER"] = float(row["Close"])
-
-    # 2) TODO: adapt holdings_snapshot to your internal structure if needed
-
-    # 3) TODO: CALL YOUR REAL FUNCTION HERE, for example:
-    #
-    # from weinstein_intraday import compute_signals_for_snapshot
-    # signals = compute_signals_for_snapshot(
-    #     prices=prices,
-    #     holdings=holdings_snapshot,
-    #     cfg=cfg,
-    #     as_of_ts=ts_bar,
-    # )
-    # return signals
-    #
-    # For now, return empty list so the script is runnable without wiring.
-    return []
-
-
-# ========== Main replay loop ==========
-
-def run_backtest(year: int, config_path: str) -> None:
-    cfg, bench, account_size, risk_pct = load_config(config_path)
-    weekly_df, weekly_path = load_weekly_report()
-    log(f"Using weekly CSV: {weekly_path}")
-    universe = build_universe(weekly_df, bench)
-    log(f"Focus universe: {len(universe)-1} Stage 1/2 + benchmark {bench}")
-
-    daily, intraday = download_data(universe, year)
-
-    # restrict intraday index to target year
-    idx = intraday.index
-    start = datetime(year, 1, 1)
-    end = datetime(year, 12, 31, 23, 59)
-    idx = idx[(idx >= start) & (idx <= end)]
-    if len(idx) == 0:
-        raise ValueError(f"No intraday bars for year {year}.")
-
-    log(f"Intraday bars in {year}: {len(idx)}")
-    equity = account_size
-    positions: Dict[str, SimPosition] = {}
-    trades: List[SimTrade] = []
-
-    n_bars = len(idx)
-    milestones = {max(1, int(n_bars * f / 10)) for f in range(1, 10)}
-
-    for i, ts_bar in enumerate(idx, start=1):
-        row = intraday.loc[ts_bar]
-
-        # holdings_snapshot is what you pass back into your logic.
-        # Simplest: just pass current positions in a dict keyed by ticker.
-        holdings_snapshot: Dict[str, dict] = {}
-        for key, pos in positions.items():
-            holdings_snapshot[pos.ticker] = {
-                "side": pos.side,
-                "qty": pos.qty,
-                "entry_price": pos.entry_price,
-                "entry_ts": pos.entry_ts,
-                "stop_price": pos.stop_price,
-            }
-
-        # 1) Get live-like signals from your real logic
-        signals = compute_signals_with_production_logic(
-            ts_bar=ts_bar,
-            row=row,
-            cfg=cfg,
-            holdings_snapshot=holdings_snapshot,
-        )
-
-        # 2) Build price snapshot for the portfolio engine
-        prices: Dict[str, float] = {}
-        if isinstance(row.index, pd.MultiIndex):
-            for (field, t) in row.index:
-                if field == "Close":
-                    px = float(row[(field, t)])
-                    if px > 0:
-                        prices[t] = px
-        else:
-            prices["TICKER"] = float(row["Close"])
-
-        # 3) Apply signals to portfolio
-        equity, new_trades = apply_signals_to_portfolio(
-            ts_bar=ts_bar,
-            prices=prices,
-            signals=signals,
-            positions=positions,
-            equity=equity,
-            risk_pct=risk_pct,
-        )
-        trades.extend(new_trades)
-
-        # 4) Progress logging
-        if i in milestones or i == n_bars:
-            log(
-                f"Progress {year}: {i}/{n_bars} bars "
-                f"({i / n_bars * 100.0:5.1f}%) — "
-                f"equity ${equity:,.2f}, open positions {len(positions)}, trades {len(trades)}"
-            )
-
-    # ===== Finish: summarize & save =====
-    total_pnl = equity - account_size
-    total_ret_pct = (total_pnl / account_size * 100.0) if account_size else 0.0
-
-    log(f"Backtest complete for {year}.")
-    log(
-        f"Final equity: ${equity:,.2f} "
-        f"(P/L ${total_pnl:,.2f}, {total_ret_pct:.2f}%) — "
-        f"Trades={len(trades)}"
-    )
-
-    os.makedirs("./output", exist_ok=True)
-    trades_df = pd.DataFrame([t.__dict__ for t in trades])
-    out_path = f"./output/live_logic_bt_{year}.csv"
-    trades_df.to_csv(out_path, index=False)
-    log(f"Wrote trade log → {out_path}")
-
-    # optional equity curve
-    if trades:
+    if isinstance(intraday_year.columns, pd.MultiIndex):
         try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
+            s = intraday_year[("Close", ticker)]
+        except KeyError:
+            return pd.Series(dtype=float)
+    else:
+        # single ticker case
+        s = intraday_year["Close"]
+    return s.dropna()
 
-            # reconstruct equity over time by replaying trades in exit order
-            eq_dates: List[pd.Timestamp] = []
-            eq_values: List[float] = []
-            eq = account_size
 
-            for tr in sorted(trades, key=lambda x: x.exit_ts):
-                if tr.action == "CLOSE":
-                    eq += tr.pnl_dollar
-                    eq_dates.append(tr.exit_ts)
-                    eq_values.append(eq)
+def _get_close_on_bar(series: pd.Series, ts) -> float:
+    """
+    Get the close at or before ts from a per-ticker close series.
+    """
+    if series.empty:
+        return math.nan
+    # Up to this timestamp
+    s = series.loc[:ts]
+    if s.empty:
+        return math.nan
+    return float(s.iloc[-1])
 
-            if eq_dates:
-                fig, ax = plt.subplots(figsize=(8, 3))
-                ax.plot(eq_dates, eq_values)
-                ax.set_title(f"Equity Curve {year} (live logic)")
-                ax.set_ylabel("Equity ($)")
-                ax.grid(alpha=0.3)
-                fig.autofmt_xdate()
-                fig.tight_layout()
-                eq_path = f"./output/live_logic_bt_{year}_equity.png"
-                fig.savefig(eq_path, dpi=120)
-                plt.close(fig)
-                log(f"Wrote equity curve PNG → {eq_path}")
-        except Exception as e:
-            log(f"Failed to plot equity curve: {e}")
+
+def _daily_slice_to(ts, daily: pd.DataFrame) -> pd.DataFrame:
+    if daily.empty:
+        return daily
+    return daily.loc[:ts.date()]
+
+
+def _entry_size(equity: float, price: float) -> float:
+    """
+    Very simple sizing: min(max_pos_fraction * equity, 5 * risk_budget).
+    """
+    if price <= 0 or equity <= 0:
+        return 0.0
+    max_pos_dollars = MAX_POSITION_FRACTION * equity
+    risk_budget = RISK_FRACTION * equity
+    dol = min(max_pos_dollars, 5.0 * risk_budget)
+    return dol / price
+
+
+def backtest_year(
+    year: int,
+    config_path: str,
+    side: str = "both",
+    initial_equity: float = INITIAL_EQUITY_DEFAULT,
+    out_csv: str | None = None,
+    no_regime_filter: bool = False,
+):
+    # --- Universe + weekly data ---
+    focus, benchmark, weekly_df = _get_universe(config_path)
+    cfg, _, _, _ = load_config(config_path)
+
+    tickers = sorted(set(focus["ticker"].tolist() + [benchmark]))
+
+    # --- Market regime (Chapter 8) ---
+    label, long_ok, short_ok = inspect_market_regime()
+    if no_regime_filter:
+        long_ok = True
+        short_ok = True
+        regime_label = f"{label} (overridden: no regime filter)"
+    else:
+        regime_label = label
+
+    log(
+        f"Market regime (Ch8): {regime_label} | long_ok={long_ok} short_ok={short_ok}",
+        level="info",
+    )
+
+    # --- Data ---
+    intraday, daily = _download_data(tickers, year)
+    intraday_year = _slice_year_intraday(intraday, year)
+    if intraday_year.empty:
+        log(f"No intraday bars found for {year}.", level="err")
+        return
+
+    bar_times = intraday_year.index.unique()
+    total_bars = len(bar_times)
+    log(f"Intraday bars in {year}: {total_bars}", level="info")
+
+    # --- Prepare per-ticker close series for quick lookup ---
+    close_series = {t: _get_close_series(intraday_year, t) for t in tickers}
+
+    # --- State ---
+    trigger_state = {
+        t: {
+            "state": "IDLE",
+            "near_hits": [],
+            "cooldown": 0,
+            "sell_state": "IDLE",
+            "sell_hits": [],
+            "sell_cooldown": 0,
+        }
+        for t in focus["ticker"].tolist()
+    }
+
+    positions = {}  # ticker -> dict(side, entry, shares)
+    cash = float(initial_equity)
+    equity = float(initial_equity)
+    trades = []
+
+    # Map weekly info for quick lookup
+    w = weekly_df.rename(columns=str.lower)
+    for col in ["ticker", "stage", "ma30", "rs_above_ma", "rank"]:
+        if col not in w.columns:
+            w[col] = np.nan
+
+    weekly_by_ticker = {
+        str(r["ticker"]): {
+            "stage": r["stage"],
+            "ma30": r.get("ma30", np.nan),
+            "rs_above_ma": bool(r.get("rs_above_ma", False)),
+            "weekly_rank": r.get("rank", np.nan),
+        }
+        for _, r in w.iterrows()
+    }
+
+    def mark_to_market(ts):
+        nonlocal equity
+        eq = cash
+        for t, pos in positions.items():
+            s = close_series.get(t)
+            if s is None or s.empty:
+                continue
+            px = _get_close_on_bar(s, ts)
+            if math.isnan(px):
+                continue
+            if pos["side"] == "long":
+                eq += px * pos["shares"]
+            else:
+                # Short P/L = (entry - current) * shares
+                eq += (pos["entry"] - px) * pos["shares"]
+        equity = eq
+
+    # --- Main bar loop ---
+    last_progress_pct = -1
+
+    for idx, ts in enumerate(bar_times, start=1):
+        # Progress every ~10%
+        pct = int(idx * 100.0 / total_bars)
+        if pct // 10 != last_progress_pct // 10:
+            last_progress_pct = pct
+            mark_to_market(ts)
+            log(
+                f"Progress {year}: {idx}/{total_bars} bars ({pct:4.1f}%) — "
+                f"equity ${equity:,.2f}, open positions {len(positions)}, trades {len(trades)}",
+                level="info",
+            )
+
+        # Per-ticker logic
+        for t in focus["ticker"].tolist():
+            s_close = close_series.get(t)
+            if s_close is None or s_close.empty:
+                continue
+
+            px = _get_close_on_bar(s_close, ts)
+            if math.isnan(px):
+                continue
+
+            wi = weekly_by_ticker.get(t, {})
+            stage = wi.get("stage", "")
+            ma30 = _safe_float(wi.get("ma30", np.nan))
+            rs_ok = bool(wi.get("rs_above_ma", False))
+            weekly_rank = wi.get("weekly_rank", np.nan)
+
+            if not _stage_ok(stage):
+                continue
+
+            ma_ok = not math.isnan(ma30)
+            if not ma_ok or not rs_ok:
+                # In live logic we also require RS + MA
+                continue
+
+            # Daily slice up to this bar's date
+            daily_to = _daily_slice_to(ts, daily)
+            if daily_to.empty:
+                continue
+
+            pivot = last_weekly_pivot_high(t, daily_to)
+            atr = compute_atr(daily_to, t, n=14)
+
+            pivot_ok = not math.isnan(pivot)
+
+            st = trigger_state.get(t)
+            if st is None:
+                st = {
+                    "state": "IDLE",
+                    "near_hits": [],
+                    "cooldown": 0,
+                    "sell_state": "IDLE",
+                    "sell_hits": [],
+                    "sell_cooldown": 0,
+                }
+                trigger_state[t] = st
+
+            # If market not favorable for longs, reset buy state (like live script)
+            if not long_ok:
+                st["state"] = "IDLE"
+                st["near_hits"] = []
+                st["cooldown"] = 0
+
+            closes_up_to_ts = s_close.loc[:ts]
+            # Need at least CONFIRM_BARS for proper confirm
+            if len(closes_up_to_ts) < max(CONFIRM_BARS, 2):
+                closes_tail = closes_up_to_ts.tail(len(closes_up_to_ts))
+            else:
+                closes_tail = closes_up_to_ts.tail(CONFIRM_BARS)
+
+            # --- BUY confirmation ---
+            buy_price_ok = False
+            buy_confirm = False
+
+            if long_ok and pivot_ok and ma_ok and len(closes_tail) >= 1:
+                def _price_ok(c):
+                    return (
+                        c >= pivot * (1.0 + MIN_BREAKOUT_PCT)
+                        and c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
+                    )
+
+                if len(closes_tail) >= CONFIRM_BARS:
+                    buy_price_ok = all(_price_ok(c) for c in closes_tail)
+                else:
+                    buy_price_ok = _price_ok(closes_tail.iloc[-1])
+
+                buy_confirm = buy_price_ok
+
+            # --- BUY "near" logic (similar to live script, using current px only) ---
+            near_now = False
+            if long_ok and pivot_ok and ma_ok:
+                above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
+                if above_ma:
+                    if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (
+                        px < pivot * (1.0 + MIN_BREAKOUT_PCT)
+                    ):
+                        near_now = True
+                    elif (px >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and not buy_confirm:
+                        near_now = True
+
+            # --- SELL "near" + confirm (mirror of live) ---
+            sell_near_now = False
+            sell_price_ok = False
+            sell_confirm = False
+
+            if ma_ok:
+                sell_near_now = _near_sell_zone(px, ma30)
+
+                closes_tail2 = closes_up_to_ts.tail(max(CONFIRM_BARS, 2))
+                if len(closes_tail2) >= 1:
+                    sell_price_ok = all(
+                        (c <= ma30 * (1.0 - SELL_BREAK_PCT))
+                        for c in closes_tail2.tail(CONFIRM_BARS)
+                    )
+                    sell_confirm = sell_price_ok
+
+            # --- Promote state: BUY side ---
+            st["near_hits"], near_count = _update_hits(
+                st.get("near_hits", []),
+                near_now,
+                NEAR_HITS_WINDOW,
+            )
+            if st.get("cooldown", 0) > 0:
+                st["cooldown"] = int(st["cooldown"]) - 1
+
+            state_now = st.get("state", "IDLE")
+            if state_now == "IDLE" and near_now:
+                state_now = "NEAR"
+            elif state_now in ("IDLE", "NEAR") and near_count >= NEAR_HITS_MIN:
+                state_now = "ARMED"
+            elif state_now == "ARMED" and buy_confirm:
+                state_now = "TRIGGERED"
+                st["cooldown"] = COOLDOWN_SCANS
+            elif st["cooldown"] > 0 and not near_now:
+                state_now = "COOLDOWN"
+            elif st["cooldown"] == 0 and not near_now and not buy_confirm:
+                state_now = "IDLE"
+            st["state"] = state_now
+
+            # --- Promote state: SELL side ---
+            st["sell_hits"], sell_hit_count = _update_hits(
+                st.get("sell_hits", []),
+                sell_near_now,
+                SELL_NEAR_HITS_WINDOW,
+            )
+            if st.get("sell_cooldown", 0) > 0:
+                st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
+
+            sell_state = st.get("sell_state", "IDLE")
+            if sell_state == "IDLE" and sell_near_now:
+                sell_state = "NEAR"
+            elif sell_state in ("IDLE", "NEAR") and sell_hit_count >= SELL_NEAR_HITS_MIN:
+                sell_state = "ARMED"
+            elif sell_state == "ARMED" and sell_confirm:
+                sell_state = "TRIGGERED"
+                st["sell_cooldown"] = SELL_COOLDOWN_SCANS
+            elif st["sell_cooldown"] > 0 and not sell_near_now:
+                sell_state = "COOLDOWN"
+            elif st["sell_cooldown"] == 0 and not sell_near_now and not sell_confirm:
+                sell_state = "IDLE"
+            st["sell_state"] = sell_state
+
+            trigger_state[t] = st
+
+            # --- Trading logic (long / short) ---
+            pos = positions.get(t)
+            current_side = pos["side"] if pos else None
+
+            # Exits first, then entries (avoid flip-flop on same bar)
+            # LONG exit: SELL trigger
+            if pos and current_side == "long" and sell_state == "TRIGGERED":
+                # close long
+                cash += px * pos["shares"]
+                trades.append(
+                    {
+                        "timestamp": ts,
+                        "ticker": t,
+                        "side": "LONG",
+                        "action": "CLOSE",
+                        "price": px,
+                        "shares": pos["shares"],
+                    }
+                )
+                del positions[t]
+
+            # SHORT exit: BUY trigger
+            elif pos and current_side == "short" and state_now == "TRIGGERED":
+                # buy to cover
+                cash -= px * pos["shares"]
+                trades.append(
+                    {
+                        "timestamp": ts,
+                        "ticker": t,
+                        "side": "SHORT",
+                        "action": "CLOSE",
+                        "price": px,
+                        "shares": pos["shares"],
+                    }
+                )
+                del positions[t]
+
+            # Re-evaluate after exits
+            pos = positions.get(t)
+            current_side = pos["side"] if pos else None
+
+            # LONG entry
+            if (
+                state_now == "TRIGGERED"
+                and long_ok
+                and (side in ("long", "both"))
+                and current_side is None
+            ):
+                # basic sizing
+                mark_to_market(ts)
+                shares = _entry_size(equity, px)
+                if shares > 0 and px * shares <= cash:
+                    positions[t] = {
+                        "side": "long",
+                        "entry": px,
+                        "shares": shares,
+                    }
+                    cash -= px * shares
+                    trades.append(
+                        {
+                            "timestamp": ts,
+                            "ticker": t,
+                            "side": "LONG",
+                            "action": "OPEN",
+                            "price": px,
+                            "shares": shares,
+                        }
+                    )
+                    # Cooldown after triggering
+                    st["state"] = "COOLDOWN"
+                    trigger_state[t] = st
+
+            # SHORT entry
+            elif (
+                sell_state == "TRIGGERED"
+                and short_ok
+                and (side in ("short", "both"))
+                and current_side is None
+            ):
+                # short sale: we receive proceeds
+                mark_to_market(ts)
+                shares = _entry_size(equity, px)
+                if shares > 0:
+                    positions[t] = {
+                        "side": "short",
+                        "entry": px,
+                        "shares": shares,
+                    }
+                    cash += px * shares
+                    trades.append(
+                        {
+                            "timestamp": ts,
+                            "ticker": t,
+                            "side": "SHORT",
+                            "action": "OPEN",
+                            "price": px,
+                            "shares": shares,
+                        }
+                    )
+                    st["sell_state"] = "COOLDOWN"
+                    trigger_state[t] = st
+
+        # End per-ticker loop
+        mark_to_market(ts)
+
+    # --- Done: final stats + CSV ---
+    mark_to_market(bar_times[-1])
+
+    pl = equity - initial_equity
+    pl_pct = (pl / initial_equity * 100.0) if initial_equity else 0.0
+
+    log(
+        f"Backtest complete for {year}.",
+        level="ok",
+    )
+    log(
+        f"Final equity: ${equity:,.2f} (P/L ${pl:,.2f}, {pl_pct:.2f}%) — "
+        f"Trades={len(trades)}",
+        level="info",
+    )
+
+    if not out_csv:
+        out_csv = os.path.join("./output", f"live_logic_bt_{year}.csv")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+    df_trades = pd.DataFrame(trades)
+    if not df_trades.empty:
+        df_trades.sort_values("timestamp", inplace=True)
+    df_trades.to_csv(out_csv, index=False)
+    log(f"Wrote trade log → {out_csv}", level="ok")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--year", type=int, required=True, help="Calendar year to simulate")
+    ap.add_argument(
+        "--year",
+        type=int,
+        required=True,
+        help="Year to backtest (e.g. 2025)",
+    )
     ap.add_argument(
         "--config",
-        type=str,
         default="./config.yaml",
-        help="Path to config.yaml",
+        help="Path to config.yaml (same as intraday watcher)",
+    )
+    ap.add_argument(
+        "--side",
+        choices=["long", "short", "both"],
+        default="both",
+        help="Which side(s) to trade: long, short, or both (default).",
+    )
+    ap.add_argument(
+        "--initial-equity",
+        type=float,
+        default=INITIAL_EQUITY_DEFAULT,
+        help=f"Starting equity for backtest (default {INITIAL_EQUITY_DEFAULT}).",
+    )
+    ap.add_argument(
+        "--out-csv",
+        default="",
+        help="Output CSV path for trades (default ./output/live_logic_bt_<year>.csv).",
+    )
+    ap.add_argument(
+        "--no-regime-filter",
+        action="store_true",
+        help="Ignore market regime filter (force long_ok=True, short_ok=True).",
     )
     args = ap.parse_args()
-    run_backtest(args.year, args.config)
+
+    out_csv = args.out_csv or None
+
+    backtest_year(
+        year=args.year,
+        config_path=args.config,
+        side=args.side,
+        initial_equity=args.initial_equity,
+        out_csv=out_csv,
+        no_regime_filter=args.no_regime_filter,
+    )
 
 
 if __name__ == "__main__":
