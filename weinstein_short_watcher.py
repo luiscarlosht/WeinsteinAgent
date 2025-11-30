@@ -45,6 +45,33 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
+# Shared short-side core (used by watcher + backtest)
+from weinstein_short_core import (
+    INTRADAY_INTERVAL,
+    PIVOT_LOOKBACK_WEEKS,
+    SHORT_BREAK_PCT,
+    NEAR_ABOVE_PIVOT_PCT,
+    VOL_PACE_MIN,
+    NEAR_VOL_PACE_MIN,
+    INTRADAY_AVG_VOL_WINDOW,
+    INTRADAY_LASTBAR_MULT,
+    INTRABAR_CONFIRM_MIN_ELAPSED,
+    INTRABAR_VOLPACE_MIN,
+    READY_ABOVE_MA_PCT,
+    SHORT_NEAR_HITS_WINDOW,
+    SHORT_NEAR_HITS_MIN,
+    SHORT_COOLDOWN_SCANS,
+    SHORT_HARD_STOP_PCT,
+    SHORT_TRAIL_ATR_MULT,
+    SHORT_MA_GUARD_PCT,
+    SHORT_TARGET1_PCT,
+    SHORT_TARGET2_PCT,
+    _short_price_break,
+    _short_near_zone,
+    _short_ready_to_close,
+    _short_entry_stop_targets,
+)
+
 # Optional: Google Sheets integration for READY filter
 try:
     import gspread
@@ -56,40 +83,13 @@ WEEKLY_OUTPUT_DIR = "./output"
 WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
 BENCHMARK_DEFAULT = "SPY"
 
-INTRADAY_INTERVAL = "60m"     # '60m' or '30m'
 LOOKBACK_DAYS     = 60
-PIVOT_LOOKBACK_WEEKS = 10
 PRICE_WINDOW_DAYS = 260
 SMA_DAYS          = 150
 
-# Short trigger thresholds
-SHORT_BREAK_PCT          = 0.004   # 0.4% below pivot/MA for confirm
-NEAR_ABOVE_PIVOT_PCT     = 0.02    # considers "just above" pivot if within +2%
-VOL_PACE_MIN             = 1.30    # full-day vol pace gate for TRIG shorts
-NEAR_VOL_PACE_MIN        = 1.00    # for NEAR shorts
-INTRADAY_AVG_VOL_WINDOW  = 20
-INTRADAY_LASTBAR_MULT    = 1.20    # (used only for non-60m modes)
-
-# 60m intrabar confirmations
-INTRABAR_CONFIRM_MIN_ELAPSED  = 40    # minutes into bar
-INTRABAR_VOLPACE_MIN          = 1.20  # intrabar pace vs avg for confirm
-
-# READY-TO-CLOSE threshold
-READY_ABOVE_MA_PCT       = 0.005  # 0.5% above MA150 => consider short "ready to close"
-
-# Stateful short triggers
+# Stateful short triggers (file path + cadence for cron)
 SHORT_STATE_FILE       = "./state/short_triggers.json"
 SCAN_INTERVAL_MIN      = 10
-SHORT_NEAR_HITS_WINDOW = 6
-SHORT_NEAR_HITS_MIN    = 3
-SHORT_COOLDOWN_SCANS   = 24
-
-# Short risk/profit mapping
-SHORT_HARD_STOP_PCT    = 0.20   # 20% above entry
-SHORT_TRAIL_ATR_MULT   = 2.0
-SHORT_MA_GUARD_PCT     = 0.03   # 3% over MA150
-SHORT_TARGET1_PCT      = 0.15   # 15% downside
-SHORT_TARGET2_PCT      = 0.20   # 20% downside
 
 CHART_DIR            = "./output/charts"
 MAX_CHARTS_PER_EMAIL = 12
@@ -447,49 +447,7 @@ def intrabar_volume_pace(
     est_full = last_bar_vol / frac if frac > 0 else last_bar_vol
     return float(_safe_div(est_full, avg_bar_vol))
 
-# ---------------- Short logic helpers ----------------
-def _short_price_break(px, ma, pivot_low):
-    """True if price has broken below short zone (~pivot low/MA150)."""
-    conds = []
-    if pd.notna(pivot_low):
-        conds.append(px <= pivot_low * (1.0 - SHORT_BREAK_PCT))
-    if pd.notna(ma):
-        conds.append(px <= ma * (1.0 - SHORT_BREAK_PCT))
-    return any(conds) if conds else False
-
-
-def _short_near_zone(px, ma, pivot_low):
-    """Near-breakdown zone: under MA150 but not yet breaking pivot/MA too hard."""
-    if pd.isna(px) or (pd.isna(ma) and pd.isna(pivot_low)):
-        return False
-    # must be below MA150 (downtrend active)
-    below_ma = (pd.notna(ma) and px < ma)
-    if not below_ma:
-        return False
-    # treat "near" as above pivot low but not crazy far
-    if pd.notna(pivot_low):
-        if px <= pivot_low:  # already at/below pivot; let full trigger handle
-            return False
-        if px <= pivot_low * (1.0 + NEAR_ABOVE_PIVOT_PCT):
-            return True
-    # fallback: a mild cushion below MA150 but not full 0.4% break
-    if pd.notna(ma):
-        if (px <= ma) and (px >= ma * (1.0 - SHORT_BREAK_PCT)):
-            return True
-    return False
-
-
-def _short_ready_to_close(px, ma):
-    """
-    READY-TO-CLOSE short:
-      - price has reclaimed MA150 by READY_ABOVE_MA_PCT (e.g. 0.5+% above MA150),
-        suggesting downtrend thesis is weakening.
-    """
-    if pd.isna(px) or pd.isna(ma):
-        return False
-    return px >= ma * (1.0 + READY_ABOVE_MA_PCT)
-
-
+# ---------------- Sorting helpers ----------------
 def stage_order(stage: str) -> int:
     if isinstance(stage, str):
         if stage.startswith("Stage 4"):
@@ -519,33 +477,6 @@ def _fmt_num(x):
         return f"{float(x):.2f}"
     except Exception:
         return "—"
-
-
-def _short_entry_stop_targets(px, ma30, pivot_low, atr):
-    """
-    For shorts:
-      entry ≈ px (current price)
-      stop  = max(
-                 entry * (1 + SHORT_HARD_STOP_PCT),
-                 entry + SHORT_TRAIL_ATR_MULT * ATR,
-                 ma30 * (1 + SHORT_MA_GUARD_PCT)
-              )
-      targets = [ -15%, -20% from entry ]
-    """
-    if pd.isna(px):
-        return np.nan, np.nan, np.nan, np.nan
-    entry = float(px)
-
-    hard = entry * (1.0 + SHORT_HARD_STOP_PCT)
-    atr_stop = (entry + SHORT_TRAIL_ATR_MULT * atr) if pd.notna(atr) else np.nan
-    ma_guard = (ma30 * (1.0 + SHORT_MA_GUARD_PCT)) if pd.notna(ma30) else np.nan
-
-    cand = [c for c in [hard, atr_stop, ma_guard] if pd.notna(c)]
-    stop = max(cand) if cand else hard
-
-    t1 = entry * (1.0 - SHORT_TARGET1_PCT)
-    t2 = entry * (1.0 - SHORT_TARGET2_PCT)
-    return entry, stop, t1, t2
 
 
 def _build_order_block_html(short_trigs, near_shorts, cover_shorts):
