@@ -1,132 +1,275 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-weinstein_live_logic_backtest.py
+Weinstein Live Logic Backtest — long + short using PRODUCTION intraday cores
 
-Backtest the *live intraday trigger logic* (long + short) over historical
-60-minute bars, using the same tunables as weinstein_intraday_watcher.py.
+Goal
+----
+Use the *same* intraday logic as your production watchers to simulate a
+simple portfolio and build an equity curve.
 
-- Universe: Stage 1/2 from latest weekly CSV (+ benchmark)
-- Signals: same state machine (NEAR → ARMED → TRIGGERED + cooldown)
-- Entries:
-    * LONG:  when buy_state == TRIGGERED and long_ok == True
-    * SHORT: when sell_state == TRIGGERED and short_ok == True
-- Exits:
-    * LONG:  when sell_state == TRIGGERED
-    * SHORT: when buy_state == TRIGGERED
+- Long side: uses weinstein_intraday_core.eval_long_bar(...)
+- Short side: uses weinstein_short_core.eval_short_bar(...)
+- Universe: Stage 2 (uptrend) for longs, Stage 4 (downtrend) for shorts,
+  from the newest weekly scan CSV under ./output.
+- Data: yfinance 60m bars + daily bars.
+- Stops/targets: use the same param mapping as your intraday watcher cores.
 
-This is intentionally simplified on volume pacing (no intrabar/pace), but
-reuses the same price/pivot/MA/near/confirm logic and the same trigger states.
+Notes / Simplifications
+-----------------------
+- Chapter 8 market regime: **NOT** dynamically simulated here. We treat
+  long_ok = short_ok = True across the whole backtest.
+  (Production watcher may skip shorts in BULL, etc.)
+- Volume pace (pace_full) for backtest is simplified to:
+    full_day_volume / 50dma_volume
+  and applied uniformly across that day's intraday bars.
+- Intrabar pace is approximated as:
+    bar_volume / mean(bar_volume, last 20 bars)
+- Position sizing:
+    * risk_per_trade = capital * risk_per_trade_pct
+    * shares = floor(risk_per_trade / per-share risk)
+    * per-share risk = |stop - entry|
+- Targets are tracked for diagnostics, but exits are stop-based only
+  (no automatic profit-taking). You can extend this if you want.
+
+CLI
+---
+Example:
+
+  python3 weinstein_live_logic_backtest.py \
+      --start 2024-01-01 --end 2024-10-31 \
+      --capital 100000 \
+      --risk-per-trade 0.01 \
+      --max-long 10 --max-short 10 \
+      --mode both
+
+Outputs
+-------
+- ./output/live_logic_trades.csv      (all fills)
+- ./output/live_logic_equity_curve.csv
+- ./output/live_logic_equity_curve.png
 """
 
 import os
 import math
 import argparse
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# --- Reuse config, weekly loader, regime + tunables from the intraday watcher ---
-from weinstein_intraday_watcher import (
-    load_config,
-    load_weekly_report,
-    inspect_market_regime,
-    compute_atr,
-    last_weekly_pivot_high,
-    _update_hits,
-    _price_below_ma,
-    _near_sell_zone,
-    MIN_BREAKOUT_PCT,
-    BUY_DIST_ABOVE_MA_MIN,
-    CONFIRM_BARS,
-    NEAR_BELOW_PIVOT_PCT,
-    SELL_BREAK_PCT,
-    NEAR_HITS_WINDOW,
-    NEAR_HITS_MIN,
-    COOLDOWN_SCANS,
-    SELL_NEAR_HITS_WINDOW,
-    SELL_NEAR_HITS_MIN,
-    SELL_COOLDOWN_SCANS,
-    BENCHMARK_DEFAULT,
-    log,
+# ----- LONG core (ASSUMED API — adjust if needed) -----
+from weinstein_intraday_core import (
+    eval_long_bar,
+    LONG_HARD_STOP_PCT,
+    LONG_TRAIL_ATR_MULT,
+    LONG_MA_GUARD_PCT,
+    LONG_TARGET1_PCT,
+    LONG_TARGET2_PCT,
 )
 
+# ----- SHORT core (new) -----
+from weinstein_short_core import (
+    eval_short_bar,
+    SHORT_HARD_STOP_PCT,
+    SHORT_TRAIL_ATR_MULT,
+    SHORT_MA_GUARD_PCT,
+    SHORT_TARGET1_PCT,
+    SHORT_TARGET2_PCT,
+    PIVOT_LOOKBACK_WEEKS,
+    INTRADAY_AVG_VOL_WINDOW,
+)
+
+WEEKLY_OUTPUT_DIR = "./output"
+WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
+BENCHMARK_DEFAULT = "SPY"
+
 INTRADAY_INTERVAL = "60m"
-
-# --- Backtest-specific tunables (you can tweak) ---
-INITIAL_EQUITY_DEFAULT = 5000.0
-MAX_POSITION_FRACTION = 0.10   # max 10% of equity per trade
-RISK_FRACTION = 0.01           # risk budget per trade (~1% of equity)
+DAILY_LOOKBACK_YEARS = 3  # enough to get MA150 & 50dma for most sims
 
 
-def _ts():
-    return datetime.now().strftime("%H:%M:%S")
+# ========= helpers =========
+
+def newest_weekly_csv() -> str:
+    files = [
+        f for f in os.listdir(WEEKLY_OUTPUT_DIR)
+        if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
+    ]
+    if not files:
+        raise FileNotFoundError(
+            f"No weekly CSV found in {WEEKLY_OUTPUT_DIR}. "
+            f"Run weinstein_report_weekly.py first."
+        )
+    files.sort(reverse=True)
+    return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
 
 
-def _safe_float(x, default=np.nan):
+def _fmt_ts(ts) -> str:
+    if isinstance(ts, str):
+        return ts
     try:
-        return float(x)
+        return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(ts)
+
+
+def _safe_int(x, default=0):
+    try:
+        return int(x)
     except Exception:
         return default
 
 
-def _stage_ok(stage: str) -> bool:
-    s = str(stage or "")
-    return s.startswith("Stage 1") or s.startswith("Stage 2")
-
-
-def _get_universe(config_path: str):
+def _compute_ma150_and_pivots(daily_df: pd.DataFrame):
     """
-    Load latest weekly CSV and build Stage 1/2 focus universe + benchmark.
+    daily_df: must have columns ["Open","High","Low","Close","Volume"] and DatetimeIndex.
+    Returns:
+      ma150: pd.Series
+      pivot_low: pd.Series (rolling N-bar min of Low, ~10 weeks)
+      pivot_high: pd.Series (rolling N-bar max of High, ~10 weeks)
+      atr14: pd.Series
+      vol50: pd.Series
     """
-    cfg, benchmark, _, _ = load_config(config_path)
-    weekly_df, weekly_path = load_weekly_report()
-    log(f"Using weekly CSV: {weekly_path}", level="info")
+    low = daily_df["Low"]
+    high = daily_df["High"]
+    close = daily_df["Close"]
+    vol = daily_df["Volume"]
 
-    w = weekly_df.rename(columns=str.lower)
-    for col in ["ticker", "stage", "ma30", "rs_above_ma"]:
-        if col not in w.columns:
-            w[col] = np.nan
+    ma150 = close.rolling(150).mean()
 
-    focus = w[w["stage"].apply(_stage_ok)].copy()
-    if "rank" in w.columns:
-        focus["weekly_rank"] = w["rank"]
-    else:
-        focus["weekly_rank"] = 999999
+    # 10 weeks * 5 trading days
+    win = PIVOT_LOOKBACK_WEEKS * 5
+    pivot_low = low.rolling(win).min()
+    pivot_high = high.rolling(win).max()
 
-    tickers = sorted(set(focus["ticker"].tolist()))
-    bench = benchmark or BENCHMARK_DEFAULT
+    prev_c = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_c).abs(), (low - prev_c).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr14 = tr.rolling(14).mean()
 
-    if bench not in tickers:
-        tickers.append(bench)
+    vol50 = vol.rolling(50).mean()
 
-    log(
-        f"Focus universe: {len(focus)} Stage 1/2 + benchmark {bench}",
-        level="info",
-    )
-    return focus, bench, weekly_df
+    return ma150, pivot_low, pivot_high, atr14, vol50
 
 
-def _download_data(tickers, year: int):
+def _compute_intraday_vol_pace(intraday_vol: pd.Series) -> pd.Series:
     """
-    Download daily + intraday 60m bars for a window around the given year.
-    We pad a bit before/after to have enough context for pivots/ATR.
+    Approx intrabar volume pace vs avg over INTRADAY_AVG_VOL_WINDOW bars.
     """
-    start = datetime(year - 1, 11, 1)
-    end = datetime(year + 1, 2, 1)
+    vavg = intraday_vol.rolling(INTRADAY_AVG_VOL_WINDOW).mean()
+    return intraday_vol / vavg
 
-    log(
-        f"Downloading daily + intraday for {len(tickers)} tickers "
-        f"({start.date()} → {end.date()})...",
-        level="step",
-    )
 
+def _plot_equity_curve(eq_df: pd.DataFrame, out_path: str):
+    plt.figure(figsize=(10, 5))
+    plt.plot(eq_df["timestamp"], eq_df["equity"])
+    plt.xlabel("Time")
+    plt.ylabel("Equity ($)")
+    plt.title("Weinstein Live Logic Backtest — Equity Curve")
+    plt.grid(True)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path)
+    plt.close()
+
+
+# ========= position / portfolio structures =========
+
+@dataclass
+class Position:
+    ticker: str
+    side: str        # "LONG" or "SHORT"
+    entry_ts: pd.Timestamp
+    entry_price: float
+    shares: float
+    stop: float
+    target1: float
+    target2: float
+    max_favorable_px: float = field(default_factory=float)
+
+
+@dataclass
+class TradeFill:
+    timestamp: pd.Timestamp
+    ticker: str
+    side: str
+    action: str      # "OPEN" or "CLOSE"
+    price: float
+    shares: float
+    pnl: float
+    equity_after: float
+    reason: str
+
+
+# ========= main backtest engine =========
+
+def run_backtest(
+    start_date: str,
+    end_date: str,
+    capital: float,
+    risk_per_trade_pct: float,
+    max_long_positions: int,
+    max_short_positions: int,
+    mode: str = "both",
+    max_long_universe: int = 40,
+    max_short_universe: int = 40,
+    benchmark: str = BENCHMARK_DEFAULT,
+):
+
+    mode = mode.lower()
+    use_long = mode in ("long", "both")
+    use_short = mode in ("short", "both")
+
+    print(f"⭐ Backtest from {start_date} to {end_date}")
+    print(f"   Capital: ${capital:,.2f} | Risk per trade: {risk_per_trade_pct*100:.1f}%")
+    print(f"   Max positions: long={max_long_positions}, short={max_short_positions}")
+    print(f"   Mode: {mode}")
+
+    # ---- Load weekly universe ----
+    weekly_path = newest_weekly_csv()
+    print(f"   Weekly universe from: {weekly_path}")
+    w = pd.read_csv(weekly_path)
+    wl = w.rename(columns=str.lower)
+
+    for col in ["ticker", "stage", "rank", "ma30", "rs_above_ma"]:
+        if col not in wl.columns:
+            wl[col] = np.nan
+
+    wl["rank"] = pd.to_numeric(wl["rank"], errors="coerce").fillna(999999).astype(int)
+
+    long_universe = []
+    short_universe = []
+
+    if use_long:
+        # Stage 2 uptrend names
+        cand = wl[wl["stage"].str.startswith("Stage 2")].copy()
+        cand = cand.sort_values("rank").head(max_long_universe)
+        long_universe = cand["ticker"].dropna().astype(str).str.upper().tolist()
+
+    if use_short:
+        cand = wl[wl["stage"] == "Stage 4 (Downtrend)"].copy()
+        cand = cand.sort_values("rank").head(max_short_universe)
+        short_universe = cand["ticker"].dropna().astype(str).str.upper().tolist()
+
+    tickers = sorted(set(long_universe + short_universe + [benchmark]))
+    print(f"   Long universe:  {len(long_universe)} symbols")
+    print(f"   Short universe: {len(short_universe)} symbols")
+    print(f"   Total (incl. benchmark): {len(tickers)} symbols")
+
+    # ---- Download data ----
     intraday = yf.download(
         tickers,
-        start=start,
-        end=end,
+        start=start_date,
+        end=end_date,
         interval=INTRADAY_INTERVAL,
         auto_adjust=True,
         ignore_tz=True,
@@ -134,516 +277,429 @@ def _download_data(tickers, year: int):
     )
     daily = yf.download(
         tickers,
-        start=start.date() - timedelta(days=200),
-        end=end.date(),
+        period=f"{DAILY_LOOKBACK_YEARS}y",
         interval="1d",
         auto_adjust=True,
         ignore_tz=True,
         progress=False,
     )
 
-    log("Download complete.", level="ok")
-    return intraday, daily
-
-
-def _slice_year_intraday(intraday: pd.DataFrame, year: int) -> pd.DataFrame:
-    """
-    Restrict intraday to bars within the requested year.
-    """
     if intraday.empty:
-        return intraday
-    # yfinance intraday index is a DatetimeIndex
-    return intraday.loc[str(year)]
+        raise RuntimeError("No intraday data downloaded; check dates / tickers.")
 
+    if not isinstance(intraday.columns, pd.MultiIndex):
+        raise RuntimeError("Expected MultiIndex columns from yfinance intraday (OHLCV, ticker).")
 
-def _get_close_series(intraday_year: pd.DataFrame, ticker: str) -> pd.Series:
-    """
-    Returns the close series for a ticker within intraday_year.
-    """
-    if intraday_year.empty:
-        return pd.Series(dtype=float)
+    if not isinstance(daily.columns, pd.MultiIndex):
+        raise RuntimeError("Expected MultiIndex columns from yfinance daily (OHLCV, ticker).")
 
-    if isinstance(intraday_year.columns, pd.MultiIndex):
+    all_times = intraday.index
+    print(f"   Intraday bars: {len(all_times)} (interval={INTRADAY_INTERVAL})")
+
+    # ---- Precompute per-symbol daily features ----
+    daily_feats = {}  # ticker -> DataFrame of daily features
+
+    for t in tickers:
         try:
-            s = intraday_year[("Close", ticker)]
+            dsub = daily.xs(t, axis=1, level=1).dropna()
         except KeyError:
-            return pd.Series(dtype=float)
-    else:
-        # single ticker case
-        s = intraday_year["Close"]
-    return s.dropna()
+            continue
+        if dsub.empty or not {"High", "Low", "Close", "Volume"}.issubset(dsub.columns):
+            continue
 
+        ma150, pivot_low, pivot_high, atr14, vol50 = _compute_ma150_and_pivots(dsub)
+        feats = pd.DataFrame(
+            {
+                "Open": dsub["Open"],
+                "High": dsub["High"],
+                "Low": dsub["Low"],
+                "Close": dsub["Close"],
+                "Volume": dsub["Volume"],
+                "MA150": ma150,
+                "PivotLow": pivot_low,
+                "PivotHigh": pivot_high,
+                "ATR14": atr14,
+                "Vol50": vol50,
+            }
+        )
+        daily_feats[t] = feats
 
-def _get_close_on_bar(series: pd.Series, ts) -> float:
-    """
-    Get the close at or before ts from a per-ticker close series.
-    """
-    if series.empty:
-        return math.nan
-    # Up to this timestamp
-    s = series.loc[:ts]
-    if s.empty:
-        return math.nan
-    return float(s.iloc[-1])
+    # ---- Precompute intraday features (volume pace etc) ----
+    intraday_feats = {}  # ticker -> DataFrame with Close, Volume, pace_intra
 
+    for t in tickers:
+        try:
+            isub = intraday.xs(t, axis=1, level=1)[["Close", "Volume"]].dropna()
+        except KeyError:
+            continue
+        if isub.empty:
+            continue
+        pace_intra = _compute_intraday_vol_pace(isub["Volume"])
+        feats = isub.copy()
+        feats["pace_intra"] = pace_intra
+        intraday_feats[t] = feats
 
-def _daily_slice_to(ts, daily: pd.DataFrame) -> pd.DataFrame:
-    if daily.empty:
-        return daily
-    return daily.loc[:ts.date()]
+    # ---- Simulation state ----
+    positions: Dict[str, Position] = {}
+    equity_curve: List[Dict] = []
+    trades: List[TradeFill] = []
 
+    cash = capital
 
-def _entry_size(equity: float, price: float) -> float:
-    """
-    Very simple sizing: min(max_pos_fraction * equity, 5 * risk_budget).
-    """
-    if price <= 0 or equity <= 0:
-        return 0.0
-    max_pos_dollars = MAX_POSITION_FRACTION * equity
-    risk_budget = RISK_FRACTION * equity
-    dol = min(max_pos_dollars, 5.0 * risk_budget)
-    return dol / price
+    # state dicts for long/short cores (per ticker)
+    long_states: Dict[str, dict] = {}
+    short_states: Dict[str, dict] = {}
 
+    # convenience to know if ticker is allowed long/short
+    is_long_candidate = {t: (t in long_universe) for t in tickers}
+    is_short_candidate = {t: (t in short_universe) for t in tickers}
 
-def backtest_year(
-    year: int,
-    config_path: str,
-    side: str = "both",
-    initial_equity: float = INITIAL_EQUITY_DEFAULT,
-    out_csv: str | None = None,
-    no_regime_filter: bool = False,
-):
-    # --- Universe + weekly data ---
-    focus, benchmark, weekly_df = _get_universe(config_path)
-    cfg, _, _, _ = load_config(config_path)
+    # ---- helper for long & short stop/targets, mirroring cores ----
+    def _long_entry_stop_targets(px, ma30, pivot_high, atr):
+        if px is None or math.isnan(px):
+            return math.nan, math.nan, math.nan, math.nan
 
-    tickers = sorted(set(focus["ticker"].tolist() + [benchmark]))
+        entry = float(px)
+        hard = entry * (1.0 - LONG_HARD_STOP_PCT)
+        atr_stop = (entry - LONG_TRAIL_ATR_MULT * atr) if not math.isnan(atr) else math.nan
+        ma_guard = (ma30 * (1.0 - LONG_MA_GUARD_PCT)) if not math.isnan(ma30) else math.nan
 
-    # --- Market regime (Chapter 8) ---
-    label, long_ok, short_ok = inspect_market_regime()
-    if no_regime_filter:
-        long_ok = True
-        short_ok = True
-        regime_label = f"{label} (overridden: no regime filter)"
-    else:
-        regime_label = label
+        candidates = [c for c in (hard, atr_stop, ma_guard) if not math.isnan(c)]
+        stop = min(candidates) if candidates else hard
 
-    log(
-        f"Market regime (Ch8): {regime_label} | long_ok={long_ok} short_ok={short_ok}",
-        level="info",
-    )
+        t1 = entry * (1.0 + LONG_TARGET1_PCT)
+        t2 = entry * (1.0 + LONG_TARGET2_PCT)
+        return entry, stop, t1, t2
 
-    # --- Data ---
-    intraday, daily = _download_data(tickers, year)
-    intraday_year = _slice_year_intraday(intraday, year)
-    if intraday_year.empty:
-        log(f"No intraday bars found for {year}.", level="err")
-        return
+    from weinstein_short_core import _short_entry_stop_targets  # reuse exact function
 
-    bar_times = intraday_year.index.unique()
-    total_bars = len(bar_times)
-    log(f"Intraday bars in {year}: {total_bars}", level="info")
+    # ---- main intraday loop ----
+    for ts in all_times:
+        ts_date = pd.Timestamp(ts).normalize()
 
-    # --- Prepare per-ticker close series for quick lookup ---
-    close_series = {t: _get_close_series(intraday_year, t) for t in tickers}
+        # 1) price marking + exits on stops
+        total_mtm = 0.0
+        for t, pos in list(positions.items()):
+            # find current price for this ticker at this timestamp
+            try:
+                px = float(intraday_feats[t].loc[ts, "Close"])
+            except Exception:
+                # no bar for this ticker at this time; skip marking
+                px = pos.entry_price
 
-    # --- State ---
-    trigger_state = {
-        t: {
-            "state": "IDLE",
-            "near_hits": [],
-            "cooldown": 0,
-            "sell_state": "IDLE",
-            "sell_hits": [],
-            "sell_cooldown": 0,
-        }
-        for t in focus["ticker"].tolist()
-    }
+            if pos.side == "LONG":
+                mtm = (px - pos.entry_price) * pos.shares
+                hit_stop = px <= pos.stop
+            else:  # SHORT
+                mtm = (pos.entry_price - px) * pos.shares
+                hit_stop = px >= pos.stop
 
-    positions = {}  # ticker -> dict(side, entry, shares)
-    cash = float(initial_equity)
-    equity = float(initial_equity)
-    trades = []
+            total_mtm += mtm
 
-    # Map weekly info for quick lookup
-    w = weekly_df.rename(columns=str.lower)
-    for col in ["ticker", "stage", "ma30", "rs_above_ma", "rank"]:
-        if col not in w.columns:
-            w[col] = np.nan
-
-    weekly_by_ticker = {
-        str(r["ticker"]): {
-            "stage": r["stage"],
-            "ma30": r.get("ma30", np.nan),
-            "rs_above_ma": bool(r.get("rs_above_ma", False)),
-            "weekly_rank": r.get("rank", np.nan),
-        }
-        for _, r in w.iterrows()
-    }
-
-    def mark_to_market(ts):
-        nonlocal equity
-        eq = cash
-        for t, pos in positions.items():
-            s = close_series.get(t)
-            if s is None or s.empty:
-                continue
-            px = _get_close_on_bar(s, ts)
-            if math.isnan(px):
-                continue
-            if pos["side"] == "long":
-                eq += px * pos["shares"]
-            else:
-                # Short P/L = (entry - current) * shares
-                eq += (pos["entry"] - px) * pos["shares"]
-        equity = eq
-
-    # --- Main bar loop ---
-    last_progress_pct = -1
-
-    for idx, ts in enumerate(bar_times, start=1):
-        # Progress every ~10%
-        pct = int(idx * 100.0 / total_bars)
-        if pct // 10 != last_progress_pct // 10:
-            last_progress_pct = pct
-            mark_to_market(ts)
-            log(
-                f"Progress {year}: {idx}/{total_bars} bars ({pct:4.1f}%) — "
-                f"equity ${equity:,.2f}, open positions {len(positions)}, trades {len(trades)}",
-                level="info",
-            )
-
-        # Per-ticker logic
-        for t in focus["ticker"].tolist():
-            s_close = close_series.get(t)
-            if s_close is None or s_close.empty:
-                continue
-
-            px = _get_close_on_bar(s_close, ts)
-            if math.isnan(px):
-                continue
-
-            wi = weekly_by_ticker.get(t, {})
-            stage = wi.get("stage", "")
-            ma30 = _safe_float(wi.get("ma30", np.nan))
-            rs_ok = bool(wi.get("rs_above_ma", False))
-            weekly_rank = wi.get("weekly_rank", np.nan)
-
-            if not _stage_ok(stage):
-                continue
-
-            ma_ok = not math.isnan(ma30)
-            if not ma_ok or not rs_ok:
-                # In live logic we also require RS + MA
-                continue
-
-            # Daily slice up to this bar's date
-            daily_to = _daily_slice_to(ts, daily)
-            if daily_to.empty:
-                continue
-
-            pivot = last_weekly_pivot_high(t, daily_to)
-            atr = compute_atr(daily_to, t, n=14)
-
-            pivot_ok = not math.isnan(pivot)
-
-            st = trigger_state.get(t)
-            if st is None:
-                st = {
-                    "state": "IDLE",
-                    "near_hits": [],
-                    "cooldown": 0,
-                    "sell_state": "IDLE",
-                    "sell_hits": [],
-                    "sell_cooldown": 0,
-                }
-                trigger_state[t] = st
-
-            # If market not favorable for longs, reset buy state (like live script)
-            if not long_ok:
-                st["state"] = "IDLE"
-                st["near_hits"] = []
-                st["cooldown"] = 0
-
-            closes_up_to_ts = s_close.loc[:ts]
-            # Need at least CONFIRM_BARS for proper confirm
-            if len(closes_up_to_ts) < max(CONFIRM_BARS, 2):
-                closes_tail = closes_up_to_ts.tail(len(closes_up_to_ts))
-            else:
-                closes_tail = closes_up_to_ts.tail(CONFIRM_BARS)
-
-            # --- BUY confirmation ---
-            buy_price_ok = False
-            buy_confirm = False
-
-            if long_ok and pivot_ok and ma_ok and len(closes_tail) >= 1:
-                def _price_ok(c):
-                    return (
-                        c >= pivot * (1.0 + MIN_BREAKOUT_PCT)
-                        and c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
-                    )
-
-                if len(closes_tail) >= CONFIRM_BARS:
-                    buy_price_ok = all(_price_ok(c) for c in closes_tail)
-                else:
-                    buy_price_ok = _price_ok(closes_tail.iloc[-1])
-
-                buy_confirm = buy_price_ok
-
-            # --- BUY "near" logic (similar to live script, using current px only) ---
-            near_now = False
-            if long_ok and pivot_ok and ma_ok:
-                above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
-                if above_ma:
-                    if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (
-                        px < pivot * (1.0 + MIN_BREAKOUT_PCT)
-                    ):
-                        near_now = True
-                    elif (px >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and not buy_confirm:
-                        near_now = True
-
-            # --- SELL "near" + confirm (mirror of live) ---
-            sell_near_now = False
-            sell_price_ok = False
-            sell_confirm = False
-
-            if ma_ok:
-                sell_near_now = _near_sell_zone(px, ma30)
-
-                closes_tail2 = closes_up_to_ts.tail(max(CONFIRM_BARS, 2))
-                if len(closes_tail2) >= 1:
-                    sell_price_ok = all(
-                        (c <= ma30 * (1.0 - SELL_BREAK_PCT))
-                        for c in closes_tail2.tail(CONFIRM_BARS)
-                    )
-                    sell_confirm = sell_price_ok
-
-            # --- Promote state: BUY side ---
-            st["near_hits"], near_count = _update_hits(
-                st.get("near_hits", []),
-                near_now,
-                NEAR_HITS_WINDOW,
-            )
-            if st.get("cooldown", 0) > 0:
-                st["cooldown"] = int(st["cooldown"]) - 1
-
-            state_now = st.get("state", "IDLE")
-            if state_now == "IDLE" and near_now:
-                state_now = "NEAR"
-            elif state_now in ("IDLE", "NEAR") and near_count >= NEAR_HITS_MIN:
-                state_now = "ARMED"
-            elif state_now == "ARMED" and buy_confirm:
-                state_now = "TRIGGERED"
-                st["cooldown"] = COOLDOWN_SCANS
-            elif st["cooldown"] > 0 and not near_now:
-                state_now = "COOLDOWN"
-            elif st["cooldown"] == 0 and not near_now and not buy_confirm:
-                state_now = "IDLE"
-            st["state"] = state_now
-
-            # --- Promote state: SELL side ---
-            st["sell_hits"], sell_hit_count = _update_hits(
-                st.get("sell_hits", []),
-                sell_near_now,
-                SELL_NEAR_HITS_WINDOW,
-            )
-            if st.get("sell_cooldown", 0) > 0:
-                st["sell_cooldown"] = int(st["sell_cooldown"]) - 1
-
-            sell_state = st.get("sell_state", "IDLE")
-            if sell_state == "IDLE" and sell_near_now:
-                sell_state = "NEAR"
-            elif sell_state in ("IDLE", "NEAR") and sell_hit_count >= SELL_NEAR_HITS_MIN:
-                sell_state = "ARMED"
-            elif sell_state == "ARMED" and sell_confirm:
-                sell_state = "TRIGGERED"
-                st["sell_cooldown"] = SELL_COOLDOWN_SCANS
-            elif st["sell_cooldown"] > 0 and not sell_near_now:
-                sell_state = "COOLDOWN"
-            elif st["sell_cooldown"] == 0 and not sell_near_now and not sell_confirm:
-                sell_state = "IDLE"
-            st["sell_state"] = sell_state
-
-            trigger_state[t] = st
-
-            # --- Trading logic (long / short) ---
-            pos = positions.get(t)
-            current_side = pos["side"] if pos else None
-
-            # Exits first, then entries (avoid flip-flop on same bar)
-            # LONG exit: SELL trigger
-            if pos and current_side == "long" and sell_state == "TRIGGERED":
-                # close long
-                cash += px * pos["shares"]
+            if hit_stop:
+                # close position at px
+                pnl = mtm
+                cash += pos.entry_price * pos.shares + pnl
                 trades.append(
-                    {
-                        "timestamp": ts,
-                        "ticker": t,
-                        "side": "LONG",
-                        "action": "CLOSE",
-                        "price": px,
-                        "shares": pos["shares"],
-                    }
+                    TradeFill(
+                        timestamp=ts,
+                        ticker=t,
+                        side=pos.side,
+                        action="CLOSE",
+                        price=px,
+                        shares=pos.shares,
+                        pnl=pnl,
+                        equity_after=cash + total_mtm - pnl,  # this bar pre-close eq
+                        reason="STOP",
+                    )
                 )
                 del positions[t]
 
-            # SHORT exit: BUY trigger
-            elif pos and current_side == "short" and state_now == "TRIGGERED":
-                # buy to cover
-                cash -= px * pos["shares"]
-                trades.append(
-                    {
-                        "timestamp": ts,
-                        "ticker": t,
-                        "side": "SHORT",
-                        "action": "CLOSE",
-                        "price": px,
-                        "shares": pos["shares"],
-                    }
+        equity = cash + total_mtm
+        equity_curve.append({"timestamp": ts, "equity": equity})
+
+        # 2) signal evaluation & entries
+        # NOTE: We only open new positions after updating equity for this bar.
+
+        # current risk-per-trade in dollars
+        risk_dollars = cash * risk_per_trade_pct if cash > 0 else 0.0
+
+        # count open positions per side
+        open_longs = sum(1 for p in positions.values() if p.side == "LONG")
+        open_shorts = sum(1 for p in positions.values() if p.side == "SHORT")
+
+        # skip new entries if we don't have cash or risk budget
+        if risk_dollars <= 0:
+            continue
+
+        for t in tickers:
+            # skip if no intraday bar
+            if t not in intraday_feats:
+                continue
+            if ts not in intraday_feats[t].index:
+                continue
+
+            px = float(intraday_feats[t].loc[ts, "Close"])
+            vol_bar = float(intraday_feats[t].loc[ts, "Volume"])
+            pace_intra = float(intraday_feats[t].loc[ts, "pace_intra"])
+
+            # map to daily features as of this date
+            if t not in daily_feats:
+                continue
+            dfeats = daily_feats[t]
+            if ts_date not in dfeats.index:
+                # before symbol started trading or before enough history
+                continue
+
+            row = dfeats.loc[ts_date]
+            ma30 = float(row["MA150"]) if not math.isnan(row["MA150"]) else math.nan
+            pivot_low = float(row["PivotLow"]) if not math.isnan(row["PivotLow"]) else math.nan
+            pivot_high = float(row["PivotHigh"]) if not math.isnan(row["PivotHigh"]) else math.nan
+            atr = float(row["ATR14"]) if not math.isnan(row["ATR14"]) else math.nan
+            vol50 = float(row["Vol50"]) if not math.isnan(row["Vol50"]) else math.nan
+
+            # full-day volume vs 50dma (simplified)
+            vol_today = float(row["Volume"])
+            pace_full = (vol_today / vol50) if vol50 > 0 else math.nan
+
+            # recent intraday closes (for non-60m cores; here 60m but we keep consistent)
+            # we use last 2 closes up to this timestamp
+            closes_tail = (
+                intraday_feats[t].loc[:ts, "Close"].tail(2).tolist()
+                if ts in intraday_feats[t].index
+                else []
+            )
+
+            # LONG SIDE ------------------------------------------------------
+            if use_long and is_long_candidate.get(t, False):
+                ls = long_states.get(t, None)
+                ls, flags_long = eval_long_bar(
+                    price=px,
+                    ma30=ma30,
+                    pivot_high=pivot_high,
+                    pace_full=pace_full,
+                    pace_intra=pace_intra,
+                    elapsed_min=60,       # backtest bar is full 60 min
+                    closes_tail=closes_tail,
+                    state=ls,
+                    intraday_interval=INTRADAY_INTERVAL,
+                    test_ease=False,
                 )
-                del positions[t]
+                long_states[t] = ls
 
-            # Re-evaluate after exits
-            pos = positions.get(t)
-            current_side = pos["side"] if pos else None
+                long_trigger = flags_long.get("long_trigger_now", False)
 
-            # LONG entry
-            if (
-                state_now == "TRIGGERED"
-                and long_ok
-                and (side in ("long", "both"))
-                and current_side is None
-            ):
-                # basic sizing
-                mark_to_market(ts)
-                shares = _entry_size(equity, px)
-                if shares > 0 and px * shares <= cash:
-                    positions[t] = {
-                        "side": "long",
-                        "entry": px,
-                        "shares": shares,
-                    }
-                    cash -= px * shares
-                    trades.append(
-                        {
-                            "timestamp": ts,
-                            "ticker": t,
-                            "side": "LONG",
-                            "action": "OPEN",
-                            "price": px,
-                            "shares": shares,
-                        }
-                    )
-                    # Cooldown after triggering
-                    st["state"] = "COOLDOWN"
-                    trigger_state[t] = st
+                if long_trigger and t not in positions and open_longs < max_long_positions:
+                    # compute entry/stop/targets from long core-mirroring helper
+                    entry, stop, t1, t2 = _long_entry_stop_targets(px, ma30, pivot_high, atr)
+                    if math.isnan(stop) or stop >= entry:
+                        # invalid stop => skip
+                        pass
+                    else:
+                        per_share_risk = entry - stop
+                        if per_share_risk > 0:
+                            shares = math.floor(risk_dollars / per_share_risk)
+                        else:
+                            shares = 0
+                        if shares > 0:
+                            # commit capital
+                            cost = entry * shares
+                            if cost <= cash:
+                                cash -= cost
+                                pos = Position(
+                                    ticker=t,
+                                    side="LONG",
+                                    entry_ts=ts,
+                                    entry_price=entry,
+                                    shares=shares,
+                                    stop=stop,
+                                    target1=t1,
+                                    target2=t2,
+                                    max_favorable_px=entry,
+                                )
+                                positions[t] = pos
+                                open_longs += 1
+                                trades.append(
+                                    TradeFill(
+                                        timestamp=ts,
+                                        ticker=t,
+                                        side="LONG",
+                                        action="OPEN",
+                                        price=entry,
+                                        shares=shares,
+                                        pnl=0.0,
+                                        equity_after=cash + total_mtm,
+                                        reason="LONG_TRIGGER",
+                                    )
+                                )
 
-            # SHORT entry
-            elif (
-                sell_state == "TRIGGERED"
-                and short_ok
-                and (side in ("short", "both"))
-                and current_side is None
-            ):
-                # short sale: we receive proceeds
-                mark_to_market(ts)
-                shares = _entry_size(equity, px)
-                if shares > 0:
-                    positions[t] = {
-                        "side": "short",
-                        "entry": px,
-                        "shares": shares,
-                    }
-                    cash += px * shares
-                    trades.append(
-                        {
-                            "timestamp": ts,
-                            "ticker": t,
-                            "side": "SHORT",
-                            "action": "OPEN",
-                            "price": px,
-                            "shares": shares,
-                        }
-                    )
-                    st["sell_state"] = "COOLDOWN"
-                    trigger_state[t] = st
+            # SHORT SIDE -----------------------------------------------------
+            if use_short and is_short_candidate.get(t, False):
+                ss = short_states.get(t, None)
+                ss, flags_short = eval_short_bar(
+                    price=px,
+                    ma30=ma30,
+                    pivot_low=pivot_low,
+                    pace_full=pace_full,
+                    pace_intra=pace_intra,
+                    elapsed_min=60,       # full bar
+                    closes_tail=closes_tail,
+                    state=ss,
+                    intraday_interval=INTRADAY_INTERVAL,
+                    test_ease=False,
+                )
+                short_states[t] = ss
 
-        # End per-ticker loop
-        mark_to_market(ts)
+                short_trigger = flags_short.get("short_trigger_now", False)
 
-    # --- Done: final stats + CSV ---
-    mark_to_market(bar_times[-1])
+                if short_trigger and t not in positions and open_shorts < max_short_positions:
+                    entry, stop, t1, t2 = _short_entry_stop_targets(px, ma30, pivot_low, atr)
+                    if math.isnan(stop) or stop <= entry:
+                        # invalid stop => skip
+                        pass
+                    else:
+                        per_share_risk = stop - entry
+                        if per_share_risk > 0:
+                            shares = math.floor(risk_dollars / per_share_risk)
+                        else:
+                            shares = 0
+                        if shares > 0:
+                            # for shorts, we assume same capital usage (margin abstracted)
+                            cost = entry * shares
+                            if cost <= cash:
+                                cash -= cost
+                                pos = Position(
+                                    ticker=t,
+                                    side="SHORT",
+                                    entry_ts=ts,
+                                    entry_price=entry,
+                                    shares=shares,
+                                    stop=stop,
+                                    target1=t1,
+                                    target2=t2,
+                                    max_favorable_px=entry,
+                                )
+                                positions[t] = pos
+                                open_shorts += 1
+                                trades.append(
+                                    TradeFill(
+                                        timestamp=ts,
+                                        ticker=t,
+                                        side="SHORT",
+                                        action="OPEN",
+                                        price=entry,
+                                        shares=shares,
+                                        pnl=0.0,
+                                        equity_after=cash + total_mtm,
+                                        reason="SHORT_TRIGGER",
+                                    )
+                                )
 
-    pl = equity - initial_equity
-    pl_pct = (pl / initial_equity * 100.0) if initial_equity else 0.0
+    # ---- finalize outputs ----
+    eq_df = pd.DataFrame(equity_curve)
+    trades_df = pd.DataFrame([
+        {
+            "timestamp": _fmt_ts(t.timestamp),
+            "ticker": t.ticker,
+            "side": t.side,
+            "action": t.action,
+            "price": t.price,
+            "shares": t.shares,
+            "pnl": t.pnl,
+            "equity_after": t.equity_after,
+            "reason": t.reason,
+        }
+        for t in trades
+    ])
 
-    log(
-        f"Backtest complete for {year}.",
-        level="ok",
-    )
-    log(
-        f"Final equity: ${equity:,.2f} (P/L ${pl:,.2f}, {pl_pct:.2f}%) — "
-        f"Trades={len(trades)}",
-        level="info",
-    )
+    os.makedirs("./output", exist_ok=True)
+    eq_path = "./output/live_logic_equity_curve.csv"
+    trades_path = "./output/live_logic_trades.csv"
+    png_path = "./output/live_logic_equity_curve.png"
 
-    if not out_csv:
-        out_csv = os.path.join("./output", f"live_logic_bt_{year}.csv")
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    eq_df.to_csv(eq_path, index=False)
+    trades_df.to_csv(trades_path, index=False)
+    _plot_equity_curve(eq_df, png_path)
 
-    df_trades = pd.DataFrame(trades)
-    if not df_trades.empty:
-        df_trades.sort_values("timestamp", inplace=True)
-    df_trades.to_csv(out_csv, index=False)
-    log(f"Wrote trade log → {out_csv}", level="ok")
+    print(f"\n✅ Backtest complete.")
+    if not eq_df.empty:
+        start_eq = float(eq_df["equity"].iloc[0])
+        end_eq = float(eq_df["equity"].iloc[-1])
+        ret_pct = (end_eq / start_eq - 1.0) * 100.0
+        print(f"   Start equity: ${start_eq:,.2f}")
+        print(f"   End equity:   ${end_eq:,.2f}")
+        print(f"   Total return: {ret_pct:.2f}%")
+    print(f"   Equity curve CSV:  {eq_path}")
+    print(f"   Trades CSV:        {trades_path}")
+    print(f"   Equity curve PNG:  {png_path}")
 
+
+# ========= CLI =========
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--year",
-        type=int,
-        required=True,
-        help="Year to backtest (e.g. 2025)",
+    ap = argparse.ArgumentParser(
+        description="Backtest Weinstein intraday live logic (long + short)."
     )
+    ap.add_argument("--start", type=str, required=True, help="Start date (YYYY-MM-DD)")
+    ap.add_argument("--end", type=str, required=True, help="End date (YYYY-MM-DD)")
+    ap.add_argument("--capital", type=float, default=100000.0, help="Initial capital")
     ap.add_argument(
-        "--config",
-        default="./config.yaml",
-        help="Path to config.yaml (same as intraday watcher)",
-    )
-    ap.add_argument(
-        "--side",
-        choices=["long", "short", "both"],
-        default="both",
-        help="Which side(s) to trade: long, short, or both (default).",
-    )
-    ap.add_argument(
-        "--initial-equity",
+        "--risk-per-trade",
         type=float,
-        default=INITIAL_EQUITY_DEFAULT,
-        help=f"Starting equity for backtest (default {INITIAL_EQUITY_DEFAULT}).",
+        default=0.01,
+        help="Fraction of current cash risked per trade (e.g. 0.01 = 1%%)",
     )
     ap.add_argument(
-        "--out-csv",
-        default="",
-        help="Output CSV path for trades (default ./output/live_logic_bt_<year>.csv).",
+        "--max-long",
+        type=int,
+        default=10,
+        help="Max simultaneous long positions",
     )
     ap.add_argument(
-        "--no-regime-filter",
-        action="store_true",
-        help="Ignore market regime filter (force long_ok=True, short_ok=True).",
+        "--max-short",
+        type=int,
+        default=10,
+        help="Max simultaneous short positions",
     )
+    ap.add_argument(
+        "--mode",
+        type=str,
+        default="both",
+        choices=["long", "short", "both"],
+        help="Run long-only, short-only, or both.",
+    )
+    ap.add_argument(
+        "--max-long-universe",
+        type=int,
+        default=40,
+        help="Max Stage 2 names from weekly scan.",
+    )
+    ap.add_argument(
+        "--max-short-universe",
+        type=int,
+        default=40,
+        help="Max Stage 4 names from weekly scan.",
+    )
+    ap.add_argument(
+        "--benchmark",
+        type=str,
+        default=BENCHMARK_DEFAULT,
+        help="Benchmark ticker (included for RS, not traded).",
+    )
+
     args = ap.parse_args()
 
-    out_csv = args.out_csv or None
-
-    backtest_year(
-        year=args.year,
-        config_path=args.config,
-        side=args.side,
-        initial_equity=args.initial_equity,
-        out_csv=out_csv,
-        no_regime_filter=args.no_regime_filter,
+    run_backtest(
+        start_date=args.start,
+        end_date=args.end,
+        capital=args.capital,
+        risk_per_trade_pct=args.risk_per_trade,
+        max_long_positions=args.max_long,
+        max_short_positions=args.max_short,
+        mode=args.mode,
+        max_long_universe=args.max_long_universe,
+        max_short_universe=args.max_short_universe,
+        benchmark=args.benchmark,
     )
 
 
