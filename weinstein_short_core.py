@@ -2,21 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 Shared short-side core logic for:
-- Weinstein Short Intraday Watcher
-- Live logic backtests
+- Weinstein Short Intraday Watcher (email + charts)
+- Live logic backtests (weinstein_live_logic_backtest.py)
 
-This holds:
-- All short-side constants
-- Price/zone helpers (near / break / ready-to-close)
-- Entry/stop/targets helper
-- A stateful `eval_short_bar` that mimics the watcher state machine
+This module owns:
+- Short-side constants (price/volume thresholds, risk/targets)
+- Core primitives:
+    _short_price_break
+    _short_near_zone
+    _short_ready_to_close
+    _short_entry_stop_targets
+- A stateful eval_short_bar() helper for the backtest, so the sim
+  uses the *same* short trigger rules as the production watcher.
 """
 
 import numpy as np
 import pandas as pd
 
 # ---------------- Shared short-side constants ----------------
-INTRADAY_INTERVAL        = "60m"   # override from caller if needed
+
+# Intraday config
+INTRADAY_INTERVAL        = "60m"   # Default; caller may override via arg
 PIVOT_LOOKBACK_WEEKS     = 10
 
 # Short trigger thresholds (price/volume)
@@ -28,11 +34,11 @@ INTRADAY_AVG_VOL_WINDOW  = 20
 INTRADAY_LASTBAR_MULT    = 1.20    # only for non-60m modes
 
 # 60m intrabar confirmations
-INTRABAR_CONFIRM_MIN_ELAPSED  = 40
-INTRABAR_VOLPACE_MIN          = 1.20
+INTRABAR_CONFIRM_MIN_ELAPSED  = 40    # minutes into bar
+INTRABAR_VOLPACE_MIN          = 1.20  # intrabar pace vs avg for confirm
 
 # READY-TO-CLOSE threshold
-READY_ABOVE_MA_PCT       = 0.005  # 0.5% above MA150 => consider short "ready to close"
+READY_ABOVE_MA_PCT       = 0.005  # 0.5% above MA150 => consider short ready to close
 
 # Stateful short triggers
 SHORT_NEAR_HITS_WINDOW   = 6
@@ -47,7 +53,8 @@ SHORT_TARGET1_PCT        = 0.15   # 15% downside
 SHORT_TARGET2_PCT        = 0.20   # 20% downside
 
 
-# ---------------- Price/zone primitives (copied from watcher) ----------------
+# ---------------- Price/zone primitives (shared with watcher + sim) ----------------
+
 def _short_price_break(px, ma, pivot_low):
     """True if price has broken below short zone (~pivot low/MA150)."""
     conds = []
@@ -59,23 +66,27 @@ def _short_price_break(px, ma, pivot_low):
 
 
 def _short_near_zone(px, ma, pivot_low):
-    """Near-breakdown zone: under MA150 but not yet breaking pivot/MA too hard."""
+    """
+    Near-breakdown zone: under MA150 but not yet breaking pivot/MA too hard.
+
+    Requirements:
+    - price below MA150 (downtrend active)
+    - price above pivot_low but within +NEAR_ABOVE_PIVOT_PCT
+      OR hugging MA150 slightly below full SHORT_BREAK_PCT.
+    """
     if pd.isna(px) or (pd.isna(ma) and pd.isna(pivot_low)):
         return False
 
-    # must be below MA150 (downtrend active)
     below_ma = (pd.notna(ma) and px < ma)
     if not below_ma:
         return False
 
-    # treat "near" as above pivot low but not crazy far
     if pd.notna(pivot_low):
-        if px <= pivot_low:  # already at/below pivot; let full trigger handle
+        if px <= pivot_low:
             return False
         if px <= pivot_low * (1.0 + NEAR_ABOVE_PIVOT_PCT):
             return True
 
-    # fallback: a mild cushion below MA150 but not full 0.4% break
     if pd.notna(ma):
         if (px <= ma) and (px >= ma * (1.0 - SHORT_BREAK_PCT)):
             return True
@@ -84,14 +95,27 @@ def _short_near_zone(px, ma, pivot_low):
 
 
 def _short_ready_to_close(px, ma):
-    """Price has reclaimed MA150 by READY_ABOVE_MA_PCT (e.g. 0.5+% above)."""
+    """
+    READY-TO-CLOSE short:
+      - price has reclaimed MA150 by READY_ABOVE_MA_PCT (e.g. 0.5+% above MA150),
+        suggesting downtrend thesis is weakening.
+    """
     if pd.isna(px) or pd.isna(ma):
         return False
     return px >= ma * (1.0 + READY_ABOVE_MA_PCT)
 
 
 def _short_entry_stop_targets(px, ma30, pivot_low, atr):
-    """Compute short entry≈px, protective stop, and two downside targets."""
+    """
+    For shorts:
+      entry ≈ px (current price)
+      stop  = max(
+                 entry * (1 + SHORT_HARD_STOP_PCT),
+                 entry + SHORT_TRAIL_ATR_MULT * ATR,
+                 ma30 * (1 + SHORT_MA_GUARD_PCT)
+              )
+      targets = [ -15%, -20% from entry ]
+    """
     if pd.isna(px):
         return np.nan, np.nan, np.nan, np.nan
 
@@ -110,6 +134,7 @@ def _short_entry_stop_targets(px, ma30, pivot_low, atr):
 
 
 # ---------------- Stateful evaluation helper for backtests ----------------
+
 def eval_short_bar(
     price,
     ma30,
@@ -123,7 +148,9 @@ def eval_short_bar(
     intraday_interval=INTRADAY_INTERVAL,
     test_ease=False,
 ):
-    """Evaluate *one bar* of short-side logic using the same rules as the intraday watcher.
+    """
+    Evaluate *one bar* of short-side logic using the same rules
+    as the intraday watcher.
 
     Parameters
     ----------
@@ -159,7 +186,6 @@ def eval_short_bar(
           "short_confirm": bool,
         }
     """
-
     if state is None:
         state = {"short_state": "IDLE", "short_hits": [], "short_cooldown": 0}
 
@@ -172,7 +198,7 @@ def eval_short_bar(
     short_confirm = False
     ready_close_now = False
 
-    # Ease thresholds for synthetic tests
+    # Easier thresholds in test mode
     if test_ease:
         short_near_hits_min = 1
         intrabar_confirm_min = 0
@@ -210,7 +236,7 @@ def eval_short_bar(
     pace_full_gate = pd.isna(pace_full) or pace_full >= VOL_PACE_MIN
     near_pace_gate = pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN
 
-    # ----- stateful promotion (same state machine as watcher) -----
+    # ----- stateful promotion (same logic as watcher) -----
     hits = list(state.get("short_hits", []))
     hits.append(1 if short_near_now else 0)
     if len(hits) > SHORT_NEAR_HITS_WINDOW:
