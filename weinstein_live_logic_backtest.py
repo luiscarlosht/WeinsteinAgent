@@ -82,7 +82,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -131,7 +131,12 @@ class ClosedTrade:
 # ─────────────────────────────────────
 
 def parse_date(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%d")
+    """
+    Parse YYYY-MM-DD into a UTC-aware datetime, so it can be safely
+    compared with tz-aware ts_dt coming from pandas.
+    """
+    dt = datetime.strptime(s, "%Y-%m-%d")
+    return dt.replace(tzinfo=timezone.utc)
 
 
 def load_signals(csv_path: str) -> pd.DataFrame:
@@ -145,7 +150,8 @@ def load_signals(csv_path: str) -> pd.DataFrame:
     tkr_col = cols.get("ticker") or "ticker"
     side_col = cols.get("side") or "side"
 
-    df["ts_dt"] = pd.to_datetime(df[ts_col], errors="coerce")
+    # ts values are ISO8601 with Z → tz-aware if possible
+    df["ts_dt"] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
     df["ticker"] = df[tkr_col].astype(str).str.upper().str.strip()
     df["side"] = df[side_col].astype(str).str.upper().str.strip()
 
@@ -230,7 +236,10 @@ def next_trading_day_open(
     op = float(row["open"]) if "open" in row.index else np.nan
     if np.isnan(op) or op <= 0:
         return None
-    return datetime.combine(d0, datetime.min.time()), op
+
+    # Return UTC-aware datetime so comparisons vs start/end work
+    dt_out = datetime.combine(d0, datetime.min.time()).replace(tzinfo=timezone.utc)
+    return dt_out, op
 
 
 # ─────────────────────────────────────
@@ -254,7 +263,7 @@ def run_backtest_long_only(
       - Size = equity * risk_per_trade / entry_price.
       - If allow_new_longs is False (e.g. BEAR regime), no new longs are opened.
     """
-    # Filter to window
+    # Filter to window (signals ts_dt is tz-aware UTC, start/end are tz-aware UTC)
     sig = signals[(signals["ts_dt"] >= start) & (signals["ts_dt"] <= end)].copy()
     if sig.empty:
         if not quiet:
@@ -390,13 +399,13 @@ def main():
     if args.mode in ("short", "both"):
         print("⚠️ NOTE: current implementation simulates LONG side only; shorts are ignored for now.")
 
-    # Determine date range
+    # Determine date range (UTC-aware)
     if args.start and args.end:
         start = parse_date(args.start)
         end = parse_date(args.end)
     elif args.year:
-        start = datetime(args.year, 1, 1)
-        end = datetime(args.year, 12, 31)
+        start = datetime(args.year, 1, 1, tzinfo=timezone.utc)
+        end = datetime(args.year, 12, 31, tzinfo=timezone.utc)
     else:
         raise SystemExit("You must provide either --start/--end or --year.")
 
