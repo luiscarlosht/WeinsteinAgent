@@ -45,6 +45,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Shared Weinstein indicators (ADX single source of truth)
+from weinstein_indicators import compute_adx_series, ADX_WINDOW, ADX_MIN
+
 # ---------------- Logging helpers ----------------
 
 VERBOSE = True
@@ -412,10 +415,26 @@ def backtest(
     portfolio = Portfolio(cash=capital, positions={}, equity=capital)
     equity_curve = []
 
-    # Precompute MA30 & ATR for each ticker for speed
+    # Precompute MA30, ATR, and ADX for each ticker for speed
     ma_cache: Dict[str, pd.Series] = {}
+    adx_cache: Dict[str, pd.Series] = {}
     for t in long_tickers | short_tickers:
+        # MA30
         ma_cache[t] = get_ma_series(daily_df, t, window=30)
+        # ADX series via shared helper (single source of truth)
+        if isinstance(daily_df.columns, pd.MultiIndex):
+            try:
+                sub = daily_df.xs(t, axis=1, level=1)
+            except KeyError:
+                adx_cache[t] = pd.Series(dtype="float64")
+                continue
+        else:
+            sub = daily_df
+        # sub should have High/Low/Close
+        if not {"High", "Low", "Close"}.issubset(sub.columns):
+            adx_cache[t] = pd.Series(dtype="float64")
+        else:
+            adx_cache[t] = compute_adx_series(sub[["High", "Low", "Close"]], n=ADX_WINDOW)
 
     atr_cache: Dict[str, float] = {}
     for t in long_tickers | short_tickers:
@@ -517,6 +536,26 @@ def backtest(
                 pivot_high = get_pivot_high(daily_df, t, dt)
                 rs_above_ma = bool(row.get("rs_above_ma", False))
                 vol_mult = volume_vs_50dma(daily_df, t, dt)
+
+                # ADX filter (mirrors intraday: NaN → no block, real < ADX_MIN → block)
+                adx_series = adx_cache.get(t)
+                if adx_series is not None and not adx_series.empty and dt in adx_series.index:
+                    adx_val = float(adx_series.loc[dt])
+                else:
+                    adx_val = np.nan
+
+                if np.isnan(adx_val):
+                    adx_ok = True
+                else:
+                    adx_ok = (adx_val >= ADX_MIN)
+
+                if not adx_ok:
+                    # Diagnostic similar to intraday watcher
+                    log(
+                        f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx_val:.1f} < {ADX_MIN:.1f} on {dt.date()}",
+                        level="debug",
+                    )
+                    continue
 
                 if not should_enter_long(price, ma_val, pivot_high, rs_above_ma, vol_mult):
                     continue
