@@ -2,41 +2,47 @@
 # -*- coding: utf-8 -*-
 
 """
-Weinstein Live-Logic Backtest (simplified, long-only + market regime gate)
--------------------------------------------------------------------------
+Weinstein Live-Logic Backtest
+-----------------------------
 
 Goal
 ----
 Replay historical BUY/SELL signals from ./output/signals_log.csv and produce a
-daily PnL time series that you can compare vs. your real trades using:
+daily PnL time series that you can compare vs. your real trades using, e.g.:
 
   python3 weinstein_real_vs_sim_monthly.py \
+    --sim-monthly ./output/live_logic_bt_monthly_YYYYMMDD_HHMMSS.csv \
     --real-trades ./data/weinstein_real_trades_2025YTD.csv \
+    --initial-capital 10000 \
     --real-date-col Date \
     --real-pnl-col Realized_PnL \
-    --sim-trades ./data/weinstein_sim_trades_2025YTD.csv \
-    --sim-date-col Date \
-    --sim-pnl-col Simulated_PnL
+    --output ./output/real_vs_sim_monthly_2025YTD.csv
 
 What this implementation does
 -----------------------------
-* Reads ./output/signals_log.csv (from export_signals_from_sheets.py or signal_engine.py)
-  Expected columns:
+* Reads ./output/signals_log.csv (exported from Google Sheets by
+  export_signals_from_sheets.py). Expected columns (case-insensitive):
+
     ts, ticker, side, price, reason, near_hits, state_before, state_after
+
+* Normalizes timestamps to **timezone-naive** UTC so we can safely compare
+  against naive datetime objects from --start / --end.
 
 * Filters signals to a given date range [--start, --end].
 
 * Uses yfinance to fetch daily OHLC for all tickers in the range.
 
 * Calls market_regime.inspect() ONCE at the start of the run:
+
     from market_regime import inspect as inspect_market_regime
     label, long_ok, short_ok = inspect_market_regime()
 
-  For now we apply this as a **global gate** for the whole run:
+  and applies this as a **global gate** for the whole run:
     - If long_ok is False (i.e., BEAR regime) we do NOT open any new longs.
     - If long_ok is True (BULL / NEUTRAL / UNKNOWN), long entries are allowed.
-  This is mainly a convenience to reuse the same Chapter 8 logic; it is NOT a
-  historically-accurate regime backtest (we don't recompute regime per day).
+
+  This is a convenience reuse of your Chapter 8 logic; it is NOT a full
+  historical regime reconstruction.
 
 * Sim logic (LONG side only, for now):
     - When we see a BUY signal for T:
@@ -45,21 +51,17 @@ What this implementation does
               at that day's OPEN price.
             - Position size:
                 qty = (current_equity * risk_per_trade) / entry_price
-              (i.e., risk_per_trade fraction of equity is allocated)
 
     - When we see a SELL signal for T:
         * If we have an open long in T:
             - Exit on the **next trading day** after the SELL signal date,
               at that day's OPEN price.
-            - Realize PnL and free slot for a new position.
+            - Realize PnL and free the slot.
 
-* After processing all signals, any open positions are **force-closed** at
-  the end of the backtest window:
-    - Exit date: last trading day <= --end with available data.
-    - Exit price: that day's CLOSE price.
-    - This ensures the simulation produces realized PnL for all positions
-      opened during the window (useful when your Signals tab has BUYs but
-      no SELLs wired yet).
+* At the **end of the backtest window**, any still-open positions are
+  **force-closed** at the last available daily price (prefers CLOSE, falls
+  back to OPEN) on or before --end. This ensures you get realized PnL
+  instead of "0 closed trades".
 
 * We aggregate PnL by exit date and write:
 
@@ -72,17 +74,14 @@ Limitations / Notes
 * SHORT logic is not implemented yet. --mode and --max-short are accepted
   but only the LONG side is actually simulated.
 * Market regime in this script is a **single snapshot at run time**:
-  it does NOT reconstruct historical regimes; it's just a coarse gate:
-    - If current regime is BEAR, no longs will be opened.
-    - If current regime is BULL / NEUTRAL / UNKNOWN, longs are allowed.
+  it does NOT reconstruct historical regimes per day.
 * If there is no next trading day data for a signal (e.g. very recent):
   the signal is skipped.
-* If there are BUYs but never a SELL for a ticker, the position is
-  force-closed at the end of the backtest window using the last available
-  daily CLOSE before or on --end.
+* If there is no price data up to --end for a still-open position, it is
+  left out of the force-close step (conservative).
 
-You can refine this later (e.g., add stops, take-profit, shorts, and
-historical regime reconstruction).
+You can refine this later (stops, take-profit, true historical regime
+reconstruction, shorts, etc.).
 """
 
 from __future__ import annotations
@@ -96,12 +95,13 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# yfinance for daily bars
 try:
     import yfinance as yf
 except Exception:  # pragma: no cover
     yf = None
 
-# Market regime (Weinstein Chapter 8) helper
+# Weinstein Chapter 8 market regime helper
 try:
     from market_regime import inspect as inspect_market_regime
 except Exception:  # pragma: no cover
@@ -139,24 +139,37 @@ class ClosedTrade:
 # ─────────────────────────────────────
 
 def parse_date(s: str) -> datetime:
+    """Parse YYYY-MM-DD into a naive datetime."""
     return datetime.strptime(s, "%Y-%m-%d")
 
 
 def load_signals(csv_path: str) -> pd.DataFrame:
+    """
+    Load signals from CSV and normalize:
+      - ts_dt: timezone-NAIVE datetime (UTC, but tz info stripped)
+      - ticker: UPPERCASE, stripped
+      - side: BUY/SELL only
+      - drops option-style tickers starting with '-'
+    """
     if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
         raise FileNotFoundError(f"Signals CSV not found or empty: {csv_path}")
 
     df = pd.read_csv(csv_path)
-    # Normalize
+
+    # Flexible column detection
     cols = {c.lower(): c for c in df.columns}
     ts_col = cols.get("ts") or cols.get("timestamp") or list(df.columns)[0]
     tkr_col = cols.get("ticker") or "ticker"
     side_col = cols.get("side") or "side"
 
-    df["ts_dt"] = pd.to_datetime(df[ts_col], errors="coerce")
+    # Make timestamps tz-aware UTC, then drop tz to become naive
+    dt = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+    df["ts_dt"] = dt.dt.tz_convert("UTC").dt.tz_localize(None)
+
     df["ticker"] = df[tkr_col].astype(str).str.upper().str.strip()
     df["side"] = df[side_col].astype(str).str.upper().str.strip()
 
+    # Keep only valid rows
     df = df[df["ts_dt"].notna() & df["ticker"].ne("") & df["side"].isin(["BUY", "SELL"])]
 
     # Drop option-style tickers (starting with "-")
@@ -167,9 +180,11 @@ def load_signals(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def fetch_daily_bars(tickers: List[str],
-                     start: datetime,
-                     end: datetime) -> Dict[str, pd.DataFrame]:
+def fetch_daily_bars(
+    tickers: List[str],
+    start: datetime,
+    end: datetime,
+) -> Dict[str, pd.DataFrame]:
     """
     Fetch daily OHLC for each ticker (inclusive of [start, end]),
     returns dict[ticker] -> DataFrame with Date index (date-only).
@@ -206,13 +221,14 @@ def fetch_daily_bars(tickers: List[str],
                 out[t] = df_t
     else:
         # Single ticker case
-        t = tickers[0]
-        df_t = data.copy()
-        df_t.columns = [c.lower() for c in df_t.columns]
-        df_t.index = df_t.index.tz_localize(None)
-        df_t["date"] = df_t.index.date
-        df_t.set_index("date", inplace=True)
-        out[t] = df_t
+        if not data.empty:
+            t = tickers[0]
+            df_t = data.copy()
+            df_t.columns = [c.lower() for c in df_t.columns]
+            df_t.index = df_t.index.tz_localize(None)
+            df_t["date"] = df_t.index.date
+            df_t.set_index("date", inplace=True)
+            out[t] = df_t
 
     return out
 
@@ -222,7 +238,7 @@ def next_trading_day_open(
     ticker: str,
     signal_dt: datetime,
 ) -> Optional[Tuple[datetime, float]]:
-    """Return (date, open_price) of the next trading day after signal_dt."""
+    """Return (date, open_price) of the next trading day AFTER signal_dt."""
     df = bars.get(ticker)
     if df is None or df.empty:
         return None
@@ -240,34 +256,54 @@ def next_trading_day_open(
     return datetime.combine(d0, datetime.min.time()), op
 
 
-def last_trading_day_close(
+def force_close_at_end(
     bars: Dict[str, pd.DataFrame],
-    ticker: str,
-    end_dt: datetime,
-) -> Optional[Tuple[datetime, float]]:
+    open_positions: Dict[str, Position],
+    end: datetime,
+    quiet: bool = False,
+) -> Tuple[List[ClosedTrade], float]:
     """
-    Return (date, close_price) of the last trading day <= end_dt.
-    Used to force-close any open positions at the end of the backtest window.
+    Force-close any remaining open positions at the last available daily price
+    on or before `end`. Prefers CLOSE, falls back to OPEN.
+    Returns (list_of_closed_trades, extra_pnl).
     """
-    df = bars.get(ticker)
-    if df is None or df.empty:
-        return None
+    closed: List[ClosedTrade] = []
+    extra_pnl = 0.0
+    end_date = end.date()
 
-    end_date = end_dt.date()
-    # All trading days up to and including end_date
-    candidates = [d for d in df.index if d <= end_date]
-    if not candidates:
-        # If nothing <= end_date, fall back to the very last available bar
-        candidates = list(df.index)
-        if not candidates:
-            return None
+    for tkr, pos in list(open_positions.items()):
+        df = bars.get(tkr)
+        if df is None or df.empty:
+            continue
+        # any data up to end_date
+        available_dates = [d for d in df.index if d <= end_date]
+        if not available_dates:
+            continue
+        d_last = max(available_dates)
+        row = df.loc[d_last]
+        price = float(row.get("close", row.get("open", np.nan)))
+        if np.isnan(price) or price <= 0:
+            continue
+        exit_dt = datetime.combine(d_last, datetime.min.time())
+        trade = ClosedTrade(
+            ticker=tkr,
+            entry_date=pos.entry_date,
+            exit_date=exit_dt,
+            entry_price=pos.entry_price,
+            exit_price=price,
+            qty=pos.qty,
+        )
+        pnl = trade.pnl
+        extra_pnl += pnl
+        closed.append(trade)
 
-    d_last = max(candidates)
-    row = df.loc[d_last]
-    cl = float(row.get("close", np.nan))
-    if np.isnan(cl) or cl <= 0:
-        return None
-    return datetime.combine(d_last, datetime.min.time()), cl
+        if not quiet:
+            print(
+                f"[FORCE CLOSE] {tkr} {pos.qty:.4f} @ {price:.4f} on {exit_dt.date()} "
+                f"(entry {pos.entry_price:.4f} {pos.entry_date.date()}, pnl={pnl:.2f})"
+            )
+
+    return closed, extra_pnl
 
 
 # ─────────────────────────────────────
@@ -290,10 +326,9 @@ def run_backtest_long_only(
       - Entry/exit next trading day's OPEN.
       - Size = equity * risk_per_trade / entry_price.
       - If allow_new_longs is False (e.g. BEAR regime), no new longs are opened.
-      - After processing all signals, any remaining open positions are
-        force-closed at the end of the window using last available CLOSE.
+      - Any remaining open positions are force-closed at the end of the window.
     """
-    # Filter to window (signals are tz-naive here)
+    # Filter to window (ts_dt is naive; start/end are naive → safe compare)
     sig = signals[(signals["ts_dt"] >= start) & (signals["ts_dt"] <= end)].copy()
     if sig.empty:
         if not quiet:
@@ -302,8 +337,7 @@ def run_backtest_long_only(
 
     tickers = sorted(sig["ticker"].unique().tolist())
 
-    # Fetch daily bars for all tickers
-    # Expand range slightly to allow next-day lookups near edges.
+    # Fetch daily bars for all tickers (slightly expanded window)
     fetch_start = start - timedelta(days=5)
     fetch_end = end + timedelta(days=5)
     bars = fetch_daily_bars(tickers, fetch_start, fetch_end)
@@ -312,7 +346,6 @@ def run_backtest_long_only(
     open_positions: Dict[str, Position] = {}
     closed_trades: List[ClosedTrade] = []
 
-    # Process BUY/SELL signals
     for _, row in sig.iterrows():
         tkr = row["ticker"]
         side = row["side"]
@@ -385,40 +418,11 @@ def run_backtest_long_only(
                     f"(entry {pos.entry_price:.4f} {pos.entry_date.date()}, pnl={pnl:.2f}, equity={equity:.2f})"
                 )
 
-    # Force-close any remaining open positions at end-of-window
+    # At the end of the window, force-close any remaining open positions
     if open_positions:
-        if not quiet:
-            print(f"⚠️ Force-closing {len(open_positions)} open position(s) at end of window ({end.date()}).")
-
-        remaining = list(open_positions.values())
-        for pos in remaining:
-            tkr = pos.ticker
-            last_bar = last_trading_day_close(bars, tkr, end)
-            if last_bar is None:
-                # No usable bar to close; leave unrealized
-                if not quiet:
-                    print(f"  • Skipping force-close for {tkr}: no daily bar found up to {end.date()}.")
-                continue
-
-            exit_date, exit_price = last_bar
-            trade = ClosedTrade(
-                ticker=tkr,
-                entry_date=pos.entry_date,
-                exit_date=exit_date,
-                entry_price=pos.entry_price,
-                exit_price=exit_price,
-                qty=pos.qty,
-            )
-            pnl = trade.pnl
-            equity += pnl
-            closed_trades.append(trade)
-            del open_positions[tkr]
-
-            if not quiet:
-                print(
-                    f"[FORCE CLOSE] {tkr} {pos.qty:.4f} @ {exit_price:.4f} on {exit_date.date()} "
-                    f"(entry {pos.entry_price:.4f} {pos.entry_date.date()}, pnl={pnl:.2f}, equity={equity:.2f})"
-                )
+        fc_trades, extra_pnl = force_close_at_end(bars, open_positions, end, quiet=quiet)
+        closed_trades.extend(fc_trades)
+        equity += extra_pnl
 
     if not quiet:
         print(f"Completed backtest: {len(closed_trades)} closed trades, final equity={equity:.2f}")
@@ -427,6 +431,7 @@ def run_backtest_long_only(
 
 
 def trades_to_daily_pnl(trades: List[ClosedTrade]) -> pd.DataFrame:
+    """Aggregate closed trades into daily PnL."""
     if not trades:
         return pd.DataFrame(columns=["Date", "Simulated_PnL"])
 
@@ -439,7 +444,7 @@ def trades_to_daily_pnl(trades: List[ClosedTrade]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df = df.groupby("Date", as_index=False)["Simulated_PnL"].sum()
     df.sort_values("Date", inplace=True)
-    df.reset_index(drop=True, inplace(True)
+    df.reset_index(drop=True, inplace=True)
     return df
 
 
@@ -456,12 +461,17 @@ def main():
     ap.add_argument("--risk-per-trade", type=float, default=0.01,
                     help="Fraction of equity allocated per new trade (0.01 = 1%)")
     ap.add_argument("--max-long", type=int, default=10)
-    ap.add_argument("--max-short", type=int, default=10, help="(accepted but not used yet)")
+    ap.add_argument("--max-short", type=int, default=10,
+                    help="(accepted but not used yet)")
     ap.add_argument("--mode", choices=["long", "short", "both"], default="long",
                     help="Simulation mode (short/both not implemented yet)")
     ap.add_argument("--quiet", action="store_true", help="Less verbose")
-    ap.add_argument("--save-trades", type=str, default=None,
-                    help="If set, write daily PnL CSV here with columns: Date,Simulated_PnL")
+    ap.add_argument(
+        "--save-trades",
+        type=str,
+        default=None,
+        help="If set, write daily PnL CSV here with columns: Date,Simulated_PnL",
+    )
     args = ap.parse_args()
 
     if args.mode in ("short", "both"):
