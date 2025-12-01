@@ -10,6 +10,7 @@ Adds:
 - "Order Block" proposing entries/stops for BUY/SELL (stocks + crypto)
 - NEW: Alert Levels for BUY triggers (low stop + 15% / 20% upside targets)
 - NEW: Market Regime filter (Weinstein Chapter 8) via market_regime.inspect()
+- NEW: Daily ADX filter to avoid low-trend / choppy environments for new longs
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
@@ -68,6 +69,10 @@ NEAR_VOL_PACE_MIN = 1.00
 HARD_STOP_PCT = 0.08
 TRAIL_ATR_MULT = 2.0
 PIVOT_ENTRY_BUFFER_PCT = 0.002   # +0.20% over pivot for limit-into-strength orders
+
+# NEW: ADX filter (daily trend strength)
+ADX_WINDOW = 14
+ADX_MIN = 20.0   # classic threshold; can be tuned (e.g. 22–25 for stricter trend requirement)
 
 STATE_FILE = "./state/positions.json"
 CHART_DIR = "./output/charts"
@@ -260,6 +265,75 @@ def compute_atr(daily_df, t, n=14):
     tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     atr = tr.rolling(n).mean()
     return float(atr.dropna().iloc[-1]) if len(atr.dropna()) else np.nan
+
+def compute_adx(daily_df, t, n=ADX_WINDOW):
+    """
+    Wilder's ADX on the daily timeframe for ticker t.
+    Returns the latest ADX value (float) or np.nan on failure.
+    """
+    # Handle MultiIndex (yf.download with multiple tickers) vs single
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            sub = daily_df.xs(t, axis=1, level=1)
+        except KeyError:
+            return np.nan
+    else:
+        sub = daily_df
+
+    needed = {"High", "Low", "Close"}
+    if not needed.issubset(sub.columns):
+        return np.nan
+
+    high = sub["High"].astype(float)
+    low  = sub["Low"].astype(float)
+    close = sub["Close"].astype(float)
+
+    # True Range
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    # Directional Movements
+    up_move   = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0),  up_move,  0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = pd.Series(tr, index=high.index)
+    plus_dm  = pd.Series(plus_dm, index=high.index)
+    minus_dm = pd.Series(minus_dm, index=high.index)
+
+    # Wilder smoothing
+    tr_n       = tr.rolling(n).sum()
+    plus_dm_n  = plus_dm.rolling(n).sum()
+    minus_dm_n = minus_dm.rolling(n).sum()
+
+    # After the first n values, apply Wilder smoothing
+    for i in range(n + 1, len(tr)):
+        tr_n.iloc[i]       = tr_n.iloc[i - 1] - (tr_n.iloc[i - 1] / n)       + tr.iloc[i]
+        plus_dm_n.iloc[i]  = plus_dm_n.iloc[i - 1] - (plus_dm_n.iloc[i - 1] / n)  + plus_dm.iloc[i]
+        minus_dm_n.iloc[i] = minus_dm_n.iloc[i - 1] - (minus_dm_n.iloc[i - 1] / n) + minus_dm.iloc[i]
+
+    # Directional Indexes
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di  = 100.0 * (plus_dm_n / tr_n)
+        minus_di = 100.0 * (minus_dm_n / tr_n)
+
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).abs()
+    dx = dx.replace([np.inf, -np.inf], np.nan) * 100.0
+
+    adx = dx.rolling(n).mean()
+    if adx.dropna().empty:
+        return np.nan
+
+    return float(adx.dropna().iloc[-1])
 
 def last_weekly_pivot_high(ticker, daily_df, weeks=PIVOT_LOOKBACK_WEEKS):
     bars = weeks * (7 if _is_crypto(ticker) else 5)
@@ -885,6 +959,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         pace = volume_pace_today_vs_50dma(t, daily)
         atr = compute_atr(daily, t, n=14)
 
+        # ---- ADX trend-strength filter (daily) ----
+        adx = compute_adx(daily, t, n=ADX_WINDOW)
+        adx_ok = pd.notna(adx) and (adx >= ADX_MIN)
+
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
         ma_ok = pd.notna(ma30); pivot_ok = pd.notna(pivot); rs_ok = rs_above
 
@@ -898,18 +976,28 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "pace_intrabar": None if pd.isna(pace_intra) else float(pace_intra),
             "elapsed_min": elapsed,
             "held": (t in held),
+            "adx": None if pd.isna(adx) else float(adx),
         })
         d["cond"]["weekly_stage_ok"] = stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
         d["cond"]["rs_ok"] = bool(rs_ok)
         d["cond"]["ma_ok"] = bool(ma_ok)
         d["cond"]["pivot_ok"] = bool(pivot_ok)
         d["cond"]["market_long_ok"] = bool(market_long_ok)
+        d["cond"]["adx_ok"] = bool(adx_ok)
+
         if not market_long_ok:
             d["why"].append("Market regime not favorable for LONG (Chapter 8)")
 
+        if not adx_ok:
+            if pd.notna(adx):
+                log(f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx:.1f} < {ADX_MIN}", level="debug")
+            else:
+                log(f"[SKIP-ADX] {t} because ADX{ADX_WINDOW} is NaN", level="debug")
+            d["why"].append(f"ADX{ADX_WINDOW} below {ADX_MIN}")
+
         # --- BUY confirm ---
         confirm = False; vol_ok = True; price_ok = False
-        if market_long_ok and ma_ok and pivot_ok and closes_n:
+        if market_long_ok and adx_ok and ma_ok and pivot_ok and closes_n:
             def _price_ok(c):
                 return (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
             if INTRADAY_INTERVAL == "60m":
@@ -942,7 +1030,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
         # --- BUY near flag ---
         near_now = False
-        if market_long_ok and d["cond"]["weekly_stage_ok"] and rs_ok and pivot_ok and ma_ok and pd.notna(px):
+        if market_long_ok and adx_ok and d["cond"]["weekly_stage_ok"] and rs_ok and pivot_ok and ma_ok and pd.notna(px):
             above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
             if above_ma:
                 if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (px < pivot * (1.0 + MIN_BREAKOUT_PCT)):
@@ -1034,13 +1122,13 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                 })
 
         # --- EMIT by state ---
-        if st["state"] == "TRIGGERED" and market_long_ok and (pd.isna(pace) or pace >= VOL_PACE_MIN):
+        if st["state"] == "TRIGGERED" and market_long_ok and adx_ok and (pd.isna(pace) or pace >= VOL_PACE_MIN):
             buy_signals.append({
                 "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
                 "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "atr": atr
             })
             trigger_state[t]["state"] = "COOLDOWN"
-        elif st["state"] in ("NEAR","ARMED") and market_long_ok:
+        elif st["state"] in ("NEAR","ARMED") and market_long_ok and adx_ok:
             if (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN):
                 near_signals.append({
                     "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
@@ -1060,6 +1148,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "two_bar_confirm": confirm, "last_bar_vol_ok": vol_ok if 'vol_ok' in locals() else None,
             "weekly_rank": weekly_rank,
             "buy_state": st["state"], "sell_state": st["sell_state"],
+            "adx": None if pd.isna(adx) else float(adx),
         })
         debug_rows.append({"ticker": t, **d["metrics"],
                            **{f"cond_{k}": v for k,v in d["cond"].items()},
@@ -1186,10 +1275,10 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     <h3>Weinstein Intraday Watch — {now}</h3>
     <p><i>
       BUY: Weekly Stage 1/2 + confirm over ~10-week pivot & 30-wk MA proxy (SMA150),
-      +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×.
-      For 60m bars: ≥{INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {INTRABAR_VOLPACE_MIN}×.<br>
+      +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×,
+      and daily ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} (trend-strength filter).<br>
       NEAR-TRIGGER: Stage 1/2 + RS ok, price within {NEAR_BELOW_PIVOT_PCT*100:.1f}% below pivot or first close over pivot but not fully confirmed yet,
-      volume pace ≥ {NEAR_VOL_PACE_MIN}×.<br>
+      volume pace ≥ {NEAR_VOL_PACE_MIN}×, and ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f}.<br>
       SELL-TRIGGER: Confirmed crack below MA150 by {SELL_BREAK_PCT*100:.1f}% with persistence; for 60m bars, ≥{SELL_INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {SELL_INTRABAR_VOLPACE_MIN}×.
     </i></p>
     <p style="font-size:13px;color:#555;">
@@ -1250,7 +1339,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
     text = (
         f"Weinstein Intraday Watch — {now}\n"
-        f"Market Regime (Ch8): {regime_label} | LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}\n\n"
+        f"Market Regime (Ch8): {regime_label} | LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}\n"
+        f"ADX filter: ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} required for new BUY/NEAR longs.\n\n"
         f"BUY (ranked):\n{_lines(buy_signals,'BUY')}\n\n"
         f"NEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\n"
         f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers,'SELLTRIG')}\n\n"
