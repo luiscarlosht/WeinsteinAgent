@@ -1373,6 +1373,42 @@ def main():
     # Monthly-by-kind-by-source (equity vs options)
     monthly_src_df = build_perf_by_month_source_kind(realized_df.copy(), options_results_df.copy())
 
+    # --- Real-trades YTD CSV for real_vs_sim comparison ---
+    try:
+        if not realized_df.empty:
+            daily = realized_df.copy()
+            daily["ExitTimeUTC"] = pd.to_datetime(daily["ExitTimeUTC"], errors="coerce", utc=True)
+            daily["EntryPrice_num"] = pd.to_numeric(daily["EntryPrice"], errors="coerce")
+            daily["ExitPrice_num"]  = pd.to_numeric(daily["ExitPrice"], errors="coerce")
+            daily["Qty_num"]        = pd.to_numeric(daily["Qty"], errors="coerce")
+            daily["PnL$"] = (daily["ExitPrice_num"] - daily["EntryPrice_num"]) * daily["Qty_num"]
+
+            # Map to calendar date
+            daily["Date"] = daily["ExitTimeUTC"].dt.date
+            daily = daily.dropna(subset=["Date"])
+
+            # Focus on current year; fallback to all if no rows match
+            current_year = pd.Timestamp.now(tz="UTC").year
+            daily_year = daily[daily["ExitTimeUTC"].dt.year == current_year].copy()
+            if daily_year.empty:
+                daily_year = daily.copy()
+
+            grouped = (
+                daily_year
+                .groupby("Date", as_index=False)["PnL$"]
+                .sum()
+                .rename(columns={"PnL$": "Realized_PnL"})
+            )
+
+            data_dir = ((cfg.get("reporting") or {}).get("data_dir") or "./data")
+            os.makedirs(data_dir, exist_ok=True)
+            ytd_name = f"weinstein_real_trades_{current_year}YTD.csv"
+            real_csv_path = os.path.join(data_dir, ytd_name)
+            grouped.to_csv(real_csv_path, index=False)
+            print(f"📝 Wrote real-vs-sim helper CSV: {real_csv_path}")
+    except Exception as e:
+        print(f"⚠️ Could not generate real-trades YTD CSV: {type(e).__name__}: {e}")
+
     # Write tabs
     ws_real        = open_ws(gc, sheet_url, tab_real)
     ws_open        = open_ws(gc, sheet_url, tab_openpos)
