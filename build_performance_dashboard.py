@@ -70,7 +70,7 @@ TAB_REALIZED     = "Realized_Trades"
 TAB_OPEN         = "Open_Positions"
 TAB_PERF         = "Performance_By_Source"
 TAB_MONTHLY      = "Performance_By_Month"          # NEW
-TAB_MONTHLY_SRC  = "Performance_By_Month_Source"   # NEW (Month + Kind + Source)
+TAB_MONTHLY_SRC  = "Performance_By_Month_Source"   # NEW (Month + Kind (Equity/Option) + Source)
 TAB_OPEN_DETAIL  = "OpenLots_Detail"
 TAB_SNAPSHOT     = "Open_Positions_Snapshot"
 TAB_WEEKLY       = "Weekly_Report"
@@ -288,6 +288,9 @@ def googlefinance_formula_for(ticker: str, row_idx: int, mapping: Dict[str, Dict
     mapped = mapping.get(ticker, {}) or mapping.get(base, {}) or {}
     sym = mapped.get("FormulaSym") or (DEFAULT_EXCHANGE_PREFIX + base)
     return f'=IFERROR(GOOGLEFINANCE("{sym}","price"), IFERROR(GOOGLEFINANCE(B{row_idx},"price"), ""))'
+
+def googlefinance_formula_for_snapshot(tkr: str, row_index: int, mapping: dict) -> str:
+    return googlefinance_formula_for(tkr, row_index, mapping)
 
 # ─────────────────────────────
 # LOAD SIGNALS (+ options)
@@ -563,41 +566,66 @@ def _fetch_last_prices_yf(tickers: list[str]) -> dict:
                 out[t] = float(ser.iloc[-1])
     return out
 
-def googlefinance_formula_for_snapshot(tkr: str, row_index: int, mapping: dict) -> str:
-    return googlefinance_formula_for(tkr, row_index, mapping)
-
 def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, str]]) -> pd.DataFrame:
+    """
+    Attach GOOGLEFINANCE() formulas for PriceNow and a long/short-aware Unrealized%:
+
+      LONG  : (PriceNow / EntryPrice - 1) * 100
+      SHORT : (EntryPrice / PriceNow - 1) * 100
+
+    Shorts are detected via OpenQty < 0.
+    """
     if open_df.empty:
         return open_df
 
     out = open_df.copy()
-    price_now, unreal = [], []
+
+    # Ensure we have the columns we expect
+    if "OpenQty" not in out.columns or "EntryPrice" not in out.columns or "Ticker" not in out.columns:
+        return out
+
+    # Insert blank columns so we know final layout (Ticker, OpenQty, EntryPrice, PriceNow, Unrealized%, ...)
+    out.insert(out.columns.get_loc("EntryPrice") + 1, "PriceNow", "")
+    out.insert(out.columns.get_loc("PriceNow") + 1, "Unrealized%", "")
+
+    # Column indices for A1 references (after insertion)
+    col_openqty = out.columns.get_loc("OpenQty") + 1
+    col_entry   = out.columns.get_loc("EntryPrice") + 1
 
     for idx, r in out.iterrows():
         tkr = r["Ticker"]
         ep  = r.get("EntryPrice")
-        row_index = idx + 2  # sheet row (1-based) including header
+        row_index = idx + 2  # row 2 is first data row in sheet
 
-        # Full formula (with leading '=') for PriceNow cell
+        # GOOGLEFINANCE formula for live price
         formula = googlefinance_formula_for_snapshot(tkr, row_index, mapping)
-        price_now.append(formula)
+        out.at[idx, "PriceNow"] = formula
 
+        # Build Unrealized% formula if we have a usable entry price
         try:
             epf = float(ep)
-            if epf > 0:
-                # Strip leading '=' when embedding inside another formula
-                inner = formula.lstrip("=").strip()
-                unreal.append(
-                    f'=IFERROR(( {inner} / {epf} - 1 ) * 100,"")'
-                )
-            else:
-                unreal.append("")
         except Exception:
-            unreal.append("")
+            epf = float("nan")
 
-    # Insert columns right after EntryPrice
-    out.insert(out.columns.get_loc("EntryPrice") + 1, "PriceNow", price_now)
-    out.insert(out.columns.get_loc("PriceNow") + 1, "Unrealized%", unreal)
+        if not (epf > 0):
+            # Leave Unrealized% blank if no valid entry
+            continue
+
+        oq_cell    = gspread.utils.rowcol_to_a1(row_index, col_openqty)
+        entry_cell = gspread.utils.rowcol_to_a1(row_index, col_entry)
+
+        # Strip leading '=' when embedding the GOOGLEFINANCE formula
+        inner = formula.lstrip("=").strip()
+
+        # If OpenQty < 0 → short: (EntryPrice / PriceNow - 1)*100
+        # else long: (PriceNow / EntryPrice - 1)*100
+        unreal_formula = (
+            f'=IFERROR('
+            f'IF({oq_cell}<0, (({entry_cell})/({inner})-1)*100, (({inner})/({entry_cell})-1)*100)'
+            f',"")'
+        )
+        out.at[idx, "Unrealized%"] = unreal_formula
+
     return out
 
 # ─────────────────────────────
@@ -1117,6 +1145,16 @@ def build_perf_by_month_source_kind(
 # SNAPSHOT / WEEKLY + SHORTS FROM HOLDINGS
 # ─────────────────────────────
 def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: dict | None = None, *, price_source: str = "sheets") -> pd.DataFrame:
+    """
+    Build Open_Positions_Snapshot.
+
+    For price_source == "yfinance":
+      - Fetch Last Price via yfinance
+      - Compute long/short-aware PnL:
+          LONG  : PnL$ = (Current - Cost), % = PnL$ / Cost
+          SHORT : PnL$ = (Cost - Current), % = PnL$ / Cost
+        where Cost = |Qty| * EntryPrice, Current = |Qty| * LastPrice.
+    """
     if open_detail_df is None or open_detail_df.empty:
         return pd.DataFrame(columns=[
             "Symbol","Description","Quantity","Last Price","Current Value",
@@ -1130,6 +1168,7 @@ def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: dict 
     df["Description"] = ""
 
     if price_source == "sheets":
+        # Let the sheet compute prices via GOOGLEFINANCE (no PnL here)
         last_price = []
         for i, r in df.iterrows():
             row_index = i + 2
@@ -1142,14 +1181,24 @@ def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: dict 
         df["Total Gain/Loss Dollar"] = ""
         df["Total Gain/Loss Percent"] = ""
     else:
+        # Use yfinance and compute PnL with side-awareness
         prices = _fetch_last_prices_yf(df["Symbol"].dropna().unique().tolist())
         df["Last Price"] = df["Symbol"].map(prices).astype(float)
-        df["Cost Basis Total"] = (df["Quantity"] * df["Average Cost Basis"]).astype(float)
-        df["Current Value"] = (df["Quantity"] * df["Last Price"]).astype(float)
-        df["Total Gain/Loss Dollar"] = (df["Current Value"] - df["Cost Basis Total"]).astype(float)
+
+        abs_qty = df["Quantity"].abs()
+        df["Cost Basis Total"] = (abs_qty * df["Average Cost Basis"]).astype(float)
+        df["Current Value"] = (abs_qty * df["Last Price"]).astype(float)
+
+        is_short = df["Quantity"] < 0
+        df["Total Gain/Loss Dollar"] = np.where(
+            is_short,
+            df["Cost Basis Total"] - df["Current Value"],   # SHORT: profit when price falls
+            df["Current Value"] - df["Cost Basis Total"],   # LONG : profit when price rises
+        ).astype(float)
+
         df["Total Gain/Loss Percent"] = np.where(
-            df["Average Cost Basis"].fillna(0) > 0,
-            (df["Last Price"] / df["Average Cost Basis"] - 1) * 100.0,
+            df["Cost Basis Total"].fillna(0) > 0,
+            df["Total Gain/Loss Dollar"] / df["Cost Basis Total"] * 100.0,
             np.nan
         )
 
@@ -1452,19 +1501,35 @@ def main():
         # Open positions CSV (equities + shorts)
         csv_path = os.path.join(out_dir, "Open_Positions.csv")
         csv_df = snapshot_df.copy()
+
+        # Ensure numeric for PnL calc
+        csv_df["Quantity"] = pd.to_numeric(csv_df.get("Quantity", np.nan), errors="coerce")
+        csv_df["Average Cost Basis"] = pd.to_numeric(csv_df.get("Average Cost Basis", np.nan), errors="coerce")
+
         if price_source == "sheets":
+            # Re-fetch prices for CSV if snapshot was formula-based
             prices = _fetch_last_prices_yf(csv_df["Symbol"].dropna().unique().tolist())
-            csv_df["Quantity"] = pd.to_numeric(csv_df["Quantity"], errors="coerce")
-            csv_df["Average Cost Basis"] = pd.to_numeric(csv_df["Average Cost Basis"], errors="coerce")
             csv_df["Last Price"] = csv_df["Symbol"].map(prices).astype(float)
-            csv_df["Cost Basis Total"] = (csv_df["Quantity"] * csv_df["Average Cost Basis"]).astype(float)
-            csv_df["Current Value"] = (csv_df["Quantity"] * csv_df["Last Price"]).astype(float)
-            csv_df["Total Gain/Loss Dollar"] = (csv_df["Current Value"] - csv_df["Cost Basis Total"]).astype(float)
-            csv_df["Total Gain/Loss Percent"] = np.where(
-                csv_df["Average Cost Basis"].fillna(0) > 0,
-                (csv_df["Last Price"] / csv_df["Average Cost Basis"] - 1) * 100.0,
-                np.nan
-            )
+        else:
+            csv_df["Last Price"] = pd.to_numeric(csv_df.get("Last Price", np.nan), errors="coerce")
+
+        abs_qty = csv_df["Quantity"].abs()
+        csv_df["Cost Basis Total"] = (abs_qty * csv_df["Average Cost Basis"]).astype(float)
+        csv_df["Current Value"] = (abs_qty * csv_df["Last Price"]).astype(float)
+
+        is_short = csv_df["Quantity"] < 0
+        csv_df["Total Gain/Loss Dollar"] = np.where(
+            is_short,
+            csv_df["Cost Basis Total"] - csv_df["Current Value"],   # SHORT
+            csv_df["Current Value"] - csv_df["Cost Basis Total"],   # LONG
+        ).astype(float)
+
+        csv_df["Total Gain/Loss Percent"] = np.where(
+            csv_df["Cost Basis Total"].fillna(0) > 0,
+            csv_df["Total Gain/Loss Dollar"] / csv_df["Cost Basis Total"] * 100.0,
+            np.nan
+        )
+
         csv_df.to_csv(csv_path, index=False)
         print(f"📝 Wrote local CSV for email: {csv_path}")
 
