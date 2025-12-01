@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Weinstein Live-Logic Backtest (simplified)
-------------------------------------------
+Weinstein Live-Logic Backtest (simplified, long-only + market regime gate)
+-------------------------------------------------------------------------
 
 Goal
 ----
@@ -28,9 +28,19 @@ What this implementation does
 
 * Uses yfinance to fetch daily OHLC for all tickers in the range.
 
+* Calls market_regime.inspect() ONCE at the start of the run:
+    from market_regime import inspect as inspect_market_regime
+    label, long_ok, short_ok = inspect_market_regime()
+
+  For now we apply this as a **global gate** for the whole run:
+    - If long_ok is False (i.e., BEAR regime) we do NOT open any new longs.
+    - If long_ok is True (BULL / NEUTRAL / UNKNOWN), long entries are allowed.
+  This is mainly a convenience to reuse the same Chapter 8 logic; it is NOT a
+  historically-accurate regime backtest (we don't recompute regime per day).
+
 * Sim logic (LONG side only, for now):
     - When we see a BUY signal for T:
-        * If we have fewer than max_long open longs:
+        * If long_ok == True AND we have fewer than max_long open longs:
             - Entry on the **next trading day** after the signal date,
               at that day's OPEN price.
             - Position size:
@@ -53,13 +63,18 @@ Limitations / Notes
 -------------------
 * SHORT logic is not implemented yet. --mode and --max-short are accepted
   but only the LONG side is actually simulated.
+* Market regime in this script is a **single snapshot at run time**:
+  it does NOT reconstruct historical regimes; it's just a coarse gate:
+    - If current regime is BEAR, no longs will be opened.
+    - If current regime is BULL / NEUTRAL / UNKNOWN, longs are allowed.
 * If there is no next trading day data for a signal (e.g. very recent):
   the signal is skipped.
 * If there are BUYs but never a SELL for a ticker, the position stays open
   and is NOT force-closed at the end of the backtest window (to keep it
   conservative and simple).
 
-You can refine this later (e.g., add stops, take-profit, shorts, etc.).
+You can refine this later (e.g., add stops, take-profit, shorts, and
+historical regime reconstruction).
 """
 
 from __future__ import annotations
@@ -77,6 +92,12 @@ try:
     import yfinance as yf
 except Exception:  # pragma: no cover
     yf = None
+
+# Market regime (Weinstein Chapter 8) helper
+try:
+    from market_regime import inspect as inspect_market_regime
+except Exception:  # pragma: no cover
+    inspect_market_regime = None
 
 
 # ─────────────────────────────────────
@@ -224,12 +245,14 @@ def run_backtest_long_only(
     risk_per_trade: float,
     max_long: int,
     quiet: bool = False,
+    allow_new_longs: bool = True,
 ) -> Tuple[List[ClosedTrade], float]:
     """
     Very simple long-only book:
       - Open long on BUY, close on SELL (same ticker).
       - Entry/exit next trading day's OPEN.
       - Size = equity * risk_per_trade / entry_price.
+      - If allow_new_longs is False (e.g. BEAR regime), no new longs are opened.
     """
     # Filter to window
     sig = signals[(signals["ts_dt"] >= start) & (signals["ts_dt"] <= end)].copy()
@@ -256,6 +279,10 @@ def run_backtest_long_only(
         ts_dt = row["ts_dt"]
 
         if side == "BUY":
+            # Global market regime gate: skip new longs if not allowed
+            if not allow_new_longs:
+                continue
+
             if tkr in open_positions:
                 # Already long; skip this signal
                 continue
@@ -380,6 +407,24 @@ def main():
     if not args.quiet:
         print(f"• Loaded {len(sig)} signals total.")
 
+    # Market regime filter (global, single snapshot)
+    allow_new_longs = True
+    if inspect_market_regime is not None:
+        try:
+            regime_label, long_ok, short_ok = inspect_market_regime()
+            allow_new_longs = bool(long_ok)
+            if not args.quiet:
+                print(f"📊 Market Regime: {regime_label}, long_ok={long_ok}, short_ok={short_ok}")
+                if not allow_new_longs:
+                    print("⛔ Regime gate: new LONG entries are disabled for this backtest run.")
+        except Exception as e:
+            if not args.quiet:
+                print(f"⚠️ Could not compute market regime ({type(e).__name__}: {e}); proceeding with longs enabled.")
+            allow_new_longs = True
+    else:
+        if not args.quiet:
+            print("⚠️ market_regime.inspect() not available; proceeding with longs enabled.")
+
     trades, final_equity = run_backtest_long_only(
         signals=sig,
         start=start,
@@ -388,6 +433,7 @@ def main():
         risk_per_trade=args.risk_per_trade,
         max_long=args.max_long,
         quiet=args.quiet,
+        allow_new_longs=allow_new_longs,
     )
 
     daily = trades_to_daily_pnl(trades)
