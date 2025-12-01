@@ -10,7 +10,7 @@ Adds:
 - "Order Block" proposing entries/stops for BUY/SELL (stocks + crypto)
 - NEW: Alert Levels for BUY triggers (low stop + 15% / 20% upside targets)
 - NEW: Market Regime filter (Weinstein Chapter 8) via market_regime.inspect()
-- NEW: Daily ADX filter to avoid low-trend / choppy environments for new longs
+- NEW: ADX trend-strength filter for BUYs (with safe fallback when ADX is NaN)
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
@@ -70,10 +70,6 @@ HARD_STOP_PCT = 0.08
 TRAIL_ATR_MULT = 2.0
 PIVOT_ENTRY_BUFFER_PCT = 0.002   # +0.20% over pivot for limit-into-strength orders
 
-# NEW: ADX filter (daily trend strength)
-ADX_WINDOW = 14
-ADX_MIN = 20.0   # classic threshold; can be tuned (e.g. 22–25 for stricter trend requirement)
-
 STATE_FILE = "./state/positions.json"
 CHART_DIR = "./output/charts"
 MAX_CHARTS_PER_EMAIL = 12
@@ -95,27 +91,6 @@ VERBOSE = True
 ALERT_TARGET_PCTS = [0.15, 0.20]   # 15% and 20% upside
 ALERT_CSV_PATH = "./output/alert_levels_latest.csv"
 
-# ---- Optional Google Sheets pull (Signals) ----
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
-
-TAB_SIGNALS = "Signals"
-TAB_MAPPING = "Mapping"
-
-# ---------- Small helpers ----------
-def _ts():
-    return datetime.now().strftime("%H:%M:%S")
-
-def log(msg, *, level="info"):
-    if not VERBOSE and level == "debug":
-        return
-    prefix = {"info":"•", "ok":"✅", "step":"▶️", "warn":"⚠️", "err":"❌", "debug":"··"}.get(level, "•")
-    print(f"{prefix} [{_ts()}] {msg}", flush=True)
-
 # --- Stateful trigger tunables (BUY) ---
 INTRADAY_STATE_FILE = "./state/intraday_triggers.json"
 SCAN_INTERVAL_MIN = 10
@@ -136,6 +111,32 @@ SELL_NEAR_HITS_MIN = 3
 SELL_COOLDOWN_SCANS = 24
 SELL_INTRABAR_CONFIRM_MIN_ELAPSED = 40
 SELL_INTRABAR_VOLPACE_MIN = 1.20
+
+# --- ADX Trend-strength filter (for BUY entries) ---
+ADX_WINDOW = 14
+ADX_MIN = 22.0  # only block trades when ADX is real and below this; NaN does NOT block
+
+
+# ---- Optional Google Sheets pull (Signals) ----
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
+TAB_SIGNALS = "Signals"
+TAB_MAPPING = "Mapping"
+
+# ---------- Small helpers ----------
+def _ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+def log(msg, *, level="info"):
+    if not VERBOSE and level == "debug":
+        return
+    prefix = {"info":"•", "ok":"✅", "step":"▶️", "warn":"⚠️", "err":"❌", "debug":"··"}.get(level, "•")
+    print(f"{prefix} [{_ts()}] {msg}", flush=True)
 
 # ---------------- Config / IO ----------------
 def load_config(path):
@@ -268,10 +269,11 @@ def compute_atr(daily_df, t, n=14):
 
 def compute_adx(daily_df, t, n=ADX_WINDOW):
     """
-    Wilder's ADX on the daily timeframe for ticker t.
-    Returns the latest ADX value (float) or np.nan on failure.
+    Compute ADX(n) for ticker t from daily OHLC data.
+
+    If there is not enough data or required columns, returns NaN.
+    We use a rolling-sum approximation (good enough for a regime filter).
     """
-    # Handle MultiIndex (yf.download with multiple tickers) vs single
     if isinstance(daily_df.columns, pd.MultiIndex):
         try:
             sub = daily_df.xs(t, axis=1, level=1)
@@ -280,60 +282,41 @@ def compute_adx(daily_df, t, n=ADX_WINDOW):
     else:
         sub = daily_df
 
-    needed = {"High", "Low", "Close"}
-    if not needed.issubset(sub.columns):
+    required = {"High", "Low", "Close"}
+    if not required.issubset(sub.columns):
         return np.nan
 
-    high = sub["High"].astype(float)
-    low  = sub["Low"].astype(float)
-    close = sub["Close"].astype(float)
+    df = sub[["High", "Low", "Close"]].dropna()
+    if len(df) < n + 2:
+        return np.nan
 
-    # True Range
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
 
-    # Directional Movements
-    up_move   = high - high.shift(1)
-    down_move = low.shift(1) - low
+    up_move = high.diff()
+    down_move = -low.diff()
 
-    plus_dm  = np.where((up_move > down_move) & (up_move > 0),  up_move,  0.0)
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    tr = pd.Series(tr, index=high.index)
-    plus_dm  = pd.Series(plus_dm, index=high.index)
-    minus_dm = pd.Series(minus_dm, index=high.index)
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    # Wilder smoothing
-    tr_n       = tr.rolling(n).sum()
-    plus_dm_n  = plus_dm.rolling(n).sum()
-    minus_dm_n = minus_dm.rolling(n).sum()
+    tr_n = pd.Series(tr, index=df.index).rolling(n).sum()
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(n).sum() / tr_n)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(n).sum() / tr_n)
 
-    # After the first n values, apply Wilder smoothing
-    for i in range(n + 1, len(tr)):
-        tr_n.iloc[i]       = tr_n.iloc[i - 1] - (tr_n.iloc[i - 1] / n)       + tr.iloc[i]
-        plus_dm_n.iloc[i]  = plus_dm_n.iloc[i - 1] - (plus_dm_n.iloc[i - 1] / n)  + plus_dm.iloc[i]
-        minus_dm_n.iloc[i] = minus_dm_n.iloc[i - 1] - (minus_dm_n.iloc[i - 1] / n) + minus_dm.iloc[i]
-
-    # Directional Indexes
-    with np.errstate(divide="ignore", invalid="ignore"):
-        plus_di  = 100.0 * (plus_dm_n / tr_n)
-        minus_di = 100.0 * (minus_dm_n / tr_n)
-
-    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).abs()
-    dx = dx.replace([np.inf, -np.inf], np.nan) * 100.0
-
+    denom = (plus_di + minus_di).replace(0, np.nan)
+    dx = ((plus_di - minus_di).abs() / denom) * 100.0
     adx = dx.rolling(n).mean()
-    if adx.dropna().empty:
-        return np.nan
 
-    return float(adx.dropna().iloc[-1])
+    adx_clean = adx.dropna()
+    if not len(adx_clean):
+        return np.nan
+    return float(adx_clean.iloc[-1])
 
 def last_weekly_pivot_high(ticker, daily_df, weeks=PIVOT_LOOKBACK_WEEKS):
     bars = weeks * (7 if _is_crypto(ticker) else 5)
@@ -958,10 +941,13 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
         atr = compute_atr(daily, t, n=14)
-
-        # ---- ADX trend-strength filter (daily) ----
         adx = compute_adx(daily, t, n=ADX_WINDOW)
-        adx_ok = pd.notna(adx) and (adx >= ADX_MIN)
+
+        # ADX filter with SAFE fallback: NaN -> do NOT block
+        if pd.isna(adx):
+            adx_ok = True
+        else:
+            adx_ok = (adx >= ADX_MIN)
 
         closes_n = get_last_n_intraday_closes(intraday, t, n=max(CONFIRM_BARS, 2))
         ma_ok = pd.notna(ma30); pivot_ok = pd.notna(pivot); rs_ok = rs_above
@@ -987,13 +973,17 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
         if not market_long_ok:
             d["why"].append("Market regime not favorable for LONG (Chapter 8)")
-
-        if not adx_ok:
-            if pd.notna(adx):
-                log(f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx:.1f} < {ADX_MIN}", level="debug")
-            else:
-                log(f"[SKIP-ADX] {t} because ADX{ADX_WINDOW} is NaN", level="debug")
+        if not adx_ok and pd.notna(adx):
+            log(
+                f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx:.1f} < {ADX_MIN}",
+                level="debug",
+            )
             d["why"].append(f"ADX{ADX_WINDOW} below {ADX_MIN}")
+
+        if not d["cond"]["weekly_stage_ok"]: d["why"].append("Not Stage 1/2")
+        if not d["cond"]["rs_ok"]: d["why"].append("RS below MA")
+        if not d["cond"]["ma_ok"]: d["why"].append("No MA30")
+        if not d["cond"]["pivot_ok"]: d["why"].append("No 10w pivot")
 
         # --- BUY confirm ---
         confirm = False; vol_ok = True; price_ok = False
@@ -1023,10 +1013,6 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "pace_full_gate": (pd.isna(pace) or pace >= VOL_PACE_MIN),
             "near_pace_gate": (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN),
         })
-        if not d["cond"]["weekly_stage_ok"]: d["why"].append("Not Stage 1/2")
-        if not d["cond"]["rs_ok"]: d["why"].append("RS below MA")
-        if not d["cond"]["ma_ok"]: d["why"].append("No MA30")
-        if not d["cond"]["pivot_ok"]: d["why"].append("No 10w pivot")
 
         # --- BUY near flag ---
         near_now = False
@@ -1148,11 +1134,14 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "two_bar_confirm": confirm, "last_bar_vol_ok": vol_ok if 'vol_ok' in locals() else None,
             "weekly_rank": weekly_rank,
             "buy_state": st["state"], "sell_state": st["sell_state"],
-            "adx": None if pd.isna(adx) else float(adx),
         })
-        debug_rows.append({"ticker": t, **d["metrics"],
-                           **{f"cond_{k}": v for k,v in d["cond"].items()},
-                           "state": st["state"], "sell_state": st["sell_state"]})
+        debug_rows.append({
+            "ticker": t,
+            **d["metrics"],
+            **{f"cond_{k}": v for k, v in d["cond"].items()},
+            "state": st["state"],
+            "sell_state": st["sell_state"],
+        })
 
     log(f"Scan done. Raw counts → BUY:{len(buy_signals)} NEAR:{len(near_signals)} SELLTRIG:{len(sell_triggers)}", level="info")
 
@@ -1276,9 +1265,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     <p><i>
       BUY: Weekly Stage 1/2 + confirm over ~10-week pivot & 30-wk MA proxy (SMA150),
       +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×,
-      and daily ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} (trend-strength filter).<br>
+      and ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} when available (otherwise no ADX filter).<br>
       NEAR-TRIGGER: Stage 1/2 + RS ok, price within {NEAR_BELOW_PIVOT_PCT*100:.1f}% below pivot or first close over pivot but not fully confirmed yet,
-      volume pace ≥ {NEAR_VOL_PACE_MIN}×, and ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f}.<br>
+      volume pace ≥ {NEAR_VOL_PACE_MIN}×.<br>
       SELL-TRIGGER: Confirmed crack below MA150 by {SELL_BREAK_PCT*100:.1f}% with persistence; for 60m bars, ≥{SELL_INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {SELL_INTRABAR_VOLPACE_MIN}×.
     </i></p>
     <p style="font-size:13px;color:#555;">
@@ -1340,7 +1329,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     text = (
         f"Weinstein Intraday Watch — {now}\n"
         f"Market Regime (Ch8): {regime_label} | LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}\n"
-        f"ADX filter: ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} required for new BUY/NEAR longs.\n\n"
+        f"ADX filter: ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} required when available; NaN → no ADX filter.\n\n"
         f"BUY (ranked):\n{_lines(buy_signals,'BUY')}\n\n"
         f"NEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\n"
         f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers,'SELLTRIG')}\n\n"
