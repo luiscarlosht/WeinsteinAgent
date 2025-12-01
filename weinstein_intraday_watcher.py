@@ -34,6 +34,9 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
+# NEW: shared indicators (single source of truth for ADX)
+from weinstein_indicators import compute_adx_for_ticker, ADX_WINDOW, ADX_MIN
+
 # NEW: market regime (Weinstein Chapter 8) via market_regime.inspect()
 try:
     from market_regime import inspect as inspect_market_regime
@@ -111,11 +114,6 @@ SELL_NEAR_HITS_MIN = 3
 SELL_COOLDOWN_SCANS = 24
 SELL_INTRABAR_CONFIRM_MIN_ELAPSED = 40
 SELL_INTRABAR_VOLPACE_MIN = 1.20
-
-# --- ADX Trend-strength filter (for BUY entries) ---
-ADX_WINDOW = 14
-ADX_MIN = 22.0  # only block trades when ADX is real and below this; NaN does NOT block
-
 
 # ---- Optional Google Sheets pull (Signals) ----
 try:
@@ -266,57 +264,6 @@ def compute_atr(daily_df, t, n=14):
     tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     atr = tr.rolling(n).mean()
     return float(atr.dropna().iloc[-1]) if len(atr.dropna()) else np.nan
-
-def compute_adx(daily_df, t, n=ADX_WINDOW):
-    """
-    Compute ADX(n) for ticker t from daily OHLC data.
-
-    If there is not enough data or required columns, returns NaN.
-    We use a rolling-sum approximation (good enough for a regime filter).
-    """
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            sub = daily_df.xs(t, axis=1, level=1)
-        except KeyError:
-            return np.nan
-    else:
-        sub = daily_df
-
-    required = {"High", "Low", "Close"}
-    if not required.issubset(sub.columns):
-        return np.nan
-
-    df = sub[["High", "Low", "Close"]].dropna()
-    if len(df) < n + 2:
-        return np.nan
-
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    tr_n = pd.Series(tr, index=df.index).rolling(n).sum()
-    plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(n).sum() / tr_n)
-    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(n).sum() / tr_n)
-
-    denom = (plus_di + minus_di).replace(0, np.nan)
-    dx = ((plus_di - minus_di).abs() / denom) * 100.0
-    adx = dx.rolling(n).mean()
-
-    adx_clean = adx.dropna()
-    if not len(adx_clean):
-        return np.nan
-    return float(adx_clean.iloc[-1])
 
 def last_weekly_pivot_high(ticker, daily_df, weeks=PIVOT_LOOKBACK_WEEKS):
     bars = weeks * (7 if _is_crypto(ticker) else 5)
@@ -941,7 +888,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma(t, daily)
         atr = compute_atr(daily, t, n=14)
-        adx = compute_adx(daily, t, n=ADX_WINDOW)
+        # ADX computed via shared helper (single source of truth)
+        adx = compute_adx_for_ticker(daily, t, n=ADX_WINDOW)
 
         # ADX filter with SAFE fallback: NaN -> do NOT block
         if pd.isna(adx):
