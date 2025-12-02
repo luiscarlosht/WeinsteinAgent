@@ -116,18 +116,16 @@ python3 weinstein_report_weekly.py \
 PORTFOLIO_STEP_RC=$?
 set -e
 
-# 3) Classic Weinstein scan (S&P 500) – only if watcher exists AND enabled
+# 3) Classic Weinstein scan (S&P 500) – only if enabled AND scanner script exists
 if [[ "${ENABLE_SCAN}" == "1" ]]; then
-  if [[ -f "weinstein_intraday_watcher.py" ]]; then
+  if [[ -f "weinstein_weekly_scan.py" ]]; then
     bold "🔎 Running classic Weinstein scan (${SCAN_UNIVERSE}, bench ${SCAN_BENCHMARK})…"
     set +e
-    python3 weinstein_intraday_watcher.py \
+    python3 weinstein_weekly_scan.py \
       --universe "${SCAN_UNIVERSE}" \
       --benchmark "${SCAN_BENCHMARK}" \
-      --write-csv "${SCAN_CSV}" \
-      --write-html "${SCAN_HTML}" \
-      --quiet \
-      --max-rows "${SCAN_MAX_ROWS}"
+      --out-dir "./output" \
+      --max-rows-email "${SCAN_MAX_ROWS}"
     SCAN_STEP_RC=$?
     set -e
     if [[ "${SCAN_STEP_RC}" -ne 0 ]]; then
@@ -135,7 +133,7 @@ if [[ "${ENABLE_SCAN}" == "1" ]]; then
       SCAN_HTML="" ; SCAN_CSV=""
     fi
   else
-    yellow "weinstein_intraday_watcher.py not found. Skipping classic scan."
+    yellow "weinstein_weekly_scan.py not found. Skipping classic scan."
     SCAN_HTML="" ; SCAN_CSV=""
   fi
 else
