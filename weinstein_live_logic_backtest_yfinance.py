@@ -24,11 +24,6 @@ Key points:
 - Risk sizing:
     * Risk per trade = equity * risk_per_trade / per-share-risk
     * Stops use ATR and MA30 guard, similar to your intraday logic
-- Market / VIX filters:
-    * Market regime from major indices vs 200d MA (Weinstein Chapter 8 style)
-    * VIX overlay:
-        - NO new longs if VIX > VIX_LONG_MAX
-        - NO new shorts if VIX < VIX_SHORT_MIN
 - Outputs:
     * Trade log CSV
     * Equity curve PNG
@@ -40,7 +35,7 @@ import os
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -243,18 +238,6 @@ SHORT_VOL_MIN = 1.30
 
 PIVOT_LOOKBACK_DAYS = 50    # pivot highs/lows over last ~10 weeks
 
-# ----- Market regime + VIX parameters (historical, to mirror intraday inspect()) -----
-
-REGIME_INDEX_SYMBOLS = ["^GSPC", "^NDX", "^DJI", "^RUT"]
-REGIME_MA_WINDOW = 200
-REGIME_MA_SLOPE_DAYS = 20
-REGIME_MIN_BULLISH_FRACTION = 0.6
-REGIME_MIN_BEARISH_FRACTION = 0.6
-
-VIX_SYMBOL = "^VIX"
-VIX_LONG_MAX = 22.0    # NO new longs if VIX > this
-VIX_SHORT_MIN = 15.0   # NO new shorts if VIX < this
-
 def _safe_float(x):
     try:
         return float(x)
@@ -304,212 +287,6 @@ def get_pivot_low(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp)
     sub = low.loc[:as_of_date].iloc[:-1]
     sub = sub.dropna().tail(PIVOT_LOOKBACK_DAYS)
     return float(sub.min()) if len(sub) else np.nan
-
-# ---------------- Market regime + VIX helpers (historical) ----------------
-
-class IndexState:
-    BULLISH = "BULLISH"
-    BEARISH = "BEARISH"
-    NEUTRAL = "NEUTRAL"
-    UNKNOWN = "UNKNOWN"
-
-class MarketRegimeLabel:
-    BULL = "BULL"
-    BEAR = "BEAR"
-    NEUTRAL = "NEUTRAL"
-    UNKNOWN = "UNKNOWN"
-
-def download_regime_index_data(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> Dict[str, pd.Series]:
-    """
-    Download daily close data for major indices used in the market regime.
-    Returns dict: {symbol: close_series}
-    """
-    pad_start = (start_dt - timedelta(days=REGIME_MA_WINDOW + REGIME_MA_SLOPE_DAYS + 40)).strftime("%Y-%m-%d")
-    log(
-        f"Downloading regime index data ({', '.join(REGIME_INDEX_SYMBOLS)}) "
-        f"{pad_start} → {end_dt.date()}...",
-        level="step",
-    )
-    data = yf.download(
-        REGIME_INDEX_SYMBOLS,
-        start=pad_start,
-        end=end_dt.strftime("%Y-%m-%d"),
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
-    if data.empty:
-        raise RuntimeError("No index data for regime computation.")
-    out: Dict[str, pd.Series] = {}
-    if isinstance(data.columns, pd.MultiIndex):
-        if "Close" not in data.columns.get_level_values(0):
-            raise RuntimeError("Downloaded index data has no 'Close' column.")
-        close_df = data["Close"]
-        for sym in REGIME_INDEX_SYMBOLS:
-            try:
-                series = close_df[sym].dropna()
-                if not series.empty:
-                    out[sym] = series
-            except Exception:
-                continue
-    else:
-        if "Close" not in data.columns:
-            raise RuntimeError("Downloaded index data has no 'Close' column.")
-        # Single symbol case (unlikely, but keep for completeness)
-        series = data["Close"].dropna()
-        if not series.empty:
-            out[REGIME_INDEX_SYMBOLS[0]] = series
-    log("Regime index data download complete.", level="ok")
-    return out
-
-def build_index_state_series(
-    index_close_dict: Dict[str, pd.Series]
-) -> Dict[str, pd.Series]:
-    """
-    For each index, compute a Series of IndexState.* per date
-    using 200d MA and slope over REGIME_MA_SLOPE_DAYS.
-    """
-    state_series: Dict[str, pd.Series] = {}
-    for sym, close in index_close_dict.items():
-        close = close.sort_index()
-        ma = close.rolling(REGIME_MA_WINDOW).mean()
-        past_ma = ma.shift(REGIME_MA_SLOPE_DAYS)
-        ma_slope_pct = (ma / past_ma - 1.0) * 100.0
-        above_ma = close > ma
-        # Here we mirror market_regime logic:
-        #   BULLISH: above MA and slope >= 0
-        #   BEARISH: below MA and slope <= 0
-        #   else NEUTRAL
-        state = pd.Series(IndexState.UNKNOWN, index=close.index, dtype="object")
-        bull_mask = above_ma & (ma_slope_pct >= 0.0)
-        bear_mask = (~above_ma) & (ma_slope_pct <= 0.0)
-        state.loc[bull_mask] = IndexState.BULLISH
-        state.loc[bear_mask] = IndexState.BEARISH
-        # everything else remains NEUTRAL where we have MA values
-        neutral_mask = (~bull_mask) & (~bear_mask) & ma.notna()
-        state.loc[neutral_mask] = IndexState.NEUTRAL
-        state_series[sym] = state
-    return state_series
-
-def aggregate_market_regime_for_date(
-    dt: pd.Timestamp,
-    index_state_series: Dict[str, pd.Series],
-) -> str:
-    """
-    Combine per-index states into a single MarketRegimeLabel.* for a given date.
-    """
-    states: List[str] = []
-    for sym in REGIME_INDEX_SYMBOLS:
-        series = index_state_series.get(sym)
-        if series is None:
-            continue
-        if dt in series.index:
-            val = series.loc[dt]
-            if isinstance(val, str):
-                states.append(val)
-            else:
-                states.append(IndexState.UNKNOWN)
-        else:
-            # try "last known"
-            sub = series.loc[:dt]
-            if len(sub):
-                val = sub.iloc[-1]
-                states.append(val if isinstance(val, str) else IndexState.UNKNOWN)
-            else:
-                states.append(IndexState.UNKNOWN)
-
-    if not states:
-        return MarketRegimeLabel.UNKNOWN
-
-    n = len(states)
-    n_bull = sum(1 for s in states if s == IndexState.BULLISH)
-    n_bear = sum(1 for s in states if s == IndexState.BEARISH)
-
-    frac_bull = n_bull / n
-    frac_bear = n_bear / n
-
-    if frac_bull >= REGIME_MIN_BULLISH_FRACTION:
-        return MarketRegimeLabel.BULL
-    if frac_bear >= REGIME_MIN_BEARISH_FRACTION:
-        return MarketRegimeLabel.BEAR
-    # otherwise NEUTRAL
-    return MarketRegimeLabel.NEUTRAL
-
-def download_vix_series(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.Series:
-    """
-    Download VIX daily close series for historical VIX filter.
-    """
-    pad_start = (start_dt - timedelta(days=120)).strftime("%Y-%m-%d")
-    log(
-        f"Downloading VIX ({VIX_SYMBOL}) {pad_start} → {end_dt.date()}...",
-        level="step",
-    )
-    data = yf.download(
-        VIX_SYMBOL,
-        start=pad_start,
-        end=end_dt.strftime("%Y-%m-%d"),
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
-    if data.empty or "Close" not in data.columns:
-        log("WARNING: No VIX data available; VIX filter will be disabled.", level="warn")
-        return pd.Series(dtype="float64")
-    vix = data["Close"].dropna()
-    log("VIX data download complete.", level="ok")
-    return vix
-
-def get_vix_for_date(vix_series: pd.Series, dt: pd.Timestamp) -> float:
-    """
-    Get VIX value as-of dt (using last known close <= dt).
-    """
-    if vix_series is None or vix_series.empty:
-        return np.nan
-    if dt in vix_series.index:
-        return float(vix_series.loc[dt])
-    sub = vix_series.loc[:dt]
-    if len(sub) == 0:
-        return np.nan
-    return float(sub.iloc[-1])
-
-def compute_long_short_flags_with_vix(
-    regime_label: str,
-    vix_value: float,
-) -> Tuple[bool, bool]:
-    """
-    Mirror market_regime.inspect() + VIX overlay:
-
-    Base regime:
-      - BULL:   long_ok=True,  short_ok=False
-      - BEAR:   long_ok=False, short_ok=True
-      - NEUTRAL: long_ok=True, short_ok=False
-      - UNKNOWN: long_ok=True, short_ok=False
-
-    VIX overlay:
-      - If VIX available:
-          * Block NEW LONGS if VIX > VIX_LONG_MAX
-          * Block NEW SHORTS if VIX < VIX_SHORT_MIN
-    """
-    # Base regime logic
-    if regime_label == MarketRegimeLabel.BEAR:
-        long_ok = False
-        short_ok = True
-    elif regime_label == MarketRegimeLabel.BULL:
-        long_ok = True
-        short_ok = False
-    else:
-        # NEUTRAL or UNKNOWN
-        long_ok = True
-        short_ok = False
-
-    # VIX overlay
-    if not np.isnan(vix_value):
-        if long_ok and vix_value > VIX_LONG_MAX:
-            long_ok = False
-        if short_ok and vix_value < VIX_SHORT_MIN:
-            short_ok = False
-
-    return long_ok, short_ok
 
 # ---------------- Entry / exit rules ----------------
 
@@ -663,11 +440,6 @@ def backtest(
     for t in long_tickers | short_tickers:
         atr_cache[t] = compute_atr_from_df(daily_df, t, n=14)
 
-    # Precompute market regime index states and VIX series for the full backtest
-    index_close_dict = download_regime_index_data(start_dt, end_dt)
-    index_state_series = build_index_state_series(index_close_dict)
-    vix_series = download_vix_series(start_dt, end_dt)
-
     # Main daily loop
     for i, dt in enumerate(all_dates):
         if dt < start_dt or dt > end_dt:
@@ -699,19 +471,7 @@ def backtest(
             else:
                 eq += pos.qty * (pos.entry_price - p)
         portfolio.equity = eq
-
-        # Compute historical regime + VIX-based long/short gates for this date
-        regime_label = aggregate_market_regime_for_date(dt, index_state_series)
-        vix_val = get_vix_for_date(vix_series, dt)
-        long_ok, short_ok = compute_long_short_flags_with_vix(regime_label, vix_val)
-
-        # Store equity curve with environment context for debugging
-        equity_curve.append({
-            "date": dt,
-            "equity": eq,
-            "regime": regime_label,
-            "vix": vix_val,
-        })
+        equity_curve.append({"date": dt, "equity": eq})
 
         # First exits, then entries (so freed risk can be reused)
         # ------ Exits ------
@@ -761,7 +521,7 @@ def backtest(
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
         # LONG entries
-        if mode in ("long", "both") and n_long_now < max_long and long_ok:
+        if mode in ("long", "both") and n_long_now < max_long:
             for _, row in long_universe.iterrows():
                 t = str(row["ticker"]).upper()
                 pos_key = f"{t}_long"
@@ -828,7 +588,7 @@ def backtest(
                     break
 
         # SHORT entries
-        if mode in ("short", "both") and n_short_now < max_short and short_ok:
+        if mode in ("short", "both") and n_short_now < max_short:
             for _, row in short_universe.iterrows():
                 t = str(row["ticker"]).upper()
                 pos_key = f"{t}_short"
@@ -951,7 +711,8 @@ def save_monthly_pnl(
         )
     df_tr = pd.DataFrame(rows)
     df_tr["ExitDate"] = pd.to_datetime(df_tr["ExitDate"])
-    df_tr["Month"] = df_tr["ExitDate"].dt.to_period("M").dt.to_timestamp()
+    # Use month-end timestamps so they align with equity resample("ME")
+    df_tr["Month"] = df_tr["ExitDate"].dt.to_period("M").dt.to_timestamp(how="end")
 
     monthly = df_tr.groupby("Month").agg(
         PnL=("PnL", "sum"),
@@ -964,7 +725,7 @@ def save_monthly_pnl(
     eq_df = pd.DataFrame(equity_curve)
     eq_df["date"] = pd.to_datetime(eq_df["date"])
     eq_df = eq_df.set_index("date").sort_index()
-    # Use "ME" for month-end to avoid FutureWarning about "M"
+    # Use "ME" (month-end) to avoid FutureWarning about "M"
     eq_monthly = eq_df.resample("ME").last().rename(columns={"equity": "Equity"})
 
     monthly = monthly.join(eq_monthly["Equity"], how="left")
