@@ -158,10 +158,10 @@ class MarketRegimeConfig:
     vix_history_days: int = 400
 
     # Max VIX to allow new longs. If VIX > vix_long_max → block new longs.
-    vix_long_max: float = 22.0
+    vix_long_max: float = 20.0
 
     # Min VIX to allow new shorts. If VIX < vix_short_min → block new shorts.
-    vix_short_min: float = 15.0
+    vix_short_min: float = 12.0
 
     def __post_init__(self):
         if self.index_symbols is None:
