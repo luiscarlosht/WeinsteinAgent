@@ -6,19 +6,20 @@ weinstein_indicators.py
 Shared technical indicator helpers for Weinstein-style systems.
 
 This module is the single source of truth for:
-- ADX_WINDOW, ADX_MIN
-- ADX computation helpers used by:
-    * weinstein_intraday_watcher.py  (production intraday)
-    * weinstein_live_logic_backtest_yfinance.py  (daily backtest)
+- ADX parameters + computation
+- Breadth Health (% of tickers above MA50)
 
-Design:
-- compute_adx_series(df, n=ADX_WINDOW):
-    * df: single-ticker daily OHLC DataFrame with columns ['High','Low','Close']
-    * returns: ADX(n) series aligned to df.index (NaN when not enough data)
-- compute_adx_for_ticker(daily_df, ticker, n=ADX_WINDOW):
-    * daily_df: multi-ticker yfinance panel (MultiIndex columns) or single-ticker df
-    * ticker: symbol string
-    * returns: float ADX(n) (last available), or NaN if not enough data
+Used by:
+    * weinstein_intraday_watcher.py   (PROD intraday)
+    * weinstein_live_logic_backtest_yfinance.py   (SIM/backtest)
+    * Any dashboards or performance analyzers
+
+Functions provided:
+
+    compute_adx_series(df)
+    compute_adx_for_ticker(daily_df, ticker)
+
+    compute_breadth_series_above_ma(close_panel, tickers, ma_window=50)
 """
 
 from __future__ import annotations
@@ -26,9 +27,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# ============================================================================
+# ADX (Average Directional Index)
+# ============================================================================
+
 # --- ADX parameters (single source of truth) ---
 ADX_WINDOW = 14
-ADX_MIN = 22.0  # intraday & backtest will both use this unless overridden here
+ADX_MIN = 22.0   # intraday & backtest will both use this unless overridden
 
 
 def _adx_from_hlc(
@@ -41,7 +46,6 @@ def _adx_from_hlc(
     Core ADX(n) computation from H/L/C series.
 
     Returns a Series of ADX values indexed like the (cleaned) input.
-    This mirrors the logic previously used inside weinstein_intraday_watcher.py.
     """
     df = pd.DataFrame({"High": high, "Low": low, "Close": close}).dropna()
     if len(df) < n + 2:
@@ -51,6 +55,7 @@ def _adx_from_hlc(
     l = df["Low"].astype(float)
     c = df["Close"].astype(float)
 
+    # Directional movements
     up_move = h.diff()
     down_move = -l.diff()
 
@@ -77,24 +82,13 @@ def compute_adx_series(df: pd.DataFrame, n: int = ADX_WINDOW) -> pd.Series:
     """
     Compute ADX(n) for a single-ticker daily OHLC dataframe.
 
-    Parameters
-    ----------
-    df : DataFrame
-        Must contain columns: 'High', 'Low', 'Close'.
-    n : int
-        ADX window length (default: ADX_WINDOW).
-
-    Returns
-    -------
-    Series
-        ADX values aligned to df.index (NaN where not enough data).
+    df must contain: ['High','Low','Close']
     """
     required = {"High", "Low", "Close"}
     if not required.issubset(df.columns):
         return pd.Series(index=df.index, dtype="float64")
 
     adx_core = _adx_from_hlc(df["High"], df["Low"], df["Close"], n=n)
-    # Re-align back to the full original index
     return adx_core.reindex(df.index)
 
 
@@ -104,23 +98,11 @@ def compute_adx_for_ticker(
     n: int = ADX_WINDOW,
 ) -> float:
     """
-    Compute ADX(n) for a specific ticker from a yfinance-style DAILY panel.
+    Compute ADX(n) for a specific ticker from yfinance-style panel.
 
-    Parameters
-    ----------
-    daily_df : DataFrame
-        Either:
-        - MultiIndex columns (['Open','High','Low','Close','Adj Close','Volume'], ticker)
-        - Single-ticker OHLCV with the same column names.
-    ticker : str
-        Symbol to slice out of a MultiIndex panel.
-    n : int
-        ADX window length (default: ADX_WINDOW).
-
-    Returns
-    -------
-    float
-        The last available ADX value, or NaN if not enough data.
+    Supports:
+        - MultiIndex: daily_df[("High", ticker)]
+        - Flat OHLC dataframe: daily_df['High'], etc.
     """
     if isinstance(daily_df.columns, pd.MultiIndex):
         try:
@@ -138,4 +120,66 @@ def compute_adx_for_ticker(
     adx_clean = adx_series.dropna()
     if not len(adx_clean):
         return np.nan
+
     return float(adx_clean.iloc[-1])
+
+
+# ============================================================================
+# BREADTH HEALTH (Advance/Decline Strength Filter)
+# ============================================================================
+
+def compute_breadth_series_above_ma(
+    daily_close_panel: pd.DataFrame,
+    tickers: list[str],
+    ma_window: int = 50,
+) -> pd.Series:
+    """
+    Compute % of tickers above MA `ma_window`.
+
+    Parameters
+    ----------
+    daily_close_panel : DataFrame
+        Either:
+            - MultiIndex columns: ("Close", ticker)
+            - Flat columns: ticker names containing daily close prices
+    tickers : list[str]
+        Universe to measure breadth on.
+    ma_window : int
+        MA window (default: 50)
+
+    Returns
+    -------
+    Series (float)
+        breadth(t) = (# tickers with Close > MA) / (# tickers with valid data)
+        indexed by trading date.
+    """
+    if not tickers or daily_close_panel.empty:
+        return pd.Series(dtype=float)
+
+    # Normalize to flat Close-panel: date × ticker
+    if isinstance(daily_close_panel.columns, pd.MultiIndex):
+        if "Close" not in daily_close_panel.columns.levels[0]:
+            # No Close data available
+            return pd.Series(dtype=float)
+        close_panel = daily_close_panel["Close"]
+    else:
+        close_panel = daily_close_panel
+
+    # Keep only tickers we actually have data for
+    cols = [t for t in tickers if t in close_panel.columns]
+    if not cols:
+        return pd.Series(dtype=float)
+
+    close_panel = close_panel[cols]
+
+    # Rolling MA for each ticker
+    ma = close_panel.rolling(ma_window).mean()
+
+    # Boolean matrix: True = Close > MA
+    above = close_panel > ma
+
+    # Breadth = fraction above MA
+    breadth = above.sum(axis=1) / above.count(axis=1)
+    breadth.name = f"breadth_above_ma{ma_window}"
+
+    return breadth
