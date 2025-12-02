@@ -125,7 +125,7 @@ SELL_INTRABAR_VOLPACE_MIN = 1.20
 # We approximate "% of S&P500 above MA50" by using your equity universe:
 # weekly_df[asset_class == 'Equity'], measuring Close > MA50 on the daily panel.
 BREADTH_MA_WINDOW = 50
-BREADTH_MIN_LONG = 0.60   # require 60% of breadth universe above MA50 to allow new longs
+BREADTH_MIN_LONG = 0.50   # require 60% of breadth universe above MA50 to allow new longs
 
 # ---- Optional Google Sheets pull (Signals) ----
 try:
