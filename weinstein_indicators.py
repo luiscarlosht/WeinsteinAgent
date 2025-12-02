@@ -33,7 +33,7 @@ import pandas as pd
 
 # --- ADX parameters (single source of truth) ---
 ADX_WINDOW = 14
-ADX_MIN = 22.0   # intraday & backtest will both use this unless overridden
+ADX_MIN = 18.0   # intraday & backtest will both use this unless overridden
 
 
 def _adx_from_hlc(
