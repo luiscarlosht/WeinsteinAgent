@@ -11,6 +11,7 @@ Adds:
 - NEW: Alert Levels for BUY triggers (low stop + 15% / 20% upside targets)
 - NEW: Market Regime filter (Weinstein Chapter 8) via market_regime.inspect()
 - NEW: ADX trend-strength filter for BUYs (with safe fallback when ADX is NaN)
+- NEW: Breadth Health filter: longs allowed only when breadth (% above MA50) is strong
 
 Email behavior:
 - Email is sent ONLY when there is at least one of:
@@ -34,8 +35,13 @@ import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
 
-# NEW: shared indicators (single source of truth for ADX)
-from weinstein_indicators import compute_adx_for_ticker, ADX_WINDOW, ADX_MIN
+# NEW: shared indicators (single source of truth for ADX + Breadth)
+from weinstein_indicators import (
+    compute_adx_for_ticker,
+    compute_breadth_series_above_ma,
+    ADX_WINDOW,
+    ADX_MIN,
+)
 
 # NEW: market regime (Weinstein Chapter 8) via market_regime.inspect()
 try:
@@ -114,6 +120,12 @@ SELL_NEAR_HITS_MIN = 3
 SELL_COOLDOWN_SCANS = 24
 SELL_INTRABAR_CONFIRM_MIN_ELAPSED = 40
 SELL_INTRABAR_VOLPACE_MIN = 1.20
+
+# ---- Breadth Health filter (Advance/Decline strength) ----
+# We approximate "% of S&P500 above MA50" by using your equity universe:
+# weekly_df[asset_class == 'Equity'], measuring Close > MA50 on the daily panel.
+BREADTH_MA_WINDOW = 50
+BREADTH_MIN_LONG = 0.60   # require 60% of breadth universe above MA50 to allow new longs
 
 # ---- Optional Google Sheets pull (Signals) ----
 try:
@@ -835,14 +847,52 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
         market_long_ok = True
         market_short_ok = True
 
+    # ---- Breadth Health filter ----
+    breadth_today = np.nan
+    breadth_long_ok = True
+    try:
+        # Use your equity universe for breadth: asset_class contains 'Equity' when present.
+        if "asset_class" in w.columns:
+            mask_eq = w["asset_class"].fillna("").astype(str).str.contains("Equity", case=False)
+            breadth_universe = w.loc[mask_eq, "ticker"].astype(str).str.upper().tolist()
+        else:
+            breadth_universe = focus["ticker"].astype(str).str.upper().tolist()
+
+        breadth_universe = sorted(set(breadth_universe))
+        if breadth_universe:
+            breadth_series = compute_breadth_series_above_ma(
+                daily,
+                breadth_universe,
+                ma_window=BREADTH_MA_WINDOW,
+            )
+            breadth_clean = breadth_series.dropna()
+            if len(breadth_clean):
+                breadth_today = float(breadth_clean.iloc[-1])
+                breadth_long_ok = (breadth_today >= BREADTH_MIN_LONG)
+        log(
+            f"Breadth Health: {breadth_today*100:.1f}% of breadth universe above MA{BREADTH_MA_WINDOW} "
+            f"→ breadth_long_ok={breadth_long_ok} (threshold {BREADTH_MIN_LONG*100:.1f}%)",
+            level="info",
+        )
+    except Exception as e:
+        log(f"Failed to compute Breadth Health filter ({e}); defaulting to breadth_long_ok=True.", level="warn")
+        breadth_today = np.nan
+        breadth_long_ok = True
+
+    # Combined environment gate for LONGS:
+    env_long_ok = market_long_ok and breadth_long_ok
+
     log(
         f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}",
         level="info",
     )
 
     # NEW: strings for subject + email header
-    regime_header = f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok}"
-    subject_tag   = f"INTRADAY {regime_label} L={market_long_ok} S={market_short_ok}"
+    regime_header = (
+        f"Market regime (Ch8): {regime_label} | long_ok={market_long_ok} short_ok={market_short_ok} | "
+        f"breadth_above_MA{BREADTH_MA_WINDOW}={breadth_today*100:.1f}% (long_ok={breadth_long_ok})"
+    )
+    subject_tag   = f"INTRADAY {regime_label} L={env_long_ok} S={market_short_ok}"
 
     if isinstance(intraday.columns, pd.MultiIndex):
         last_closes = intraday["Close"].ffill().iloc[-1]
@@ -911,16 +961,21 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "elapsed_min": elapsed,
             "held": (t in held),
             "adx": None if pd.isna(adx) else float(adx),
+            "breadth_today": None if pd.isna(breadth_today) else float(breadth_today),
         })
         d["cond"]["weekly_stage_ok"] = stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
         d["cond"]["rs_ok"] = bool(rs_ok)
         d["cond"]["ma_ok"] = bool(ma_ok)
         d["cond"]["pivot_ok"] = bool(pivot_ok)
         d["cond"]["market_long_ok"] = bool(market_long_ok)
+        d["cond"]["breadth_long_ok"] = bool(breadth_long_ok)
+        d["cond"]["long_env_ok"] = bool(env_long_ok)
         d["cond"]["adx_ok"] = bool(adx_ok)
 
         if not market_long_ok:
             d["why"].append("Market regime not favorable for LONG (Chapter 8)")
+        if not breadth_long_ok:
+            d["why"].append(f"Breadth below threshold: {breadth_today*100:.1f}% < {BREADTH_MIN_LONG*100:.1f}%")
         if not adx_ok and pd.notna(adx):
             log(
                 f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx:.1f} < {ADX_MIN}",
@@ -935,7 +990,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
         # --- BUY confirm ---
         confirm = False; vol_ok = True; price_ok = False
-        if market_long_ok and adx_ok and ma_ok and pivot_ok and closes_n:
+        if env_long_ok and adx_ok and ma_ok and pivot_ok and closes_n:
             def _price_ok(c):
                 return (c >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and (c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN))
             if INTRADAY_INTERVAL == "60m":
@@ -964,7 +1019,7 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
 
         # --- BUY near flag ---
         near_now = False
-        if market_long_ok and adx_ok and d["cond"]["weekly_stage_ok"] and rs_ok and pivot_ok and ma_ok and pd.notna(px):
+        if env_long_ok and adx_ok and d["cond"]["weekly_stage_ok"] and rs_ok and pivot_ok and ma_ok and pd.notna(px):
             above_ma = px >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
             if above_ma:
                 if (px >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (px < pivot * (1.0 + MIN_BREAKOUT_PCT)):
@@ -1001,8 +1056,8 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
             "sell_state":"IDLE", "sell_hits":[], "sell_cooldown":0
         })
 
-        # If market regime not favorable for LONGs (Ch. 8), reset BUY state to avoid stale triggers
-        if not market_long_ok:
+        # If environment not favorable for LONGs (Ch. 8 + Breadth), reset BUY state
+        if not env_long_ok:
             st["state"] = "IDLE"
             st["near_hits"] = []
             st["cooldown"] = 0
@@ -1056,13 +1111,13 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
                 })
 
         # --- EMIT by state ---
-        if st["state"] == "TRIGGERED" and market_long_ok and adx_ok and (pd.isna(pace) or pace >= VOL_PACE_MIN):
+        if st["state"] == "TRIGGERED" and env_long_ok and adx_ok and (pd.isna(pace) or pace >= VOL_PACE_MIN):
             buy_signals.append({
                 "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
                 "stage": stage, "ma30": ma30, "weekly_rank": weekly_rank, "atr": atr
             })
             trigger_state[t]["state"] = "COOLDOWN"
-        elif st["state"] in ("NEAR","ARMED") and market_long_ok and adx_ok:
+        elif st["state"] in ("NEAR","ARMED") and env_long_ok and adx_ok:
             if (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN):
                 near_signals.append({
                     "ticker": t, "price": px, "pivot": pivot, "pace": None if pd.isna(pace) else float(pace),
@@ -1213,13 +1268,20 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     <p><i>
       BUY: Weekly Stage 1/2 + confirm over ~10-week pivot & 30-wk MA proxy (SMA150),
       +{MIN_BREAKOUT_PCT*100:.1f}% headroom, RS support, volume pace ≥ {VOL_PACE_MIN}×,
-      and ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} when available (otherwise no ADX filter).<br>
+      ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} when available (otherwise no ADX filter),
+      and global environment ON (Chapter 8 regime + Breadth Health).
+      <br>
       NEAR-TRIGGER: Stage 1/2 + RS ok, price within {NEAR_BELOW_PIVOT_PCT*100:.1f}% below pivot or first close over pivot but not fully confirmed yet,
-      volume pace ≥ {NEAR_VOL_PACE_MIN}×.<br>
+      volume pace ≥ {NEAR_VOL_PACE_MIN}×.
+      <br>
       SELL-TRIGGER: Confirmed crack below MA150 by {SELL_BREAK_PCT*100:.1f}% with persistence; for 60m bars, ≥{SELL_INTRABAR_CONFIRM_MIN_ELAPSED} min elapsed & intrabar pace ≥ {SELL_INTRABAR_VOLPACE_MIN}×.
     </i></p>
     <p style="font-size:13px;color:#555;">
-      <b>Market Regime (Chapter 8 filter):</b> {regime_label} — LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}.
+      <b>Market Regime (Chapter 8 filter):</b> {regime_label} — LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}.<br>
+      <b>Breadth Health (Advance/Decline):</b> {breadth_today*100:.1f}% of breadth universe above MA{BREADTH_MA_WINDOW}
+      (LONG breadth_ok={breadth_long_ok}, threshold {BREADTH_MIN_LONG*100:.1f}%).
+      <br>
+      <b>Effective LONG gate:</b> env_long_ok = market_long_ok AND breadth_long_ok → {env_long_ok}.
     </p>
     """
 
@@ -1277,6 +1339,9 @@ def run(_config_path="./config.yaml", *, only_tickers=None, test_ease=False, log
     text = (
         f"Weinstein Intraday Watch — {now}\n"
         f"Market Regime (Ch8): {regime_label} | LONG allowed={market_long_ok}, SHORT allowed={market_short_ok}\n"
+        f"Breadth Health: {breadth_today*100:.1f}% above MA{BREADTH_MA_WINDOW} "
+        f"(LONG breadth_ok={breadth_long_ok}, threshold {BREADTH_MIN_LONG*100:.1f}%)\n"
+        f"Effective LONG gate env_long_ok = market_long_ok AND breadth_long_ok → {env_long_ok}\n"
         f"ADX filter: ADX{ADX_WINDOW} ≥ {ADX_MIN:.1f} required when available; NaN → no ADX filter.\n\n"
         f"BUY (ranked):\n{_lines(buy_signals,'BUY')}\n\n"
         f"NEAR-TRIGGER (ranked):\n{_lines(near_signals,'NEAR')}\n\n"
