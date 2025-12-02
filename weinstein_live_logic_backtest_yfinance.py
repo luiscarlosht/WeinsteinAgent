@@ -45,15 +45,22 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Shared Weinstein indicators (ADX single source of truth)
-from weinstein_indicators import compute_adx_series, ADX_WINDOW, ADX_MIN
+# Shared Weinstein indicators (ADX + breadth single source of truth)
+from weinstein_indicators import (
+    compute_adx_series,
+    ADX_WINDOW,
+    ADX_MIN,
+    compute_breadth_series_above_ma,
+)
 
 # ---------------- Logging helpers ----------------
 
 VERBOSE = True
 
+
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
 
 def log(msg: str, *, level: str = "info"):
     if not VERBOSE and level == "debug":
@@ -68,14 +75,17 @@ def log(msg: str, *, level: str = "info"):
     }.get(level, "•")
     print(f"{prefix} [{_ts()}] {msg}", flush=True)
 
+
 # ---------------- File / data helpers ----------------
 
 WEEKLY_OUTPUT_DIR = "./output"
 WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
 
+
 def newest_weekly_csv() -> str:
     files = [
-        f for f in os.listdir(WEEKLY_OUTPUT_DIR)
+        f
+        for f in os.listdir(WEEKLY_OUTPUT_DIR)
         if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
     ]
     if not files:
@@ -86,12 +96,14 @@ def newest_weekly_csv() -> str:
     files.sort(reverse=True)
     return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
 
+
 def load_weekly_report() -> pd.DataFrame:
     path = newest_weekly_csv()
     log(f"Using weekly CSV: {path}", level="info")
     df = pd.read_csv(path)
     df = df.rename(columns=str.lower)
     return df
+
 
 def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
@@ -118,6 +130,7 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
     log("Download complete.", level="ok")
     return data
 
+
 def compute_atr_from_df(daily_df: pd.DataFrame, ticker: str, n: int = 14) -> float:
     if isinstance(daily_df.columns, pd.MultiIndex):
         try:
@@ -138,9 +151,13 @@ def compute_atr_from_df(daily_df: pd.DataFrame, ticker: str, n: int = 14) -> flo
     atr = tr.rolling(n).mean()
     return float(atr.iloc[-1]) if len(atr.dropna()) else np.nan
 
+
 # ------ volume vs 50dma helper (daily approximation of intraday pace) ------
 
-def volume_vs_50dma(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp) -> float:
+
+def volume_vs_50dma(
+    daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp
+) -> float:
     """
     daily_vol / 50-day average volume, using only data BEFORE as_of_date
     for the 50-day window.
@@ -164,7 +181,9 @@ def volume_vs_50dma(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestam
         return np.nan
     return float(today_vol / vol50)
 
+
 # ---------------- Weinstein-universe helpers ----------------
+
 
 def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     """
@@ -188,23 +207,28 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
         raise ValueError("side must be 'long' or 'short'")
 
     df["rs_above_ma"] = df["rs_above_ma"].fillna(False).astype(bool)
-    df["weekly_rank"] = pd.to_numeric(df["weekly_rank"], errors="coerce").fillna(999999)
+    df["weekly_rank"] = (
+        pd.to_numeric(df["weekly_rank"], errors="coerce").fillna(999999)
+    )
     df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
     df = df.sort_values(["weekly_rank", "ticker"])
     log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
     return df
 
+
 # ---------------- Backtest data structures ----------------
+
 
 @dataclass
 class Position:
     ticker: str
-    side: str      # "long" or "short"
+    side: str  # "long" or "short"
     qty: float
     entry_price: float
     stop: float
     atr: float
     opened: datetime
+
 
 @dataclass
 class Trade:
@@ -218,31 +242,39 @@ class Trade:
     pnl: float
     pnl_pct: float
 
+
 # ---------------- Trading logic parameters ----------------
 
 # Long side — tuned more closely to production intraday thresholds
-LONG_BREAK_PCT = 0.004      # ≈0.4% above pivot breakout, matching short break magnitude
-LONG_STOP_HARD = 0.20       # 20% hard stop (Weinstein-style disaster stop)
-LONG_TRAIL_ATR = 2.0        # ATR-based cushion
-LONG_MA_GUARD = 0.03        # extra guard vs MA30 (≈3% under)
+LONG_BREAK_PCT = 0.004  # ≈0.4% above pivot breakout, matching short break magnitude
+LONG_STOP_HARD = 0.20  # 20% hard stop (Weinstein-style disaster stop)
+LONG_TRAIL_ATR = 2.0  # ATR-based cushion
+LONG_MA_GUARD = 0.03  # extra guard vs MA30 (≈3% under)
 
 # Short side (mirrored)
-SHORT_BREAK_PCT = 0.004     # ≈0.4% below pivot breakdown
+SHORT_BREAK_PCT = 0.004  # ≈0.4% below pivot breakdown
 SHORT_STOP_HARD = 0.20
 SHORT_TRAIL_ATR = 2.0
-SHORT_MA_GUARD = 0.03       # extra guard above MA30 (≈3% over)
+SHORT_MA_GUARD = 0.03  # extra guard above MA30 (≈3% over)
 
 # Volume filters (approximate your intraday VOL_PACE_MIN 1.3×)
 LONG_VOL_MIN = 1.30
 SHORT_VOL_MIN = 1.30
 
-PIVOT_LOOKBACK_DAYS = 50    # pivot highs/lows over last ~10 weeks
+PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
+
+# Breadth Health filter (Advance/Decline strength)
+# Approximates "% of S&P500 above MA50" by using your Stage 2 universe.
+BREADTH_MA_WINDOW = 50
+BREADTH_MIN_LONG = 0.60  # require 60% of breadth universe above MA50 to allow new longs
+
 
 def _safe_float(x):
     try:
         return float(x)
     except Exception:
         return np.nan
+
 
 def get_close_series(daily_df: pd.DataFrame, ticker: str) -> pd.Series:
     if isinstance(daily_df.columns, pd.MultiIndex):
@@ -254,11 +286,17 @@ def get_close_series(daily_df: pd.DataFrame, ticker: str) -> pd.Series:
         s = daily_df["Close"].dropna()
     return s
 
-def get_ma_series(daily_df: pd.DataFrame, ticker: str, window: int = 30) -> pd.Series:
+
+def get_ma_series(
+    daily_df: pd.DataFrame, ticker: str, window: int = 30
+) -> pd.Series:
     c = get_close_series(daily_df, ticker)
     return c.rolling(window).mean()
 
-def get_pivot_high(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp) -> float:
+
+def get_pivot_high(
+    daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp
+) -> float:
     """
     Last 50-day high BEFORE as_of_date (exclusive).
     """
@@ -273,7 +311,10 @@ def get_pivot_high(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp
     sub = sub.dropna().tail(PIVOT_LOOKBACK_DAYS)
     return float(sub.max()) if len(sub) else np.nan
 
-def get_pivot_low(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp) -> float:
+
+def get_pivot_low(
+    daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp
+) -> float:
     """
     Last 50-day low BEFORE as_of_date (exclusive).
     """
@@ -288,7 +329,9 @@ def get_pivot_low(daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp)
     sub = sub.dropna().tail(PIVOT_LOOKBACK_DAYS)
     return float(sub.min()) if len(sub) else np.nan
 
+
 # ---------------- Entry / exit rules ----------------
+
 
 def should_enter_long(
     price: float,
@@ -313,6 +356,7 @@ def should_enter_long(
         return False
     return True
 
+
 def long_stop_level(entry: float, atr: float, ma30_val: float) -> float:
     if np.isnan(entry):
         return np.nan
@@ -321,6 +365,7 @@ def long_stop_level(entry: float, atr: float, ma30_val: float) -> float:
     ma_guard = ma30_val * (1.0 - LONG_MA_GUARD) if not np.isnan(ma30_val) else np.nan
     cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
     return max(cands) if cands else hard
+
 
 def should_exit_long(price: float, stop: float, ma30_val: float) -> bool:
     if np.isnan(price):
@@ -332,6 +377,7 @@ def should_exit_long(price: float, stop: float, ma30_val: float) -> bool:
     if not np.isnan(ma30_val) and price <= ma30_val * (1.0 - LONG_MA_GUARD):
         return True
     return False
+
 
 def should_enter_short(
     price: float,
@@ -356,6 +402,7 @@ def should_enter_short(
         return False
     return True
 
+
 def short_stop_level(entry: float, atr: float, ma30_val: float) -> float:
     if np.isnan(entry):
         return np.nan
@@ -364,6 +411,7 @@ def short_stop_level(entry: float, atr: float, ma30_val: float) -> float:
     ma_guard = ma30_val * (1.0 + SHORT_MA_GUARD) if not np.isnan(ma30_val) else np.nan
     cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
     return min(cands) if cands else hard
+
 
 def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
     if np.isnan(price):
@@ -376,13 +424,16 @@ def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
         return True
     return False
 
+
 # ---------------- Backtest engine ----------------
+
 
 @dataclass
 class Portfolio:
-    cash: float          # realized P&L + unallocated capital
+    cash: float  # realized P&L + unallocated capital
     positions: Dict[str, Position]
-    equity: float        # cash + open P&L
+    equity: float  # cash + open P&L
+
 
 def backtest(
     daily_df: pd.DataFrame,
@@ -403,6 +454,32 @@ def backtest(
 
     long_tickers = set(long_universe["ticker"].astype(str).str.upper())
     short_tickers = set(short_universe["ticker"].astype(str).str.upper())
+
+    # ----- Breadth series (approx "% of S&P500 above MA50") -----
+    # We use the Stage 2 (long) universe as the breadth universe.
+    breadth_series = None
+    if isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
+        close_panel = daily_df["Close"]
+        breadth_series = compute_breadth_series_above_ma(
+            daily_close_panel=close_panel,
+            tickers=sorted(long_tickers),
+            ma_window=BREADTH_MA_WINDOW,
+        )
+        if breadth_series is not None and not breadth_series.empty:
+            log(
+                f"Breadth series computed over {len(long_tickers)} long-universe tickers "
+                f"(MA{BREADTH_MA_WINDOW}).",
+                level="info",
+            )
+        else:
+            log("Breadth series is empty; breadth gate will be effectively disabled.", level="warn")
+            breadth_series = None
+    else:
+        log(
+            "Daily data not in expected MultiIndex Close panel; breadth gate disabled.",
+            level="warn",
+        )
+        breadth_series = None
 
     all_dates = daily_df.index
     all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
@@ -434,7 +511,9 @@ def backtest(
         if not {"High", "Low", "Close"}.issubset(sub.columns):
             adx_cache[t] = pd.Series(dtype="float64")
         else:
-            adx_cache[t] = compute_adx_series(sub[["High", "Low", "Close"]], n=ADX_WINDOW)
+            adx_cache[t] = compute_adx_series(
+                sub[["High", "Low", "Close"]], n=ADX_WINDOW
+            )
 
     atr_cache: Dict[str, float] = {}
     for t in long_tickers | short_tickers:
@@ -473,6 +552,23 @@ def backtest(
         portfolio.equity = eq
         equity_curve.append({"date": dt, "equity": eq})
 
+        # Compute breadth gate for this day (for new LONG entries)
+        breadth_ok = True
+        breadth_val = np.nan
+        if breadth_series is not None and dt in breadth_series.index:
+            breadth_val = float(breadth_series.loc[dt])
+            if not np.isnan(breadth_val):
+                breadth_ok = breadth_val >= BREADTH_MIN_LONG
+            else:
+                breadth_ok = True  # if NaN, don't block
+        # Optional debug logging when breadth blocks new longs
+        if not breadth_ok:
+            log(
+                f"[SKIP-BREADTH] No new LONGs on {dt.date()} because breadth="
+                f"{breadth_val:.2%} < {BREADTH_MIN_LONG:.0%}",
+                level="debug",
+            )
+
         # First exits, then entries (so freed risk can be reused)
         # ------ Exits ------
         to_remove = []
@@ -481,7 +577,11 @@ def backtest(
             if np.isnan(p):
                 continue
             ma_series = ma_cache.get(pos.ticker)
-            ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
+            ma_val = (
+                ma_series.loc[dt]
+                if ma_series is not None and dt in ma_series.index
+                else np.nan
+            )
 
             if pos.side == "long":
                 if not should_exit_long(p, pos.stop, ma_val):
@@ -494,7 +594,9 @@ def backtest(
                 exit_price = p
                 pnl = pos.qty * (pos.entry_price - exit_price)
 
-            pnl_pct = pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
+            pnl_pct = (
+                pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
+            )
             portfolio.cash += pnl  # realize P&L into cash
 
             trade_log.append(
@@ -520,8 +622,12 @@ def backtest(
         n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # LONG entries
-        if mode in ("long", "both") and n_long_now < max_long:
+        # LONG entries (gated by breadth_ok)
+        if (
+            mode in ("long", "both")
+            and n_long_now < max_long
+            and breadth_ok
+        ):
             for _, row in long_universe.iterrows():
                 t = str(row["ticker"]).upper()
                 pos_key = f"{t}_long"
@@ -532,14 +638,22 @@ def backtest(
                     continue
 
                 ma_series = ma_cache.get(t)
-                ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
+                ma_val = (
+                    ma_series.loc[dt]
+                    if ma_series is not None and dt in ma_series.index
+                    else np.nan
+                )
                 pivot_high = get_pivot_high(daily_df, t, dt)
                 rs_above_ma = bool(row.get("rs_above_ma", False))
                 vol_mult = volume_vs_50dma(daily_df, t, dt)
 
                 # ADX filter (mirrors intraday: NaN → no block, real < ADX_MIN → block)
                 adx_series = adx_cache.get(t)
-                if adx_series is not None and not adx_series.empty and dt in adx_series.index:
+                if (
+                    adx_series is not None
+                    and not adx_series.empty
+                    and dt in adx_series.index
+                ):
                     adx_val = float(adx_series.loc[dt])
                 else:
                     adx_val = np.nan
@@ -547,7 +661,7 @@ def backtest(
                 if np.isnan(adx_val):
                     adx_ok = True
                 else:
-                    adx_ok = (adx_val >= ADX_MIN)
+                    adx_ok = adx_val >= ADX_MIN
 
                 if not adx_ok:
                     # Diagnostic similar to intraday watcher
@@ -557,7 +671,9 @@ def backtest(
                     )
                     continue
 
-                if not should_enter_long(price, ma_val, pivot_high, rs_above_ma, vol_mult):
+                if not should_enter_long(
+                    price, ma_val, pivot_high, rs_above_ma, vol_mult
+                ):
                     continue
 
                 atr = atr_cache.get(t, np.nan)
@@ -587,7 +703,7 @@ def backtest(
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries
+        # SHORT entries (not breadth-gated; only Weinstein stage + price/volume rules)
         if mode in ("short", "both") and n_short_now < max_short:
             for _, row in short_universe.iterrows():
                 t = str(row["ticker"]).upper()
@@ -599,12 +715,18 @@ def backtest(
                     continue
 
                 ma_series = ma_cache.get(t)
-                ma_val = ma_series.loc[dt] if ma_series is not None and dt in ma_series.index else np.nan
+                ma_val = (
+                    ma_series.loc[dt]
+                    if ma_series is not None and dt in ma_series.index
+                    else np.nan
+                )
                 pivot_low = get_pivot_low(daily_df, t, dt)
                 rs_above_ma = bool(row.get("rs_above_ma", False))
                 vol_mult = volume_vs_50dma(daily_df, t, dt)
 
-                if not should_enter_short(price, ma_val, pivot_low, rs_above_ma, vol_mult):
+                if not should_enter_short(
+                    price, ma_val, pivot_low, rs_above_ma, vol_mult
+                ):
                     continue
 
                 atr = atr_cache.get(t, np.nan)
@@ -646,7 +768,9 @@ def backtest(
         "equity_curve": equity_curve,
     }
 
+
 # ---------------- Plotting & CSV helpers ----------------
+
 
 def save_trade_log(trades: List[Trade], path: str):
     if not trades:
@@ -671,6 +795,7 @@ def save_trade_log(trades: List[Trade], path: str):
     df.to_csv(path, index=False)
     log(f"Wrote trade log → {path}", level="ok")
 
+
 def save_equity_curve(equity_curve: List[Dict[str, object]], path: str):
     if not equity_curve:
         log("No equity curve to plot.", level="warn")
@@ -687,6 +812,7 @@ def save_equity_curve(equity_curve: List[Dict[str, object]], path: str):
     plt.savefig(path, dpi=120, bbox_inches="tight")
     plt.close()
     log(f"Wrote equity curve PNG → {path}", level="ok")
+
 
 def save_monthly_pnl(
     trades: List[Trade],
@@ -751,7 +877,9 @@ def save_monthly_pnl(
             level="info",
         )
 
+
 # ---------------- CLI ----------------
+
 
 def main():
     global VERBOSE
@@ -796,9 +924,7 @@ def main():
 
     weekly_df = load_weekly_report()
 
-    all_tickers = set(
-        weekly_df["ticker"].astype(str).str.upper().tolist()
-    )
+    all_tickers = set(weekly_df["ticker"].astype(str).str.upper().tolist())
     daily_df = download_daily_bars(sorted(all_tickers), start, end)
 
     result = backtest(
@@ -814,8 +940,8 @@ def main():
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
-    trades: List[Trade] = result["trades"]      # type: ignore
-    equity_curve = result["equity_curve"]       # type: ignore
+    trades: List[Trade] = result["trades"]  # type: ignore
+    equity_curve = result["equity_curve"]  # type: ignore
 
     # Summary
     final_eq = portfolio.equity
@@ -836,6 +962,7 @@ def main():
     save_trade_log(trades, trades_path)
     save_equity_curve(equity_curve, eq_path)
     save_monthly_pnl(trades, equity_curve, args.capital, monthly_path)
+
 
 if __name__ == "__main__":
     main()
