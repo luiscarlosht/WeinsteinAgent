@@ -4,11 +4,14 @@
 """
 market_regime.py
 
-Weinstein Chapter 8 style market regime filter.
+Weinstein Chapter 8 style market regime filter + VIX regime filter (v2).
 
 Goal:
   - Use the behavior of the major indices vs. their 200-day moving averages
     to decide whether the overall environment is favorable for new LONG / SHORT entries.
+  - Add a VIX-based volatility filter to prevent:
+        * New LONGS when volatility is too high
+        * New SHORTS when volatility is too low
   - This is a coarse "market is in gear or not" filter, not a stock-selection tool.
 
 Core Weinstein-style ideas (Chapter 8, adapted for automation):
@@ -19,11 +22,22 @@ Core Weinstein-style ideas (Chapter 8, adapted for automation):
       * Falling MA + index below MA → bearish.
       * Mixed conditions           → neutral.
 
+VIX Regime Filter (v2):
+  - Download VIX (^VIX) daily closes.
+  - Apply simple hard thresholds:
+
+      * NO new longs if VIX > 22
+      * NO new shorts if VIX < 15
+
+  - In “normal / good” years VIX spends a lot of time < 20, so
+    this mainly filters out high-volatility chop and low-vol short traps.
+
 We implement:
   - Download recent daily data for the chosen indices via yfinance.
   - Compute 200-day SMA and its "slope" over N days (default 20) for each index.
   - Classify each index as BULLISH / BEARISH / NEUTRAL.
   - Aggregate to a single market regime: BULL, BEAR, NEUTRAL, UNKNOWN.
+  - Download VIX, compute last close, and derive VIX long/short gates.
 
 Tiny helper for intraday / short watchers
 -----------------------------------------
@@ -33,27 +47,29 @@ about all the internals:
     from market_regime import inspect
 
     label, long_ok, short_ok = inspect()
-    # label:  "BULL", "BEAR", "NEUTRAL", "UNKNOWN"
+    # label:   "BULL", "BEAR", "NEUTRAL", "UNKNOWN"
     # long_ok:  True if environment ok for *new longs*
     # short_ok: True if environment ok for *new shorts*
 
-BASIC POLICY (Chapter 8 style):
+The final long_ok / short_ok are:
 
-  - LONGS:
-      * Allowed in BULL and NEUTRAL regimes (Weinstein: favor new longs when
-        the major indices are in an uptrend; NEUTRAL is treated as "ok but
-        cautious" here so we don't choke your system completely).
+  1) Weinstein regime gates:
+        - LONGS:
+            * Allowed in BULL and NEUTRAL.
+        - SHORTS:
+            * Allowed ONLY in BEAR.
+        - UNKNOWN:
+            * Treat as NEUTRAL for longs, but block shorts.
 
-  - SHORTS:
-      * Allowed ONLY in BEAR regimes.
-        This matches your requirement: "do not have short signals trigger
-        unless it's during bearish markets."
+  2) AND VIX gates:
+        - LONGS:
+            * Allowed only if VIX <= 22
+        - SHORTS:
+            * Allowed only if VIX >= 15
 
-  - UNKNOWN:
-      * Treat as NEUTRAL for longs (long_ok = True), but block new shorts
-        (short_ok = False).
-
-This tiny wrapper is what intraday and short watchers should be using.
+So:
+    long_ok  = long_ok_from_regime  AND long_ok_from_vix
+    short_ok = short_ok_from_regime AND short_ok_from_vix
 """
 
 from __future__ import annotations
@@ -130,6 +146,22 @@ class MarketRegimeConfig:
 
     # If True, we print details / debugging info
     verbose: bool = False
+
+    # ── VIX filter settings ───────────────────────────
+    # Whether to apply the VIX-based long/short gates
+    use_vix_filter: bool = True
+
+    # Symbol for VIX
+    vix_symbol: str = "^VIX"
+
+    # How many days of history for VIX (usually same as history_days)
+    vix_history_days: int = 400
+
+    # Max VIX to allow new longs. If VIX > vix_long_max → block new longs.
+    vix_long_max: float = 22.0
+
+    # Min VIX to allow new shorts. If VIX < vix_short_min → block new shorts.
+    vix_short_min: float = 15.0
 
     def __post_init__(self):
         if self.index_symbols is None:
@@ -301,7 +333,8 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
       - overall regime (BULL / BEAR / NEUTRAL / UNKNOWN)
       - per-index metrics (state, last_close, MA, slope, etc.)
 
-    This is what we will call from intraday / short watchers to gate new entries.
+    This is what we will call from intraday / short watchers to gate new entries
+    on the Weinstein side. VIX gating is applied at the `inspect()` level.
     """
     if cfg is None:
         cfg = MarketRegimeConfig()
@@ -359,6 +392,74 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
 
 
 # ─────────────────────────────
+# VIX FILTER HELPERS
+# ─────────────────────────────
+
+def _download_vix_series(cfg: MarketRegimeConfig) -> pd.Series:
+    """
+    Download daily close series for VIX (cfg.vix_symbol).
+    Returns pd.Series of closes indexed by date.
+    """
+    if yf is None:
+        raise RuntimeError("yfinance is not available; cannot download VIX data.")
+
+    period = f"{cfg.vix_history_days}d"
+    try:
+        data = yf.download(
+            cfg.vix_symbol,
+            period=period,
+            interval="1d",
+            auto_adjust=False,  # for VIX, no need to adjust
+            progress=False,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to download VIX data via yfinance: {e}") from e
+
+    if data.empty or "Close" not in data.columns:
+        raise RuntimeError("Downloaded VIX data has no 'Close' column or is empty.")
+
+    return data["Close"].dropna()
+
+
+def _compute_vix_gates(cfg: MarketRegimeConfig) -> Tuple[float, bool, bool]:
+    """
+    Compute VIX-based gating for longs/shorts.
+
+    Returns:
+        (vix_last, long_ok_vix, short_ok_vix)
+
+    - If use_vix_filter is False OR yfinance missing OR download fails:
+        vix_last = nan
+        long_ok_vix  = True
+        short_ok_vix = True
+    """
+    if (not cfg.use_vix_filter) or (yf is None):
+        return float("nan"), True, True
+
+    try:
+        series = _download_vix_series(cfg)
+        if series.empty:
+            raise RuntimeError("Empty VIX series.")
+        vix_last = float(series.iloc[-1])
+    except Exception as e:
+        if cfg.verbose:
+            print(f"[VIX] Warning: could not compute VIX gates: {e}")
+        return float("nan"), True, True
+
+    long_ok_vix = vix_last <= cfg.vix_long_max
+    short_ok_vix = vix_last >= cfg.vix_short_min
+
+    if cfg.verbose:
+        print(
+            f"[VIX] {cfg.vix_symbol}: last={vix_last:.2f} | "
+            f"long_ok_vix={long_ok_vix} (max {cfg.vix_long_max:.2f}) | "
+            f"short_ok_vix={short_ok_vix} (min {cfg.vix_short_min:.2f})"
+        )
+
+    return vix_last, long_ok_vix, short_ok_vix
+
+
+# ─────────────────────────────
 # TINY INSPECT WRAPPER FOR WATCHERS
 # ─────────────────────────────
 
@@ -386,7 +487,7 @@ def _compute_long_short_flags(regime: MarketRegime) -> Tuple[bool, bool]:
     return long_ok, short_ok
 
 
-def inspect() -> Tuple[str, bool, bool]:
+def inspect(cfg: Optional[MarketRegimeConfig] = None) -> Tuple[str, bool, bool]:
     """
     Tiny helper for intraday / short watchers.
 
@@ -396,23 +497,40 @@ def inspect() -> Tuple[str, bool, bool]:
         label:     "BULL", "BEAR", "NEUTRAL", "UNKNOWN"
         long_ok:   bool → whether new LONG entries are allowed
         short_ok:  bool → whether new SHORT entries are allowed
+
+    Logic:
+        1) Compute Weinstein regime and base long_ok/short_ok.
+        2) Compute VIX gates and AND them with the regime gates.
     """
-    snap = detect_market_regime()
+    # Use same config for both regime and VIX gating
+    if cfg is None:
+        cfg = MarketRegimeConfig()
+
+    snap = detect_market_regime(cfg)
     regime = snap.regime
-    long_ok, short_ok = _compute_long_short_flags(regime)
+
+    # Weinstein regime gates
+    long_ok_regime, short_ok_regime = _compute_long_short_flags(regime)
+
+    # VIX gates
+    _, long_ok_vix, short_ok_vix = _compute_vix_gates(cfg)
+
+    long_ok = long_ok_regime and long_ok_vix
+    short_ok = short_ok_regime and short_ok_vix
+
     label = regime.name.upper()  # BULL / BEAR / NEUTRAL / UNKNOWN
     return label, long_ok, short_ok
 
 
 # Backwards-compatible aliases in case watchers look for a specific name
-def inspect_for_intraday() -> Tuple[str, bool, bool]:
+def inspect_for_intraday(cfg: Optional[MarketRegimeConfig] = None) -> Tuple[str, bool, bool]:
     """Alias for inspect()."""
-    return inspect()
+    return inspect(cfg)
 
 
-def inspect_market_regime() -> Tuple[str, bool, bool]:
+def inspect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> Tuple[str, bool, bool]:
     """Alias for inspect()."""
-    return inspect()
+    return inspect(cfg)
 
 
 # ─────────────────────────────
@@ -420,7 +538,7 @@ def inspect_market_regime() -> Tuple[str, bool, bool]:
 # ─────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Weinstein-style market regime detector (Chapter 8).")
+    ap = argparse.ArgumentParser(description="Weinstein-style market regime detector (Chapter 8) + VIX filter.")
     ap.add_argument(
         "--indices",
         nargs="+",
@@ -463,10 +581,34 @@ def _parse_args() -> argparse.Namespace:
         default=400,
         help="Number of calendar days of history to request from yfinance, default=400.",
     )
+    # VIX-related CLI toggles (optional)
+    ap.add_argument(
+        "--no-vix-filter",
+        action="store_true",
+        help="Disable VIX filter (only Weinstein regime will be used).",
+    )
+    ap.add_argument(
+        "--vix-symbol",
+        type=str,
+        default="^VIX",
+        help="VIX symbol to use, default=^VIX.",
+    )
+    ap.add_argument(
+        "--vix-long-max",
+        type=float,
+        default=22.0,
+        help="Max VIX to allow new longs (default=22.0). If VIX > this, longs are blocked.",
+    )
+    ap.add_argument(
+        "--vix-short-min",
+        type=float,
+        default=15.0,
+        help="Min VIX to allow new shorts (default=15.0). If VIX < this, shorts are blocked.",
+    )
     ap.add_argument(
         "--quiet",
         action="store_true",
-        help="Do not print per-index details; only print final regime.",
+        help="Do not print per-index details; only print final regime and gates.",
     )
     return ap.parse_args()
 
@@ -482,19 +624,51 @@ def main() -> None:
         min_bearish_fraction=args.min_bearish_fraction,
         history_days=args.history_days,
         verbose=not args.quiet,
+        use_vix_filter=not args.no_vix_filter,
+        vix_symbol=args.vix_symbol,
+        vix_long_max=args.vix_long_max,
+        vix_short_min=args.vix_short_min,
+        vix_history_days=args.history_days,
     )
 
     snap = detect_market_regime(cfg)
+
+    # Weinstein regime gates
+    long_ok_regime, short_ok_regime = _compute_long_short_flags(snap.regime)
+
+    # VIX gates
+    vix_last, long_ok_vix, short_ok_vix = _compute_vix_gates(cfg)
+
+    # Combined gates (what inspect() would give)
+    long_ok = long_ok_regime and long_ok_vix
+    short_ok = short_ok_regime and short_ok_vix
+
     if args.quiet:
+        # Just print final regime label + combined gates
         print(snap.regime.value)
+        print(f"long_ok={long_ok} short_ok={short_ok}")
     else:
         print()
         print("Final regime:", snap.regime.value.upper())
         print()
 
-        # Also show how the tiny inspect wrapper would see it
-        long_ok, short_ok = _compute_long_short_flags(snap.regime)
-        print(f"inspect() → label={snap.regime.name.upper()}, long_ok={long_ok}, short_ok={short_ok}")
+        if not np.isnan(vix_last):
+            print(
+                f"VIX ({cfg.vix_symbol}): last={vix_last:.2f} | "
+                f"long_ok_vix={long_ok_vix} (max {cfg.vix_long_max:.2f}) | "
+                f"short_ok_vix={short_ok_vix} (min {cfg.vix_short_min:.2f})"
+            )
+        else:
+            print("VIX: unavailable (filter effectively disabled).")
+
+        print()
+        print(
+            f"Regime-only gates: long_ok_regime={long_ok_regime}, "
+            f"short_ok_regime={short_ok_regime}"
+        )
+        print(
+            f"Combined gates (inspect): long_ok={long_ok}, short_ok={short_ok}"
+        )
         print()
 
 
