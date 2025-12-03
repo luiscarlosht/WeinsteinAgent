@@ -12,7 +12,11 @@ Goals:
     * Behavior of long + short sides
 
 Key points:
-- Uses the latest weekly scan CSV: ./output/weinstein_weekly_equities_*.csv
+- DEFAULT: Uses the latest weekly scan CSV: ./output/weinstein_weekly_equities_*.csv
+- OPTIONAL (when available): can use a directory of *historical* weekly snapshots,
+  one CSV per as-of date, under:
+      ./data/weekly_snapshots/
+  and chooses the latest snapshot with date <= current backtest date.
 - Stage 2 (Uptrend) universe for LONG side
 - Stage 4 (Downtrend) universe for SHORT side
 - Uses DAILY bars (yfinance, auto_adjust=True)
@@ -24,11 +28,6 @@ Key points:
 - Risk sizing:
     * Risk per trade = equity * risk_per_trade / per-share-risk
     * Stops use ATR and MA30 guard, similar to your intraday logic
-- Regime / filters:
-    * Breadth gate using Stage 2 universe (~% above MA50)
-    * VIX gate using ^VIX daily close:
-        - New LONGs only when VIX <= VIX_LONG_MAX
-        - New SHORTs only when VIX >= VIX_SHORT_MIN
 - Outputs:
     * Trade log CSV
     * Equity curve PNG
@@ -38,8 +37,9 @@ Key points:
 import argparse
 import os
 import math
+import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
 
 import numpy as np
@@ -86,11 +86,14 @@ def log(msg: str, *, level: str = "info"):
 WEEKLY_OUTPUT_DIR = "./output"
 WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
 
-# VIX regime settings
-VIX_SYMBOL = "^VIX"
-# Conservative defaults – you can tune these:
-VIX_LONG_MAX = 22.0   # Allow NEW LONG entries only when VIX <= this
-VIX_SHORT_MIN = 20.0  # Allow NEW SHORT entries only when VIX >= this
+# Historical snapshot dir (optional, for Option A)
+# Expected: many CSVs like:
+#   data/weekly_snapshots/weinstein_weekly_equities_2019-01-04.csv
+#   data/weekly_snapshots/weinstein_weekly_equities_20190104.csv
+#   data/weekly_snapshots/weinstein_weekly_equities_20190104_1801.csv
+WEEKLY_SNAPSHOT_DIR = "./data/weekly_snapshots"
+
+_SNAPSHOT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
 
 
 def newest_weekly_csv() -> str:
@@ -114,6 +117,91 @@ def load_weekly_report() -> pd.DataFrame:
     df = pd.read_csv(path)
     df = df.rename(columns=str.lower)
     return df
+
+
+def _parse_snapshot_date_from_name(fname: str) -> Optional[date]:
+    """
+    Try to extract an as-of date from a snapshot filename.
+
+    Accepts:
+      - YYYYMMDD
+      - YYYY-MM-DD
+
+    Examples:
+      weinstein_weekly_equities_20190104_1801.csv -> 2019-01-04
+      weinstein_weekly_equities_2019-01-04.csv   -> 2019-01-04
+    """
+    m = _SNAPSHOT_NAME_RE.search(fname)
+    if not m:
+        return None
+    token = m.group(1)
+    try:
+        if len(token) == 8:
+            dt_obj = datetime.strptime(token, "%Y%m%d").date()
+        else:
+            dt_obj = datetime.strptime(token, "%Y-%m-%d").date()
+        return dt_obj
+    except Exception:
+        return None
+
+
+def load_weekly_snapshots(snapshot_dir: str) -> List[tuple[date, pd.DataFrame]]:
+    """
+    Load historical weekly equity CSV snapshots from snapshot_dir.
+
+    Returns a list of (as_of_date, df) sorted by as_of_date.
+    If the directory does not exist or nothing matches, returns [].
+    """
+    if not os.path.isdir(snapshot_dir):
+        log(f"No snapshot dir {snapshot_dir} (skipping historical snapshots).", level="info")
+        return []
+
+    snapshots: List[tuple[date, pd.DataFrame]] = []
+    for fname in os.listdir(snapshot_dir):
+        if not fname.startswith(WEEKLY_FILE_PREFIX) or not fname.endswith(".csv"):
+            continue
+        d = _parse_snapshot_date_from_name(fname)
+        if not d:
+            continue
+        path = os.path.join(snapshot_dir, fname)
+        try:
+            df = pd.read_csv(path)
+            df = df.rename(columns=str.lower)
+            snapshots.append((d, df))
+        except Exception as e:
+            log(f"Skipping snapshot {path}: {e}", level="warn")
+
+    snapshots.sort(key=lambda tup: tup[0])
+    if snapshots:
+        first, last = snapshots[0][0], snapshots[-1][0]
+        log(
+            f"Loaded {len(snapshots)} weekly snapshots from {snapshot_dir} "
+            f"(range {first} → {last}).",
+            level="info",
+        )
+    else:
+        log(f"No weekly snapshots found under {snapshot_dir}.", level="info")
+    return snapshots
+
+
+def pick_snapshot_for_date(
+    snapshots: List[tuple[date, pd.DataFrame]],
+    as_of_ts: pd.Timestamp,
+) -> Optional[tuple[date, pd.DataFrame]]:
+    """
+    Choose the most recent snapshot with as_of_date <= current date.
+    If none qualifies yet (e.g. before first snapshot), returns None.
+    """
+    if not snapshots:
+        return None
+    target = as_of_ts.date()
+    chosen: Optional[tuple[date, pd.DataFrame]] = None
+    for d, df in snapshots:
+        if d <= target:
+            chosen = (d, df)
+        else:
+            break
+    return chosen
 
 
 def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
@@ -140,40 +228,6 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
         raise RuntimeError("No daily data returned from yfinance.")
     log("Download complete.", level="ok")
     return data
-
-
-def download_vix_series(start: str, end: str) -> Optional[pd.Series]:
-    """
-    Download ^VIX daily Close series with the same 120d padding as equities.
-    Returns a Series indexed by date or None if download fails.
-    """
-    start_dt = datetime.fromisoformat(start)
-    pad_start = (start_dt - timedelta(days=120)).strftime("%Y-%m-%d")
-    try:
-        log(
-            f"Downloading VIX ({VIX_SYMBOL}) daily Close ({pad_start} → {end})...",
-            level="step",
-        )
-        vix_df = yf.download(
-            VIX_SYMBOL,
-            start=pad_start,
-            end=end,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-        )
-        if vix_df.empty or "Close" not in vix_df.columns:
-            log("VIX download returned empty/invalid data; VIX gate disabled.", level="warn")
-            return None
-        vix_series = pd.to_numeric(vix_df["Close"], errors="coerce").dropna()
-        if vix_series.empty:
-            log("VIX Close series is empty after cleaning; VIX gate disabled.", level="warn")
-            return None
-        log(f"VIX series loaded with {len(vix_series)} points.", level="ok")
-        return vix_series
-    except Exception as e:
-        log(f"VIX download failed ({e}); VIX gate disabled.", level="warn")
-        return None
 
 
 def compute_atr_from_df(daily_df: pd.DataFrame, ticker: str, n: int = 14) -> float:
@@ -235,6 +289,9 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     side = "long" -> Stage 2 universe
     side = "short" -> Stage 4 universe
     """
+    if weekly_df is None or weekly_df.empty:
+        return pd.DataFrame(columns=["ticker", "stage", "rs_above_ma", "ma30"])
+
     for miss in ["ticker", "stage", "rs_above_ma", "ma30"]:
         if miss not in weekly_df.columns:
             weekly_df[miss] = np.nan
@@ -309,7 +366,7 @@ SHORT_VOL_MIN = 1.30
 PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
 
 # Breadth Health filter (Advance/Decline strength)
-# Approximates "% of S&P500 above MA50" by using your Stage 2 universe.
+# Approximates "% of S&P500 above MA50" by using a breadth universe of tickers.
 BREADTH_MA_WINDOW = 50
 BREADTH_MIN_LONG = 0.60  # require 60% of breadth universe above MA50 to allow new longs
 
@@ -482,7 +539,6 @@ class Portfolio:
 
 def backtest(
     daily_df: pd.DataFrame,
-    weekly_df: pd.DataFrame,
     start: str,
     end: str,
     capital: float,
@@ -490,33 +546,42 @@ def backtest(
     max_long: int,
     max_short: int,
     mode: str,
-    vix_series: Optional[pd.Series] = None,
+    *,
+    universe_tickers: List[str],
+    weekly_df: Optional[pd.DataFrame] = None,
+    weekly_snapshots: Optional[List[tuple[date, pd.DataFrame]]] = None,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", or "both"
-    VIX gating:
-      - new LONG entries require vix_long_ok (VIX <= VIX_LONG_MAX)
-      - new SHORT entries require vix_short_ok (VIX >= VIX_SHORT_MIN)
+
+    If weekly_snapshots is provided and non-empty:
+      - uses dynamic weekly universes per date (Option A).
+    Else:
+      - uses single weekly_df snapshot (current behavior).
     """
-    long_universe = build_universe(weekly_df, side="long")
-    short_universe = build_universe(weekly_df, side="short")
+    use_snapshots = bool(weekly_snapshots)
 
-    long_tickers = set(long_universe["ticker"].astype(str).str.upper())
-    short_tickers = set(short_universe["ticker"].astype(str).str.upper())
+    # Precompute static universes for fallback mode
+    static_long_universe: Optional[pd.DataFrame] = None
+    static_short_universe: Optional[pd.DataFrame] = None
+    if not use_snapshots:
+        if weekly_df is None:
+            raise RuntimeError("weekly_df is required when no weekly_snapshots are provided.")
+        static_long_universe = build_universe(weekly_df, side="long")
+        static_short_universe = build_universe(weekly_df, side="short")
 
-    # ----- Breadth series (approx "% of S&P500 above MA50") -----
-    # We use the Stage 2 (long) universe as the breadth universe.
+    # ----- Breadth series (approx "% of universe above MA50") -----
     breadth_series = None
     if isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
         close_panel = daily_df["Close"]
         breadth_series = compute_breadth_series_above_ma(
             daily_close_panel=close_panel,
-            tickers=sorted(long_tickers),
+            tickers=sorted(universe_tickers),
             ma_window=BREADTH_MA_WINDOW,
         )
         if breadth_series is not None and not breadth_series.empty:
             log(
-                f"Breadth series computed over {len(long_tickers)} long-universe tickers "
+                f"Breadth series computed over {len(universe_tickers)} breadth tickers "
                 f"(MA{BREADTH_MA_WINDOW}).",
                 level="info",
             )
@@ -544,7 +609,7 @@ def backtest(
     # Precompute MA30, ATR, and ADX for each ticker for speed
     ma_cache: Dict[str, pd.Series] = {}
     adx_cache: Dict[str, pd.Series] = {}
-    for t in long_tickers | short_tickers:
+    for t in universe_tickers:
         # MA30
         ma_cache[t] = get_ma_series(daily_df, t, window=30)
         # ADX series via shared helper (single source of truth)
@@ -565,28 +630,58 @@ def backtest(
             )
 
     atr_cache: Dict[str, float] = {}
-    for t in long_tickers | short_tickers:
+    for t in universe_tickers:
         atr_cache[t] = compute_atr_from_df(daily_df, t, n=14)
 
-    # Main daily loop
-    for i, dt_ in enumerate(all_dates):
-        if dt_ < start_dt or dt_ > end_dt:
-            continue
-        dt = pd.Timestamp(dt_)
+    # State for dynamic snapshots
+    current_snapshot_date: Optional[date] = None
+    current_long_universe: Optional[pd.DataFrame] = static_long_universe
+    current_short_universe: Optional[pd.DataFrame] = static_short_universe
 
-        # ----- VIX regime gate for this day -----
-        vix_val = np.nan
-        vix_long_ok = True
-        vix_short_ok = True
-        if vix_series is not None and dt in vix_series.index:
-            try:
-                vix_val = float(vix_series.loc[dt])
-                if not np.isnan(vix_val):
-                    vix_long_ok = vix_val <= VIX_LONG_MAX
-                    vix_short_ok = vix_val >= VIX_SHORT_MIN
-            except Exception:
-                vix_long_ok = True
-                vix_short_ok = True
+    # Main daily loop
+    for i, dt in enumerate(all_dates):
+        if dt < start_dt or dt > end_dt:
+            continue
+
+        # ----- choose weekly universe for this date -----
+        if use_snapshots and weekly_snapshots:
+            snap = pick_snapshot_for_date(weekly_snapshots, dt)
+            if snap is None:
+                # Before first snapshot: no universe yet; let exits run, but no new entries
+                long_universe = pd.DataFrame(columns=["ticker"])
+                short_universe = pd.DataFrame(columns=["ticker"])
+            else:
+                snap_date, wdf = snap
+                if snap_date != current_snapshot_date:
+                    current_long_universe = build_universe(wdf, side="long")
+                    current_short_universe = build_universe(wdf, side="short")
+                    current_snapshot_date = snap_date
+                    log(
+                        f"Using weekly snapshot as of {snap_date} for {dt.date()} — "
+                        f"long_univ={len(current_long_universe)}, short_univ={len(current_short_universe)}",
+                        level="debug",
+                    )
+                long_universe = (
+                    current_long_universe
+                    if current_long_universe is not None
+                    else pd.DataFrame(columns=["ticker"])
+                )
+                short_universe = (
+                    current_short_universe
+                    if current_short_universe is not None
+                    else pd.DataFrame(columns=["ticker"])
+                )
+        else:
+            long_universe = (
+                static_long_universe
+                if static_long_universe is not None
+                else pd.DataFrame(columns=["ticker"])
+            )
+            short_universe = (
+                static_short_universe
+                if static_short_universe is not None
+                else pd.DataFrame(columns=["ticker"])
+            )
 
         # Build price snapshot for this day
         price_today: Dict[str, float] = {}
@@ -633,19 +728,6 @@ def backtest(
                 level="debug",
             )
 
-        # Optional debug logging when VIX blocks entries
-        if not np.isnan(vix_val):
-            if not vix_long_ok:
-                log(
-                    f"[SKIP-VIX] No new LONGs on {dt.date()} because VIX={vix_val:.2f} > {VIX_LONG_MAX:.2f}",
-                    level="debug",
-                )
-            if not vix_short_ok:
-                log(
-                    f"[SKIP-VIX] No new SHORTs on {dt.date()} because VIX={vix_val:.2f} < {VIX_SHORT_MIN:.2f}",
-                    level="debug",
-                )
-
         # First exits, then entries (so freed risk can be reused)
         # ------ Exits ------
         to_remove = []
@@ -681,7 +763,7 @@ def backtest(
                     ticker=pos.ticker,
                     side=pos.side,
                     entry_date=pos.opened,
-                    exit_date=dt.to_pydatetime(),
+                    exit_date=dt,
                     entry_price=pos.entry_price,
                     exit_price=exit_price,
                     qty=pos.qty,
@@ -699,12 +781,11 @@ def backtest(
         n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # LONG entries (gated by breadth_ok AND VIX)
+        # LONG entries (gated by breadth_ok)
         if (
             mode in ("long", "both")
             and n_long_now < max_long
             and breadth_ok
-            and vix_long_ok
         ):
             for _, row in long_universe.iterrows():
                 t = str(row["ticker"]).upper()
@@ -775,18 +856,14 @@ def backtest(
                     entry_price=price,
                     stop=stop,
                     atr=atr,
-                    opened=dt.to_pydatetime(),
+                    opened=dt,
                 )
                 n_long_now += 1
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries (gated by VIX only; breadth not used for shorts)
-        if (
-            mode in ("short", "both")
-            and n_short_now < max_short
-            and vix_short_ok
-        ):
+        # SHORT entries (not breadth-gated; only Weinstein stage + price/volume rules)
+        if mode in ("short", "both") and n_short_now < max_short:
             for _, row in short_universe.iterrows():
                 t = str(row["ticker"]).upper()
                 pos_key = f"{t}_short"
@@ -831,7 +908,7 @@ def backtest(
                     entry_price=price,
                     stop=stop,
                     atr=atr,
-                    opened=dt.to_pydatetime(),
+                    opened=dt,
                 )
                 n_short_now += 1
                 if n_short_now >= max_short:
@@ -1004,17 +1081,38 @@ def main():
         level="info",
     )
 
-    weekly_df = load_weekly_report()
+    # ---- Try to use historical weekly snapshots (Option A) ----
+    weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
 
-    all_tickers = set(weekly_df["ticker"].astype(str).str.upper().tolist())
+    weekly_df: Optional[pd.DataFrame] = None
+    all_tickers: set[str] = set()
+
+    if weekly_snapshots:
+        # Union of tickers across all snapshots
+        for _, df in weekly_snapshots:
+            if "ticker" in df.columns:
+                all_tickers.update(df["ticker"].astype(str).str.upper())
+        log(
+            f"Using historical weekly snapshots for universe (unique tickers={len(all_tickers)}).",
+            level="info",
+        )
+    else:
+        # Fallback: single latest weekly report (current behavior)
+        weekly_df = load_weekly_report()
+        all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
+        log(
+            f"No historical snapshots; using latest weekly report for static universe "
+            f"({len(all_tickers)} tickers).",
+            level="info",
+        )
+
+    if not all_tickers:
+        raise RuntimeError("Universe of tickers is empty; cannot run backtest.")
+
     daily_df = download_daily_bars(sorted(all_tickers), start, end)
-
-    # VIX regime series (optional; if download fails, the VIX gate is disabled)
-    vix_series = download_vix_series(start, end)
 
     result = backtest(
         daily_df=daily_df,
-        weekly_df=weekly_df,
         start=start,
         end=end,
         capital=args.capital,
@@ -1022,7 +1120,9 @@ def main():
         max_long=args.max_long,
         max_short=args.max_short,
         mode=args.mode,
-        vix_series=vix_series,
+        universe_tickers=sorted(all_tickers),
+        weekly_df=weekly_df,
+        weekly_snapshots=weekly_snapshots if weekly_snapshots else None,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
