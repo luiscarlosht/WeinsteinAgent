@@ -12,8 +12,7 @@ Goals:
     * Behavior of long + short sides
 
 Key points:
-- Uses historical weekly snapshots via weinstein_weekly_snapshot.get_weekly_snapshot
-  (same engine as weinstein_report_weekly / intraday watcher)
+- Uses the latest weekly scan CSV: ./output/weinstein_weekly_equities_*.csv
 - Stage 2 (Uptrend) universe for LONG side
 - Stage 4 (Downtrend) universe for SHORT side
 - Uses DAILY bars (yfinance, auto_adjust=True)
@@ -36,7 +35,7 @@ import os
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -54,14 +53,9 @@ from weinstein_indicators import (
     compute_breadth_series_above_ma,
 )
 
-# Historical weekly snapshots (same engine as weekly report / intraday watcher)
-from weinstein_weekly_snapshot import get_weekly_snapshot
-
 # ---------------- Logging helpers ----------------
 
 VERBOSE = True
-DEFAULT_CONFIG_PATH = "./config.yaml"
-SIM_WEEKLY_CACHE_DIR = "./output/sim_weekly"
 
 
 def _ts() -> str:
@@ -84,15 +78,38 @@ def log(msg: str, *, level: str = "info"):
 
 # ---------------- File / data helpers ----------------
 
+WEEKLY_OUTPUT_DIR = "./output"
+WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
+
+
+def newest_weekly_csv() -> str:
+    files = [
+        f
+        for f in os.listdir(WEEKLY_OUTPUT_DIR)
+        if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
+    ]
+    if not files:
+        raise FileNotFoundError(
+            f"No weekly CSV found in {WEEKLY_OUTPUT_DIR}. "
+            f"Run weinstein_report_weekly.py first."
+        )
+    files.sort(reverse=True)
+    return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
+
+
+def load_weekly_report() -> pd.DataFrame:
+    path = newest_weekly_csv()
+    log(f"Using weekly CSV: {path}", level="info")
+    df = pd.read_csv(path)
+    df = df.rename(columns=str.lower)
+    return df
+
 
 def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
     Download DAILY OHLCV for tickers via yfinance, with a bit of padding
     before start to compute ATR and MAs.
     """
-    if not tickers:
-        raise RuntimeError("No tickers provided to download_daily_bars().")
-
     start_dt = datetime.fromisoformat(start)
     pad_start = (start_dt - timedelta(days=120)).strftime("%Y-%m-%d")
     log(
@@ -173,9 +190,6 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     side = "long" -> Stage 2 universe
     side = "short" -> Stage 4 universe
     """
-    weekly_df = weekly_df.copy()
-    weekly_df.columns = [str(c).lower() for c in weekly_df.columns]
-
     for miss in ["ticker", "stage", "rs_above_ma", "ma30"]:
         if miss not in weekly_df.columns:
             weekly_df[miss] = np.nan
@@ -200,20 +214,6 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     df = df.sort_values(["weekly_rank", "ticker"])
     log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
     return df
-
-
-def week_anchor(ts: pd.Timestamp) -> pd.Timestamp:
-    """
-    Approximate "weekly file" anchor date:
-    - Use the most recent Friday ON or BEFORE the given timestamp.
-    This mirrors how, in prod, your weekly report is run once after
-    the week closes and then used for the following intraday sessions.
-    """
-    d = ts.normalize()
-    # 0=Mon, ..., 4=Fri, ..., 6=Sun
-    while d.weekday() != 4:
-        d = d - pd.Timedelta(days=1)
-    return d
 
 
 # ---------------- Backtest data structures ----------------
@@ -264,7 +264,7 @@ SHORT_VOL_MIN = 1.30
 PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
 
 # Breadth Health filter (Advance/Decline strength)
-# Approximates "% of S&P500 above MA50" using the full Close panel universe.
+# Approximates "% of S&P500 above MA50" by using your Stage 2 universe.
 BREADTH_MA_WINDOW = 50
 BREADTH_MIN_LONG = 0.60  # require 60% of breadth universe above MA50 to allow new longs
 
@@ -437,6 +437,7 @@ class Portfolio:
 
 def backtest(
     daily_df: pd.DataFrame,
+    weekly_df: pd.DataFrame,
     start: str,
     end: str,
     capital: float,
@@ -444,38 +445,29 @@ def backtest(
     max_long: int,
     max_short: int,
     mode: str,
-    config_path: str = DEFAULT_CONFIG_PATH,
-    weekly_cache_dir: str = SIM_WEEKLY_CACHE_DIR,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", or "both"
-
-    weekly universe:
-      For each trading day, we anchor to the most recent Friday ON/BEOFRE that day,
-      fetch a historical weekly snapshot (Stage 1/2/3/4 + RS) via
-      weinstein_weekly_snapshot.get_weekly_snapshot, and build the long/short
-      universes from that snapshot. This mirrors how prod uses the most recent
-      weekly equities CSV across intraday sessions until the next weekly run.
     """
-    # Extract ticker universe from the daily Close panel
-    if isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
-        all_tickers = list(daily_df["Close"].columns)
-    else:
-        # Fallback: single-ticker case
-        all_tickers = ["SINGLE"]
+    long_universe = build_universe(weekly_df, side="long")
+    short_universe = build_universe(weekly_df, side="short")
+
+    long_tickers = set(long_universe["ticker"].astype(str).str.upper())
+    short_tickers = set(short_universe["ticker"].astype(str).str.upper())
 
     # ----- Breadth series (approx "% of S&P500 above MA50") -----
+    # We use the Stage 2 (long) universe as the breadth universe.
     breadth_series = None
     if isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
         close_panel = daily_df["Close"]
         breadth_series = compute_breadth_series_above_ma(
             daily_close_panel=close_panel,
-            tickers=sorted(all_tickers),
+            tickers=sorted(long_tickers),
             ma_window=BREADTH_MA_WINDOW,
         )
         if breadth_series is not None and not breadth_series.empty:
             log(
-                f"Breadth series computed over {len(all_tickers)} tickers "
+                f"Breadth series computed over {len(long_tickers)} long-universe tickers "
                 f"(MA{BREADTH_MA_WINDOW}).",
                 level="info",
             )
@@ -489,7 +481,9 @@ def backtest(
         )
         breadth_series = None
 
-    all_dates = [pd.Timestamp(d) for d in daily_df.index]
+    all_dates = daily_df.index
+    all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
+    all_dates = [pd.Timestamp(d) for d in all_dates]
 
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
@@ -501,12 +495,9 @@ def backtest(
     # Precompute MA30, ATR, and ADX for each ticker for speed
     ma_cache: Dict[str, pd.Series] = {}
     adx_cache: Dict[str, pd.Series] = {}
-    atr_cache: Dict[str, float] = {}
-
-    for t in all_tickers:
+    for t in long_tickers | short_tickers:
         # MA30
         ma_cache[t] = get_ma_series(daily_df, t, window=30)
-
         # ADX series via shared helper (single source of truth)
         if isinstance(daily_df.columns, pd.MultiIndex):
             try:
@@ -516,6 +507,7 @@ def backtest(
                 continue
         else:
             sub = daily_df
+        # sub should have High/Low/Close
         if not {"High", "Low", "Close"}.issubset(sub.columns):
             adx_cache[t] = pd.Series(dtype="float64")
         else:
@@ -523,39 +515,14 @@ def backtest(
                 sub[["High", "Low", "Close"]], n=ADX_WINDOW
             )
 
+    atr_cache: Dict[str, float] = {}
+    for t in long_tickers | short_tickers:
         atr_cache[t] = compute_atr_from_df(daily_df, t, n=14)
-
-    # Cache weekly universes per anchor date
-    weekly_universe_cache: Dict[Tuple[pd.Timestamp, str], pd.DataFrame] = {}
 
     # Main daily loop
     for i, dt in enumerate(all_dates):
         if dt < start_dt or dt > end_dt:
             continue
-
-        # Determine which weekly snapshot PROD would've been using on this day
-        anchor = week_anchor(dt)
-        cache_key_long = (anchor, "long")
-        cache_key_short = (anchor, "short")
-
-        if cache_key_long not in weekly_universe_cache or cache_key_short not in weekly_universe_cache:
-            # Fetch / build the weekly snapshot (this is where Yahoo weekly +
-            # Weinstein stages / RS are computed, same as report + intraday).
-            weekly_df, csv_path = get_weekly_snapshot(
-                anchor.date(),
-                config_path,
-                weekly_cache_dir,
-            )
-            log(
-                f"Weekly snapshot for anchor {anchor.date()} → {csv_path} "
-                f"(rows={len(weekly_df)})",
-                level="info",
-            )
-            weekly_universe_cache[cache_key_long] = build_universe(weekly_df, side="long")
-            weekly_universe_cache[cache_key_short] = build_universe(weekly_df, side="short")
-
-        long_universe = weekly_universe_cache[cache_key_long]
-        short_universe = weekly_universe_cache[cache_key_short]
 
         # Build price snapshot for this day
         price_today: Dict[str, float] = {}
@@ -567,7 +534,7 @@ def backtest(
                 if dt in closes.index:
                     price_today[t] = _safe_float(closes.loc[dt, t])
         else:
-            # Single ticker case
+            # Single ticker case (unlikely in your universe)
             if dt in daily_df.index:
                 price_today["SINGLE"] = _safe_float(daily_df["Close"].loc[dt])
 
@@ -594,6 +561,7 @@ def backtest(
                 breadth_ok = breadth_val >= BREADTH_MIN_LONG
             else:
                 breadth_ok = True  # if NaN, don't block
+        # Optional debug logging when breadth blocks new longs
         if not breadth_ok:
             log(
                 f"[SKIP-BREADTH] No new LONGs on {dt.date()} because breadth="
@@ -869,7 +837,7 @@ def save_monthly_pnl(
         )
     df_tr = pd.DataFrame(rows)
     df_tr["ExitDate"] = pd.to_datetime(df_tr["ExitDate"])
-    # Use month-end timestamps so they align with equity resample("ME")
+    # Use month-end timestamps so they align conceptually with equity
     df_tr["Month"] = df_tr["ExitDate"].dt.to_period("M").dt.to_timestamp(how="end")
 
     monthly = df_tr.groupby("Month").agg(
@@ -879,15 +847,10 @@ def save_monthly_pnl(
     )
     monthly["WinRate"] = monthly["Wins"] / monthly["Trades"]
 
-    # Equity month-end
-    eq_df = pd.DataFrame(equity_curve)
-    eq_df["date"] = pd.to_datetime(eq_df["date"])
-    eq_df = eq_df.set_index("date").sort_index()
-    # Use "ME" (month-end) to avoid FutureWarning about "M"
-    eq_monthly = eq_df.resample("ME").last().rename(columns={"equity": "Equity"})
-
-    monthly = monthly.join(eq_monthly["Equity"], how="left")
+    # ✅ Simpler, robust equity per month:
+    # equity = initial_capital + cumulative realized PnL
     monthly = monthly.reset_index().rename(columns={"Month": "MonthEnd"})
+    monthly["Equity"] = initial_capital + monthly["PnL"].cumsum()
 
     # Simple % PnL vs initial capital (not path-dependent)
     monthly["PnL_pct_of_initial"] = monthly["PnL"] / initial_capital * 100.0
@@ -904,8 +867,7 @@ def save_monthly_pnl(
         winrate = r["WinRate"] * 100.0 if not np.isnan(r["WinRate"]) else 0.0
         eq = r["Equity"]
         log(
-            f"  {month_str}: PnL=${pnl:,.2f} | Trades={trades_n} | "
-            f"WinRate={winrate:5.1f}% | Equity=${eq:,.2f}",
+            f"  {month_str}: PnL=${pnl:,.2f} | Trades={trades_n} | WinRate={winrate:5.1f}% | Equity=${eq:,.2f}",
             level="info",
         )
 
@@ -931,12 +893,6 @@ def main():
         choices=["long", "short", "both"],
         help="Enable long-only, short-only, or both",
     )
-    ap.add_argument(
-        "--config",
-        type=str,
-        default=DEFAULT_CONFIG_PATH,
-        help="YAML config path (same one used by weekly report / intraday watcher)",
-    )
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -960,18 +916,14 @@ def main():
         level="info",
     )
 
-    # Daily bars: use the full config-based universe (same as weekly engine)
-    from weinstein_weekly_core import load_config  # local import to avoid circulars
+    weekly_df = load_weekly_report()
 
-    params = load_config(args.config)
-    eq_tickers = params["eq_tickers"]
-    if not eq_tickers:
-        raise SystemExit("Config universe (eq_tickers) is empty; check config.yaml 'universe' section.")
-
-    daily_df = download_daily_bars(sorted(eq_tickers), start, end)
+    all_tickers = set(weekly_df["ticker"].astype(str).str.upper().tolist())
+    daily_df = download_daily_bars(sorted(all_tickers), start, end)
 
     result = backtest(
         daily_df=daily_df,
+        weekly_df=weekly_df,
         start=start,
         end=end,
         capital=args.capital,
@@ -979,8 +931,6 @@ def main():
         max_long=args.max_long,
         max_short=args.max_short,
         mode=args.mode,
-        config_path=args.config,
-        weekly_cache_dir=SIM_WEEKLY_CACHE_DIR,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
