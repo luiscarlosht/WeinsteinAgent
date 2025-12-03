@@ -13,14 +13,16 @@ Goals:
 
 Key points:
 - Uses the latest weekly scan CSV: ./output/weinstein_weekly_equities_*.csv
-- Stage 2 (Uptrend) universe for LONG side
-- Stage 4 (Downtrend) universe for SHORT side
+- Universe comes from that weekly CSV (tickers + rank)
+- Historical Weinstein stage & RS are approximated from DAILY bars:
+    * Weekly (W-FRI) closes vs SPY, 30-week MA
+    * Stage 2/4 and rs_above_ma recomputed per week
 - Uses DAILY bars (yfinance, auto_adjust=True)
 - Entry rules:
-    * Long: price above MA30, RS strong, breakout > prior 50-day high,
-      daily volume ≥ ~1.3× 50-day avg
-    * Short: price below MA30, RS weak, breakdown < prior 50-day low,
-      daily volume ≥ ~1.3× 50-day avg
+    * Long: Stage 2 (Uptrend), RS strong, price above MA30,
+      breakout > prior 50-day high, daily volume ≥ ~1.3× 50-day avg
+    * Short: Stage 4 (Downtrend), RS weak, price below MA30,
+      breakdown < prior 50-day low, daily volume ≥ ~1.3× 50-day avg
 - Risk sizing:
     * Risk per trade = equity * risk_per_trade / per-share-risk
     * Stops use ATR and MA30 guard, similar to your intraday logic
@@ -35,7 +37,7 @@ import os
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -80,6 +82,7 @@ def log(msg: str, *, level: str = "info"):
 
 WEEKLY_OUTPUT_DIR = "./output"
 WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
+BENCH_TICKER = "SPY"  # benchmark used for RS snapshots
 
 
 def newest_weekly_csv() -> str:
@@ -185,35 +188,146 @@ def volume_vs_50dma(
 # ---------------- Weinstein-universe helpers ----------------
 
 
-def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
+def build_universe(weekly_df: pd.DataFrame) -> pd.DataFrame:
     """
-    side = "long" -> Stage 2 universe
-    side = "short" -> Stage 4 universe
+    Build a static universe DataFrame:
+
+    - One row per ticker from the weekly CSV
+    - Keeps 'rank' (if present) as 'weekly_rank' for iteration order
+    - Does NOT filter by stage; stage/RS are now handled dynamically
+      via historical weekly snapshots.
     """
-    for miss in ["ticker", "stage", "rs_above_ma", "ma30"]:
+    for miss in ["ticker", "rank"]:
         if miss not in weekly_df.columns:
             weekly_df[miss] = np.nan
 
     if "rank" in weekly_df.columns:
-        weekly_df["weekly_rank"] = weekly_df["rank"]
+        weekly_df["weekly_rank"] = (
+            pd.to_numeric(weekly_df["rank"], errors="coerce").fillna(999999)
+        )
     else:
         weekly_df["weekly_rank"] = 999999
 
-    if side == "long":
-        df = weekly_df[weekly_df["stage"].isin(["Stage 2 (Uptrend)"])].copy()
-    elif side == "short":
-        df = weekly_df[weekly_df["stage"].isin(["Stage 4 (Downtrend)"])].copy()
-    else:
-        raise ValueError("side must be 'long' or 'short'")
-
-    df["rs_above_ma"] = df["rs_above_ma"].fillna(False).astype(bool)
-    df["weekly_rank"] = (
-        pd.to_numeric(df["weekly_rank"], errors="coerce").fillna(999999)
-    )
-    df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
+    df = weekly_df.copy()
+    df["ticker"] = df["ticker"].astype(str).str.upper()
+    df = df.dropna(subset=["ticker"])
     df = df.sort_values(["weekly_rank", "ticker"])
-    log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
+    df = df.reset_index(drop=True)
+    log(f"Universe size: {len(df)} symbols.", level="info")
     return df
+
+
+# ---------------- Historical weekly snapshots (Option A) ----------------
+
+
+class WeeklySnapshots:
+    """
+    Builds historical weekly Weinstein-style attributes from daily bars:
+
+    - For each ticker and week (W-FRI):
+        * 30-week MA (of weekly close)
+        * RS vs benchmark (SPY) and RS 30w MA
+        * Stage:
+            "Stage 2 (Uptrend)"  if price > 30w MA and MA rising
+            "Stage 4 (Downtrend)" if price < 30w MA and MA falling
+            "Other" otherwise
+        * rs_above_ma = RS > RS_MA
+    """
+
+    def __init__(self, daily_df: pd.DataFrame, tickers: List[str], bench: str = BENCH_TICKER):
+        self.snapshots: Dict[str, pd.DataFrame] = {}
+        self.bench = bench
+
+        if not isinstance(daily_df.columns, pd.MultiIndex):
+            log("Daily data is not MultiIndex; WeeklySnapshots disabled.", level="warn")
+            return
+
+        if "Close" not in daily_df.columns.levels[0]:
+            log("Daily data missing Close panel; WeeklySnapshots disabled.", level="warn")
+            return
+
+        close_panel = daily_df["Close"]
+
+        if bench not in close_panel.columns:
+            log(
+                f"Benchmark {bench} not found in daily data; "
+                f"WeeklySnapshots will not compute RS/Stage.",
+                level="warn",
+            )
+            return
+
+        bench_close = close_panel[bench].dropna()
+        # Weekly benchmark closes (Friday)
+        bench_weekly = bench_close.resample("W-FRI").last().rename("bench_close")
+
+        for t in sorted(set(tickers)):
+            if t == bench:
+                continue
+            if t not in close_panel.columns:
+                continue
+            price_daily = close_panel[t].dropna()
+            if price_daily.empty:
+                continue
+
+            w_close = price_daily.resample("W-FRI").last().rename("close")
+            if w_close.empty:
+                continue
+
+            dfw = pd.DataFrame({"close": w_close}).join(bench_weekly, how="inner")
+            dfw = dfw.dropna(subset=["close", "bench_close"])
+            if dfw.empty:
+                continue
+
+            dfw["ma30w"] = dfw["close"].rolling(30).mean()
+            dfw["rs"] = dfw["close"] / dfw["bench_close"]
+            dfw["rs_ma"] = dfw["rs"].rolling(30).mean()
+
+            # Stage logic (simplified Weinstein)
+            ma = dfw["ma30w"]
+            ma_slope = ma - ma.shift(1)
+            stage2 = (dfw["close"] > ma) & (ma_slope > 0)
+            stage4 = (dfw["close"] < ma) & (ma_slope < 0)
+
+            stage = np.where(
+                stage2,
+                "Stage 2 (Uptrend)",
+                np.where(stage4, "Stage 4 (Downtrend)", "Other"),
+            )
+
+            dfw["stage"] = stage
+            dfw["rs_above_ma"] = dfw["rs"] > dfw["rs_ma"]
+
+            self.snapshots[t] = dfw[["stage", "rs_above_ma", "ma30w"]]
+
+        log(
+            f"WeeklySnapshots built for {len(self.snapshots)} symbols "
+            f"(benchmark={bench}).",
+            level="info",
+        )
+
+    def get_attrs(
+        self, ticker: str, as_of_date: pd.Timestamp
+    ) -> Optional[Tuple[str, bool, float]]:
+        """
+        Return (stage, rs_above_ma, ma30w) for the last completed week
+        at or before `as_of_date`. If not available, returns None.
+        """
+        t = ticker.upper()
+        df = self.snapshots.get(t)
+        if df is None or df.empty:
+            return None
+        if not isinstance(as_of_date, pd.Timestamp):
+            as_of_date = pd.Timestamp(as_of_date)
+
+        # Restrict to weeks <= as_of_date
+        sub = df.loc[df.index <= as_of_date]
+        if sub.empty:
+            return None
+        row = sub.iloc[-1]
+        stage = str(row["stage"])
+        rs_flag = bool(row["rs_above_ma"])
+        ma30w = float(row["ma30w"]) if not pd.isna(row["ma30w"]) else np.nan
+        return stage, rs_flag, ma30w
 
 
 # ---------------- Backtest data structures ----------------
@@ -264,7 +378,7 @@ SHORT_VOL_MIN = 1.30
 PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
 
 # Breadth Health filter (Advance/Decline strength)
-# Approximates "% of S&P500 above MA50" by using your Stage 2 universe.
+# Approximates "% of S&P500 above MA50" by using the universe tickers.
 BREADTH_MA_WINDOW = 50
 BREADTH_MIN_LONG = 0.60  # require 60% of breadth universe above MA50 to allow new longs
 
@@ -445,18 +559,26 @@ def backtest(
     max_long: int,
     max_short: int,
     mode: str,
+    weekly_snapshots: Optional[WeeklySnapshots] = None,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", or "both"
-    """
-    long_universe = build_universe(weekly_df, side="long")
-    short_universe = build_universe(weekly_df, side="short")
 
-    long_tickers = set(long_universe["ticker"].astype(str).str.upper())
-    short_tickers = set(short_universe["ticker"].astype(str).str.upper())
+    weekly_snapshots:
+        If provided, historical weekly stage/RS are used (Option A).
+        If None, falls back to static weekly_df stage/rs_above_ma.
+    """
+    universe_df = build_universe(weekly_df)
+    universe_tickers = set(universe_df["ticker"].astype(str).str.upper())
+
+    long_universe = universe_df
+    short_universe = universe_df
+
+    # For breadth we use the same universe tickers
+    long_tickers = universe_tickers
+    short_tickers = universe_tickers
 
     # ----- Breadth series (approx "% of S&P500 above MA50") -----
-    # We use the Stage 2 (long) universe as the breadth universe.
     breadth_series = None
     if isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
         close_panel = daily_df["Close"]
@@ -467,7 +589,7 @@ def backtest(
         )
         if breadth_series is not None and not breadth_series.empty:
             log(
-                f"Breadth series computed over {len(long_tickers)} long-universe tickers "
+                f"Breadth series computed over {len(long_tickers)} universe tickers "
                 f"(MA{BREADTH_MA_WINDOW}).",
                 level="info",
             )
@@ -520,8 +642,8 @@ def backtest(
         atr_cache[t] = compute_atr_from_df(daily_df, t, n=14)
 
     # Main daily loop
-    for i, dt in enumerate(all_dates):
-        if dt < start_dt or dt > end_dt:
+    for i, dt_cur in enumerate(all_dates):
+        if dt_cur < start_dt or dt_cur > end_dt:
             continue
 
         # Build price snapshot for this day
@@ -531,12 +653,12 @@ def backtest(
                 continue
             closes = daily_df["Close"]
             for t in closes.columns:
-                if dt in closes.index:
-                    price_today[t] = _safe_float(closes.loc[dt, t])
+                if dt_cur in closes.index:
+                    price_today[t] = _safe_float(closes.loc[dt_cur, t])
         else:
             # Single ticker case (unlikely in your universe)
-            if dt in daily_df.index:
-                price_today["SINGLE"] = _safe_float(daily_df["Close"].loc[dt])
+            if dt_cur in daily_df.index:
+                price_today["SINGLE"] = _safe_float(daily_df["Close"].loc[dt_cur])
 
         # Mark-to-market holdings: equity = cash + open P&L
         eq = portfolio.cash
@@ -550,26 +672,24 @@ def backtest(
             else:
                 eq += pos.qty * (pos.entry_price - p)
         portfolio.equity = eq
-        equity_curve.append({"date": dt, "equity": eq})
+        equity_curve.append({"date": dt_cur, "equity": eq})
 
         # Compute breadth gate for this day (for new LONG entries)
         breadth_ok = True
         breadth_val = np.nan
-        if breadth_series is not None and dt in breadth_series.index:
-            breadth_val = float(breadth_series.loc[dt])
+        if breadth_series is not None and dt_cur in breadth_series.index:
+            breadth_val = float(breadth_series.loc[dt_cur])
             if not np.isnan(breadth_val):
                 breadth_ok = breadth_val >= BREADTH_MIN_LONG
             else:
                 breadth_ok = True  # if NaN, don't block
-        # Optional debug logging when breadth blocks new longs
         if not breadth_ok:
             log(
-                f"[SKIP-BREADTH] No new LONGs on {dt.date()} because breadth="
+                f"[SKIP-BREADTH] No new LONGs on {dt_cur.date()} because breadth="
                 f"{breadth_val:.2%} < {BREADTH_MIN_LONG:.0%}",
                 level="debug",
             )
 
-        # First exits, then entries (so freed risk can be reused)
         # ------ Exits ------
         to_remove = []
         for key, pos in list(portfolio.positions.items()):
@@ -578,8 +698,8 @@ def backtest(
                 continue
             ma_series = ma_cache.get(pos.ticker)
             ma_val = (
-                ma_series.loc[dt]
-                if ma_series is not None and dt in ma_series.index
+                ma_series.loc[dt_cur]
+                if ma_series is not None and dt_cur in ma_series.index
                 else np.nan
             )
 
@@ -604,7 +724,7 @@ def backtest(
                     ticker=pos.ticker,
                     side=pos.side,
                     entry_date=pos.opened,
-                    exit_date=dt,
+                    exit_date=dt_cur,
                     entry_price=pos.entry_price,
                     exit_price=exit_price,
                     qty=pos.qty,
@@ -622,7 +742,7 @@ def backtest(
         n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # LONG entries (gated by breadth_ok)
+        # LONG entries (gated by breadth_ok + weekly snapshot Stage 2)
         if (
             mode in ("long", "both")
             and n_long_now < max_long
@@ -637,24 +757,38 @@ def backtest(
                 if np.isnan(price):
                     continue
 
+                # Weekly snapshot attrs (Option A)
+                rs_flag = False
+                stage_ok = True  # fallback default
+                if weekly_snapshots is not None:
+                    attrs = weekly_snapshots.get_attrs(t, dt_cur)
+                    if attrs is None:
+                        continue
+                    stage_name, rs_flag, _ma30w = attrs
+                    stage_ok = (stage_name == "Stage 2 (Uptrend)")
+                    if not stage_ok:
+                        continue
+                else:
+                    # Fallback: static weekly_df columns
+                    rs_flag = bool(row.get("rs_above_ma", False))
+
                 ma_series = ma_cache.get(t)
                 ma_val = (
-                    ma_series.loc[dt]
-                    if ma_series is not None and dt in ma_series.index
+                    ma_series.loc[dt_cur]
+                    if ma_series is not None and dt_cur in ma_series.index
                     else np.nan
                 )
-                pivot_high = get_pivot_high(daily_df, t, dt)
-                rs_above_ma = bool(row.get("rs_above_ma", False))
-                vol_mult = volume_vs_50dma(daily_df, t, dt)
+                pivot_high = get_pivot_high(daily_df, t, dt_cur)
+                vol_mult = volume_vs_50dma(daily_df, t, dt_cur)
 
                 # ADX filter (mirrors intraday: NaN → no block, real < ADX_MIN → block)
                 adx_series = adx_cache.get(t)
                 if (
                     adx_series is not None
                     and not adx_series.empty
-                    and dt in adx_series.index
+                    and dt_cur in adx_series.index
                 ):
-                    adx_val = float(adx_series.loc[dt])
+                    adx_val = float(adx_series.loc[dt_cur])
                 else:
                     adx_val = np.nan
 
@@ -664,15 +798,14 @@ def backtest(
                     adx_ok = adx_val >= ADX_MIN
 
                 if not adx_ok:
-                    # Diagnostic similar to intraday watcher
                     log(
-                        f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx_val:.1f} < {ADX_MIN:.1f} on {dt.date()}",
+                        f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx_val:.1f} < {ADX_MIN:.1f} on {dt_cur.date()}",
                         level="debug",
                     )
                     continue
 
                 if not should_enter_long(
-                    price, ma_val, pivot_high, rs_above_ma, vol_mult
+                    price, ma_val, pivot_high, rs_flag, vol_mult
                 ):
                     continue
 
@@ -697,13 +830,13 @@ def backtest(
                     entry_price=price,
                     stop=stop,
                     atr=atr,
-                    opened=dt,
+                    opened=dt_cur,
                 )
                 n_long_now += 1
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries (not breadth-gated; only Weinstein stage + price/volume rules)
+        # SHORT entries (weekly snapshot Stage 4 if available)
         if mode in ("short", "both") and n_short_now < max_short:
             for _, row in short_universe.iterrows():
                 t = str(row["ticker"]).upper()
@@ -714,18 +847,30 @@ def backtest(
                 if np.isnan(price):
                     continue
 
+                rs_flag = False
+                stage_ok = True
+                if weekly_snapshots is not None:
+                    attrs = weekly_snapshots.get_attrs(t, dt_cur)
+                    if attrs is None:
+                        continue
+                    stage_name, rs_flag, _ma30w = attrs
+                    stage_ok = (stage_name == "Stage 4 (Downtrend)")
+                    if not stage_ok:
+                        continue
+                else:
+                    rs_flag = bool(row.get("rs_above_ma", False))
+
                 ma_series = ma_cache.get(t)
                 ma_val = (
-                    ma_series.loc[dt]
-                    if ma_series is not None and dt in ma_series.index
+                    ma_series.loc[dt_cur]
+                    if ma_series is not None and dt_cur in ma_series.index
                     else np.nan
                 )
-                pivot_low = get_pivot_low(daily_df, t, dt)
-                rs_above_ma = bool(row.get("rs_above_ma", False))
-                vol_mult = volume_vs_50dma(daily_df, t, dt)
+                pivot_low = get_pivot_low(daily_df, t, dt_cur)
+                vol_mult = volume_vs_50dma(daily_df, t, dt_cur)
 
                 if not should_enter_short(
-                    price, ma_val, pivot_low, rs_above_ma, vol_mult
+                    price, ma_val, pivot_low, rs_flag, vol_mult
                 ):
                     continue
 
@@ -749,7 +894,7 @@ def backtest(
                     entry_price=price,
                     stop=stop,
                     atr=atr,
-                    opened=dt,
+                    opened=dt_cur,
                 )
                 n_short_now += 1
                 if n_short_now >= max_short:
@@ -757,7 +902,7 @@ def backtest(
 
         if (i + 1) % 20 == 0:
             log(
-                f"Progress: {dt.date()} — equity ${portfolio.equity:,.2f}, "
+                f"Progress: {dt_cur.date()} — equity ${portfolio.equity:,.2f}, "
                 f"positions: {len(portfolio.positions)}, trades so far: {len(trade_log)}",
                 level="debug",
             )
@@ -847,12 +992,8 @@ def save_monthly_pnl(
     )
     monthly["WinRate"] = monthly["Wins"] / monthly["Trades"]
 
-    # ✅ Simpler, robust equity per month:
-    # equity = initial_capital + cumulative realized PnL
     monthly = monthly.reset_index().rename(columns={"Month": "MonthEnd"})
     monthly["Equity"] = initial_capital + monthly["PnL"].cumsum()
-
-    # Simple % PnL vs initial capital (not path-dependent)
     monthly["PnL_pct_of_initial"] = monthly["PnL"] / initial_capital * 100.0
 
     monthly.to_csv(path, index=False)
@@ -919,7 +1060,18 @@ def main():
     weekly_df = load_weekly_report()
 
     all_tickers = set(weekly_df["ticker"].astype(str).str.upper().tolist())
+    # Ensure benchmark is present for RS snapshots
+    all_tickers.add(BENCH_TICKER)
+
     daily_df = download_daily_bars(sorted(all_tickers), start, end)
+
+    # Build historical weekly snapshots (Option A)
+    weekly_snapshots: Optional[WeeklySnapshots] = None
+    try:
+        weekly_snapshots = WeeklySnapshots(daily_df, sorted(all_tickers), bench=BENCH_TICKER)
+    except Exception as e:
+        log(f"WeeklySnapshots construction failed: {e}. Falling back to static weekly CSV.", level="warn")
+        weekly_snapshots = None
 
     result = backtest(
         daily_df=daily_df,
@@ -931,6 +1083,7 @@ def main():
         max_long=args.max_long,
         max_short=args.max_short,
         mode=args.mode,
+        weekly_snapshots=weekly_snapshots,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
