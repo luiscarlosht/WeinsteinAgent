@@ -45,21 +45,19 @@ NEW:
   regime. That means the regime gate is a coarse on/off overlay for the entire
   backtest run, not a historical regime reconstruction.
 
-- Optional Coppock mutual-fund timing filter on a benchmark (e.g. SPY):
+- Optional benchmark Coppock filter (classic Coppock curve on monthly closes):
 
     --benchmark SPY
-        Benchmark symbol to compute Coppock curve on (default SPY).
+        Benchmark symbol to compute Coppock (default: SPY).
     --use-coppock-long
-        Gate NEW LONG entries: only when benchmark Coppock is in "risk-on".
+        Gate NEW LONG entries: only when Coppock(benchmark) > 0.
     --use-coppock-short
-        Gate NEW SHORT entries: only when benchmark Coppock is in "risk-off".
+        Gate NEW SHORT entries: only when Coppock(benchmark) < 0.
 
-  Risk-on / risk-off interpretation:
-    * risk-on  = Coppock > +CO_MIN and slope > 0
-    * risk-off = Coppock < -CO_MIN and slope < 0
-
-  CO_MIN and slope lookback are taken from weinstein_indicators if defined,
-  otherwise reasonable defaults are used.
+  Coppock is computed from benchmark daily closes → monthly, with:
+      CC = WMA_10( ROC_14 + ROC_11 ), classic settings,
+  then forward-filled back to the daily index so each day reuses the latest
+  monthly Coppock value.
 """
 
 import argparse
@@ -85,29 +83,6 @@ from weinstein_indicators import (
     ADX_MIN,
     compute_breadth_series_above_ma,
 )
-
-# Optional Coppock curve support (benchmark timing filter)
-try:
-    from weinstein_indicators import compute_coppock_series  # type: ignore
-except Exception:
-    compute_coppock_series = None  # type: ignore
-
-# Defaults for Coppock parameters (overridden if module provides them)
-COPPOCK_MIN = 0.0
-COPPOCK_SLOPE_LOOKBACK = 5
-
-try:
-    # Optional constants from weinstein_indicators, if present
-    from weinstein_indicators import COPPOCK_MIN as _CO_MIN  # type: ignore
-    COPPOCK_MIN = float(_CO_MIN)
-except Exception:
-    pass
-
-try:
-    from weinstein_indicators import COPPOCK_SLOPE_LOOKBACK as _CO_SLOPE_LB  # type: ignore
-    COPPOCK_SLOPE_LOOKBACK = int(_CO_SLOPE_LB)
-except Exception:
-    pass
 
 # Optional: Chapter 8 + VIX regime gating
 try:
@@ -489,6 +464,60 @@ def get_pivot_low(
     return float(sub.min()) if len(sub) else np.nan
 
 
+# ---------------- Coppock curve helper ----------------
+
+
+def compute_coppock_from_daily(daily_df: pd.DataFrame, benchmark: str) -> pd.Series:
+    """
+    Classic Coppock curve on MONTHLY closes for the given benchmark:
+
+        CC = WMA_10( ROC_14 + ROC_11 )
+
+    where ROC_n is % rate-of-change over n months.
+    Returns a DAILY series aligned to the benchmark daily index by
+    forward-filling the latest monthly Coppock value.
+    """
+    # Get benchmark close
+    if isinstance(daily_df.columns, pd.MultiIndex):
+        try:
+            close = daily_df[("Close", benchmark)].dropna()
+        except KeyError:
+            log(f"Coppock: benchmark {benchmark} not found in daily data.", level="warn")
+            return pd.Series(dtype="float64")
+    else:
+        # Single-ticker case
+        close = daily_df["Close"].dropna()
+
+    if close.empty:
+        log("Coppock: close series empty; disabling Coppock filter.", level="warn")
+        return pd.Series(dtype="float64")
+
+    # Monthly closes (month-end)
+    monthly_close = close.resample("M").last()
+
+    # 14-month and 11-month ROC (%)
+    roc_14 = monthly_close.pct_change(14) * 100.0
+    roc_11 = monthly_close.pct_change(11) * 100.0
+    coppock_raw = roc_14 + roc_11
+
+    # 10-period WMA
+    weights = np.arange(1, 11, dtype=float)
+
+    def _wma(x: np.ndarray) -> float:
+        return float(np.sum(weights * x) / np.sum(weights))
+
+    coppock_monthly = coppock_raw.rolling(10).apply(_wma, raw=True)
+
+    # Map back to daily index by forward-filling monthly values
+    coppock_daily = coppock_monthly.reindex(close.index, method="ffill")
+    log(
+        f"Coppock curve computed for benchmark {benchmark} "
+        f"(monthly points={len(coppock_monthly.dropna())}).",
+        level="info",
+    )
+    return coppock_daily
+
+
 # ---------------- Entry / exit rules ----------------
 
 
@@ -609,9 +638,10 @@ def backtest(
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None,
     long_regime_ok: bool = True,
     short_regime_ok: bool = True,
+    benchmark: str = "SPY",
     use_coppock_long: bool = False,
     use_coppock_short: bool = False,
-    benchmark: str = "SPY",
+    coppock_series: Optional[pd.Series] = None,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", or "both"
@@ -625,13 +655,9 @@ def backtest(
       - coarse on/off gates (e.g. from Chapter 8 + VIX via market_regime.inspect()).
       - If False, NEW entries of that side are blocked for the entire run.
 
-    use_coppock_long / use_coppock_short:
-      - when True, gate NEW entries by benchmark Coppock timing:
-          risk-on  = Coppock > +COPPOCK_MIN and slope > 0
-          risk-off = Coppock < -COPPOCK_MIN and slope < 0
-
-      - risk-on used for longs, risk-off for shorts.
-      - if Coppock series is unavailable, these gates are effectively disabled.
+    Coppock gates:
+      - use_coppock_long: if True, NEW longs allowed only when Coppock(benchmark) > 0.
+      - use_coppock_short: if True, NEW shorts allowed only when Coppock(benchmark) < 0.
     """
     use_snapshots = bool(weekly_snapshots)
 
@@ -669,66 +695,10 @@ def backtest(
         )
         breadth_series = None
 
-    # ----- Coppock series on benchmark (for mutual-fund timing) -----
-    coppock_series: Optional[pd.Series] = None
-    coppock_slope: Optional[pd.Series] = None
-    coppock_enabled = False
-
-    if (use_coppock_long or use_coppock_short) and compute_coppock_series is None:
-        log(
-            "Coppock filter requested but compute_coppock_series is not available "
-            "in weinstein_indicators; Coppock gates disabled.",
-            level="warn",
-        )
-    elif (use_coppock_long or use_coppock_short):
-        if not isinstance(daily_df.columns, pd.MultiIndex) or "Close" not in daily_df.columns.levels[0]:
-            log(
-                "Coppock filter requested but daily data is not MultiIndex with Close panel; "
-                "Coppock gates disabled.",
-                level="warn",
-            )
-        else:
-            close_panel = daily_df["Close"]
-            if benchmark not in close_panel.columns:
-                log(
-                    f"Coppock filter requested but benchmark {benchmark} not found in Close panel; "
-                    "Coppock gates disabled.",
-                    level="warn",
-                )
-            else:
-                bench_close = close_panel[benchmark].dropna()
-                if bench_close.empty:
-                    log(
-                        f"Coppock filter requested but benchmark {benchmark} has no close data; "
-                        "Coppock gates disabled.",
-                        level="warn",
-                    )
-                else:
-                    try:
-                        coppock_series = compute_coppock_series(bench_close)  # type: ignore
-                        if coppock_series is not None and not coppock_series.empty:
-                            coppock_slope = coppock_series.diff(COPPOCK_SLOPE_LOOKBACK)
-                            coppock_enabled = True
-                            log(
-                                f"Coppock series computed for {benchmark} "
-                                f"(min={coppock_series.min():.2f}, max={coppock_series.max():.2f}).",
-                                level="info",
-                            )
-                        else:
-                            log(
-                                f"compute_coppock_series returned empty series for {benchmark}; "
-                                "Coppock gates disabled.",
-                                level="warn",
-                            )
-                    except Exception as e:
-                        log(
-                            f"compute_coppock_series failed for {benchmark}: {e}; "
-                            "Coppock gates disabled.",
-                            level="warn",
-                        )
-                        coppock_series = None
-                        coppock_slope = None
-                        coppock_enabled = False
+    # ----- Coppock series (benchmark) -----
+    if coppock_series is None or coppock_series.empty:
+        log("Coppock series is empty; Coppock gates will be effectively disabled.", level="warn")
+        coppock_series = None
 
     all_dates = daily_df.index
     all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
@@ -863,25 +833,30 @@ def backtest(
                 level="debug",
             )
 
-        # Coppock risk-on / risk-off flags for this day
-        coppock_on = True
-        coppock_off = True
+        # Coppock gate for this day
         coppock_val = np.nan
-        if coppock_enabled and coppock_series is not None and dt in coppock_series.index:
+        coppock_long_ok = True
+        coppock_short_ok = True
+        if coppock_series is not None and not coppock_series.empty and dt in coppock_series.index:
             coppock_val = float(coppock_series.loc[dt])
-            if coppock_slope is not None and dt in coppock_slope.index:
-                sl = float(coppock_slope.loc[dt])
-            else:
-                sl = np.nan
-            if not np.isnan(coppock_val) and not np.isnan(sl):
-                # Mutual-fund style:
-                #   risk-on  = CO > +MIN and slope > 0
-                #   risk-off = CO < -MIN and slope < 0
-                coppock_on = (coppock_val > COPPOCK_MIN) and (sl > 0)
-                coppock_off = (coppock_val < -COPPOCK_MIN) and (sl < 0)
-            else:
-                coppock_on = True
-                coppock_off = True
+
+        if use_coppock_long and not np.isnan(coppock_val):
+            coppock_long_ok = coppock_val > 0.0
+            if not coppock_long_ok:
+                log(
+                    f"[SKIP-COPPOCK-LONG] No new LONGs on {dt.date()} because "
+                    f"Coppock({benchmark})={coppock_val:.2f} ≤ 0.",
+                    level="debug",
+                )
+
+        if use_coppock_short and not np.isnan(coppock_val):
+            coppock_short_ok = coppock_val < 0.0
+            if not coppock_short_ok:
+                log(
+                    f"[SKIP-COPPOCK-SHORT] No new SHORTs on {dt.date()} because "
+                    f"Coppock({benchmark})={coppock_val:.2f} ≥ 0.",
+                    level="debug",
+                )
 
         # First exits, then entries (so freed risk can be reused)
         # ------ Exits ------
@@ -936,48 +911,14 @@ def backtest(
         n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # Precompute daily "can enter" flags (before per-ticker filters)
-        can_enter_long_today = (
+        # LONG entries (gated by breadth_ok + optional regime gate + Coppock gate)
+        if (
             mode in ("long", "both")
             and n_long_now < max_long
             and breadth_ok
             and long_regime_ok
-        )
-        can_enter_short_today = (
-            mode in ("short", "both")
-            and n_short_now < max_short
-            and short_regime_ok
-        )
-
-        # Extra logs when Coppock gates are blocking otherwise-allowed entries
-        if can_enter_long_today and use_coppock_long and not coppock_on:
-            if not np.isnan(coppock_val):
-                log(
-                    f"[SKIP-CO] No new LONGs on {dt.date()} because Coppock risk-on is OFF "
-                    f"(CO={coppock_val:.2f}, min={COPPOCK_MIN:.2f}).",
-                    level="debug",
-                )
-            else:
-                log(
-                    f"[SKIP-CO] No new LONGs on {dt.date()} because Coppock risk-on is indeterminate.",
-                    level="debug",
-                )
-
-        if can_enter_short_today and use_coppock_short and not coppock_off:
-            if not np.isnan(coppock_val):
-                log(
-                    f"[SKIP-CO] No new SHORTs on {dt.date()} because Coppock risk-off is OFF "
-                    f"(CO={coppock_val:.2f}, min={COPPOCK_MIN:.2f}).",
-                    level="debug",
-                )
-            else:
-                log(
-                    f"[SKIP-CO] No new SHORTs on {dt.date()} because Coppock risk-off is indeterminate.",
-                    level="debug",
-                )
-
-        # LONG entries (gated by breadth_ok + optional regime + Coppock)
-        if can_enter_long_today and (not use_coppock_long or coppock_on):
+            and coppock_long_ok
+        ):
             for _, row in long_universe.iterrows():
                 t = str(row["ticker"]).upper()
                 pos_key = f"{t}_long"
@@ -1053,8 +994,13 @@ def backtest(
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries (optional regime gate + optional Coppock risk-off)
-        if can_enter_short_today and (not use_coppock_short or coppock_off):
+        # SHORT entries (gated by regime gate + Coppock gate)
+        if (
+            mode in ("short", "both")
+            and n_short_now < max_short
+            and short_regime_ok
+            and coppock_short_ok
+        ):
             for _, row in short_universe.iterrows():
                 t = str(row["ticker"]).upper()
                 pos_key = f"{t}_short"
@@ -1261,22 +1207,22 @@ def main():
         action="store_true",
         help="Gate NEW short entries by Chapter 8 + VIX via market_regime.inspect().",
     )
-    # NEW: Coppock mutual-fund timing filter
+    # NEW: benchmark + Coppock gates
     ap.add_argument(
         "--benchmark",
         type=str,
         default="SPY",
-        help="Benchmark ticker to compute Coppock curve on (default SPY).",
+        help="Benchmark symbol used for RS/breadth/Coppock filters (default: SPY).",
     )
     ap.add_argument(
         "--use-coppock-long",
         action="store_true",
-        help="Gate NEW long entries by benchmark Coppock risk-on.",
+        help="Gate NEW long entries by benchmark Coppock > 0.",
     )
     ap.add_argument(
         "--use-coppock-short",
         action="store_true",
-        help="Gate NEW short entries by benchmark Coppock risk-off.",
+        help="Gate NEW short entries by benchmark Coppock < 0.",
     )
 
     args = ap.parse_args()
@@ -1295,11 +1241,14 @@ def main():
             raise SystemExit("Provide both --start and --end if not using --year.")
         start, end = args.start, args.end
 
+    benchmark = args.benchmark.upper()
+
     log(
         f"Backtest range: {start} → {end} | mode={args.mode}, capital={args.capital:,.2f}, "
         f"risk_per_trade={args.risk_per_trade:.3f}, max_long={args.max_long}, max_short={args.max_short}",
         level="info",
     )
+    log(f"Benchmark for Coppock/filters: {benchmark}", level="info")
 
     # ---- Optional Chapter 8 + VIX regime gating (single snapshot, applies to full run) ----
     long_regime_ok = True
@@ -1358,13 +1307,16 @@ def main():
             level="info",
         )
 
-    # Ensure benchmark is included so Coppock can be computed
-    all_tickers.add(args.benchmark.upper())
+    # Ensure benchmark is present in daily data for Coppock computation
+    all_tickers.add(benchmark)
 
     if not all_tickers:
         raise RuntimeError("Universe of tickers is empty; cannot run backtest.")
 
     daily_df = download_daily_bars(sorted(all_tickers), start, end)
+
+    # Compute Coppock curve for benchmark (daily series)
+    coppock_series = compute_coppock_from_daily(daily_df, benchmark)
 
     result = backtest(
         daily_df=daily_df,
@@ -1380,9 +1332,10 @@ def main():
         weekly_snapshots=weekly_snapshots if weekly_snapshots else None,
         long_regime_ok=long_regime_ok,
         short_regime_ok=short_regime_ok,
+        benchmark=benchmark,
         use_coppock_long=args.use_coppock_long,
         use_coppock_short=args.use_coppock_short,
-        benchmark=args.benchmark.upper(),
+        coppock_series=coppock_series,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
