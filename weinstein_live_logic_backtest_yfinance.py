@@ -32,12 +32,6 @@ Key points:
     * Trade log CSV
     * Equity curve PNG
     * Monthly P/L CSV + printed summary
-
-NEW:
-- Weinstein Option 4 SPY-stage regime for short side:
-    * New short entries are only allowed on days when SPY is in Stage 4
-      in the most recent weekly snapshot (or static weekly_df).
-    * Exits still always occur (stops / MA guard).
 """
 
 import argparse
@@ -64,10 +58,17 @@ from weinstein_indicators import (
     compute_breadth_series_above_ma,
 )
 
-# Shared short-side regime helper (Option 4: SPY Stage-4)
+# Shared short-side core (same module used by intraday short watcher)
 from weinstein_short_core import (
-    ShortRegimeContext,
-    build_short_regime_from_spy_stage,
+    SHORT_BREAK_PCT,
+    SHORT_HARD_STOP_PCT,
+    SHORT_TRAIL_ATR_MULT,
+    SHORT_MA_GUARD_PCT,
+    VOL_PACE_MIN,
+    READY_ABOVE_MA_PCT,
+    _short_entry_stop_targets,
+    _short_ready_to_close,
+    eval_short_bar as eval_short_bar_core,
 )
 
 # ---------------- Logging helpers ----------------
@@ -365,15 +366,8 @@ LONG_STOP_HARD = 0.20  # 20% hard stop (Weinstein-style disaster stop)
 LONG_TRAIL_ATR = 2.0  # ATR-based cushion
 LONG_MA_GUARD = 0.03  # extra guard vs MA30 (≈3% under)
 
-# Short side (mirrored)
-SHORT_BREAK_PCT = 0.004  # ≈0.4% below pivot breakdown
-SHORT_STOP_HARD = 0.20
-SHORT_TRAIL_ATR = 2.0
-SHORT_MA_GUARD = 0.03  # extra guard above MA30 (≈3% over)
-
 # Volume filters (approximate your intraday VOL_PACE_MIN 1.3×)
 LONG_VOL_MIN = 1.30
-SHORT_VOL_MIN = 1.30
 
 PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
 
@@ -444,7 +438,7 @@ def get_pivot_low(
     return float(sub.min()) if len(sub) else np.nan
 
 
-# ---------------- Entry / exit rules ----------------
+# ---------------- Entry / exit rules (LONG side only) ----------------
 
 
 def should_enter_long(
@@ -493,52 +487,6 @@ def should_exit_long(price: float, stop: float, ma30_val: float) -> bool:
     return False
 
 
-def should_enter_short(
-    price: float,
-    ma30_val: float,
-    pivot_low: float,
-    rs_above_ma: bool,
-    vol_mult: float,
-) -> bool:
-    if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_low):
-        return False
-    # RS must be weak (NOT above its MA)
-    if rs_above_ma:
-        return False
-    # Price must be below MA30
-    if price > ma30_val:
-        return False
-    # Breakdown under pivot low by ≈0.4%
-    if price > pivot_low * (1.0 - SHORT_BREAK_PCT):
-        return False
-    # Volume pace gate ~1.3× 50dma, like intraday VOL_PACE_MIN
-    if not np.isnan(vol_mult) and vol_mult < SHORT_VOL_MIN:
-        return False
-    return True
-
-
-def short_stop_level(entry: float, atr: float, ma30_val: float) -> float:
-    if np.isnan(entry):
-        return np.nan
-    hard = entry * (1.0 + SHORT_STOP_HARD)
-    atr_stop = entry + SHORT_TRAIL_ATR * atr if not np.isnan(atr) else np.nan
-    ma_guard = ma30_val * (1.0 + SHORT_MA_GUARD) if not np.isnan(ma30_val) else np.nan
-    cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
-    return min(cands) if cands else hard
-
-
-def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
-    if np.isnan(price):
-        return False
-    # 1) Stop violation
-    if not np.isnan(stop) and price >= stop:
-        return True
-    # 2) Extra guard: reclaimed MA30 by ~3%
-    if not np.isnan(ma30_val) and price >= ma30_val * (1.0 + SHORT_MA_GUARD):
-        return True
-    return False
-
-
 # ---------------- Backtest engine ----------------
 
 
@@ -570,45 +518,17 @@ def backtest(
       - uses dynamic weekly universes per date (Option A).
     Else:
       - uses single weekly_df snapshot (current behavior).
-
-    Short side additionally obeys Weinstein Option 4:
-      - New SHORT entries only when SPY is Stage 4 in the relevant
-        weekly snapshot (or static weekly_df).
-      - Exits always allowed.
     """
     use_snapshots = bool(weekly_snapshots)
 
     # Precompute static universes for fallback mode
     static_long_universe: Optional[pd.DataFrame] = None
     static_short_universe: Optional[pd.DataFrame] = None
-    static_short_regime: Optional[ShortRegimeContext] = None
-
     if not use_snapshots:
         if weekly_df is None:
             raise RuntimeError("weekly_df is required when no weekly_snapshots are provided.")
         static_long_universe = build_universe(weekly_df, side="long")
         static_short_universe = build_universe(weekly_df, side="short")
-
-        # SPY-stage short regime for static weekly_df
-        spy_stage = None
-        try:
-            if "ticker" in weekly_df.columns and "stage" in weekly_df.columns:
-                spy_rows = weekly_df[
-                    weekly_df["ticker"].astype(str).str.upper() == "SPY"
-                ]
-                if not spy_rows.empty:
-                    spy_stage = spy_rows.iloc[0].get("stage", None)
-        except Exception as e:
-            log(f"Static SPY stage detection failed for short regime: {e}", level="warn")
-
-        static_short_regime = build_short_regime_from_spy_stage(
-            spy_stage,
-            as_of=start,
-        )
-        log(
-            f"Short regime (static SPY stage): {static_short_regime.note}",
-            level="info",
-        )
 
     # ----- Breadth series (approx "% of universe above MA50") -----
     breadth_series = None
@@ -633,7 +553,7 @@ def backtest(
             "Daily data not in expected MultiIndex Close panel; breadth gate disabled.",
             level="warn",
         )
-    breadth_series = breadth_series
+        breadth_series = None
 
     all_dates = daily_df.index
     all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
@@ -677,61 +597,33 @@ def backtest(
     current_snapshot_date: Optional[date] = None
     current_long_universe: Optional[pd.DataFrame] = static_long_universe
     current_short_universe: Optional[pd.DataFrame] = static_short_universe
-    current_short_regime: Optional[ShortRegimeContext] = None
+
+    # Short-side CORE state (per-ticker)
+    short_states: Dict[str, dict] = {}
 
     # Main daily loop
     for i, dt in enumerate(all_dates):
         if dt < start_dt or dt > end_dt:
             continue
 
-        # ----- choose weekly universe + SPY short regime for this date -----
+        # ----- choose weekly universe for this date -----
         if use_snapshots and weekly_snapshots:
             snap = pick_snapshot_for_date(weekly_snapshots, dt)
             if snap is None:
                 # Before first snapshot: no universe yet; let exits run, but no new entries
                 long_universe = pd.DataFrame(columns=["ticker"])
                 short_universe = pd.DataFrame(columns=["ticker"])
-                short_regime_today: ShortRegimeContext = build_short_regime_from_spy_stage(
-                    spy_stage=None,
-                    as_of=str(dt.date()),
-                )
             else:
                 snap_date, wdf = snap
                 if snap_date != current_snapshot_date:
                     current_long_universe = build_universe(wdf, side="long")
                     current_short_universe = build_universe(wdf, side="short")
                     current_snapshot_date = snap_date
-
-                    # Recompute SPY-stage short regime for this snapshot date
-                    spy_stage = None
-                    try:
-                        if "ticker" in wdf.columns and "stage" in wdf.columns:
-                            spy_rows = wdf[
-                                wdf["ticker"].astype(str).str.upper() == "SPY"
-                            ]
-                            if not spy_rows.empty:
-                                spy_stage = spy_rows.iloc[0].get("stage", None)
-                    except Exception as e:
-                        log(
-                            f"Snapshot SPY stage detection failed for {snap_date}: {e}",
-                            level="warn",
-                        )
-
-                    current_short_regime = build_short_regime_from_spy_stage(
-                        spy_stage,
-                        as_of=str(snap_date),
-                    )
-                    log(
-                        f"Short regime (SPY stage as of {snap_date}): {current_short_regime.note}",
-                        level="debug",
-                    )
-
                     log(
                         f"Using weekly snapshot as of {snap_date} for {dt.date()} — "
                         f"long_univ={len(current_long_universe)}, short_univ={len(current_short_universe)}",
                         level="debug",
                     )
-
                 long_universe = (
                     current_long_universe
                     if current_long_universe is not None
@@ -741,11 +633,6 @@ def backtest(
                     current_short_universe
                     if current_short_universe is not None
                     else pd.DataFrame(columns=["ticker"])
-                )
-                short_regime_today = (
-                    current_short_regime
-                    if current_short_regime is not None
-                    else build_short_regime_from_spy_stage(None, as_of=str(dt.date()))
                 )
         else:
             long_universe = (
@@ -757,11 +644,6 @@ def backtest(
                 static_short_universe
                 if static_short_universe is not None
                 else pd.DataFrame(columns=["ticker"])
-            )
-            short_regime_today = (
-                static_short_regime
-                if static_short_regime is not None
-                else build_short_regime_from_spy_stage(None, as_of=str(dt.date()))
             )
 
         # Build price snapshot for this day
@@ -829,7 +711,12 @@ def backtest(
                 exit_price = p
                 pnl = pos.qty * (exit_price - pos.entry_price)
             else:
-                if not should_exit_short(p, pos.stop, ma_val):
+                # Short side: use CORE-style stop + READY-to-close
+                hit_stop = (not np.isnan(pos.stop)) and p >= pos.stop
+                ready_close = False
+                if not np.isnan(ma_val):
+                    ready_close = _short_ready_to_close(p, ma_val)
+                if not (hit_stop or ready_close):
                     continue
                 exit_price = p
                 pnl = pos.qty * (pos.entry_price - exit_price)
@@ -943,69 +830,88 @@ def backtest(
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries (gated by SPY Stage-4 short regime, Option 4)
+        # SHORT entries — now driven by CORE eval_short_bar()
         if mode in ("short", "both") and n_short_now < max_short:
-            allow_shorts_today = True
-            if short_regime_today is not None and not short_regime_today.allow_shorts:
-                allow_shorts_today = False
+            for _, row in short_universe.iterrows():
+                t = str(row["ticker"]).upper()
+                pos_key = f"{t}_short"
+                if pos_key in portfolio.positions:
+                    continue
+                price = price_today.get(t, np.nan)
+                if np.isnan(price):
+                    continue
 
-            if not allow_shorts_today:
-                if short_regime_today is not None:
-                    log(
-                        f"[SKIP-SPY] No new SHORTs on {dt.date()} because SPY regime "
-                        f"disallows shorts (SPY stage={short_regime_today.spy_stage}).",
-                        level="debug",
-                    )
-            else:
-                for _, row in short_universe.iterrows():
-                    t = str(row["ticker"]).upper()
-                    pos_key = f"{t}_short"
-                    if pos_key in portfolio.positions:
-                        continue
-                    price = price_today.get(t, np.nan)
-                    if np.isnan(price):
-                        continue
+                ma_series = ma_cache.get(t)
+                ma_val = (
+                    ma_series.loc[dt]
+                    if ma_series is not None and dt in ma_series.index
+                    else np.nan
+                )
+                pivot_low = get_pivot_low(daily_df, t, dt)
+                rs_above_ma = bool(row.get("rs_above_ma", False))
+                vol_mult = volume_vs_50dma(daily_df, t, dt)
 
-                    ma_series = ma_cache.get(t)
-                    ma_val = (
-                        ma_series.loc[dt]
-                        if ma_series is not None and dt in ma_series.index
-                        else np.nan
-                    )
-                    pivot_low = get_pivot_low(daily_df, t, dt)
-                    rs_above_ma = bool(row.get("rs_above_ma", False))
-                    vol_mult = volume_vs_50dma(daily_df, t, dt)
+                # Require weak RS for shorts (same gating as PROD watcher)
+                if rs_above_ma:
+                    continue
 
-                    if not should_enter_short(
-                        price, ma_val, pivot_low, rs_above_ma, vol_mult
-                    ):
-                        continue
+                # Daily adaptor for CORE short eval:
+                # - closes_tail: last 2 daily closes up to today
+                # - intraday_interval != "60m" → CORE uses closes_tail
+                price_series = get_close_series(daily_df, t)
+                closes_tail = list(price_series.loc[:dt].tail(2).values)
 
-                    atr = atr_cache.get(t, np.nan)
-                    stop = short_stop_level(price, atr, ma_val)
-                    if np.isnan(stop) or stop <= price:
-                        continue  # invalid stop
+                state_in = short_states.get(
+                    t, {"short_state": "IDLE", "short_hits": [], "short_cooldown": 0}
+                )
 
-                    risk_per_pos = portfolio.equity * risk_per_trade
-                    per_share_risk = stop - price
-                    if per_share_risk <= 0:
-                        continue
-                    qty = math.floor(risk_per_pos / per_share_risk)
-                    if qty <= 0:
-                        continue
+                new_state, flags = eval_short_bar_core(
+                    price=price,
+                    ma30=ma_val,
+                    pivot_low=pivot_low,
+                    pace_full=vol_mult,   # daily vol / 50dma → same as intraday pace_full
+                    pace_intra=np.nan,    # not used in daily mode
+                    elapsed_min=None,     # not used when intraday_interval != "60m"
+                    closes_tail=closes_tail,
+                    state=state_in,
+                    intraday_interval="1d",  # force non-60m branch
+                    test_ease=False,
+                )
+                short_states[t] = new_state
 
-                    portfolio.positions[pos_key] = Position(
-                        ticker=t,
-                        side="short",
-                        qty=qty,
-                        entry_price=price,
-                        stop=stop,
-                        atr=atr,
-                        opened=dt,
-                    )
-                    n_short_now += 1
-                    if n_short_now >= max_short:
-                        break
+                if not flags.get("short_trigger_now", False):
+                    continue
+
+                # At this point, CORE has already enforced:
+                # - price breakdown via _short_price_break
+                # - volume pace gate via VOL_PACE_MIN
+                atr = atr_cache.get(t, np.nan)
+                entry, stop, t1, t2 = _short_entry_stop_targets(
+                    price, ma_val, pivot_low, atr
+                )
+                if np.isnan(stop) or stop <= price:
+                    continue  # invalid stop
+
+                risk_per_pos = portfolio.equity * risk_per_trade
+                per_share_risk = stop - price
+                if per_share_risk <= 0:
+                    continue
+                qty = math.floor(risk_per_pos / per_share_risk)
+                if qty <= 0:
+                    continue
+
+                portfolio.positions[pos_key] = Position(
+                    ticker=t,
+                    side="short",
+                    qty=qty,
+                    entry_price=price,
+                    stop=stop,
+                    atr=atr,
+                    opened=dt,
+                )
+                n_short_now += 1
+                if n_short_now >= max_short:
+                    break
 
         if (i + 1) % 20 == 0:
             log(
