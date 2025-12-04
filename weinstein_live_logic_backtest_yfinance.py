@@ -65,6 +65,12 @@ NEW:
     * volume vs 50dma
     * ADX filter (NaN → no block)
   via weinstein_long_core.check_long_entry / LongEntryParams.
+
+- Config-driven backtest behavior (Option C via config.yaml.backtest):
+    * snapshot_mode: static | historical | auto
+    * regime.use_long / regime.use_short gates
+    * coppock.use_long / coppock.use_short gates
+    * breadth.enabled / breadth.ma_window / breadth.min_long
 """
 
 import argparse
@@ -82,6 +88,8 @@ import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+import yaml  # NEW: config.yaml loader
 
 # Shared Weinstein indicators (ADX + breadth single source of truth)
 from weinstein_indicators import (
@@ -121,6 +129,26 @@ def log(msg: str, *, level: str = "info"):
         "debug": "··",
     }.get(level, "•")
     print(f"{prefix} [{_ts()}] {msg}", flush=True)
+
+
+# ---------------- Config helper ----------------
+
+
+def load_yaml_config(path: str = "./config.yaml") -> dict:
+    """
+    Load YAML config shared with weekly/intraday.
+    Returns {} if file is missing or invalid.
+    """
+    try:
+        with open(path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg
+    except FileNotFoundError:
+        log(f"Config file {path} not found; using code defaults.", level="warn")
+        return {}
+    except Exception as e:
+        log(f"Failed to load config {path}: {e}; using code defaults.", level="warn")
+        return {}
 
 
 # ---------------- File / data helpers ----------------
@@ -628,6 +656,7 @@ def backtest(
     use_coppock_long: bool = False,
     use_coppock_short: bool = False,
     coppock_series: Optional[pd.Series] = None,
+    breadth_enabled: bool = True,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", or "both"
@@ -644,6 +673,9 @@ def backtest(
     Coppock gates:
       - use_coppock_long: if True, NEW longs allowed only when Coppock(benchmark) > 0.
       - use_coppock_short: if True, NEW shorts allowed only when Coppock(benchmark) < 0.
+
+    breadth_enabled:
+      - if False, breadth gate is disabled regardless of BREADTH_* constants.
     """
     use_snapshots = bool(weekly_snapshots)
 
@@ -658,7 +690,7 @@ def backtest(
 
     # ----- Breadth series (approx "% of universe above MA50") -----
     breadth_series = None
-    if isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
+    if breadth_enabled and isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
         close_panel = daily_df["Close"]
         breadth_series = compute_breadth_series_above_ma(
             daily_close_panel=close_panel,
@@ -675,10 +707,13 @@ def backtest(
             log("Breadth series is empty; breadth gate will be effectively disabled.", level="warn")
             breadth_series = None
     else:
-        log(
-            "Daily data not in expected MultiIndex Close panel; breadth gate disabled.",
-            level="warn",
-        )
+        if not breadth_enabled:
+            log("Breadth gate disabled by config.", level="info")
+        else:
+            log(
+                "Daily data not in expected MultiIndex Close panel; breadth gate disabled.",
+                level="warn",
+            )
         breadth_series = None
 
     # ----- Coppock series (benchmark) -----
@@ -1195,6 +1230,15 @@ def main():
         help="Enable long-only, short-only, or both",
     )
     ap.add_argument("--quiet", action="store_true")
+
+    # Config path (Option C)
+    ap.add_argument(
+        "--config",
+        type=str,
+        default="./config.yaml",
+        help="Path to YAML config (default: ./config.yaml).",
+    )
+
     # NEW: optional Chapter 8 + VIX regime gates
     ap.add_argument(
         "--use-regime-long",
@@ -1206,12 +1250,13 @@ def main():
         action="store_true",
         help="Gate NEW short entries by Chapter 8 + VIX via market_regime.inspect().",
     )
+
     # NEW: benchmark + Coppock gates
     ap.add_argument(
         "--benchmark",
         type=str,
-        default="SPY",
-        help="Benchmark symbol used for RS/breadth/Coppock filters (default: SPY).",
+        default=None,
+        help="Benchmark symbol used for RS/breadth/Coppock filters (default: from config.app.benchmark or SPY).",
     )
     ap.add_argument(
         "--use-coppock-long",
@@ -1224,9 +1269,54 @@ def main():
         help="Gate NEW short entries by benchmark Coppock < 0.",
     )
 
+    # NEW: snapshot-mode override (static | historical | auto)
+    ap.add_argument(
+        "--snapshot-mode",
+        type=str,
+        choices=["static", "historical", "auto"],
+        help="Universe source: static (latest weekly), historical (snapshots), auto (prefer snapshots, fallback static).",
+    )
+
     args = ap.parse_args()
 
     VERBOSE = not args.quiet
+
+    # ---- Load config.yaml for Option C behavior ----
+    cfg = load_yaml_config(args.config)
+    app_cfg = cfg.get("app", {}) or {}
+    bt_cfg = cfg.get("backtest", {}) or {}
+
+    # Benchmark: CLI wins, otherwise config, otherwise default "SPY"
+    benchmark_cfg = (app_cfg.get("benchmark") or "SPY").upper()
+    benchmark = (args.benchmark or benchmark_cfg).upper()
+
+    # Snapshot mode: CLI override > config > default "static"
+    snapshot_mode_cfg = bt_cfg.get("snapshot_mode", "static")
+    snapshot_mode = args.snapshot_mode or snapshot_mode_cfg
+
+    # Regime toggles: CLI flags OR config booleans
+    regime_cfg = bt_cfg.get("regime", {}) or {}
+    use_regime_long_cfg = bool(regime_cfg.get("use_long", False))
+    use_regime_short_cfg = bool(regime_cfg.get("use_short", False))
+
+    use_regime_long_effective = args.use_regime_long or use_regime_long_cfg
+    use_regime_short_effective = args.use_regime_short or use_regime_short_cfg
+
+    # Coppock toggles: CLI flags OR config
+    coppock_cfg = bt_cfg.get("coppock", {}) or {}
+    use_coppock_long_cfg = bool(coppock_cfg.get("use_long", False))
+    use_coppock_short_cfg = bool(coppock_cfg.get("use_short", False))
+
+    use_coppock_long_effective = args.use_coppock_long or use_coppock_long_cfg
+    use_coppock_short_effective = args.use_coppock_short or use_coppock_short_cfg
+
+    # Breadth parameters
+    breadth_cfg = bt_cfg.get("breadth", {}) or {}
+    breadth_enabled = bool(breadth_cfg.get("enabled", True))
+
+    global BREADTH_MA_WINDOW, BREADTH_MIN_LONG
+    BREADTH_MA_WINDOW = int(breadth_cfg.get("ma_window", BREADTH_MA_WINDOW))
+    BREADTH_MIN_LONG = float(breadth_cfg.get("min_long", BREADTH_MIN_LONG))
 
     # Resolve start/end range
     if args.year and (args.start or args.end):
@@ -1240,20 +1330,25 @@ def main():
             raise SystemExit("Provide both --start and --end if not using --year.")
         start, end = args.start, args.end
 
-    benchmark = args.benchmark.upper()
-
     log(
         f"Backtest range: {start} → {end} | mode={args.mode}, capital={args.capital:,.2f}, "
         f"risk_per_trade={args.risk_per_trade:.3f}, max_long={args.max_long}, max_short={args.max_short}",
         level="info",
     )
     log(f"Benchmark for Coppock/filters: {benchmark}", level="info")
+    log(
+        f"Config: snapshot_mode={snapshot_mode}, regime_long={use_regime_long_effective}, "
+        f"regime_short={use_regime_short_effective}, coppock_long={use_coppock_long_effective}, "
+        f"coppock_short={use_coppock_short_effective}, breadth_enabled={breadth_enabled}, "
+        f"breadth_ma={BREADTH_MA_WINDOW}, breadth_min_long={BREADTH_MIN_LONG:.2f}",
+        level="info",
+    )
 
     # ---- Optional Chapter 8 + VIX regime gating (single snapshot, applies to full run) ----
     long_regime_ok = True
     short_regime_ok = True
 
-    if args.use_regime_long or args.use_regime_short:
+    if use_regime_long_effective or use_regime_short_effective:
         if inspect_market_regime is None:
             log(
                 "market_regime.py not available; regime gates disabled "
@@ -1268,9 +1363,9 @@ def main():
                     f"long_ok={long_ok_flag} short_ok={short_ok_flag}",
                     level="info",
                 )
-                if args.use_regime_long:
+                if use_regime_long_effective:
                     long_regime_ok = bool(long_ok_flag)
-                if args.use_regime_short:
+                if use_regime_short_effective:
                     short_regime_ok = bool(short_ok_flag)
             except Exception as e:
                 log(
@@ -1281,28 +1376,57 @@ def main():
                 long_regime_ok = True
                 short_regime_ok = True
 
-    # ---- Try to use historical weekly snapshots (Option A) ----
-    weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
-
+    # ---- Weekly universe source selection (Option C via snapshot_mode) ----
+    weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
     weekly_df: Optional[pd.DataFrame] = None
     all_tickers: set[str] = set()
 
-    if weekly_snapshots:
-        # Union of tickers across all snapshots
-        for _, df in weekly_snapshots:
-            if "ticker" in df.columns:
-                all_tickers.update(df["ticker"].astype(str).str.upper())
-        log(
-            f"Using historical weekly snapshots for universe (unique tickers={len(all_tickers)}).",
-            level="info",
-        )
+    if snapshot_mode == "historical":
+        weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
+        if not weekly_snapshots:
+            log(
+                "snapshot_mode='historical' but no snapshots found; "
+                "you may want snapshot_mode='static' or 'auto'.",
+                level="warn",
+            )
+        else:
+            for _, df in weekly_snapshots:
+                if "ticker" in df.columns:
+                    all_tickers.update(df["ticker"].astype(str).str.upper())
+            log(
+                f"Using historical weekly snapshots for universe "
+                f"(unique tickers={len(all_tickers)}).",
+                level="info",
+            )
+
+    elif snapshot_mode == "auto":
+        tmp_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
+        if tmp_snapshots:
+            weekly_snapshots = tmp_snapshots
+            for _, df in weekly_snapshots:
+                if "ticker" in df.columns:
+                    all_tickers.update(df["ticker"].astype(str).str.upper())
+            log(
+                f"[auto] Using historical weekly snapshots for universe "
+                f"(unique tickers={len(all_tickers)}).",
+                level="info",
+            )
+        else:
+            weekly_df = load_weekly_report()
+            all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
+            log(
+                "[auto] No historical snapshots; using latest weekly report "
+                f"for static universe ({len(all_tickers)} tickers).",
+                level="info",
+            )
+
     else:
-        # Fallback: single latest weekly report (current behavior)
+        # snapshot_mode == "static" (Option B)
         weekly_df = load_weekly_report()
         all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
         log(
-            f"No historical snapshots; using latest weekly report for static universe "
-            f"({len(all_tickers)} tickers).",
+            "snapshot_mode='static': using latest weekly report only "
+            f"for static universe ({len(all_tickers)} tickers).",
             level="info",
         )
 
@@ -1332,9 +1456,10 @@ def main():
         long_regime_ok=long_regime_ok,
         short_regime_ok=short_regime_ok,
         benchmark=benchmark,
-        use_coppock_long=args.use_coppock_long,
-        use_coppock_short=args.use_coppock_short,
+        use_coppock_long=use_coppock_long_effective,
+        use_coppock_short=use_coppock_short_effective,
         coppock_series=coppock_series,
+        breadth_enabled=breadth_enabled,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
