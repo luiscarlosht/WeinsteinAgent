@@ -32,6 +32,12 @@ Key points:
     * Trade log CSV
     * Equity curve PNG
     * Monthly P/L CSV + printed summary
+
+NEW:
+- Weinstein Option 4 SPY-stage regime for short side:
+    * New short entries are only allowed on days when SPY is in Stage 4
+      in the most recent weekly snapshot (or static weekly_df).
+    * Exits still always occur (stops / MA guard).
 """
 
 import argparse
@@ -56,6 +62,12 @@ from weinstein_indicators import (
     ADX_WINDOW,
     ADX_MIN,
     compute_breadth_series_above_ma,
+)
+
+# Shared short-side regime helper (Option 4: SPY Stage-4)
+from weinstein_short_core import (
+    ShortRegimeContext,
+    build_short_regime_from_spy_stage,
 )
 
 # ---------------- Logging helpers ----------------
@@ -558,17 +570,45 @@ def backtest(
       - uses dynamic weekly universes per date (Option A).
     Else:
       - uses single weekly_df snapshot (current behavior).
+
+    Short side additionally obeys Weinstein Option 4:
+      - New SHORT entries only when SPY is Stage 4 in the relevant
+        weekly snapshot (or static weekly_df).
+      - Exits always allowed.
     """
     use_snapshots = bool(weekly_snapshots)
 
     # Precompute static universes for fallback mode
     static_long_universe: Optional[pd.DataFrame] = None
     static_short_universe: Optional[pd.DataFrame] = None
+    static_short_regime: Optional[ShortRegimeContext] = None
+
     if not use_snapshots:
         if weekly_df is None:
             raise RuntimeError("weekly_df is required when no weekly_snapshots are provided.")
         static_long_universe = build_universe(weekly_df, side="long")
         static_short_universe = build_universe(weekly_df, side="short")
+
+        # SPY-stage short regime for static weekly_df
+        spy_stage = None
+        try:
+            if "ticker" in weekly_df.columns and "stage" in weekly_df.columns:
+                spy_rows = weekly_df[
+                    weekly_df["ticker"].astype(str).str.upper() == "SPY"
+                ]
+                if not spy_rows.empty:
+                    spy_stage = spy_rows.iloc[0].get("stage", None)
+        except Exception as e:
+            log(f"Static SPY stage detection failed for short regime: {e}", level="warn")
+
+        static_short_regime = build_short_regime_from_spy_stage(
+            spy_stage,
+            as_of=start,
+        )
+        log(
+            f"Short regime (static SPY stage): {static_short_regime.note}",
+            level="info",
+        )
 
     # ----- Breadth series (approx "% of universe above MA50") -----
     breadth_series = None
@@ -593,7 +633,7 @@ def backtest(
             "Daily data not in expected MultiIndex Close panel; breadth gate disabled.",
             level="warn",
         )
-        breadth_series = None
+    breadth_series = breadth_series
 
     all_dates = daily_df.index
     all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
@@ -637,30 +677,61 @@ def backtest(
     current_snapshot_date: Optional[date] = None
     current_long_universe: Optional[pd.DataFrame] = static_long_universe
     current_short_universe: Optional[pd.DataFrame] = static_short_universe
+    current_short_regime: Optional[ShortRegimeContext] = None
 
     # Main daily loop
     for i, dt in enumerate(all_dates):
         if dt < start_dt or dt > end_dt:
             continue
 
-        # ----- choose weekly universe for this date -----
+        # ----- choose weekly universe + SPY short regime for this date -----
         if use_snapshots and weekly_snapshots:
             snap = pick_snapshot_for_date(weekly_snapshots, dt)
             if snap is None:
                 # Before first snapshot: no universe yet; let exits run, but no new entries
                 long_universe = pd.DataFrame(columns=["ticker"])
                 short_universe = pd.DataFrame(columns=["ticker"])
+                short_regime_today: ShortRegimeContext = build_short_regime_from_spy_stage(
+                    spy_stage=None,
+                    as_of=str(dt.date()),
+                )
             else:
                 snap_date, wdf = snap
                 if snap_date != current_snapshot_date:
                     current_long_universe = build_universe(wdf, side="long")
                     current_short_universe = build_universe(wdf, side="short")
                     current_snapshot_date = snap_date
+
+                    # Recompute SPY-stage short regime for this snapshot date
+                    spy_stage = None
+                    try:
+                        if "ticker" in wdf.columns and "stage" in wdf.columns:
+                            spy_rows = wdf[
+                                wdf["ticker"].astype(str).str.upper() == "SPY"
+                            ]
+                            if not spy_rows.empty:
+                                spy_stage = spy_rows.iloc[0].get("stage", None)
+                    except Exception as e:
+                        log(
+                            f"Snapshot SPY stage detection failed for {snap_date}: {e}",
+                            level="warn",
+                        )
+
+                    current_short_regime = build_short_regime_from_spy_stage(
+                        spy_stage,
+                        as_of=str(snap_date),
+                    )
+                    log(
+                        f"Short regime (SPY stage as of {snap_date}): {current_short_regime.note}",
+                        level="debug",
+                    )
+
                     log(
                         f"Using weekly snapshot as of {snap_date} for {dt.date()} — "
                         f"long_univ={len(current_long_universe)}, short_univ={len(current_short_universe)}",
                         level="debug",
                     )
+
                 long_universe = (
                     current_long_universe
                     if current_long_universe is not None
@@ -670,6 +741,11 @@ def backtest(
                     current_short_universe
                     if current_short_universe is not None
                     else pd.DataFrame(columns=["ticker"])
+                )
+                short_regime_today = (
+                    current_short_regime
+                    if current_short_regime is not None
+                    else build_short_regime_from_spy_stage(None, as_of=str(dt.date()))
                 )
         else:
             long_universe = (
@@ -681,6 +757,11 @@ def backtest(
                 static_short_universe
                 if static_short_universe is not None
                 else pd.DataFrame(columns=["ticker"])
+            )
+            short_regime_today = (
+                static_short_regime
+                if static_short_regime is not None
+                else build_short_regime_from_spy_stage(None, as_of=str(dt.date()))
             )
 
         # Build price snapshot for this day
@@ -862,57 +943,69 @@ def backtest(
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries (not breadth-gated; only Weinstein stage + price/volume rules)
+        # SHORT entries (gated by SPY Stage-4 short regime, Option 4)
         if mode in ("short", "both") and n_short_now < max_short:
-            for _, row in short_universe.iterrows():
-                t = str(row["ticker"]).upper()
-                pos_key = f"{t}_short"
-                if pos_key in portfolio.positions:
-                    continue
-                price = price_today.get(t, np.nan)
-                if np.isnan(price):
-                    continue
+            allow_shorts_today = True
+            if short_regime_today is not None and not short_regime_today.allow_shorts:
+                allow_shorts_today = False
 
-                ma_series = ma_cache.get(t)
-                ma_val = (
-                    ma_series.loc[dt]
-                    if ma_series is not None and dt in ma_series.index
-                    else np.nan
-                )
-                pivot_low = get_pivot_low(daily_df, t, dt)
-                rs_above_ma = bool(row.get("rs_above_ma", False))
-                vol_mult = volume_vs_50dma(daily_df, t, dt)
+            if not allow_shorts_today:
+                if short_regime_today is not None:
+                    log(
+                        f"[SKIP-SPY] No new SHORTs on {dt.date()} because SPY regime "
+                        f"disallows shorts (SPY stage={short_regime_today.spy_stage}).",
+                        level="debug",
+                    )
+            else:
+                for _, row in short_universe.iterrows():
+                    t = str(row["ticker"]).upper()
+                    pos_key = f"{t}_short"
+                    if pos_key in portfolio.positions:
+                        continue
+                    price = price_today.get(t, np.nan)
+                    if np.isnan(price):
+                        continue
 
-                if not should_enter_short(
-                    price, ma_val, pivot_low, rs_above_ma, vol_mult
-                ):
-                    continue
+                    ma_series = ma_cache.get(t)
+                    ma_val = (
+                        ma_series.loc[dt]
+                        if ma_series is not None and dt in ma_series.index
+                        else np.nan
+                    )
+                    pivot_low = get_pivot_low(daily_df, t, dt)
+                    rs_above_ma = bool(row.get("rs_above_ma", False))
+                    vol_mult = volume_vs_50dma(daily_df, t, dt)
 
-                atr = atr_cache.get(t, np.nan)
-                stop = short_stop_level(price, atr, ma_val)
-                if np.isnan(stop) or stop <= price:
-                    continue  # invalid stop
+                    if not should_enter_short(
+                        price, ma_val, pivot_low, rs_above_ma, vol_mult
+                    ):
+                        continue
 
-                risk_per_pos = portfolio.equity * risk_per_trade
-                per_share_risk = stop - price
-                if per_share_risk <= 0:
-                    continue
-                qty = math.floor(risk_per_pos / per_share_risk)
-                if qty <= 0:
-                    continue
+                    atr = atr_cache.get(t, np.nan)
+                    stop = short_stop_level(price, atr, ma_val)
+                    if np.isnan(stop) or stop <= price:
+                        continue  # invalid stop
 
-                portfolio.positions[pos_key] = Position(
-                    ticker=t,
-                    side="short",
-                    qty=qty,
-                    entry_price=price,
-                    stop=stop,
-                    atr=atr,
-                    opened=dt,
-                )
-                n_short_now += 1
-                if n_short_now >= max_short:
-                    break
+                    risk_per_pos = portfolio.equity * risk_per_trade
+                    per_share_risk = stop - price
+                    if per_share_risk <= 0:
+                        continue
+                    qty = math.floor(risk_per_pos / per_share_risk)
+                    if qty <= 0:
+                        continue
+
+                    portfolio.positions[pos_key] = Position(
+                        ticker=t,
+                        side="short",
+                        qty=qty,
+                        entry_price=price,
+                        stop=stop,
+                        atr=atr,
+                        opened=dt,
+                    )
+                    n_short_now += 1
+                    if n_short_now >= max_short:
+                        break
 
         if (i + 1) % 20 == 0:
             log(
