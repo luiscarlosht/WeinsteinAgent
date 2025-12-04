@@ -14,10 +14,18 @@ This module owns:
     _short_entry_stop_targets
 - A stateful eval_short_bar() helper for the backtest, so the sim
   uses the *same* short trigger rules as the production watcher.
+
+NEW:
+- ShortRegimeContext + build_short_regime_from_spy_stage(spy_stage, as_of)
+  to implement Weinstein Option 4:
+    "Only allow new shorts when SPY itself is in Stage 4 (Downtrend)
+     on the weekly chart."
 """
 
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass
+from typing import Optional
 
 # ---------------- Shared short-side constants ----------------
 
@@ -51,6 +59,63 @@ SHORT_TRAIL_ATR_MULT     = 2.0
 SHORT_MA_GUARD_PCT       = 0.03   # 3% over MA150
 SHORT_TARGET1_PCT        = 0.15   # 15% downside
 SHORT_TARGET2_PCT        = 0.20   # 20% downside
+
+
+# ---------------- Short regime context (Option 4: SPY Stage 4) ----------------
+
+@dataclass
+class ShortRegimeContext:
+    """
+    Encapsulates whether new SHORT entries are allowed for a given environment.
+
+    We use SPY's weekly Weinstein stage as a simple regime proxy:
+      - allow_shorts = True  iff SPY is in Stage 4
+      - otherwise False
+
+    Existing shorts are still managed (exits, READY-to-close) even if the
+    regime disallows new entries; callers decide how strictly to apply it.
+    """
+    allow_shorts: bool
+    spy_stage: Optional[str] = None   # e.g. "Stage 4 (Downtrend)"
+    as_of: Optional[str] = None       # e.g. "2019-08-23"
+    note: Optional[str] = None        # human-friendly debug string
+
+
+def build_short_regime_from_spy_stage(
+    spy_stage: Optional[str],
+    as_of: Optional[str] = None,
+) -> ShortRegimeContext:
+    """
+    Option 4 (pure Weinstein): shorts only when SPY is Stage 4 on the weekly chart.
+
+    Parameters
+    ----------
+    spy_stage : str or None
+        Value from weekly 'stage' column for SPY, e.g. "Stage 4 (Downtrend)".
+        If None/NaN, we conservatively *disable* new shorts.
+    as_of : str or None
+        Optional as-of label (date) for debug logging.
+
+    Returns
+    -------
+    ShortRegimeContext
+    """
+    if spy_stage is None or (isinstance(spy_stage, float) and pd.isna(spy_stage)):
+        return ShortRegimeContext(
+            allow_shorts=False,
+            spy_stage=None,
+            as_of=as_of,
+            note="No SPY stage available; blocking new shorts by default.",
+        )
+
+    stage_str = str(spy_stage)
+    allow = stage_str.startswith("Stage 4")
+    return ShortRegimeContext(
+        allow_shorts=allow,
+        spy_stage=stage_str,
+        as_of=as_of,
+        note=f"SPY stage = {stage_str}, allow_shorts={allow}",
+    )
 
 
 # ---------------- Price/zone primitives (shared with watcher + sim) ----------------
