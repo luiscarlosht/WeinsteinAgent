@@ -22,7 +22,7 @@ Key points:
 - Uses DAILY bars (yfinance, auto_adjust=True)
 - Entry rules:
     * Long: price above MA30, RS strong, breakout > prior 50-day high,
-      daily volume ≥ ~1.3× 50-day avg
+      daily volume ≥ ~1.3× 50-day avg, ADX filter
     * Short: price below MA30, RS weak, breakdown < prior 50-day low,
       daily volume ≥ ~1.3× 50-day avg
 - Risk sizing:
@@ -58,6 +58,13 @@ NEW:
       CC = WMA_10( ROC_14 + ROC_11 ), classic settings,
   then forward-filled back to the daily index so each day reuses the latest
   monthly Coppock value.
+
+- Shared LONG-side core:
+    * price / MA / pivot breakout
+    * RS must be strong
+    * volume vs 50dma
+    * ADX filter (NaN → no block)
+  via weinstein_long_core.check_long_entry / LongEntryParams.
 """
 
 import argparse
@@ -83,6 +90,9 @@ from weinstein_indicators import (
     ADX_MIN,
     compute_breadth_series_above_ma,
 )
+
+# NEW: shared LONG-side core (price/pivot/ADX/volume)
+from weinstein_long_core import LongEntryParams, check_long_entry
 
 # Optional: Chapter 8 + VIX regime gating
 try:
@@ -521,30 +531,6 @@ def compute_coppock_from_daily(daily_df: pd.DataFrame, benchmark: str) -> pd.Ser
 # ---------------- Entry / exit rules ----------------
 
 
-def should_enter_long(
-    price: float,
-    ma30_val: float,
-    pivot_high: float,
-    rs_above_ma: bool,
-    vol_mult: float,
-) -> bool:
-    if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_high):
-        return False
-    # RS must be strong (above its MA)
-    if not rs_above_ma:
-        return False
-    # Price must be above MA30
-    if price < ma30_val:
-        return False
-    # Breakout above pivot high by ≈0.4%
-    if price < pivot_high * (1.0 + LONG_BREAK_PCT):
-        return False
-    # Volume pace gate ~1.3× 50dma, like intraday VOL_PACE_MIN
-    if not np.isnan(vol_mult) and vol_mult < LONG_VOL_MIN:
-        return False
-    return True
-
-
 def long_stop_level(entry: float, atr: float, ma30_val: float) -> float:
     if np.isnan(entry):
         return np.nan
@@ -737,6 +723,14 @@ def backtest(
     atr_cache: Dict[str, float] = {}
     for t in universe_tickers:
         atr_cache[t] = compute_atr_from_df(daily_df, t, n=14)
+
+    # Shared LONG-side core parameters (aligned with existing constants)
+    long_params = LongEntryParams(
+        min_break_pct=LONG_BREAK_PCT,
+        dist_above_ma_min=0.0,       # backtest uses "price > MA30" (no extra headroom)
+        vol_min=LONG_VOL_MIN,
+        adx_min=ADX_MIN,
+    )
 
     # State for dynamic snapshots
     current_snapshot_date: Optional[date] = None
@@ -938,7 +932,7 @@ def backtest(
                 rs_above_ma = bool(row.get("rs_above_ma", False))
                 vol_mult = volume_vs_50dma(daily_df, t, dt)
 
-                # ADX filter (mirrors intraday: NaN → no block, real < ADX_MIN → block)
+                # ADX series
                 adx_series = adx_cache.get(t)
                 if (
                     adx_series is not None
@@ -949,22 +943,27 @@ def backtest(
                 else:
                     adx_val = np.nan
 
-                if np.isnan(adx_val):
-                    adx_ok = True
-                else:
-                    adx_ok = adx_val >= ADX_MIN
+                # Shared LONG-side core check
+                entry_check = check_long_entry(
+                    price=price,
+                    ma_val=ma_val,
+                    pivot=pivot_high,
+                    rs_above_ma=rs_above_ma,
+                    vol_mult=vol_mult,
+                    adx_val=adx_val,
+                    params=long_params,
+                )
 
-                if not adx_ok:
-                    # Diagnostic similar to intraday watcher
+                # Optional: keep your existing debug message for ADX
+                if not entry_check.adx_ok and not np.isnan(adx_val):
                     log(
                         f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx_val:.1f} < {ADX_MIN:.1f} on {dt.date()}",
                         level="debug",
                     )
                     continue
 
-                if not should_enter_long(
-                    price, ma_val, pivot_high, rs_above_ma, vol_mult
-                ):
+                if not entry_check.can_enter:
+                    # Price / RS / MA / pivot / volume not aligned for a breakout
                     continue
 
                 atr = atr_cache.get(t, np.nan)
