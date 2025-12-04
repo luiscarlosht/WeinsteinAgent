@@ -24,12 +24,9 @@ Weinstein Short Watcher — Stage 4 short setups (with Chapter 8 market regime f
     * --log-csv / --log-json diagnostics (per-symbol metrics + conditions + state)
     * Chapter 8 market regime integration via market_regime.py:
         - If market_regime.short_ok is False, the short scan is skipped.
-
-Email behavior:
-- Email is sent ONLY when there is at least one of:
-  * Short Triggers (TRIG)
-  * Near Short Setups (NEAR)
-  * Ready-to-close Shorts (READY)
+    * Weinstein Option 4 short regime via SPY weekly stage:
+        - New shorts are only emitted when SPY itself is in Stage 4
+          on the weekly report. READY-to-close still works always.
 """
 
 import os, io, json, math, base64, argparse
@@ -70,6 +67,8 @@ from weinstein_short_core import (
     _short_near_zone,
     _short_ready_to_close,
     _short_entry_stop_targets,
+    ShortRegimeContext,
+    build_short_regime_from_spy_stage,
 )
 
 # Optional: Google Sheets integration for READY filter
@@ -787,6 +786,21 @@ def run(
         if miss not in w.columns:
             w[miss] = np.nan
 
+    # ---- Weinstein Option 4 SPY-stage regime (shorts only if SPY in Stage 4) ----
+    spy_stage = None
+    try:
+        spy_rows = w[w["ticker"].astype(str).str.upper() == benchmark.upper()]
+        if not spy_rows.empty:
+            spy_stage = spy_rows.iloc[0].get("stage", None)
+    except Exception as e:
+        log(f"SPY stage detection failed for short regime: {e}", level="warn")
+
+    short_regime: ShortRegimeContext = build_short_regime_from_spy_stage(
+        spy_stage,
+        as_of=datetime.now().strftime("%Y-%m-%d"),
+    )
+    log(f"Weinstein SPY short regime: {short_regime.note}", level="info")
+
     # Stage 4 downtrend universe
     short_universe = w[w["stage"].isin(["Stage 4 (Downtrend)"])][
         ["ticker", "stage", "ma30", "rs_above_ma"]
@@ -937,6 +951,7 @@ def run(
         cond["pace_full_gate"] = pd.isna(pace_full) or pace_full >= VOL_PACE_MIN
         cond["near_pace_gate"] = pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN
         cond["ready_close_now"] = bool(ready_close_now)
+        cond["spy_regime_allow_shorts"] = bool(short_regime.allow_shorts)
 
         # Stateful promotion (short_state)
         st = short_state.get(
@@ -978,8 +993,15 @@ def run(
         st["short_state"] = sstate
         short_state[t] = st
 
+        # Weinstein Option 4 gate for new shorts (SPY must be Stage 4)
+        allow_new_shorts = short_regime.allow_shorts
+
         # Emit short lists
-        if st["short_state"] == "TRIGGERED" and cond["pace_full_gate"]:
+        if (
+            allow_new_shorts
+            and st["short_state"] == "TRIGGERED"
+            and cond["pace_full_gate"]
+        ):
             trig_shorts.append(
                 {
                     "ticker": t,
@@ -993,7 +1015,7 @@ def run(
                 }
             )
             short_state[t]["short_state"] = "COOLDOWN"
-        elif st["short_state"] in ("NEAR", "ARMED"):
+        elif allow_new_shorts and st["short_state"] in ("NEAR", "ARMED"):
             if cond["near_pace_gate"]:
                 near_shorts.append(
                     {
@@ -1008,7 +1030,7 @@ def run(
                     }
                 )
 
-        # READY-to-close list (pre-filter)
+        # READY-to-close list (pre-filter) — NOTE: not gated by SPY regime
         if ready_close_now:
             cover_shorts.append(
                 {
@@ -1167,7 +1189,8 @@ def run(
       NEAR-SHORT: Stage 4 + RS not above its MA, price hanging just above the pivot/MA breakdown zone (within +{NEAR_ABOVE_PIVOT_PCT*100:.1f}% over pivot or hugging MA150),
       volume pace ≥ {NEAR_VOL_PACE_MIN:.1f}×.<br>
       READY-TO-CLOSE (SHORT): Stage 4 names where price has reclaimed MA150 by ≈{READY_ABOVE_MA_PCT*100:.1f}% or more,
-      suggesting the short thesis is weakening and it's time to consider covering (restricted to shorts listed in your Signals tab).
+      suggesting the short thesis is weakening and it's time to consider covering (restricted to shorts listed in your Signals tab).<br>
+      SPY short regime (Option 4): new shorts are only emitted while SPY is in Stage 4 on the weekly report.
     </i></p>
     """
 
