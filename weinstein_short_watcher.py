@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weinstein Short Watcher — Stage 4 short setups (with Chapter 8 market regime filter)
+Weinstein Short Watcher — Stage 4 short setups (with Chapter 8 + VIX market regime filter)
 
 - Uses weekly Weinstein scan (equities) to build a Stage 4 (Downtrend) universe
 - Intraday checks around 10-week pivot LOW and 30-week MA proxy (SMA150)
@@ -22,7 +22,7 @@ Weinstein Short Watcher — Stage 4 short setups (with Chapter 8 market regime f
 
 - NEW:
     * --log-csv / --log-json diagnostics (per-symbol metrics + conditions + state)
-    * Chapter 8 market regime integration via market_regime.py:
+    * Chapter 8 + VIX market regime integration via market_regime.py:
         - If market_regime.short_ok is False, the short scan is skipped.
     * Weinstein Option 4 short regime via SPY weekly stage:
         - New shorts are only emitted when SPY itself is in Stage 4
@@ -632,110 +632,43 @@ def make_tiny_chart_png(ticker, benchmark, daily_df):
         b64 = base64.b64encode(f.read()).decode("ascii")
     return chart_path, f"data:image/png;base64,{b64}"
 
-# ---------------- Market Regime (Chapter 8) helper ----------------
+# ---------------- Market Regime (Chapter 8 + VIX) helper ----------------
 def _compute_market_regime_flags(weekly_df, benchmark):
     """
-    Wrapper around market_regime.py so this file is robust even if that module
-    is missing or its API changes slightly.
+    Wrapper around market_regime.inspect().
 
     Returns:
       (label, long_ok, short_ok)
 
-    Chapter 8 semantics here (STRICT short side):
-      - Shorts are ONLY allowed in BEAR regimes.
-      - In BULL or NEUTRAL: short_ok = False.
+    - label: e.g. "BULL (Ch8+VIX)"
+    - long_ok, short_ok: already include both Chapter 8 regime AND VIX gates,
+      exactly as used by the backtest (--use-regime-long / --use-regime-short).
     """
     try:
         import market_regime as mr
     except ImportError:
-        label = "NEUTRAL (no market_regime.py)"
+        label = "UNKNOWN (no market_regime.py)"
         return label, True, True  # fail-open so system still runs
 
-    # Preferred path: use detect_market_regime() from the new module
-    snap = None
-    if hasattr(mr, "detect_market_regime"):
-        try:
-            snap = mr.detect_market_regime()
-        except Exception as e:
-            log(f"Market regime (Ch8): detect_market_regime() failed: {e}", level="warn")
-            snap = None
-
-    if snap is not None:
-        reg_obj = getattr(snap, "regime", None)
-        # normalize to string
-        if reg_obj is None:
-            reg_str = "unknown"
-        else:
-            reg_str = str(
-                getattr(reg_obj, "value", getattr(reg_obj, "name", reg_obj))
-            ).lower()
-
-        if "bear" in reg_str:
-            # Strict Ch.8: shorts only in BEAR
-            label = "BEAR"
-            long_ok = False
-            short_ok = True
-        elif "bull" in reg_str:
-            label = "BULL"
-            long_ok = True
-            short_ok = False
-        elif "neutral" in reg_str:
-            label = "NEUTRAL"
-            long_ok = True
-            short_ok = False  # no new shorts in neutral, per your comment
-        else:
-            label = "UNKNOWN"
-            long_ok = True
-            short_ok = True  # fail-open on unknown regimes
-
-        return f"{label} (Ch8)", long_ok, short_ok
-
-    # Fallback to older-style APIs if detect_market_regime is not available
-    candidates = [
-        "get_market_regime",
-        "compute_market_regime",
-        "evaluate_market_regime",
-        "market_regime",
-    ]
-    regime = None
-    last_err = None
-    for name in candidates:
+    # Prefer the tiny inspect helper introduced in market_regime.py
+    inspect_fn = None
+    for name in ("inspect", "inspect_for_intraday", "inspect_market_regime"):
         fn = getattr(mr, name, None)
-        if not callable(fn):
-            continue
-        for args in (
-            (weekly_df, benchmark),
-            (weekly_df,),
-        ):
-            try:
-                regime = fn(*args)
-                break
-            except TypeError as e:
-                last_err = e
-                continue
-            except Exception as e:
-                last_err = e
-                regime = None
-                break
-        if regime is not None:
+        if callable(fn):
+            inspect_fn = fn
             break
 
-    if regime is None:
-        if last_err is not None:
-            log(f"Market regime (Ch8): fallback to NEUTRAL due to error: {last_err}", level="warn")
-        return "NEUTRAL (market_regime API not recognized)", True, True
+    if inspect_fn is None:
+        # Fall back: treat as neutral, allow shorts (so watcher still runs)
+        return "NEUTRAL (no inspect helper)", True, True
 
-    # Normalize regime into label/flags
-    if isinstance(regime, dict):
-        label = regime.get("label") or regime.get("name") or regime.get("regime") or "UNKNOWN"
-        long_ok = bool(regime.get("long_ok", True))
-        short_ok = bool(regime.get("short_ok", True))
-    else:
-        label = getattr(regime, "label", None) or getattr(regime, "name", None) or str(regime)
-        long_ok = bool(getattr(regime, "long_ok", True))
-        short_ok = bool(getattr(regime, "short_ok", True))
-
-    return label, long_ok, short_ok
+    try:
+        label, long_ok, short_ok = inspect_fn()
+        # label is already "BULL"/"BEAR"/"NEUTRAL"/"UNKNOWN"
+        return f"{label} (Ch8+VIX)", bool(long_ok), bool(short_ok)
+    except Exception as e:
+        log(f"Market regime inspect() failed: {e}; treating as NEUTRAL.", level="warn")
+        return "NEUTRAL (inspect error)", True, True
 
 # ---------------- Main logic ----------------
 def run(
@@ -754,17 +687,17 @@ def run(
     weekly_df, weekly_csv_path = load_weekly_report()
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
 
-    # ---- Chapter 8 market regime filter (short side) ----
+    # ---- Chapter 8 + VIX market regime filter (short side) ----
     regime_label, long_ok, short_ok = _compute_market_regime_flags(weekly_df, benchmark)
     log(
-        f"Market regime (Ch8): {regime_label} | long_ok={long_ok} short_ok={short_ok}",
+        f"Market regime (Ch8+VIX): {regime_label} | long_ok={long_ok} short_ok={short_ok}",
         level="info",
     )
 
     # If regime says "no shorts", exit early (optionally writing empty CSV)
     if not short_ok:
         log(
-            "Chapter 8 regime filter: short side is DISABLED in current regime — "
+            "Chapter 8 + VIX regime filter: short side is DISABLED in current regime — "
             "skipping short scan.",
             level="warn",
         )
