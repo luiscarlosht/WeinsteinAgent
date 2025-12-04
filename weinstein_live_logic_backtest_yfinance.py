@@ -32,6 +32,18 @@ Key points:
     * Trade log CSV
     * Equity curve PNG
     * Monthly P/L CSV + printed summary
+
+NEW:
+- Optional Chapter 8 + VIX regime gating (via market_regime.inspect):
+
+    --use-regime-long
+        Gate NEW LONG entries by long_ok from inspect().
+    --use-regime-short
+        Gate NEW SHORT entries by short_ok from inspect().
+
+  Note: inspect() uses *current* index/VIX data (live regime), not per-backtest-date
+  regime. That means the regime gate is a coarse on/off overlay for the entire
+  backtest run, not a historical regime reconstruction.
 """
 
 import argparse
@@ -40,7 +52,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,18 +70,11 @@ from weinstein_indicators import (
     compute_breadth_series_above_ma,
 )
 
-# Shared short-side core (same module used by intraday short watcher)
-from weinstein_short_core import (
-    SHORT_BREAK_PCT,
-    SHORT_HARD_STOP_PCT,
-    SHORT_TRAIL_ATR_MULT,
-    SHORT_MA_GUARD_PCT,
-    VOL_PACE_MIN,
-    READY_ABOVE_MA_PCT,
-    _short_entry_stop_targets,
-    _short_ready_to_close,
-    eval_short_bar as eval_short_bar_core,
-)
+# Optional: Chapter 8 + VIX regime gating
+try:
+    from market_regime import inspect as inspect_market_regime
+except ImportError:
+    inspect_market_regime = None
 
 # ---------------- Logging helpers ----------------
 
@@ -158,7 +163,7 @@ def _parse_snapshot_date_from_name(fname: str) -> Optional[date]:
         return None
 
 
-def load_weekly_snapshots(snapshot_dir: str) -> List[tuple[date, pd.DataFrame]]:
+def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
     """
     Load historical weekly equity CSV snapshots from snapshot_dir.
 
@@ -169,7 +174,7 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[tuple[date, pd.DataFrame]]:
         log(f"No snapshot dir {snapshot_dir} (skipping historical snapshots).", level="info")
         return []
 
-    snapshots: List[tuple[date, pd.DataFrame]] = []
+    snapshots: List[Tuple[date, pd.DataFrame]] = []
     for fname in os.listdir(snapshot_dir):
         if not fname.startswith(WEEKLY_FILE_PREFIX) or not fname.endswith(".csv"):
             continue
@@ -198,9 +203,9 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[tuple[date, pd.DataFrame]]:
 
 
 def pick_snapshot_for_date(
-    snapshots: List[tuple[date, pd.DataFrame]],
+    snapshots: List[Tuple[date, pd.DataFrame]],
     as_of_ts: pd.Timestamp,
-) -> Optional[tuple[date, pd.DataFrame]]:
+) -> Optional[Tuple[date, pd.DataFrame]]:
     """
     Choose the most recent snapshot with as_of_date <= current date.
     If none qualifies yet (e.g. before first snapshot), returns None.
@@ -208,7 +213,7 @@ def pick_snapshot_for_date(
     if not snapshots:
         return None
     target = as_of_ts.date()
-    chosen: Optional[tuple[date, pd.DataFrame]] = None
+    chosen: Optional[Tuple[date, pd.DataFrame]] = None
     for d, df in snapshots:
         if d <= target:
             chosen = (d, df)
@@ -366,8 +371,15 @@ LONG_STOP_HARD = 0.20  # 20% hard stop (Weinstein-style disaster stop)
 LONG_TRAIL_ATR = 2.0  # ATR-based cushion
 LONG_MA_GUARD = 0.03  # extra guard vs MA30 (≈3% under)
 
+# Short side (mirrored)
+SHORT_BREAK_PCT = 0.004  # ≈0.4% below pivot breakdown
+SHORT_STOP_HARD = 0.20
+SHORT_TRAIL_ATR = 2.0
+SHORT_MA_GUARD = 0.03  # extra guard above MA30 (≈3% over)
+
 # Volume filters (approximate your intraday VOL_PACE_MIN 1.3×)
 LONG_VOL_MIN = 1.30
+SHORT_VOL_MIN = 1.30
 
 PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
 
@@ -438,7 +450,7 @@ def get_pivot_low(
     return float(sub.min()) if len(sub) else np.nan
 
 
-# ---------------- Entry / exit rules (LONG side only) ----------------
+# ---------------- Entry / exit rules ----------------
 
 
 def should_enter_long(
@@ -487,6 +499,52 @@ def should_exit_long(price: float, stop: float, ma30_val: float) -> bool:
     return False
 
 
+def should_enter_short(
+    price: float,
+    ma30_val: float,
+    pivot_low: float,
+    rs_above_ma: bool,
+    vol_mult: float,
+) -> bool:
+    if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_low):
+        return False
+    # RS must be weak (NOT above its MA)
+    if rs_above_ma:
+        return False
+    # Price must be below MA30
+    if price > ma30_val:
+        return False
+    # Breakdown under pivot low by ≈0.4%
+    if price > pivot_low * (1.0 - SHORT_BREAK_PCT):
+        return False
+    # Volume pace gate ~1.3× 50dma, like intraday VOL_PACE_MIN
+    if not np.isnan(vol_mult) and vol_mult < SHORT_VOL_MIN:
+        return False
+    return True
+
+
+def short_stop_level(entry: float, atr: float, ma30_val: float) -> float:
+    if np.isnan(entry):
+        return np.nan
+    hard = entry * (1.0 + SHORT_STOP_HARD)
+    atr_stop = entry + SHORT_TRAIL_ATR * atr if not np.isnan(atr) else np.nan
+    ma_guard = ma30_val * (1.0 + SHORT_MA_GUARD) if not np.isnan(ma30_val) else np.nan
+    cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
+    return min(cands) if cands else hard
+
+
+def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
+    if np.isnan(price):
+        return False
+    # 1) Stop violation
+    if not np.isnan(stop) and price >= stop:
+        return True
+    # 2) Extra guard: reclaimed MA30 by ~3%
+    if not np.isnan(ma30_val) and price >= ma30_val * (1.0 + SHORT_MA_GUARD):
+        return True
+    return False
+
+
 # ---------------- Backtest engine ----------------
 
 
@@ -509,7 +567,9 @@ def backtest(
     *,
     universe_tickers: List[str],
     weekly_df: Optional[pd.DataFrame] = None,
-    weekly_snapshots: Optional[List[tuple[date, pd.DataFrame]]] = None,
+    weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None,
+    long_regime_ok: bool = True,
+    short_regime_ok: bool = True,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", or "both"
@@ -518,6 +578,10 @@ def backtest(
       - uses dynamic weekly universes per date (Option A).
     Else:
       - uses single weekly_df snapshot (current behavior).
+
+    long_regime_ok / short_regime_ok:
+      - coarse on/off gates (e.g. from Chapter 8 + VIX via market_regime.inspect()).
+      - If False, NEW entries of that side are blocked for the entire run.
     """
     use_snapshots = bool(weekly_snapshots)
 
@@ -597,9 +661,6 @@ def backtest(
     current_snapshot_date: Optional[date] = None
     current_long_universe: Optional[pd.DataFrame] = static_long_universe
     current_short_universe: Optional[pd.DataFrame] = static_short_universe
-
-    # Short-side CORE state (per-ticker)
-    short_states: Dict[str, dict] = {}
 
     # Main daily loop
     for i, dt in enumerate(all_dates):
@@ -711,12 +772,7 @@ def backtest(
                 exit_price = p
                 pnl = pos.qty * (exit_price - pos.entry_price)
             else:
-                # Short side: use CORE-style stop + READY-to-close
-                hit_stop = (not np.isnan(pos.stop)) and p >= pos.stop
-                ready_close = False
-                if not np.isnan(ma_val):
-                    ready_close = _short_ready_to_close(p, ma_val)
-                if not (hit_stop or ready_close):
+                if not should_exit_short(p, pos.stop, ma_val):
                     continue
                 exit_price = p
                 pnl = pos.qty * (pos.entry_price - exit_price)
@@ -749,11 +805,12 @@ def backtest(
         n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # LONG entries (gated by breadth_ok)
+        # LONG entries (gated by breadth_ok + optional regime gate)
         if (
             mode in ("long", "both")
             and n_long_now < max_long
             and breadth_ok
+            and long_regime_ok
         ):
             for _, row in long_universe.iterrows():
                 t = str(row["ticker"]).upper()
@@ -830,8 +887,12 @@ def backtest(
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries — now driven by CORE eval_short_bar()
-        if mode in ("short", "both") and n_short_now < max_short:
+        # SHORT entries (optional regime gate on shorts)
+        if (
+            mode in ("short", "both")
+            and n_short_now < max_short
+            and short_regime_ok
+        ):
             for _, row in short_universe.iterrows():
                 t = str(row["ticker"]).upper()
                 pos_key = f"{t}_short"
@@ -851,44 +912,13 @@ def backtest(
                 rs_above_ma = bool(row.get("rs_above_ma", False))
                 vol_mult = volume_vs_50dma(daily_df, t, dt)
 
-                # Require weak RS for shorts (same gating as PROD watcher)
-                if rs_above_ma:
+                if not should_enter_short(
+                    price, ma_val, pivot_low, rs_above_ma, vol_mult
+                ):
                     continue
 
-                # Daily adaptor for CORE short eval:
-                # - closes_tail: last 2 daily closes up to today
-                # - intraday_interval != "60m" → CORE uses closes_tail
-                price_series = get_close_series(daily_df, t)
-                closes_tail = list(price_series.loc[:dt].tail(2).values)
-
-                state_in = short_states.get(
-                    t, {"short_state": "IDLE", "short_hits": [], "short_cooldown": 0}
-                )
-
-                new_state, flags = eval_short_bar_core(
-                    price=price,
-                    ma30=ma_val,
-                    pivot_low=pivot_low,
-                    pace_full=vol_mult,   # daily vol / 50dma → same as intraday pace_full
-                    pace_intra=np.nan,    # not used in daily mode
-                    elapsed_min=None,     # not used when intraday_interval != "60m"
-                    closes_tail=closes_tail,
-                    state=state_in,
-                    intraday_interval="1d",  # force non-60m branch
-                    test_ease=False,
-                )
-                short_states[t] = new_state
-
-                if not flags.get("short_trigger_now", False):
-                    continue
-
-                # At this point, CORE has already enforced:
-                # - price breakdown via _short_price_break
-                # - volume pace gate via VOL_PACE_MIN
                 atr = atr_cache.get(t, np.nan)
-                entry, stop, t1, t2 = _short_entry_stop_targets(
-                    price, ma_val, pivot_low, atr
-                )
+                stop = short_stop_level(price, atr, ma_val)
                 if np.isnan(stop) or stop <= price:
                     continue  # invalid stop
 
@@ -1058,6 +1088,18 @@ def main():
         help="Enable long-only, short-only, or both",
     )
     ap.add_argument("--quiet", action="store_true")
+    # NEW: optional Chapter 8 + VIX regime gates
+    ap.add_argument(
+        "--use-regime-long",
+        action="store_true",
+        help="Gate NEW long entries by Chapter 8 + VIX via market_regime.inspect().",
+    )
+    ap.add_argument(
+        "--use-regime-short",
+        action="store_true",
+        help="Gate NEW short entries by Chapter 8 + VIX via market_regime.inspect().",
+    )
+
     args = ap.parse_args()
 
     VERBOSE = not args.quiet
@@ -1079,6 +1121,38 @@ def main():
         f"risk_per_trade={args.risk_per_trade:.3f}, max_long={args.max_long}, max_short={args.max_short}",
         level="info",
     )
+
+    # ---- Optional Chapter 8 + VIX regime gating (single snapshot, applies to full run) ----
+    long_regime_ok = True
+    short_regime_ok = True
+
+    if args.use_regime_long or args.use_regime_short:
+        if inspect_market_regime is None:
+            log(
+                "market_regime.py not available; regime gates disabled "
+                "(allowing new longs/shorts).",
+                level="warn",
+            )
+        else:
+            try:
+                regime_label, long_ok_flag, short_ok_flag = inspect_market_regime()
+                log(
+                    f"Market regime (Ch8+VIX): {regime_label} | "
+                    f"long_ok={long_ok_flag} short_ok={short_ok_flag}",
+                    level="info",
+                )
+                if args.use_regime_long:
+                    long_regime_ok = bool(long_ok_flag)
+                if args.use_regime_short:
+                    short_regime_ok = bool(short_ok_flag)
+            except Exception as e:
+                log(
+                    f"market_regime.inspect() failed ({e}); "
+                    "regime gates disabled (allowing new longs/shorts).",
+                    level="warn",
+                )
+                long_regime_ok = True
+                short_regime_ok = True
 
     # ---- Try to use historical weekly snapshots (Option A) ----
     weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
@@ -1122,6 +1196,8 @@ def main():
         universe_tickers=sorted(all_tickers),
         weekly_df=weekly_df,
         weekly_snapshots=weekly_snapshots if weekly_snapshots else None,
+        long_regime_ok=long_regime_ok,
+        short_regime_ok=short_regime_ok,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
