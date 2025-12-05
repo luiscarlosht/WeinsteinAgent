@@ -1,3 +1,4 @@
+# config.yaml
 app:
   mode_default: weekly
   timezone: America/Chicago
@@ -39,7 +40,8 @@ notifications:
       host: "smtp.gmail.com"
       port_ssl: 587
       username: "luiscarlosht@gmail.com"
-      app_password: "qnamoxtmakhnvlml"
+      # replace with your actual app password locally
+      app_password: "REPLACE_WITH_YOUR_GMAIL_APP_PASSWORD"
 
 reporting:
   # Files the job writes
@@ -171,3 +173,17 @@ backtest:
     ma_window: 50     # MA window for "% above MA50"
     min_long: 0.60    # require 60% of breadth universe above MA to allow new longs
 
+  # Core tunables for LONG and SHORT models (used by both SIM & PROD via CORE)
+  long:
+    break_pct: 0.004   # ≈0.4% above pivot
+    vol_min: 1.30      # min full-day volume vs 50dma
+    stop_hard: 0.20    # 20% disaster stop
+    trail_atr: 2.0     # ATR-based trail
+    ma_guard: 0.03     # extra guard vs MA30 (~3%)
+
+  short:
+    break_pct: 0.004
+    vol_min: 1.30
+    stop_hard: 0.20
+    trail_atr: 2.0
+    ma_guard: 0.03
