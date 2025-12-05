@@ -46,23 +46,23 @@ from weinstein_mailer import send_email
 from weinstein_short_core import (
     INTRADAY_INTERVAL,
     PIVOT_LOOKBACK_WEEKS,
-    SHORT_BREAK_PCT,
-    NEAR_ABOVE_PIVOT_PCT,
-    VOL_PACE_MIN,
-    NEAR_VOL_PACE_MIN,
+    SHORT_BREAK_PCT as CORE_SHORT_BREAK_PCT,
+    NEAR_ABOVE_PIVOT_PCT as CORE_NEAR_ABOVE_PIVOT_PCT,
+    VOL_PACE_MIN as CORE_VOL_PACE_MIN,
+    NEAR_VOL_PACE_MIN as CORE_NEAR_VOL_PACE_MIN,
     INTRADAY_AVG_VOL_WINDOW,
     INTRADAY_LASTBAR_MULT,
-    INTRABAR_CONFIRM_MIN_ELAPSED,
-    INTRABAR_VOLPACE_MIN,
-    READY_ABOVE_MA_PCT,
-    SHORT_NEAR_HITS_WINDOW,
-    SHORT_NEAR_HITS_MIN,
-    SHORT_COOLDOWN_SCANS,
-    SHORT_HARD_STOP_PCT,
-    SHORT_TRAIL_ATR_MULT,
-    SHORT_MA_GUARD_PCT,
-    SHORT_TARGET1_PCT,
-    SHORT_TARGET2_PCT,
+    INTRABAR_CONFIRM_MIN_ELAPSED as CORE_INTRABAR_CONFIRM_MIN_ELAPSED,
+    INTRABAR_VOLPACE_MIN as CORE_INTRABAR_VOLPACE_MIN,
+    READY_ABOVE_MA_PCT as CORE_READY_ABOVE_MA_PCT,
+    SHORT_NEAR_HITS_WINDOW as CORE_SHORT_NEAR_HITS_WINDOW,
+    SHORT_NEAR_HITS_MIN as CORE_SHORT_NEAR_HITS_MIN,
+    SHORT_COOLDOWN_SCANS as CORE_SHORT_COOLDOWN_SCANS,
+    SHORT_HARD_STOP_PCT as CORE_SHORT_HARD_STOP_PCT,
+    SHORT_TRAIL_ATR_MULT as CORE_SHORT_TRAIL_ATR_MULT,
+    SHORT_MA_GUARD_PCT as CORE_SHORT_MA_GUARD_PCT,
+    SHORT_TARGET1_PCT as CORE_SHORT_TARGET1_PCT,
+    SHORT_TARGET2_PCT as CORE_SHORT_TARGET2_PCT,
     _short_price_break,
     _short_near_zone,
     _short_ready_to_close,
@@ -70,6 +70,25 @@ from weinstein_short_core import (
     ShortRegimeContext,
     build_short_regime_from_spy_stage,
 )
+
+# ---- Effective short-side tunables (config overrides Option B) ----
+# These are the values actually used by THIS watcher. They default to the core
+# constants but can be overridden from config.intraday.short.
+SHORT_BREAK_PCT         = CORE_SHORT_BREAK_PCT
+NEAR_ABOVE_PIVOT_PCT    = CORE_NEAR_ABOVE_PIVOT_PCT
+VOL_PACE_MIN            = CORE_VOL_PACE_MIN
+NEAR_VOL_PACE_MIN       = CORE_NEAR_VOL_PACE_MIN
+INTRABAR_CONFIRM_MIN_ELAPSED = CORE_INTRABAR_CONFIRM_MIN_ELAPSED
+INTRABAR_VOLPACE_MIN    = CORE_INTRABAR_VOLPACE_MIN
+READY_ABOVE_MA_PCT      = CORE_READY_ABOVE_MA_PCT
+SHORT_NEAR_HITS_WINDOW  = CORE_SHORT_NEAR_HITS_WINDOW
+SHORT_NEAR_HITS_MIN     = CORE_SHORT_NEAR_HITS_MIN
+SHORT_COOLDOWN_SCANS    = CORE_SHORT_COOLDOWN_SCANS
+SHORT_HARD_STOP_PCT     = CORE_SHORT_HARD_STOP_PCT
+SHORT_TRAIL_ATR_MULT    = CORE_SHORT_TRAIL_ATR_MULT
+SHORT_MA_GUARD_PCT      = CORE_SHORT_MA_GUARD_PCT
+SHORT_TARGET1_PCT       = CORE_SHORT_TARGET1_PCT
+SHORT_TARGET2_PCT       = CORE_SHORT_TARGET2_PCT
 
 # Optional: Google Sheets integration for READY filter
 try:
@@ -683,6 +702,49 @@ def run(
 
     log(f"Short watcher starting with config: {_config_path}", level="step")
     cfg, benchmark, sheet_url, service_account_file = load_config(_config_path)
+
+    # ---- Override short tunables from config.intraday.short (Option B) ----
+    short_cfg = ((cfg.get("intraday") or {}).get("short") or {})
+
+    global SHORT_BREAK_PCT, NEAR_ABOVE_PIVOT_PCT
+    global VOL_PACE_MIN, NEAR_VOL_PACE_MIN
+    global INTRABAR_CONFIRM_MIN_ELAPSED, INTRABAR_VOLPACE_MIN
+    global READY_ABOVE_MA_PCT
+    global SHORT_NEAR_HITS_WINDOW, SHORT_NEAR_HITS_MIN, SHORT_COOLDOWN_SCANS
+    global SHORT_HARD_STOP_PCT, SHORT_TRAIL_ATR_MULT, SHORT_MA_GUARD_PCT
+    global SHORT_TARGET1_PCT, SHORT_TARGET2_PCT
+
+    def _g(name, default):
+        val = short_cfg.get(name, default)
+        return val if val is not None else default
+
+    SHORT_BREAK_PCT              = float(_g("break_pct", CORE_SHORT_BREAK_PCT))
+    NEAR_ABOVE_PIVOT_PCT         = float(_g("near_above_pivot_pct", CORE_NEAR_ABOVE_PIVOT_PCT))
+    VOL_PACE_MIN                 = float(_g("vol_pace_min", CORE_VOL_PACE_MIN))
+    NEAR_VOL_PACE_MIN            = float(_g("near_vol_pace_min", CORE_NEAR_VOL_PACE_MIN))
+    INTRABAR_CONFIRM_MIN_ELAPSED = int(_g("intrabar_confirm_min_elapsed", CORE_INTRABAR_CONFIRM_MIN_ELAPSED))
+    INTRABAR_VOLPACE_MIN         = float(_g("intrabar_volpace_min", CORE_INTRABAR_VOLPACE_MIN))
+    READY_ABOVE_MA_PCT           = float(_g("ready_above_ma_pct", CORE_READY_ABOVE_MA_PCT))
+    SHORT_NEAR_HITS_WINDOW       = int(_g("near_hits_window", CORE_SHORT_NEAR_HITS_WINDOW))
+    SHORT_NEAR_HITS_MIN          = int(_g("near_hits_min", CORE_SHORT_NEAR_HITS_MIN))
+    SHORT_COOLDOWN_SCANS         = int(_g("cooldown_scans", CORE_SHORT_COOLDOWN_SCANS))
+    SHORT_HARD_STOP_PCT          = float(_g("stop_hard_pct", CORE_SHORT_HARD_STOP_PCT))
+    SHORT_TRAIL_ATR_MULT         = float(_g("trail_atr_mult", CORE_SHORT_TRAIL_ATR_MULT))
+    SHORT_MA_GUARD_PCT           = float(_g("ma_guard_pct", CORE_SHORT_MA_GUARD_PCT))
+    SHORT_TARGET1_PCT            = float(_g("target1_pct", CORE_SHORT_TARGET1_PCT))
+    SHORT_TARGET2_PCT            = float(_g("target2_pct", CORE_SHORT_TARGET2_PCT))
+
+    log(
+        f"Short config: break={SHORT_BREAK_PCT:.4f}, "
+        f"near_zone=+{NEAR_ABOVE_PIVOT_PCT*100:.1f}%, "
+        f"vol_pace_min={VOL_PACE_MIN:.2f}x, near_vol_pace_min={NEAR_VOL_PACE_MIN:.2f}x, "
+        f"intrabar_confirm≥{INTRABAR_CONFIRM_MIN_ELAPSED}m @ pace≥{INTRABAR_VOLPACE_MIN:.2f}x, "
+        f"hits_window={SHORT_NEAR_HITS_WINDOW}, hits_min={SHORT_NEAR_HITS_MIN}, cooldown={SHORT_COOLDOWN_SCANS}, "
+        f"ready_above_ma={READY_ABOVE_MA_PCT*100:.2f}%, "
+        f"stop_hard={SHORT_HARD_STOP_PCT*100:.0f}%, trail_ATR={SHORT_TRAIL_ATR_MULT:.1f}×, "
+        f"targets↓ [{SHORT_TARGET1_PCT*100:.0f}%, {SHORT_TARGET2_PCT*100:.0f}%]",
+        level="info",
+    )
 
     weekly_df, weekly_csv_path = load_weekly_report()
     log(f"Weekly CSV: {weekly_csv_path}", level="debug")
