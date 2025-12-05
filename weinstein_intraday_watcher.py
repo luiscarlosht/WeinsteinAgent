@@ -5,15 +5,15 @@ Weinstein Intraday Watcher (PROD) — uses config.yaml
 
 - Uses latest weekly equities report as the "core" universe
 - Normalizes weekly CSV columns so we never crash on missing 'Ticker'/'Close'
+- Cleans 'Stage' into numeric 1..4 (default 2) so Stage filters never kill universe
 - Applies:
     * Stage 1/2 filter for longs
     * Min price / min avg volume from config.universe
-    * ADX filter controlled from config.intraday
+    * ADX filter from config.intraday / backtest
     * Intraday breakout logic using 60m bars
 - Saves:
     * intraday_debug.csv   → detailed per-ticker diagnostics
-    * intraday_watch_*.html (optional simple HTML summary)
-- Intended to be run by: ./run_cron_short_stack.sh
+    * intraday_watch_*.html (simple HTML summary)
 
 CLI:
     python3 weinstein_intraday_watcher.py \
@@ -187,7 +187,7 @@ def build_full_config(cfg: Dict) -> FullConfig:
 
 
 # ---------------------------------------------------------------------------
-# Weekly CSV loader (robust against header changes)
+# Weekly CSV loader (robust against header / Stage changes)
 # ---------------------------------------------------------------------------
 
 def find_latest_weekly_csv(output_dir: str) -> str:
@@ -204,11 +204,15 @@ def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
     Normalize the weekly equities CSV columns so that we *always* have:
         - 'Ticker'
         - 'Close'
-        - 'Stage' (or 'stage')
-        - 'AvgVolume' (or similar)
+        - 'Stage' (numeric 1..4, default 2)
+        - 'AvgVolume' (if available)
 
-    We do this by looking for plausible column names and renaming them.
+    We do this by looking for plausible column names and renaming them,
+    then coercing Stage to numeric.
     """
+    if df.empty:
+        return df
+
     cols = list(df.columns)
     lower = {c.lower(): c for c in cols}
 
@@ -219,7 +223,6 @@ def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
             ticker_col = lower[key]
             break
     if ticker_col is None:
-        # Last-resort: pick the first column
         ticker_col = cols[0]
     if ticker_col != "Ticker":
         df.rename(columns={ticker_col: "Ticker"}, inplace=True)
@@ -237,16 +240,24 @@ def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
         df.rename(columns={close_col: "Close"}, inplace=True)
 
     # Stage
-    stage_col = None
-    for key in ["stage", "weinstien_stage", "stage_weinstein"]:
+    stage_col_raw = None
+    for key in ["stage", "weinstien_stage", "stage_weinstein", "stage_num"]:
         if key in lower:
-            stage_col = lower[key]
+            stage_col_raw = lower[key]
             break
-    if stage_col is None:
-        # if no explicit stage column, create dummy Stage=2 for everyone
+
+    if stage_col_raw is None:
+        # No explicit stage column → default everyone to Stage=2
         df["Stage"] = 2
-    elif stage_col != "Stage":
-        df.rename(columns={stage_col: "Stage"}, inplace=True)
+    else:
+        if stage_col_raw != "Stage":
+            df.rename(columns={stage_col_raw: "Stage"}, inplace=True)
+        # Coerce any string forms ("Stage 2", "2.0", etc.) into numeric 1..4
+        stage_num = pd.to_numeric(df["Stage"], errors="coerce")
+        # Default unknowns to 2 (uptrend candidate) so we don't kill the universe
+        stage_num = stage_num.fillna(2)
+        stage_num = stage_num.clip(lower=1, upper=4).astype(int)
+        df["Stage"] = stage_num
 
     # Average volume
     avgv_col = None
@@ -254,10 +265,9 @@ def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
         if key in lower:
             avgv_col = lower[key]
             break
-    if avgv_col is None:
-        # try just "Volume"
-        if "volume" in lower:
-            avgv_col = lower["volume"]
+    if avgv_col is None and "volume" in lower:
+        avgv_col = lower["volume"]
+
     if avgv_col is not None and avgv_col != "AvgVolume":
         df.rename(columns={avgv_col: "AvgVolume"}, inplace=True)
     elif "AvgVolume" not in df.columns:
@@ -270,9 +280,14 @@ def load_focus_universe(weekly_csv: str, u_cfg: UniverseConfig) -> pd.DataFrame:
     df = pd.read_csv(weekly_csv)
     df = normalize_weekly_columns(df)
 
-    # Filter Stage 1/2 only (long candidates)
+    # Primary Stage filter: 1/2 for long candidates
     if "Stage" in df.columns:
-        df = df.loc[df["Stage"].isin([1, 2])]
+        long_mask = df["Stage"].isin([1, 2])
+        if long_mask.sum() == 0:
+            # If for some reason nothing is tagged 1/2, fall back to everyone
+            log("⚠️ No Stage 1/2 rows found — falling back to full weekly universe.")
+        else:
+            df = df.loc[long_mask]
 
     # Filter by price
     df = df.loc[df["Close"] >= u_cfg.min_price]
@@ -325,10 +340,7 @@ def compute_breadth(weekly_df: pd.DataFrame, ma_window: int = 50) -> float:
     """
     if weekly_df.empty or "Close" not in weekly_df.columns:
         return 100.0
-    # This is a hacky proxy: treat the weekly Close as if it already encodes
-    # whether the underlying daily series is above MA50. If you want a more
-    # accurate breadth measure, you can plug in your own here.
-    # For now, assume 50% above MA as neutral.
+    # Crude proxy: treat half of universe as "above MA" to avoid overfitting.
     above = int(len(weekly_df) * 0.5)
     return above / max(len(weekly_df), 1) * 100.0
 
@@ -349,7 +361,7 @@ def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if not tickers:
         return pd.DataFrame(), pd.DataFrame()
 
-    tickers_str = " ".join(tickers)
+    tickers_str = " ".join(sorted(set(tickers)))
 
     # Daily
     daily = yf.download(
@@ -375,6 +387,8 @@ def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     # Normalize into a consistent multi-index: (date/time, ticker)
     def stack_yf(df_raw: pd.DataFrame) -> pd.DataFrame:
+        if df_raw.empty:
+            return pd.DataFrame()
         if isinstance(df_raw.columns, pd.MultiIndex):
             frames = []
             for ticker in sorted(set(sym for sym, _ in df_raw.columns)):
@@ -387,6 +401,9 @@ def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
             out = df_raw.copy()
             out["Ticker"] = tickers[0]
         out.reset_index(inplace=True)
+        # yfinance may use "Date" or "Datetime"
+        date_col = "Date" if "Date" in out.columns else "Datetime"
+        out = out.rename(columns={date_col: "Date"})
         out = out.set_index(["Date", "Ticker"])
         return out
 
@@ -455,7 +472,7 @@ def evaluate_intraday_signals(
             )
             continue
 
-        # Stage filter: price above MA150 and MA150 rising
+        # Stage-like filter: price above MA150 and MA150 rising
         if pd.isna(last["MA150"]):
             rows.append(
                 dict(
@@ -605,6 +622,7 @@ def main() -> None:
 
     if focus_df.empty:
         print("⚠️ Focus universe is empty. Nothing to do.")
+        print("✅ Intraday tick complete.")
         return
 
     tickers = focus_df["Ticker"].tolist()
