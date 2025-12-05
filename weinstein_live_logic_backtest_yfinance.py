@@ -4,13 +4,13 @@
 Weinstein Live Logic Backtest — yfinance (SIM)
 
 - Shares knobs with config.yaml:
-    * backtest.snapshot_mode  (static / historical / auto)
+    * backtest.snapshot_mode  (static / historical / auto)  [currently static]
     * backtest.regime.use_long/use_short
-    * backtest.coppock.use_long/use_short   (stubbed in here)
+    * backtest.coppock.use_long/use_short
     * backtest.breadth.enabled/ma_window/min_long
-    * backtest.long / backtest.short  (break_pct, vol_min, stops, etc.)
+    * backtest.long / backtest.short  (break_pct, vol_min, stops, ADX, etc.)
 - Uses yfinance for daily bars
-- Universe from latest weekly equities CSV (static mode) or snapshots
+- Universe from latest weekly equities CSV (static mode)
 
 CLI example:
 
@@ -22,8 +22,6 @@ python3 weinstein_live_logic_backtest_yfinance.py \
   --risk-per-trade 0.01 \
   --max-long 10 \
   --max-short 10 \
-  --use-regime-long \
-  --use-regime-short \
   --benchmark SPY
 """
 
@@ -190,7 +188,7 @@ def build_bt_config(cfg_raw: Dict, benchmark_override: Optional[str]) -> Backtes
 
 
 # ---------------------------------------------------------------------------
-# Weekly universe loader (same normalization idea as intraday)
+# Weekly universe loader (shared Stage normalization)
 # ---------------------------------------------------------------------------
 
 def find_latest_weekly_csv(output_dir: str) -> str:
@@ -203,6 +201,9 @@ def find_latest_weekly_csv(output_dir: str) -> str:
 
 
 def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
     cols = list(df.columns)
     lower = {c.lower(): c for c in cols}
 
@@ -230,15 +231,21 @@ def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
         df.rename(columns={close_col: "Close"}, inplace=True)
 
     # Stage
-    stage_col = None
-    for key in ["stage", "weinstien_stage", "stage_weinstein"]:
+    stage_col_raw = None
+    for key in ["stage", "weinstien_stage", "stage_weinstein", "stage_num"]:
         if key in lower:
-            stage_col = lower[key]
+            stage_col_raw = lower[key]
             break
-    if stage_col is None:
+
+    if stage_col_raw is None:
         df["Stage"] = 2
-    elif stage_col != "Stage":
-        df.rename(columns={stage_col: "Stage"}, inplace=True)
+    else:
+        if stage_col_raw != "Stage":
+            df.rename(columns={stage_col_raw: "Stage"}, inplace=True)
+        stage_num = pd.to_numeric(df["Stage"], errors="coerce")
+        stage_num = stage_num.fillna(2)
+        stage_num = stage_num.clip(lower=1, upper=4).astype(int)
+        df["Stage"] = stage_num
 
     return df
 
@@ -340,6 +347,8 @@ def fetch_daily_bars(
     log("Download complete.")
 
     def stack(df_raw: pd.DataFrame) -> pd.DataFrame:
+        if df_raw.empty:
+            return pd.DataFrame()
         if isinstance(df_raw.columns, pd.MultiIndex):
             frames = []
             for ticker in sorted(set(sym for sym, _ in df_raw.columns)):
@@ -351,7 +360,8 @@ def fetch_daily_bars(
             out = df_raw.copy()
             out["Ticker"] = tickers[0]
         out.reset_index(inplace=True)
-        out = out.rename(columns={"Date": "Date"})
+        date_col = "Date" if "Date" in out.columns else "Datetime"
+        out = out.rename(columns={date_col: "Date"})
         out = out.set_index(["Date", "Ticker"])
         return out
 
@@ -391,11 +401,18 @@ def simulate_backtest(
         equity_curve: DataFrame[date, equity]
         trades:       DataFrame[trade log]
     """
-    # Build universes
+    # Build universes using cleaned Stage
     weekly_df = weekly_df.copy()
     if "Stage" in weekly_df.columns:
+        stage_num = pd.to_numeric(weekly_df["Stage"], errors="coerce").fillna(2).astype(int)
+        weekly_df["Stage"] = stage_num.clip(1, 4)
         long_universe = weekly_df.loc[weekly_df["Stage"].isin([1, 2]), "Ticker"].tolist()
         short_universe = weekly_df.loc[weekly_df["Stage"].isin([3, 4]), "Ticker"].tolist()
+        if not long_universe:
+            log("⚠️ LONG universe from Stage 1/2 is empty — falling back to all tickers for longs.")
+            long_universe = weekly_df["Ticker"].tolist()
+        if not short_universe:
+            log("⚠️ SHORT universe from Stage 3/4 is empty — using empty short set.")
     else:
         long_universe = weekly_df["Ticker"].tolist()
         short_universe = weekly_df["Ticker"].tolist()
@@ -445,8 +462,15 @@ def simulate_backtest(
     trades_rows = []
 
     # Determine all trading dates between start and end
+    if daily.empty:
+        log("⚠️ Daily price DataFrame is empty — no backtest possible.")
+        return pd.DataFrame(), pd.DataFrame()
+
     all_dates = sorted({idx[0].date() for idx in daily.index})
     trade_dates = [d for d in all_dates if start <= d <= end]
+    if not trade_dates:
+        log("⚠️ No trading dates in requested range — nothing to simulate.")
+        return pd.DataFrame(), pd.DataFrame()
 
     for idx, trade_date in enumerate(trade_dates, start=1):
         # Extract daily slice
@@ -531,7 +555,7 @@ def simulate_backtest(
                     coppock_ok_long = False
 
         allow_new_longs = (
-            "long" in mode
+            ("long" in mode or mode == "both")
             and bt_cfg.regime_cfg.use_long
             and breadth_ok_long
             and coppock_ok_long
@@ -540,7 +564,7 @@ def simulate_backtest(
         # New long entries
         if allow_new_longs:
             for ticker in long_universe:
-                if ( "long", ticker) in positions:  # already long
+                if ("long", ticker) in positions:  # already long
                     continue
                 if ticker not in day_slice.index:
                     continue
@@ -573,7 +597,7 @@ def simulate_backtest(
                     )
                     continue
 
-                # Stage conditions
+                # Stage conditions (proxy via MA150)
                 if pd.isna(last["MA150"]) or last["Close"] <= last["MA150"] * (1.0 + bt_cfg.long_cfg.ma_guard):
                     continue
 
@@ -630,6 +654,10 @@ def simulate_backtest(
             day_equity += mtm
 
         equity_curve_rows.append(dict(Date=trade_date, Equity=day_equity))
+
+    if not equity_curve_rows:
+        log("⚠️ No equity points recorded during backtest — returning empty results.")
+        return pd.DataFrame(), pd.DataFrame()
 
     equity_curve = pd.DataFrame(equity_curve_rows).set_index("Date")
     trades = pd.DataFrame(trades_rows)
