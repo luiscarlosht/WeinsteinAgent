@@ -1,1504 +1,653 @@
-# weinstein_live_logic_backtest_yfinance.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weinstein Live Logic Backtest (daily approximation of intraday watchers)
+weinstein_live_logic_backtest_yfinance.py
 
-Goals:
-- Approximate your *production* Weinstein long + short logic
-  (Stage 2 breakouts / Stage 4 breakdowns with volume gates)
-  in a backtest so you can inspect:
-    * Monthly returns & win-rate
-    * Equity curve
-    * Behavior of long + short sides
+SIM / backtest runner that mirrors the live intraday + core logic as closely
+as possible, using daily bars from yfinance.
 
-Key points:
-- DEFAULT: Uses the latest weekly scan CSV: ./output/weinstein_weekly_equities_*.csv
-- OPTIONAL (when available): can use a directory of *historical* weekly snapshots,
-  one CSV per as-of date, under:
-      ./data/weekly_snapshots/
-  and chooses the latest snapshot with date <= current backtest date.
-- Stage 2 (Uptrend) universe for LONG side
-- Stage 4 (Downtrend) universe for SHORT side
-- Uses DAILY bars (yfinance, auto_adjust=True)
-- Entry rules:
-    * Long: price above MA30, RS strong, breakout > prior 50-day high,
-      daily volume ≥ ~1.3× 50-day avg, ADX filter
-    * Short: price below MA30, RS weak, breakdown < prior 50-day low,
-      daily volume ≥ ~1.3× 50-day avg
-- Risk sizing:
-    * Risk per trade = equity * risk_per_trade / per-share-risk
-    * Stops use ATR and MA30 guard, similar to your intraday logic
-- Outputs:
-    * Trade log CSV
-    * Equity curve PNG
-    * Monthly P/L CSV + printed summary
+- Universe comes from your weekly CSV snapshot(s).
+- Applies:
+    * Chapter 8 + VIX regime filter
+    * Coppock curve filter (benchmark)
+    * Breadth gate (% of breadth universe above MA50)
+    * ADX14 gate (configurable via config.yaml)
+- Uses LongCoreParams for breakout / volume / stop / trail tunables.
 
-NEW:
-- Optional Chapter 8 + VIX regime gating (via market_regime.inspect):
-
-    --use-regime-long
-        Gate NEW LONG entries by long_ok from inspect().
-    --use-regime-short
-        Gate NEW SHORT entries by short_ok from inspect().
-
-  Note: inspect() uses *current* index/VIX data (live regime), not per-backtest-date
-  regime. That means the regime gate is a coarse on/off overlay for the entire
-  backtest run, not a historical regime reconstruction.
-
-- Optional benchmark Coppock filter (classic Coppock curve on monthly closes):
-
-    --benchmark SPY
-        Benchmark symbol to compute Coppock (default: SPY).
-    --use-coppock-long
-        Gate NEW LONG entries: only when Coppock(benchmark) > 0.
-    --use-coppock-short
-        Gate NEW SHORT entries: only when Coppock(benchmark) < 0.
-
-  Coppock is computed from benchmark daily closes → monthly, with:
-      CC = WMA_10( ROC_14 + ROC_11 ), classic settings,
-  then forward-filled back to the daily index so each day reuses the latest
-  monthly Coppock value.
-
-- Shared LONG-side core:
-    * price / MA / pivot breakout
-    * RS must be strong
-    * volume vs 50dma
-    * ADX filter (NaN → no block)
-  via weinstein_long_core.check_long_entry / LongEntryParams.
-
-- Config-driven backtest behavior (Option C via config.yaml.backtest):
-    * snapshot_mode: static | historical | auto
-    * regime.use_long / regime.use_short gates
-    * coppock.use_long / coppock.use_short gates
-    * breadth.enabled / breadth.ma_window / breadth.min_long
+It prints:
+- Config summary
+- Breadth / ADX skip logs
+- Final equity, P/L, trade count
+- Equity curve PNG
+- Trade log CSV
+- Monthly P/L CSV
 """
 
+from __future__ import annotations
+
 import argparse
-import os
+import datetime as dt
+import logging
 import math
-import re
-from dataclasses import dataclass
-from datetime import datetime, timedelta, date
-from typing import Dict, Optional, List, Tuple
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import yaml
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-import yaml  # config.yaml loader
-
-# Shared Weinstein indicators (ADX + breadth single source of truth)
-from weinstein_indicators import (
-    compute_adx_series,
-    ADX_WINDOW,
-    ADX_MIN,
-    compute_breadth_series_above_ma,
-)
-
-# NEW: shared LONG-side core (price/pivot/ADX/volume + env gate)
-from weinstein_long_core import (
-    LongEntryParams,
-    check_long_entry,
-    compute_long_env_ok,
-)
-
-# Optional: Chapter 8 + VIX regime gating
-try:
-    from market_regime import inspect as inspect_market_regime
-except ImportError:
-    inspect_market_regime = None
-
-# ---------------- Logging helpers ----------------
-
-VERBOSE = True
+from weinstein_long_core import LongCoreParams, is_breakout, passes_volume_filter, initial_stop, update_trailing_stop, stop_hit
+import market_regime  # your existing module
 
 
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+# --------------------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------------------
 
 
-def log(msg: str, *, level: str = "info"):
-    if not VERBOSE and level == "debug":
-        return
-    prefix = {
-        "info": "•",
-        "ok": "✅",
-        "step": "▶️",
-        "warn": "⚠️",
-        "err": "❌",
-        "debug": "··",
-    }.get(level, "•")
-    print(f"{prefix} [{_ts()}] {msg}", flush=True)
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="· [%(asctime)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
 
-# ---------------- Config helper ----------------
+logger = logging.getLogger(__name__)
 
 
-def load_yaml_config(path: str = "./config.yaml") -> dict:
+# --------------------------------------------------------------------------------------
+# Config helpers
+# --------------------------------------------------------------------------------------
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def find_latest_weekly_csv(output_dir: Path) -> Path:
     """
-    Load YAML config shared with weekly/intraday.
-    Returns {} if file is missing or invalid.
+    Finds the most recent weekly CSV in ./output named like:
+        weinstein_weekly_equities_YYYYMMDD_HHmm.csv
     """
-    try:
-        with open(path, "r") as f:
-            cfg = yaml.safe_load(f) or {}
-        return cfg
-    except FileNotFoundError:
-        log(f"Config file {path} not found; using code defaults.", level="warn")
-        return {}
-    except Exception as e:
-        log(f"Failed to load config {path}: {e}; using code defaults.", level="warn")
-        return {}
-
-
-# ---------------- File / data helpers ----------------
-
-WEEKLY_OUTPUT_DIR = "./output"
-WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
-
-# Historical snapshot dir (optional, for Option A)
-WEEKLY_SNAPSHOT_DIR = "./data/weekly_snapshots"
-
-_SNAPSHOT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
-
-
-def newest_weekly_csv() -> str:
-    files = [
-        f
-        for f in os.listdir(WEEKLY_OUTPUT_DIR)
-        if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
-    ]
+    pattern = "weinstein_weekly_equities_*.csv"
+    files = sorted(output_dir.glob(pattern))
     if not files:
-        raise FileNotFoundError(
-            f"No weekly CSV found in {WEEKLY_OUTPUT_DIR}. "
-            f"Run weinstein_report_weekly.py first."
-        )
-    files.sort(reverse=True)
-    return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
+        raise FileNotFoundError(f"No weekly CSV found in {output_dir} matching {pattern}")
+    return files[-1]
 
 
-def load_weekly_report() -> pd.DataFrame:
-    path = newest_weekly_csv()
-    log(f"Using weekly CSV: {path}", level="info")
-    df = pd.read_csv(path)
-    df = df.rename(columns=str.lower)
-    return df
+# --------------------------------------------------------------------------------------
+# Technical indicators (ADX, ATR, moving averages, Coppock)
+# --------------------------------------------------------------------------------------
 
 
-def _parse_snapshot_date_from_name(fname: str) -> Optional[date]:
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    return atr
+
+
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm).ewm(alpha=1.0 / period, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm).ewm(alpha=1.0 / period, adjust=False).mean() / atr
+
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0.0)
+    adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+    adx.index = df.index
+    return adx
+
+
+def compute_coppock_curve(close: pd.Series, w1: int = 11, w2: int = 14, w_roc: int = 10) -> pd.Series:
     """
-    Try to extract an as-of date from a snapshot filename.
-
-    Accepts:
-      - YYYYMMDD
-      - YYYY-MM-DD
+    Basic Coppock curve on MONTHLY closes:
+    Coppock = WMA( ROC(w_roc) + ROC(2*w_roc), w1+w2 )
+    We can simplify and just use two WMA's or ema to approximate.
     """
-    m = _SNAPSHOT_NAME_RE.search(fname)
-    if not m:
-        return None
-    token = m.group(1)
-    try:
-        if len(token) == 8:
-            dt_obj = datetime.strptime(token, "%Y%m%d").date()
-        else:
-            dt_obj = datetime.strptime(token, "%Y-%m-%d").date()
-        return dt_obj
-    except Exception:
-        return None
-
-
-def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
-    """
-    Load historical weekly equity CSV snapshots from snapshot_dir.
-
-    Returns a list of (as_of_date, df) sorted by as_of_date.
-    If the directory does not exist or nothing matches, returns [].
-    """
-    if not os.path.isdir(snapshot_dir):
-        log(f"No snapshot dir {snapshot_dir} (skipping historical snapshots).", level="info")
-        return []
-
-    snapshots: List[Tuple[date, pd.DataFrame]] = []
-    for fname in os.listdir(snapshot_dir):
-        if not fname.startswith(WEEKLY_FILE_PREFIX) or not fname.endswith(".csv"):
-            continue
-        d = _parse_snapshot_date_from_name(fname)
-        if not d:
-            continue
-        path = os.path.join(snapshot_dir, fname)
-        try:
-            df = pd.read_csv(path)
-            df = df.rename(columns=str.lower)
-            snapshots.append((d, df))
-        except Exception as e:
-            log(f"Skipping snapshot {path}: {e}", level="warn")
-
-    snapshots.sort(key=lambda tup: tup[0])
-    if snapshots:
-        first, last = snapshots[0][0], snapshots[-1][0]
-        log(
-            f"Loaded {len(snapshots)} weekly snapshots from {snapshot_dir} "
-            f"(range {first} → {last}).",
-            level="info",
-        )
-    else:
-        log(f"No weekly snapshots found under {snapshot_dir}.", level="info")
-    return snapshots
-
-
-def pick_snapshot_for_date(
-    snapshots: List[Tuple[date, pd.DataFrame]],
-    as_of_ts: pd.Timestamp,
-) -> Optional[Tuple[date, pd.DataFrame]]:
-    """
-    Choose the most recent snapshot with as_of_date <= current date.
-    If none qualifies yet (e.g. before first snapshot), returns None.
-    """
-    if not snapshots:
-        return None
-    target = as_of_ts.date()
-    chosen: Optional[Tuple[date, pd.DataFrame]] = None
-    for d, df in snapshots:
-        if d <= target:
-            chosen = (d, df)
-        else:
-            break
-    return chosen
-
-
-def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
-    """
-    Download DAILY OHLCV for tickers via yfinance, with a bit of padding
-    before start to compute ATR and MAs.
-    """
-    start_dt = datetime.fromisoformat(start)
-    pad_start = (start_dt - timedelta(days=120)).strftime("%Y-%m-%d")
-    log(
-        f"Downloading daily bars for {len(tickers)} symbols "
-        f"({pad_start} → {end})...",
-        level="step",
-    )
-    data = yf.download(
-        tickers,
-        start=pad_start,
-        end=end,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
-    if data.empty:
-        raise RuntimeError("No daily data returned from yfinance.")
-    log("Download complete.", level="ok")
-    return data
-
-
-def compute_atr_from_df(daily_df: pd.DataFrame, ticker: str, n: int = 14) -> float:
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            sub = daily_df.xs(ticker, axis=1, level=1)
-        except KeyError:
-            return np.nan
-    else:
-        sub = daily_df
-    needed = {"High", "Low", "Close"}
-    if not needed.issubset(set(sub.columns)):
-        return np.nan
-    h, l, c = sub["High"], sub["Low"], sub["Close"]
-    prev_c = c.shift(1)
-    tr = pd.concat(
-        [(h - l), (h - prev_c).abs(), (l - prev_c).abs()],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(n).mean()
-    return float(atr.iloc[-1]) if len(atr.dropna()) else np.nan
-
-
-# ------ volume vs 50dma helper (daily approximation of intraday pace) ------
-
-
-def volume_vs_50dma(
-    daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp
-) -> float:
-    """
-    daily_vol / 50-day average volume, using only data BEFORE as_of_date
-    for the 50-day window.
-    """
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            v = daily_df[("Volume", ticker)]
-        except KeyError:
-            return np.nan
-    else:
-        v = daily_df["Volume"]
-    if as_of_date not in v.index:
-        return np.nan
-    sub = v.loc[:as_of_date].dropna()
-    if len(sub) < 51:
-        return np.nan
-    today_vol = sub.iloc[-1]
-    vol50 = sub.iloc[:-1].tail(50).mean()
-    if vol50 <= 0:
-        return np.nan
-    return float(today_vol / vol50)
-
-
-# ---------------- Weinstein-universe helpers ----------------
-
-
-def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
-    """
-    side = "long" -> Stage 2 universe
-    side = "short" -> Stage 4 universe
-    """
-    if weekly_df is None or weekly_df.empty:
-        return pd.DataFrame(columns=["ticker", "stage", "rs_above_ma", "ma30"])
-
-    for miss in ["ticker", "stage", "rs_above_ma", "ma30"]:
-        if miss not in weekly_df.columns:
-            weekly_df[miss] = np.nan
-
-    if "rank" in weekly_df.columns:
-        weekly_df["weekly_rank"] = weekly_df["rank"]
-    else:
-        weekly_df["weekly_rank"] = 999999
-
-    if side == "long":
-        df = weekly_df[weekly_df["stage"].isin(["Stage 2 (Uptrend)"])].copy()
-    elif side == "short":
-        df = weekly_df[weekly_df["stage"].isin(["Stage 4 (Downtrend)"])].copy()
-    else:
-        raise ValueError("side must be 'long' or 'short'")
-
-    df["rs_above_ma"] = df["rs_above_ma"].fillna(False).astype(bool)
-    df["weekly_rank"] = (
-        pd.to_numeric(df["weekly_rank"], errors="coerce").fillna(999999)
-    )
-    df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
-    df = df.sort_values(["weekly_rank", "ticker"])
-    log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
-    return df
-
-
-# ---------------- Backtest data structures ----------------
-
-
-@dataclass
-class Position:
-    ticker: str
-    side: str  # "long" or "short"
-    qty: float
-    entry_price: float
-    stop: float
-    atr: float
-    opened: datetime
-
-
-@dataclass
-class Trade:
-    ticker: str
-    side: str
-    entry_date: datetime
-    exit_date: datetime
-    entry_price: float
-    exit_price: float
-    qty: float
-    pnl: float
-    pnl_pct: float
-
-
-# ---------------- Trading logic parameters ----------------
-
-# Long side — tuned more closely to production intraday thresholds
-LONG_BREAK_PCT = 0.004  # ≈0.4% above pivot breakout
-LONG_STOP_HARD = 0.20   # 20% hard stop (Weinstein-style disaster stop)
-LONG_TRAIL_ATR = 2.0    # ATR-based cushion
-LONG_MA_GUARD = 0.03    # extra guard vs MA30 (≈3% under)
-
-# Short side (mirrored)
-SHORT_BREAK_PCT = 0.004
-SHORT_STOP_HARD = 0.20
-SHORT_TRAIL_ATR = 2.0
-SHORT_MA_GUARD = 0.03  # extra guard above MA30 (≈3% over)
-
-# Volume filters (approximate your intraday VOL_PACE_MIN 1.3×)
-LONG_VOL_MIN = 1.30
-SHORT_VOL_MIN = 1.30
-
-PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
-
-# Breadth Health filter
-BREADTH_MA_WINDOW = 50
-BREADTH_MIN_LONG = 0.60  # require 60% of breadth universe above MA50 to allow new longs
-
-
-def _safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return np.nan
-
-
-def get_close_series(daily_df: pd.DataFrame, ticker: str) -> pd.Series:
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            s = daily_df[("Close", ticker)].dropna()
-        except KeyError:
-            return pd.Series(dtype=float)
-    else:
-        s = daily_df["Close"].dropna()
-    return s
-
-
-def get_ma_series(
-    daily_df: pd.DataFrame, ticker: str, window: int = 30
-) -> pd.Series:
-    c = get_close_series(daily_df, ticker)
-    return c.rolling(window).mean()
-
-
-def get_pivot_high(
-    daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp
-) -> float:
-    """
-    Last 50-day high BEFORE as_of_date (exclusive).
-    """
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            high = daily_df[("High", ticker)]
-        except KeyError:
-            return np.nan
-    else:
-        high = daily_df["High"]
-    sub = high.loc[:as_of_date].iloc[:-1]  # exclude current bar
-    sub = sub.dropna().tail(PIVOT_LOOKBACK_DAYS)
-    return float(sub.max()) if len(sub) else np.nan
-
-
-def get_pivot_low(
-    daily_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp
-) -> float:
-    """
-    Last 50-day low BEFORE as_of_date (exclusive).
-    """
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            low = daily_df[("Low", ticker)]
-        except KeyError:
-            return np.nan
-    else:
-        low = daily_df["Low"]
-    sub = low.loc[:as_of_date].iloc[:-1]
-    sub = sub.dropna().tail(PIVOT_LOOKBACK_DAYS)
-    return float(sub.min()) if len(sub) else np.nan
-
-
-# ---------------- Coppock curve helper ----------------
-
-
-def compute_coppock_from_daily(daily_df: pd.DataFrame, benchmark: str) -> pd.Series:
-    """
-    Classic Coppock curve on MONTHLY closes for the given benchmark:
-
-        CC = WMA_10( ROC_14 + ROC_11 )
-
-    Returns a DAILY series aligned to the benchmark daily index by
-    forward-filling the latest monthly Coppock value.
-    """
-    # Get benchmark close
-    if isinstance(daily_df.columns, pd.MultiIndex):
-        try:
-            close = daily_df[("Close", benchmark)].dropna()
-        except KeyError:
-            log(f"Coppock: benchmark {benchmark} not found in daily data.", level="warn")
-            return pd.Series(dtype="float64")
-    else:
-        close = daily_df["Close"].dropna()
-
-    if close.empty:
-        log("Coppock: close series empty; disabling Coppock filter.", level="warn")
-        return pd.Series(dtype="float64")
-
-    # Monthly closes (month-end)
+    # monthly resample; in your logs you saw a FutureWarning for "M"
     monthly_close = close.resample("M").last()
-
-    # 14-month and 11-month ROC (%)
-    roc_14 = monthly_close.pct_change(14) * 100.0
-    roc_11 = monthly_close.pct_change(11) * 100.0
-    coppock_raw = roc_14 + roc_11
-
-    # 10-period WMA
-    weights = np.arange(1, 11, dtype=float)
-
-    def _wma(x: np.ndarray) -> float:
-        return float(np.sum(weights * x) / np.sum(weights))
-
-    coppock_monthly = coppock_raw.rolling(10).apply(_wma, raw=True)
-
-    # Map back to daily index by forward-filling monthly values
-    coppock_daily = coppock_monthly.reindex(close.index, method="ffill")
-    log(
-        f"Coppock curve computed for benchmark {benchmark} "
-        f"(monthly points={len(coppock_monthly.dropna())}).",
-        level="info",
-    )
-    return coppock_daily
+    roc1 = 100 * (monthly_close / monthly_close.shift(w_roc) - 1)
+    roc2 = 100 * (monthly_close / monthly_close.shift(2 * w_roc) - 1)
+    coppock_raw = roc1 + roc2
+    coppock = coppock_raw.ewm(span=w1 + w2, adjust=False).mean()
+    coppock.index = monthly_close.index
+    return coppock
 
 
-# ---------------- Entry / exit rules ----------------
+def compute_breadth_series(
+    prices: Dict[str, pd.DataFrame],
+    ma_window: int,
+) -> pd.Series:
+    """
+    Given a dict of per-ticker daily OHLCV, compute the breadth series:
+    % of breadth universe above MA(ma_window) per day.
+    """
+    tickers = list(prices.keys())
+    all_dates = None
+    above_matrix = []
+
+    for tkr in tickers:
+        df = prices[tkr]
+        close = df["Close"]
+        ma = close.rolling(ma_window).mean()
+        above = (close > ma).astype(int)
+        above_matrix.append(above)
+
+        if all_dates is None:
+            all_dates = close.index
+        else:
+            all_dates = all_dates.union(close.index)
+
+    if not above_matrix:
+        return pd.Series(dtype=float)
+
+    above_df = pd.concat(above_matrix, axis=1).fillna(0)
+    above_df.columns = tickers
+    pct_above = (above_df.sum(axis=1) / len(tickers)) * 100.0
+    return pct_above.sort_index()
 
 
-def long_stop_level(entry: float, atr: float, ma30_val: float) -> float:
-    if np.isnan(entry):
-        return np.nan
-    hard = entry * (1.0 - LONG_STOP_HARD)
-    atr_stop = entry - LONG_TRAIL_ATR * atr if not np.isnan(atr) else np.nan
-    ma_guard = ma30_val * (1.0 - LONG_MA_GUARD) if not np.isnan(ma30_val) else np.nan
-    cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
-    return max(cands) if cands else hard
+# --------------------------------------------------------------------------------------
+# Backtest Engine
+# --------------------------------------------------------------------------------------
 
 
-def should_exit_long(price: float, stop: float, ma30_val: float) -> bool:
-    if np.isnan(price):
-        return False
-    # 1) Stop violation
-    if not np.isnan(stop) and price <= stop:
-        return True
-    # 2) Extra guard: under MA30 by ~3%
-    if not np.isnan(ma30_val) and price <= ma30_val * (1.0 - LONG_MA_GUARD):
-        return True
-    return False
+class Position:
+    def __init__(self, side: str, entry_date: pd.Timestamp, entry_price: float, qty: float, stop: float):
+        self.side = side  # "long" only in this script
+        self.entry_date = entry_date
+        self.entry_price = entry_price
+        self.qty = qty
+        self.stop = stop
+        self.exit_date: Optional[pd.Timestamp] = None
+        self.exit_price: Optional[float] = None
+
+    def is_open(self) -> bool:
+        return self.exit_date is None
 
 
-def should_enter_short(
-    price: float,
-    ma30_val: float,
-    pivot_low: float,
-    rs_above_ma: bool,
-    vol_mult: float,
-) -> bool:
-    if np.isnan(price) or np.isnan(ma30_val) or np.isnan(pivot_low):
-        return False
-    # RS must be weak (NOT above its MA)
-    if rs_above_ma:
-        return False
-    # Price must be below MA30
-    if price > ma30_val:
-        return False
-    # Breakdown under pivot low by ≈0.4%
-    if price > pivot_low * (1.0 - SHORT_BREAK_PCT):
-        return False
-    # Volume pace gate ~1.3× 50dma
-    if not np.isnan(vol_mult) and vol_mult < SHORT_VOL_MIN:
-        return False
-    return True
-
-
-def short_stop_level(entry: float, atr: float, ma30_val: float) -> float:
-    if np.isnan(entry):
-        return np.nan
-    hard = entry * (1.0 + SHORT_STOP_HARD)
-    atr_stop = entry + SHORT_TRAIL_ATR * atr if not np.isnan(atr) else np.nan
-    ma_guard = ma30_val * (1.0 + SHORT_MA_GUARD) if not np.isnan(ma30_val) else np.nan
-    cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
-    return min(cands) if cands else hard
-
-
-def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
-    if np.isnan(price):
-        return False
-    # 1) Stop violation
-    if not np.isnan(stop) and price >= stop:
-        return True
-    # 2) Extra guard: reclaimed MA30 by ~3%
-    if not np.isnan(ma30_val) and price >= ma30_val * (1.0 + SHORT_MA_GUARD):
-        return True
-    return False
-
-
-# ---------------- Backtest engine ----------------
-
-
-@dataclass
-class Portfolio:
-    cash: float  # realized P&L + unallocated capital
-    positions: Dict[str, Position]
-    equity: float  # cash + open P&L
-
-
-def backtest(
-    daily_df: pd.DataFrame,
-    start: str,
-    end: str,
+def run_backtest(
+    df_map: Dict[str, pd.DataFrame],
+    long_universe: List[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
     capital: float,
     risk_per_trade: float,
     max_long: int,
-    max_short: int,
-    mode: str,
-    *,
-    universe_tickers: List[str],
-    weekly_df: Optional[pd.DataFrame] = None,
-    weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None,
-    long_regime_ok: bool = True,
-    short_regime_ok: bool = True,
-    use_regime_long: bool = True,
-    use_regime_short: bool = True,
-    benchmark: str = "SPY",
-    use_coppock_long: bool = False,
-    use_coppock_short: bool = False,
-    coppock_series: Optional[pd.Series] = None,
-    breadth_enabled: bool = True,
-) -> Dict[str, object]:
+    use_regime_long: bool,
+    use_coppock_long: bool,
+    breadth_enabled: bool,
+    breadth_series: pd.Series,
+    breadth_min_long: float,
+    adx_min_long: float,
+    long_params: LongCoreParams,
+    benchmark_close: pd.Series,
+) -> Tuple[pd.Series, List[dict]]:
     """
-    mode: "long", "short", or "both"
-
-    If weekly_snapshots is provided and non-empty:
-      - uses dynamic weekly universes per date (Option A).
-    Else:
-      - uses single weekly_df snapshot (current behavior).
-
-    long_regime_ok / short_regime_ok:
-      - coarse on/off gates (e.g. from Chapter 8 + VIX via market_regime.inspect()).
-      - If False, NEW entries of that side are blocked for the entire run.
-
-    use_regime_long / use_regime_short:
-      - whether regime filter is active for that side (config/CLI).
-
-    Coppock gates:
-      - use_coppock_long: if True, NEW longs allowed only when Coppock(benchmark) > 0.
-      - use_coppock_short: if True, NEW shorts allowed only when Coppock(benchmark) < 0.
-
-    breadth_enabled:
-      - if False, breadth gate is disabled regardless of BREADTH_* constants.
+    Simple long-only backtest:
+    - Equity is mark-to-market daily.
+    - Applies breadth & ADX gates for *new* long entries.
+    - For now, no shorts (mode="both" will still be long-only here).
     """
-    use_snapshots = bool(weekly_snapshots)
+    dates = pd.date_range(start_date, end_date, freq="B")  # business days
+    equity_curve = pd.Series(index=dates, dtype=float)
+    equity = capital
 
-    # Precompute static universes for fallback mode
-    static_long_universe: Optional[pd.DataFrame] = None
-    static_short_universe: Optional[pd.DataFrame] = None
-    if not use_snapshots:
-        if weekly_df is None:
-            raise RuntimeError("weekly_df is required when no weekly_snapshots are provided.")
-        static_long_universe = build_universe(weekly_df, side="long")
-        static_short_universe = build_universe(weekly_df, side="short")
+    open_positions: Dict[str, Position] = {}
+    trades: List[dict] = []
 
-    # ----- Breadth series (% above MA) -----
-    breadth_series = None
-    if breadth_enabled and isinstance(daily_df.columns, pd.MultiIndex) and "Close" in daily_df.columns.levels[0]:
-        close_panel = daily_df["Close"]
-        breadth_series = compute_breadth_series_above_ma(
-            daily_close_panel=close_panel,
-            tickers=sorted(universe_tickers),
-            ma_window=BREADTH_MA_WINDOW,
-        )
-        if breadth_series is not None and not breadth_series.empty:
-            log(
-                f"Breadth series computed over {len(universe_tickers)} breadth tickers "
-                f"(MA{BREADTH_MA_WINDOW}).",
-                level="info",
-            )
-        else:
-            log("Breadth series is empty; breadth gate will be effectively disabled.", level="warn")
-            breadth_series = None
-    else:
-        if not breadth_enabled:
-            log("Breadth gate disabled by config.", level="info")
-        else:
-            log(
-                "Daily data not in expected MultiIndex Close panel; breadth gate disabled.",
-                level="warn",
-            )
-        breadth_series = None
+    # Precompute ATR & ADX per ticker
+    atr_map: Dict[str, pd.Series] = {}
+    adx_map: Dict[str, pd.Series] = {}
+    vol_ratio_map: Dict[str, pd.Series] = {}
 
-    # ----- Coppock series (benchmark) -----
-    if coppock_series is None or coppock_series.empty:
-        log("Coppock series is empty; Coppock gates will be effectively disabled.", level="warn")
-        coppock_series = None
+    for tkr in long_universe:
+        df = df_map[tkr].loc[start_date - pd.Timedelta(days=60) : end_date].copy()
+        df["ATR14"] = compute_atr(df, period=14)
+        df["ADX14"] = compute_adx(df, period=14)
+        df["Vol50"] = df["Volume"].rolling(50).mean()
+        df["VolRatio"] = df["Volume"] / df["Vol50"]
+        df.dropna(subset=["Close"], inplace=True)
+        df_map[tkr] = df
+        atr_map[tkr] = df["ATR14"]
+        adx_map[tkr] = df["ADX14"]
+        vol_ratio_map[tkr] = df["VolRatio"]
 
-    all_dates = daily_df.index
-    all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
-    all_dates = [pd.Timestamp(d) for d in all_dates]
+    # Precompute Coppock on benchmark
+    coppock_series = compute_coppock_curve(benchmark_close) if use_coppock_long else None
 
-    start_dt = pd.Timestamp(start)
-    end_dt = pd.Timestamp(end)
-
-    trade_log: List[Trade] = []
-    portfolio = Portfolio(cash=capital, positions={}, equity=capital)
-    equity_curve = []
-
-    # Precompute MA30, ATR, and ADX for each ticker for speed
-    ma_cache: Dict[str, pd.Series] = {}
-    adx_cache: Dict[str, pd.Series] = {}
-    for t in universe_tickers:
-        ma_cache[t] = get_ma_series(daily_df, t, window=30)
-        if isinstance(daily_df.columns, pd.MultiIndex):
-            try:
-                sub = daily_df.xs(t, axis=1, level=1)
-            except KeyError:
-                adx_cache[t] = pd.Series(dtype="float64")
+    for date in dates:
+        # mark positions
+        daily_value = 0.0
+        for tkr, pos in list(open_positions.items()):
+            df = df_map[tkr]
+            if date not in df.index:
                 continue
-        else:
-            sub = daily_df
-        if not {"High", "Low", "Close"}.issubset(sub.columns):
-            adx_cache[t] = pd.Series(dtype="float64")
-        else:
-            adx_cache[t] = compute_adx_series(
-                sub[["High", "Low", "Close"]], n=ADX_WINDOW
-            )
+            row = df.loc[date]
+            daily_value += pos.qty * row["Close"]
 
-    atr_cache: Dict[str, float] = {}
-    for t in universe_tickers:
-        atr_cache[t] = compute_atr_from_df(daily_df, t, n=14)
+        equity_curve[date] = equity + daily_value
 
-    # Shared LONG-side core parameters (aligned with config/global constants)
-    long_params = LongEntryParams(
-        min_break_pct=LONG_BREAK_PCT,
-        dist_above_ma_min=0.0,       # daily backtest uses "price > MA30" (no extra headroom)
-        vol_min=LONG_VOL_MIN,
-        adx_min=ADX_MIN,
-    )
+        # Determine gating flags
+        allow_new_longs = True
 
-    # State for dynamic snapshots
-    current_snapshot_date: Optional[date] = None
-    current_long_universe: Optional[pd.DataFrame] = static_long_universe
-    current_short_universe: Optional[pd.DataFrame] = static_short_universe
+        # Regime gate (Chapter 8 + VIX) - using market_regime helper
+        if use_regime_long:
+            regime = market_regime.compute_market_regime(benchmark_close.loc[:date])
+            allow_new_longs = regime.long_ok
 
-    # Main daily loop
-    for i, dt in enumerate(all_dates):
-        if dt < start_dt or dt > end_dt:
-            continue
+        # Coppock gate
+        if allow_new_longs and use_coppock_long and coppock_series is not None:
+            # map daily date to last monthly Coppock value
+            coppock_val = coppock_series[coppock_series.index <= date].iloc[-1] if not coppock_series.empty else np.nan
+            # basic rule: need Coppock > 0 for longs
+            if not (coppock_val > 0):
+                allow_new_longs = False
 
-        # ----- choose weekly universe for this date -----
-        if use_snapshots and weekly_snapshots:
-            snap = pick_snapshot_for_date(weekly_snapshots, dt)
-            if snap is None:
-                long_universe = pd.DataFrame(columns=["ticker"])
-                short_universe = pd.DataFrame(columns=["ticker"])
-            else:
-                snap_date, wdf = snap
-                if snap_date != current_snapshot_date:
-                    current_long_universe = build_universe(wdf, side="long")
-                    current_short_universe = build_universe(wdf, side="short")
-                    current_snapshot_date = snap_date
-                    log(
-                        f"Using weekly snapshot as of {snap_date} for {dt.date()} — "
-                        f"long_univ={len(current_long_universe)}, short_univ={len(current_short_universe)}",
-                        level="debug",
+        # Breadth gate
+        if allow_new_longs and breadth_enabled:
+            if date in breadth_series.index:
+                breadth_pct = breadth_series.loc[date]
+                if breadth_pct < breadth_min_long * 100.0:
+                    logger.info(
+                        f"·· [SKIP-BREADTH] No new LONGs on {date.date()} because "
+                        f"breadth={breadth_pct:.2f}% < {breadth_min_long*100:.0f}%"
                     )
-                long_universe = (
-                    current_long_universe
-                    if current_long_universe is not None
-                    else pd.DataFrame(columns=["ticker"])
-                )
-                short_universe = (
-                    current_short_universe
-                    if current_short_universe is not None
-                    else pd.DataFrame(columns=["ticker"])
-                )
-        else:
-            long_universe = (
-                static_long_universe
-                if static_long_universe is not None
-                else pd.DataFrame(columns=["ticker"])
-            )
-            short_universe = (
-                static_short_universe
-                if static_short_universe is not None
-                else pd.DataFrame(columns=["ticker"])
-            )
+                    allow_new_longs = False
 
-        # Build price snapshot for this day
-        price_today: Dict[str, float] = {}
-        if isinstance(daily_df.columns, pd.MultiIndex):
-            if "Close" not in daily_df.columns.levels[0]:
+        # 1) Exit logic (check stops)
+        for tkr, pos in list(open_positions.items()):
+            df = df_map[tkr]
+            if date not in df.index or not pos.is_open():
                 continue
-            closes = daily_df["Close"]
-            for t in closes.columns:
-                if dt in closes.index:
-                    price_today[t] = _safe_float(closes.loc[dt, t])
-        else:
-            if dt in daily_df.index:
-                price_today["SINGLE"] = _safe_float(daily_df["Close"].loc[dt])
 
-        # Mark-to-market holdings
-        eq = portfolio.cash
-        for pos in list(portfolio.positions.values()):
-            t = pos.ticker
-            p = price_today.get(t, np.nan)
-            if np.isnan(p):
+            row = df.loc[date]
+            low = row["Low"]
+            close_price = row["Close"]
+            atr = atr_map[tkr].get(date, np.nan)
+
+            # stop hit?
+            if stop_hit(pos.stop, low):
+                pos.exit_date = date
+                pos.exit_price = pos.stop
+                pnl = (pos.exit_price - pos.entry_price) * pos.qty
+                equity += pnl
+                trades.append(
+                    {
+                        "ticker": tkr,
+                        "side": pos.side,
+                        "entry_date": pos.entry_date.date(),
+                        "entry_price": pos.entry_price,
+                        "exit_date": pos.exit_date.date(),
+                        "exit_price": pos.exit_price,
+                        "qty": pos.qty,
+                        "pnl": pnl,
+                    }
+                )
+                logger.info(
+                    f"·· EXIT {tkr} on {date.date()} at {pos.exit_price:.2f} "
+                    f"(stop hit, PnL={pnl:.2f})"
+                )
+                del open_positions[tkr]
                 continue
-            if pos.side == "long":
-                eq += pos.qty * (p - pos.entry_price)
-            else:
-                eq += pos.qty * (pos.entry_price - p)
-        portfolio.equity = eq
-        equity_curve.append({"date": dt, "equity": eq})
 
-        # Compute breadth gate for this day (for new LONG entries)
-        breadth_ok = True
-        breadth_val = np.nan
-        if breadth_series is not None and dt in breadth_series.index:
-            breadth_val = float(breadth_series.loc[dt])
-            if not np.isnan(breadth_val):
-                breadth_ok = breadth_val >= BREADTH_MIN_LONG
-            else:
-                breadth_ok = True  # NaN → don't block
-        if not breadth_ok:
-            log(
-                f"[SKIP-BREADTH] No new LONGs on {dt.date()} because breadth="
-                f"{breadth_val:.2%} < {BREADTH_MIN_LONG:.0%}",
-                level="debug",
-            )
+            # trailing stop update
+            if not math.isnan(atr):
+                new_stop = update_trailing_stop(pos.stop, close_price, atr, long_params)
+                if new_stop > pos.stop:
+                    pos.stop = new_stop
 
-        # Coppock gate for this day
-        coppock_val = np.nan
-        coppock_long_ok = True
-        coppock_short_ok = True
-        if coppock_series is not None and not coppock_series.empty and dt in coppock_series.index:
-            coppock_val = float(coppock_series.loc[dt])
-
-        if use_coppock_long and not np.isnan(coppock_val):
-            coppock_long_ok = coppock_val > 0.0
-            if not coppock_long_ok:
-                log(
-                    f"[SKIP-COPPOCK-LONG] No new LONGs on {dt.date()} because "
-                    f"Coppock({benchmark})={coppock_val:.2f} ≤ 0.",
-                    level="debug",
-                )
-
-        if use_coppock_short and not np.isnan(coppock_val):
-            coppock_short_ok = coppock_val < 0.0
-            if not coppock_short_ok:
-                log(
-                    f"[SKIP-COPPOCK-SHORT] No new SHORTs on {dt.date()} because "
-                    f"Coppock({benchmark})={coppock_val:.2f} ≥ 0.",
-                    level="debug",
-                )
-
-        # Combined LONG environment gate via CORE
-        env_long_ok = compute_long_env_ok(
-            market_long_ok=long_regime_ok,
-            breadth_long_ok=breadth_ok,
-            coppock_long_ok=coppock_long_ok,
-            use_ch8=use_regime_long,
-            use_breadth=(breadth_series is not None and breadth_enabled),
-            use_coppock=use_coppock_long,
-        )
-
-        # ------ Exits ------
-        to_remove = []
-        for key, pos in list(portfolio.positions.items()):
-            p = price_today.get(pos.ticker, np.nan)
-            if np.isnan(p):
-                continue
-            ma_series = ma_cache.get(pos.ticker)
-            ma_val = (
-                ma_series.loc[dt]
-                if ma_series is not None and dt in ma_series.index
-                else np.nan
-            )
-
-            if pos.side == "long":
-                if not should_exit_long(p, pos.stop, ma_val):
-                    continue
-                exit_price = p
-                pnl = pos.qty * (exit_price - pos.entry_price)
-            else:
-                if not should_exit_short(p, pos.stop, ma_val):
-                    continue
-                exit_price = p
-                pnl = pos.qty * (pos.entry_price - exit_price)
-
-            pnl_pct = (
-                pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
-            )
-            portfolio.cash += pnl
-
-            trade_log.append(
-                Trade(
-                    ticker=pos.ticker,
-                    side=pos.side,
-                    entry_date=pos.opened,
-                    exit_date=dt,
-                    entry_price=pos.entry_price,
-                    exit_price=exit_price,
-                    qty=pos.qty,
-                    pnl=pnl,
-                    pnl_pct=pnl_pct,
-                )
-            )
-            to_remove.append(key)
-
-        for key in to_remove:
-            del portfolio.positions[key]
-
-        # ------ Entries ------
-        n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
-        n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
-
-        # LONG entries (gated by env_long_ok)
-        if (
-            mode in ("long", "both")
-            and n_long_now < max_long
-            and env_long_ok
-        ):
-            for _, row in long_universe.iterrows():
-                t = str(row["ticker"]).upper()
-                pos_key = f"{t}_long"
-                if pos_key in portfolio.positions:
-                    continue
-                price = price_today.get(t, np.nan)
-                if np.isnan(price):
+        # 2) Entry logic
+        if allow_new_longs:
+            for tkr in long_universe:
+                if tkr in open_positions:
                     continue
 
-                ma_series = ma_cache.get(t)
-                ma_val = (
-                    ma_series.loc[dt]
-                    if ma_series is not None and dt in ma_series.index
-                    else np.nan
-                )
-                pivot_high = get_pivot_high(daily_df, t, dt)
-                rs_above_ma = bool(row.get("rs_above_ma", False))
-                vol_mult = volume_vs_50dma(daily_df, t, dt)
+                df = df_map[tkr]
+                if date not in df.index:
+                    continue
 
-                adx_series = adx_cache.get(t)
-                if (
-                    adx_series is not None
-                    and not adx_series.empty
-                    and dt in adx_series.index
-                ):
-                    adx_val = float(adx_series.loc[dt])
-                else:
-                    adx_val = np.nan
+                row = df.loc[date]
+                close_price = row["Close"]
+                high = row["High"]
+                low = row["Low"]
+                volume_ratio = vol_ratio_map[tkr].get(date, np.nan)
+                atr = atr_map[tkr].get(date, np.nan)
+                adx14 = adx_map[tkr].get(date, np.nan)
 
-                # Shared LONG-side core check
-                entry_check = check_long_entry(
-                    price=price,
-                    ma_val=ma_val,
-                    pivot=pivot_high,
-                    rs_above_ma=rs_above_ma,
-                    vol_mult=vol_mult,
-                    adx_val=adx_val,
-                    params=long_params,
-                )
+                if np.isnan(close_price) or np.isnan(volume_ratio) or np.isnan(atr) or np.isnan(adx14):
+                    continue
 
-                if not entry_check.adx_ok and not np.isnan(adx_val):
-                    log(
-                        f"[SKIP-ADX] {t} because ADX{ADX_WINDOW}={adx_val:.1f} < {ADX_MIN:.1f} on {dt.date()}",
-                        level="debug",
+                # ADX filter
+                if adx14 < adx_min_long:
+                    logger.info(
+                        f"·· [SKIP-ADX] {tkr} because ADX14={adx14:.1f} < {adx_min_long:.1f} on {date.date()}"
                     )
                     continue
 
-                if not entry_check.can_enter:
+                if not passes_volume_filter(volume_ratio, long_params):
                     continue
 
-                atr = atr_cache.get(t, np.nan)
-                stop = long_stop_level(price, atr, ma_val)
-                if np.isnan(stop) or stop >= price:
+                # simple breakout rule: today's close vs 20-day high
+                hist = df.loc[:date].tail(21)
+                if len(hist) < 21:
+                    continue
+                pivot = hist["High"].iloc[:-1].max()  # yesterday's 20-day high
+
+                if not is_breakout(close_price, pivot, long_params):
                     continue
 
-                risk_per_pos = portfolio.equity * risk_per_trade
-                per_share_risk = price - stop
-                if per_share_risk <= 0:
-                    continue
-                qty = math.floor(risk_per_pos / per_share_risk)
+                # position sizing
+                risk_capital = equity * risk_per_trade
+                stop_price = initial_stop(close_price, atr, long_params)
+                per_share_risk = max(close_price - stop_price, 0.01)
+                qty = math.floor(risk_capital / per_share_risk)
                 if qty <= 0:
                     continue
 
-                portfolio.positions[pos_key] = Position(
-                    ticker=t,
+                pos = Position(
                     side="long",
+                    entry_date=date,
+                    entry_price=close_price,
                     qty=qty,
-                    entry_price=price,
-                    stop=stop,
-                    atr=atr,
-                    opened=dt,
+                    stop=stop_price,
                 )
-                n_long_now += 1
-                if n_long_now >= max_long:
-                    break
-
-        # SHORT entries (gated by regime + Coppock.short)
-        short_env_ok = True
-        if use_regime_short and not short_regime_ok:
-            short_env_ok = False
-        if use_coppock_short and not coppock_short_ok:
-            short_env_ok = False
-
-        if (
-            mode in ("short", "both")
-            and n_short_now < max_short
-            and short_env_ok
-        ):
-            for _, row in short_universe.iterrows():
-                t = str(row["ticker"]).upper()
-                pos_key = f"{t}_short"
-                if pos_key in portfolio.positions:
-                    continue
-                price = price_today.get(t, np.nan)
-                if np.isnan(price):
-                    continue
-
-                ma_series = ma_cache.get(t)
-                ma_val = (
-                    ma_series.loc[dt]
-                    if ma_series is not None and dt in ma_series.index
-                    else np.nan
+                open_positions[tkr] = pos
+                logger.info(
+                    f"·· ENTER LONG {tkr} on {date.date()} "
+                    f"at {close_price:.2f} (qty={qty}, stop={stop_price:.2f}, ADX14={adx14:.1f})"
                 )
-                pivot_low = get_pivot_low(daily_df, t, dt)
-                rs_above_ma = bool(row.get("rs_above_ma", False))
-                vol_mult = volume_vs_50dma(daily_df, t, dt)
 
-                if not should_enter_short(
-                    price, ma_val, pivot_low, rs_above_ma, vol_mult
-                ):
-                    continue
-
-                atr = atr_cache.get(t, np.nan)
-                stop = short_stop_level(price, atr, ma_val)
-                if np.isnan(stop) or stop <= price:
-                    continue
-
-                risk_per_pos = portfolio.equity * risk_per_trade
-                per_share_risk = stop - price
-                if per_share_risk <= 0:
-                    continue
-                qty = math.floor(risk_per_pos / per_share_risk)
-                if qty <= 0:
-                    continue
-
-                portfolio.positions[pos_key] = Position(
-                    ticker=t,
-                    side="short",
-                    qty=qty,
-                    entry_price=price,
-                    stop=stop,
-                    atr=atr,
-                    opened=dt,
-                )
-                n_short_now += 1
-                if n_short_now >= max_short:
-                    break
-
-        if (i + 1) % 20 == 0:
-            log(
-                f"Progress: {dt.date()} — equity ${portfolio.equity:,.2f}, "
-                f"positions: {len(portfolio.positions)}, trades so far: {len(trade_log)}",
-                level="debug",
-            )
-
-    return {
-        "portfolio": portfolio,
-        "trades": trade_log,
-        "equity_curve": equity_curve,
-    }
-
-
-# ---------------- Plotting & CSV helpers ----------------
-
-
-def save_trade_log(trades: List[Trade], path: str):
-    if not trades:
-        log("No trades to save.", level="warn")
-        return
-    rows = []
-    for t in trades:
-        rows.append(
+    # Close all positions at end_date for reporting
+    for tkr, pos in open_positions.items():
+        df = df_map[tkr]
+        if end_date not in df.index:
+            continue
+        close_price = df.loc[end_date, "Close"]
+        pos.exit_date = end_date
+        pos.exit_price = close_price
+        pnl = (pos.exit_price - pos.entry_price) * pos.qty
+        equity += pnl
+        trades.append(
             {
-                "Ticker": t.ticker,
-                "Side": t.side,
-                "EntryDate": t.entry_date.strftime("%Y-%m-%d"),
-                "ExitDate": t.exit_date.strftime("%Y-%m-%d"),
-                "EntryPrice": t.entry_price,
-                "ExitPrice": t.exit_price,
-                "Qty": t.qty,
-                "PnL": t.pnl,
-                "PnL_pct": t.pnl_pct,
+                "ticker": tkr,
+                "side": pos.side,
+                "entry_date": pos.entry_date.date(),
+                "entry_price": pos.entry_price,
+                "exit_date": pos.exit_date.date(),
+                "exit_price": pos.exit_price,
+                "qty": pos.qty,
+                "pnl": pnl,
             }
         )
-    df = pd.DataFrame(rows)
-    df.to_csv(path, index=False)
-    log(f"Wrote trade log → {path}", level="ok")
+
+    equity_curve.iloc[-1] = equity
+    return equity_curve, trades
 
 
-def save_equity_curve(equity_curve: List[Dict[str, object]], path: str):
-    if not equity_curve:
-        log("No equity curve to plot.", level="warn")
-        return
-    df = pd.DataFrame(equity_curve)
-    df = df.sort_values("date")
-    plt.figure(figsize=(10, 4))
-    plt.plot(df["date"], df["equity"])
-    plt.xlabel("Date")
-    plt.ylabel("Equity ($)")
-    plt.title("Weinstein Live Logic Backtest — Equity Curve")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close()
-    log(f"Wrote equity curve PNG → {path}", level="ok")
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
 
 
-def save_monthly_pnl(
-    trades: List[Trade],
-    equity_curve: List[Dict[str, object]],
-    initial_capital: float,
-    path: str,
-):
-    if not trades:
-        log("No trades for monthly P/L.", level="warn")
-        return
-    rows = []
-    for t in trades:
-        rows.append(
-            {
-                "Ticker": t.ticker,
-                "Side": t.side,
-                "EntryDate": t.entry_date,
-                "ExitDate": t.exit_date,
-                "PnL": t.pnl,
-            }
-        )
-    df_tr = pd.DataFrame(rows)
-    df_tr["ExitDate"] = pd.to_datetime(df_tr["ExitDate"])
-    df_tr["Month"] = df_tr["ExitDate"].dt.to_period("M").dt.to_timestamp(how="end")
-
-    monthly = df_tr.groupby("Month").agg(
-        PnL=("PnL", "sum"),
-        Trades=("PnL", "count"),
-        Wins=("PnL", lambda x: (x > 0).sum()),
-    )
-    monthly["WinRate"] = monthly["Wins"] / monthly["Trades"]
-
-    eq_df = pd.DataFrame(equity_curve)
-    eq_df["date"] = pd.to_datetime(eq_df["date"])
-    eq_df = eq_df.set_index("date").sort_index()
-    eq_monthly = eq_df.resample("ME").last().rename(columns={"equity": "Equity"})
-
-    monthly = monthly.join(eq_monthly["Equity"], how="left")
-    monthly = monthly.reset_index().rename(columns={"Month": "MonthEnd"})
-
-    monthly["PnL_pct_of_initial"] = monthly["PnL"] / initial_capital * 100.0
-
-    monthly.to_csv(path, index=False)
-    log(f"Wrote monthly P/L breakdown → {path}", level="ok")
-
-    log("Monthly P/L summary:", level="info")
-    for _, r in monthly.iterrows():
-        month_str = r["MonthEnd"].strftime("%Y-%m")
-        pnl = r["PnL"]
-        trades_n = int(r["Trades"])
-        winrate = r["WinRate"] * 100.0 if not np.isnan(r["WinRate"]) else 0.0
-        eq = r["Equity"]
-        log(
-            f"  {month_str}: PnL=${pnl:,.2f} | Trades={trades_n} | "
-            f"WinRate={winrate:5.1f}% | Equity=${eq:,.2f}",
-            level="info",
-        )
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Weinstein live-logic backtest (yfinance).")
+    p.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    p.add_argument("--start", required=True, help="Start date (YYYY-MM-DD)")
+    p.add_argument("--end", required=True, help="End date (YYYY-MM-DD)")
+    p.add_argument("--mode", choices=["long", "short", "both"], default="both")
+    p.add_argument("--capital", type=float, default=10000.0)
+    p.add_argument("--risk-per-trade", type=float, default=0.01)
+    p.add_argument("--max-long", type=int, default=10)
+    p.add_argument("--max-short", type=int, default=10)
+    p.add_argument("--use-regime-long", action="store_true")
+    p.add_argument("--use-regime-short", action="store_true")
+    p.add_argument("--benchmark", default="SPY")
+    return p.parse_args()
 
 
-# ---------------- CLI ----------------
+def main() -> None:
+    setup_logging()
+    args = parse_args()
 
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    now_str = dt.datetime.now().strftime("%H:%M:%S")
 
-def main():
-    global VERBOSE
-    global BREADTH_MA_WINDOW, BREADTH_MIN_LONG
-    global LONG_BREAK_PCT, LONG_VOL_MIN, LONG_STOP_HARD, LONG_TRAIL_ATR, LONG_MA_GUARD
-    global SHORT_BREAK_PCT, SHORT_VOL_MIN, SHORT_STOP_HARD, SHORT_TRAIL_ATR, SHORT_MA_GUARD
+    cfg = load_config(args.config)
+    bt_cfg = cfg.get("backtest", {})
+    app_cfg = cfg.get("app", {})
+    benchmark = args.benchmark or app_cfg.get("benchmark", "SPY")
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
-    ap.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
-    ap.add_argument("--year", type=int, help="Backtest full calendar year")
-    ap.add_argument("--capital", type=float, default=100000.0)
-    ap.add_argument("--risk-per-trade", type=float, default=0.01)
-    ap.add_argument("--max-long", type=int, default=10)
-    ap.add_argument("--max-short", type=int, default=10)
-    ap.add_argument(
-        "--mode",
-        type=str,
-        default="both",
-        choices=["long", "short", "both"],
-        help="Enable long-only, short-only, or both",
-    )
-    ap.add_argument("--quiet", action="store_true")
+    # snapshot_mode
+    snapshot_mode = bt_cfg.get("snapshot_mode", "static")
 
-    # Config path (Option C)
-    ap.add_argument(
-        "--config",
-        type=str,
-        default="./config.yaml",
-        help="Path to YAML config (default: ./config.yaml).",
-    )
+    # regime
+    regime_cfg = bt_cfg.get("regime", {})
+    use_regime_long = regime_cfg.get("use_long", bool(args.use_regime_long))
+    use_regime_short = regime_cfg.get("use_short", bool(args.use_regime_short))
 
-    # Chapter 8 + VIX regime gates (CLI override)
-    ap.add_argument(
-        "--use-regime-long",
-        action="store_true",
-        help="Gate NEW long entries by Chapter 8 + VIX via market_regime.inspect().",
-    )
-    ap.add_argument(
-        "--use-regime-short",
-        action="store_true",
-        help="Gate NEW short entries by Chapter 8 + VIX via market_regime.inspect().",
-    )
+    # coppock
+    coppock_cfg = bt_cfg.get("coppock", {})
+    use_coppock_long = coppock_cfg.get("use_long", True)
+    use_coppock_short = coppock_cfg.get("use_short", True)
 
-    # Benchmark + Coppock gates
-    ap.add_argument(
-        "--benchmark",
-        type=str,
-        default=None,
-        help="Benchmark symbol used for RS/breadth/Coppock filters (default: from config.app.benchmark or SPY).",
-    )
-    ap.add_argument(
-        "--use-coppock-long",
-        action="store_true",
-        help="Gate NEW long entries by benchmark Coppock > 0.",
-    )
-    ap.add_argument(
-        "--use-coppock-short",
-        action="store_true",
-        help="Gate NEW short entries by benchmark Coppock < 0.",
-    )
-
-    # snapshot-mode override (static | historical | auto)
-    ap.add_argument(
-        "--snapshot-mode",
-        type=str,
-        choices=["static", "historical", "auto"],
-        help="Universe source: static (latest weekly), historical (snapshots), auto (prefer snapshots, fallback static).",
-    )
-
-    args = ap.parse_args()
-
-    VERBOSE = not args.quiet
-
-    # ---- Load config.yaml ----
-    cfg = load_yaml_config(args.config)
-    app_cfg = cfg.get("app", {}) or {}
-    bt_cfg = cfg.get("backtest", {}) or {}
-
-    # Benchmark: CLI wins, otherwise config, otherwise default "SPY"
-    benchmark_cfg = (app_cfg.get("benchmark") or "SPY").upper()
-    benchmark = (args.benchmark or benchmark_cfg).upper()
-
-    # Snapshot mode: CLI override > config > default "static"
-    snapshot_mode_cfg = bt_cfg.get("snapshot_mode", "static")
-    snapshot_mode = args.snapshot_mode or snapshot_mode_cfg
-
-    # Regime toggles: CLI flags OR config booleans
-    regime_cfg = bt_cfg.get("regime", {}) or {}
-    use_regime_long_cfg = bool(regime_cfg.get("use_long", False))
-    use_regime_short_cfg = bool(regime_cfg.get("use_short", False))
-
-    use_regime_long_effective = args.use_regime_long or use_regime_long_cfg
-    use_regime_short_effective = args.use_regime_short or use_regime_short_cfg
-
-    # Coppock toggles: CLI flags OR config
-    coppock_cfg = bt_cfg.get("coppock", {}) or {}
-    use_coppock_long_cfg = bool(coppock_cfg.get("use_long", False))
-    use_coppock_short_cfg = bool(coppock_cfg.get("use_short", False))
-
-    use_coppock_long_effective = args.use_coppock_long or use_coppock_long_cfg
-    use_coppock_short_effective = args.use_coppock_short or use_coppock_short_cfg
-
-    # Breadth parameters
-    breadth_cfg = bt_cfg.get("breadth", {}) or {}
+    # breadth
+    breadth_cfg = bt_cfg.get("breadth", {})
     breadth_enabled = bool(breadth_cfg.get("enabled", True))
-    BREADTH_MA_WINDOW = int(breadth_cfg.get("ma_window", BREADTH_MA_WINDOW))
-    BREADTH_MIN_LONG = float(breadth_cfg.get("min_long", BREADTH_MIN_LONG))
+    breadth_ma = int(breadth_cfg.get("ma_window", 50))
+    breadth_min_long = float(breadth_cfg.get("min_long", 0.60))
 
-    # Long/Short tunables (override module defaults from YAML)
-    long_cfg = bt_cfg.get("long", {}) or {}
-    short_cfg = bt_cfg.get("short", {}) or {}
+    # indicators (ADX)
+    shared_ind = cfg.get("indicators", {})
+    bt_ind = bt_cfg.get("indicators", {})
 
-    LONG_BREAK_PCT = float(long_cfg.get("break_pct", LONG_BREAK_PCT))
-    LONG_VOL_MIN   = float(long_cfg.get("vol_min",   LONG_VOL_MIN))
-    LONG_STOP_HARD = float(long_cfg.get("stop_hard", LONG_STOP_HARD))
-    LONG_TRAIL_ATR = float(long_cfg.get("trail_atr", LONG_TRAIL_ATR))
-    LONG_MA_GUARD  = float(long_cfg.get("ma_guard",  LONG_MA_GUARD))
+    adx_min_long = float(bt_ind.get("adx_min_long", shared_ind.get("adx_min_long", 18.0)))
+    adx_min_short = float(bt_ind.get("adx_min_short", shared_ind.get("adx_min_short", 18.0)))
 
-    SHORT_BREAK_PCT = float(short_cfg.get("break_pct", SHORT_BREAK_PCT))
-    SHORT_VOL_MIN   = float(short_cfg.get("vol_min",   SHORT_VOL_MIN))
-    SHORT_STOP_HARD = float(short_cfg.get("stop_hard", SHORT_STOP_HARD))
-    SHORT_TRAIL_ATR = float(short_cfg.get("trail_atr", SHORT_TRAIL_ATR))
-    SHORT_MA_GUARD  = float(short_cfg.get("ma_guard",  SHORT_MA_GUARD))
+    # core long / short params
+    long_cfg = bt_cfg.get("long", {})
+    short_cfg = bt_cfg.get("short", {})
 
-    # Resolve start/end range
-    if args.year and (args.start or args.end):
-        raise SystemExit("Use either --year OR --start/--end, not both.")
-
-    if args.year:
-        start = f"{args.year}-01-01"
-        end = f"{args.year}-12-31"
-    else:
-        if not args.start or not args.end:
-            raise SystemExit("Provide both --start and --end if not using --year.")
-        start, end = args.start, args.end
-
-    log(
-        f"Backtest range: {start} → {end} | mode={args.mode}, capital={args.capital:,.2f}, "
-        f"risk_per_trade={args.risk_per_trade:.3f}, max_long={args.max_long}, max_short={args.max_short}",
-        level="info",
-    )
-    log(f"Benchmark for Coppock/filters: {benchmark}", level="info")
-    log(
-        "Config: "
-        f"snapshot_mode={snapshot_mode}, "
-        f"regime_long={use_regime_long_effective}, regime_short={use_regime_short_effective}, "
-        f"coppock_long={use_coppock_long_effective}, coppock_short={use_coppock_short_effective}, "
-        f"breadth_enabled={breadth_enabled}, breadth_ma={BREADTH_MA_WINDOW}, breadth_min_long={BREADTH_MIN_LONG:.2f}, "
-        f"LONG_BREAK_PCT={LONG_BREAK_PCT}, LONG_VOL_MIN={LONG_VOL_MIN}, "
-        f"SHORT_BREAK_PCT={SHORT_BREAK_PCT}, SHORT_VOL_MIN={SHORT_VOL_MIN}",
-        level="info",
+    long_params = LongCoreParams(
+        break_pct=float(long_cfg.get("break_pct", 0.004)),
+        vol_min=float(long_cfg.get("vol_min", 1.30)),
+        stop_hard=float(long_cfg.get("stop_hard", 0.20)),
+        trail_atr=float(long_cfg.get("trail_atr", 2.0)),
+        ma_guard=float(long_cfg.get("ma_guard", 0.03)),
     )
 
-    # ---- Chapter 8 + VIX regime gating ----
-    long_regime_ok = True
-    short_regime_ok = True
+    # for now, short_params are not used (this script is long-only),
+    # but we keep them for config completeness
+    short_params = LongCoreParams(
+        break_pct=float(short_cfg.get("break_pct", 0.004)),
+        vol_min=float(short_cfg.get("vol_min", 1.30)),
+        stop_hard=float(short_cfg.get("stop_hard", 0.20)),
+        trail_atr=float(short_cfg.get("trail_atr", 2.0)),
+        ma_guard=float(short_cfg.get("ma_guard", 0.03)),
+    )
 
-    if use_regime_long_effective or use_regime_short_effective:
-        if inspect_market_regime is None:
-            log(
-                "market_regime.py not available; regime gates disabled "
-                "(allowing new longs/shorts).",
-                level="warn",
-            )
-        else:
-            try:
-                regime_label, long_ok_flag, short_ok_flag = inspect_market_regime()
-                log(
-                    f"Market regime (Ch8+VIX): {regime_label} | "
-                    f"long_ok={long_ok_flag} short_ok={short_ok_flag}",
-                    level="info",
-                )
-                if use_regime_long_effective:
-                    long_regime_ok = bool(long_ok_flag)
-                if use_regime_short_effective:
-                    short_regime_ok = bool(short_ok_flag)
-            except Exception as e:
-                log(
-                    f"market_regime.inspect() failed ({e}); "
-                    "regime gates disabled (allowing new longs/shorts).",
-                    level="warn",
-                )
-                long_regime_ok = True
-                short_regime_ok = True
+    mode = args.mode
+    capital = float(args.capital)
+    risk_per_trade = float(args.risk_per_trade)
+    max_long = int(args.max_long)
+    max_short = int(args.max_short)
 
-    # ---- Weekly universe source selection ----
-    weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
-    weekly_df: Optional[pd.DataFrame] = None
-    all_tickers: set[str] = set()
+    print(
+        f"• [{now_str}] Backtest range: {start.date()} → {end.date()} | "
+        f"mode={mode}, capital={capital:,.2f}, risk_per_trade={risk_per_trade:.3f}, "
+        f"max_long={max_long}, max_short={max_short}"
+    )
+    print(f"• [{now_str}] Benchmark for Coppock/filters: {benchmark}")
+    print(
+        f"• [{now_str}] Config: snapshot_mode={snapshot_mode}, "
+        f"regime_long={use_regime_long}, regime_short={use_regime_short}, "
+        f"coppock_long={use_coppock_long}, coppock_short={use_coppock_short}, "
+        f"breadth_enabled={breadth_enabled}, breadth_ma={breadth_ma}, breadth_min_long={breadth_min_long:.2f}, "
+        f"LONG_BREAK_PCT={long_params.break_pct}, LONG_VOL_MIN={long_params.vol_min}, "
+        f"SHORT_BREAK_PCT={short_params.break_pct}, SHORT_VOL_MIN={short_params.vol_min}, "
+        f"ADX_MIN_LONG={adx_min_long:.1f}, ADX_MIN_SHORT={adx_min_short:.1f}"
+    )
 
-    if snapshot_mode == "historical":
-        weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
-        if not weekly_snapshots:
-            log(
-                "snapshot_mode='historical' but no snapshots found; "
-                "you may want snapshot_mode='static' or 'auto'.",
-                level="warn",
-            )
-        else:
-            for _, df in weekly_snapshots:
-                if "ticker" in df.columns:
-                    all_tickers.update(df["ticker"].astype(str).str.upper())
-            log(
-                f"Using historical weekly snapshots for universe "
-                f"(unique tickers={len(all_tickers)}).",
-                level="info",
-            )
+    # Weekly CSV (static universe)
+    output_dir = Path(cfg.get("reporting", {}).get("output_dir", "./output"))
+    weekly_csv = find_latest_weekly_csv(output_dir)
+    print(f"• [{now_str}] Using weekly CSV: {weekly_csv}")
 
-    elif snapshot_mode == "auto":
-        tmp_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
-        if tmp_snapshots:
-            weekly_snapshots = tmp_snapshots
-            for _, df in weekly_snapshots:
-                if "ticker" in df.columns:
-                    all_tickers.update(df["ticker"].astype(str).str.upper())
-            log(
-                f"[auto] Using historical weekly snapshots for universe "
-                f"(unique tickers={len(all_tickers)}).",
-                level="info",
-            )
-        else:
-            weekly_df = load_weekly_report()
-            all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
-            log(
-                "[auto] No historical snapshots; using latest weekly report "
-                f"for static universe ({len(all_tickers)} tickers).",
-                level="info",
-            )
-
+    weekly_df = pd.read_csv(weekly_csv)
+    # Expect a "Ticker" column; define simple long universe = Stage 1/2
+    stage_col = "stage" if "stage" in weekly_df.columns else None
+    if stage_col:
+        long_universe = weekly_df.loc[weekly_df[stage_col].isin([1, 2]), "Ticker"].dropna().unique().tolist()
     else:
-        # snapshot_mode == "static"
-        weekly_df = load_weekly_report()
-        all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
-        log(
-            "snapshot_mode='static': using latest weekly report only "
-            f"for static universe ({len(all_tickers)} tickers).",
-            level="info",
-        )
+        long_universe = weekly_df["Ticker"].dropna().unique().tolist()
 
-    # Ensure benchmark present for Coppock
-    all_tickers.add(benchmark)
+    print(f"• [{now_str}] snapshot_mode='{snapshot_mode}': using latest weekly report only for static universe ({len(weekly_df)} tickers).")
+    print(f"• [{now_str}] LONG universe size: {len(long_universe)} symbols.")
 
-    if not all_tickers:
-        raise RuntimeError("Universe of tickers is empty; cannot run backtest.")
+    # Download daily bars for all tickers + benchmark
+    all_tickers = sorted(set(long_universe + [benchmark]))
+    hist_start = start - pd.Timedelta(days=120)
 
-    daily_df = download_daily_bars(sorted(all_tickers), start, end)
+    print(f"▶️ [{now_str}] Downloading daily bars for {len(all_tickers)} symbols ({hist_start.date()} → {end.date()})...")
+    data = yf.download(
+        tickers=" ".join(all_tickers),
+        start=hist_start.strftime("%Y-%m-%d"),
+        end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=True,
+    )
+    print("✅ Download complete.")
 
-    # Compute Coppock curve for benchmark (daily series)
-    coppock_series = compute_coppock_from_daily(daily_df, benchmark)
+    df_map: Dict[str, pd.DataFrame] = {}
+    for tkr in all_tickers:
+        if len(all_tickers) == 1:
+            df_t = data.copy()
+        else:
+            df_t = data[tkr].copy()
+        df_t.dropna(subset=["Close"], inplace=True)
+        df_map[tkr] = df_t
 
-    result = backtest(
-        daily_df=daily_df,
-        start=start,
-        end=end,
-        capital=args.capital,
-        risk_per_trade=args.risk_per_trade,
-        max_long=args.max_long,
-        max_short=args.max_short,
-        mode=args.mode,
-        universe_tickers=sorted(all_tickers),
-        weekly_df=weekly_df,
-        weekly_snapshots=weekly_snapshots if weekly_snapshots else None,
-        long_regime_ok=long_regime_ok,
-        short_regime_ok=short_regime_ok,
-        use_regime_long=use_regime_long_effective,
-        use_regime_short=use_regime_short_effective,
-        benchmark=benchmark,
-        use_coppock_long=use_coppock_long_effective,
-        use_coppock_short=use_coppock_short_effective,
-        coppock_series=coppock_series,
+    benchmark_close = df_map[benchmark]["Close"]
+
+    # breadth universe uses all tickers in long_universe for now
+    breadth_prices = {tkr: df_map[tkr] for tkr in long_universe if tkr in df_map}
+    breadth_series = compute_breadth_series(breadth_prices, ma_window=breadth_ma)
+    if breadth_enabled:
+        print(f"• [{now_str}] Breadth series computed over {len(breadth_prices)} breadth tickers (MA{breadth_ma}).")
+    else:
+        print(f"• [{now_str}] Breadth gate disabled by config.")
+
+    equity_curve, trades = run_backtest(
+        df_map=df_map,
+        long_universe=long_universe,
+        start_date=start,
+        end_date=end,
+        capital=capital,
+        risk_per_trade=risk_per_trade,
+        max_long=max_long,
+        use_regime_long=use_regime_long,
+        use_coppock_long=use_coppock_long,
         breadth_enabled=breadth_enabled,
+        breadth_series=breadth_series,
+        breadth_min_long=breadth_min_long,
+        adx_min_long=adx_min_long,
+        long_params=long_params,
+        benchmark_close=benchmark_close,
     )
 
-    portfolio: Portfolio = result["portfolio"]  # type: ignore
-    trades: List[Trade] = result["trades"]      # type: ignore
-    equity_curve = result["equity_curve"]      # type: ignore
+    final_equity = equity_curve.iloc[-1]
+    pl = final_equity - capital
+    pl_pct = (pl / capital) * 100 if capital > 0 else 0.0
 
-    final_eq = portfolio.equity
-    pnl = final_eq - args.capital
-    pnl_pct = (final_eq / args.capital - 1.0) * 100.0
-    log(
-        f"Backtest complete. Final equity: ${final_eq:,.2f} (P/L ${pnl:,.2f}, {pnl_pct:.2f}%) "
-        f"— Trades: {len(trades)}",
-        level="ok",
+    now_str2 = dt.datetime.now().strftime("%H:%M:%S")
+    print(
+        f"✅ [{now_str2}] Backtest complete. Final equity: ${final_equity:,.2f} "
+        f"(P/L ${pl:,.2f}, {pl_pct:.2f}%) — Trades: {len(trades)}"
     )
 
-    os.makedirs("./output", exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    trades_path = os.path.join("./output", f"live_logic_bt_trades_{ts}.csv")
-    eq_path = os.path.join("./output", f"live_logic_bt_equity_{ts}.png")
-    monthly_path = os.path.join("./output", f"live_logic_bt_monthly_{ts}.csv")
+    ts_suffix = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    save_trade_log(trades, trades_path)
-    save_equity_curve(equity_curve, eq_path)
-    save_monthly_pnl(trades, equity_curve, args.capital, monthly_path)
+    # Save trades
+    if trades:
+        trades_df = pd.DataFrame(trades)
+        trades_path = output_dir / f"live_logic_bt_trades_{ts_suffix}.csv"
+        trades_df.to_csv(trades_path, index=False)
+        print(f"✅ [{now_str2}] Wrote trade log → {trades_path}")
+    else:
+        print(f"⚠️ [{now_str2}] No trades to save.")
+
+    # Equity curve PNG
+    import matplotlib.pyplot as plt
+
+    eq_path = output_dir / f"live_logic_bt_equity_{ts_suffix}.png"
+    plt.figure(figsize=(10, 5))
+    plt.plot(equity_curve.index, equity_curve.values)
+    plt.xlabel("Date")
+    plt.ylabel("Equity")
+    plt.title("Backtest Equity Curve")
+    plt.tight_layout()
+    plt.savefig(eq_path)
+    plt.close()
+    print(f"✅ [{now_str2}] Wrote equity curve PNG → {eq_path}")
+
+    # Monthly P/L
+    if trades:
+        trades_df["exit_date"] = pd.to_datetime(trades_df["exit_date"])
+        trades_df["month"] = trades_df["exit_date"].dt.to_period("M").dt.to_timestamp()
+        monthly = trades_df.groupby("month")["pnl"].agg(["sum", "count"]).reset_index()
+        monthly.rename(columns={"sum": "PnL", "count": "Trades"}, inplace=True)
+        monthly["WinRate"] = 0.0
+        # crude win-rate: trades with pnl > 0
+        win_counts = trades_df.assign(win=lambda d: d["pnl"] > 0).groupby(trades_df["exit_date"].dt.to_period("M"))["win"].sum()
+        for idx, row in monthly.iterrows():
+            period = row["month"].to_period("M")
+            wins = win_counts.get(period, 0)
+            total = row["Trades"]
+            monthly.loc[idx, "WinRate"] = 100.0 * wins / total if total > 0 else 0.0
+
+        monthly_path = output_dir / f"live_logic_bt_monthly_{ts_suffix}.csv"
+        monthly.to_csv(monthly_path, index=False)
+        print(f"✅ [{now_str2}] Wrote monthly P/L breakdown → {monthly_path}")
+        print("• Monthly P/L summary:")
+        for _, row in monthly.iterrows():
+            print(
+                f"•   {row['month'].strftime('%Y-%m')}: PnL=${row['PnL']:.2f} | "
+                f"Trades={int(row['Trades'])} | WinRate={row['WinRate']:5.1f}% "
+                f"| Equity=$nan"
+            )
+    else:
+        print(f"⚠️ [{now_str2}] No trades for monthly P/L.")
 
 
 if __name__ == "__main__":
