@@ -1,19 +1,24 @@
-# weinstein_long_core.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 weinstein_long_core.py
 
-Single source of truth for LONG-side breakout logic:
+Shared "core" logic for Weinstein-style LONG entries and position management.
 
-- Base breakout conditions (price vs MA + pivot)
-- Volume gate (full-day pace vs 50dma)
-- ADX filter (trend strength, with safe NaN handling)
-- Config-driven environment gate (Chapter 8 regime, Breadth, Coppock)
+This module is intentionally "dumb" and stateless — it does NOT know about:
+- market regime
+- breadth
+- ADX filters
+- universe selection
 
-Used by:
-- weinstein_live_logic_backtest_yfinance.py  (SIM / backtest)
-- weinstein_intraday_watcher.py (PROD intraday longs)
+Those gates are applied at the caller level (intraday watcher, backtest engine).
+
+Here you define:
+- LongCoreParams dataclass with main tunables
+- simple helpers to:
+    * check breakout vs pivot
+    * compute initial stops
+    * update trailing stops
 """
 
 from __future__ import annotations
@@ -21,168 +26,89 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
-
 
 @dataclass
-class LongEntryParams:
-    """
-    Tunables for base LONG breakout conditions.
-
-    min_break_pct       ~ how far above pivot a breakout must be (e.g. 0.004 ≈ 0.4%)
-    dist_above_ma_min   ~ how far above MA30/MA150 price must be (0.0 = “just above”)
-    vol_min             ~ full-day volume pace vs 50dma (e.g. 1.30x)
-    adx_min             ~ minimum ADX(n) to consider trend “strong enough”
-    """
-    min_break_pct: float = 0.004
-    dist_above_ma_min: float = 0.0
-    vol_min: float = 1.30
-    adx_min: float = 18.0
+class LongCoreParams:
+    """Core tunables for long entries and exits."""
+    break_pct: float = 0.004    # ~0.4% above pivot
+    vol_min: float = 1.30       # min full-day volume vs 50dma
+    stop_hard: float = 0.20     # 20% max loss from entry
+    trail_atr: float = 2.0      # ATR multiple for trailing stop
+    ma_guard: float = 0.03      # guard vs MA30 (~3% cushion)
 
 
-@dataclass
-class LongEntryCheck:
-    """
-    Result of evaluating base LONG breakout conditions.
-    Can be used both in backtest and intraday.
-
-    - rs_ok      : RS regime is acceptable
-    - ma_ok      : MA value is present / valid
-    - pivot_ok   : pivot is present / valid
-    - adx_ok     : ADX filter passes (NaN → True)
-    - vol_ok     : full-day volume pace passes (NaN → True)
-    - price_ok   : price above MA and pivot by requested margins
-    - can_enter  : all of the above are simultaneously satisfied
-    """
-    rs_ok: bool
-    ma_ok: bool
-    pivot_ok: bool
-    adx_ok: bool
-    vol_ok: bool
-    price_ok: bool
-    can_enter: bool
-
-
-def _nan(x) -> bool:
-    """Small helper to test for NaNs across numpy / Python floats."""
-    try:
-        return bool(np.isnan(x))
-    except Exception:
-        return False
-
-
-def price_break_ok(
-    price: float,
-    ma_val: float,
-    pivot: float,
-    params: LongEntryParams,
+def passes_volume_filter(
+    volume_ratio: float,
+    params: LongCoreParams,
 ) -> bool:
     """
-    Pure price breakout rule used by both intraday & backtest.
-
-    Conditions:
-      - price >= MA * (1 + dist_above_ma_min)
-      - price >= pivot * (1 + min_break_pct)
+    volume_ratio: today's full-day volume / 50-day avg volume
     """
-    if _nan(price) or _nan(ma_val) or _nan(pivot):
-        return False
-
-    # Above MA by at least the configured headroom
-    if price < ma_val * (1.0 + params.dist_above_ma_min):
-        return False
-
-    # Above pivot by the configured breakout margin
-    if price < pivot * (1.0 + params.min_break_pct):
-        return False
-
-    return True
+    return volume_ratio >= params.vol_min
 
 
-def check_long_entry(
-    price: float,
-    ma_val: float,
-    pivot: float,
-    rs_above_ma: bool,
-    vol_mult: Optional[float],
-    adx_val: Optional[float],
-    params: LongEntryParams,
-) -> LongEntryCheck:
-    """
-    Evaluate core LONG breakout conditions.
-
-    This is the shared implementation used by:
-      - Backtest (daily bars)
-      - Intraday watcher (as the “base rule”, on top of intrabar / state logic)
-
-    Notes:
-      - ADX filter: NaN → adx_ok=True (safe fallback, don’t block)
-      - Volume filter: NaN → vol_ok=True
-    """
-    rs_ok = bool(rs_above_ma)
-    ma_ok = not _nan(ma_val)
-    pivot_ok = not _nan(pivot)
-
-    # ADX: NaN means “do not block”
-    if _nan(adx_val):
-        adx_ok = True
-    else:
-        adx_ok = float(adx_val) >= float(params.adx_min)
-
-    # Volume: NaN means “do not block”
-    if _nan(vol_mult):
-        vol_ok = True
-    else:
-        vol_ok = float(vol_mult) >= float(params.vol_min)
-
-    # Price breakout relative to MA + pivot
-    price_ok = price_break_ok(price, ma_val, pivot, params) if (ma_ok and pivot_ok) else False
-
-    can_enter = rs_ok and ma_ok and pivot_ok and adx_ok and vol_ok and price_ok
-
-    return LongEntryCheck(
-        rs_ok=rs_ok,
-        ma_ok=ma_ok,
-        pivot_ok=pivot_ok,
-        adx_ok=adx_ok,
-        vol_ok=vol_ok,
-        price_ok=price_ok,
-        can_enter=can_enter,
-    )
-
-
-def compute_long_env_ok(
-    *,
-    market_long_ok: bool,
-    breadth_long_ok: bool,
-    coppock_long_ok: bool = True,
-    use_ch8: bool = True,
-    use_breadth: bool = True,
-    use_coppock: bool = True,
+def is_breakout(
+    close_price: float,
+    pivot_price: float,
+    params: LongCoreParams,
 ) -> bool:
     """
-    Config-driven environment gate for NEW LONG entries.
-
-    Parameters:
-      - market_long_ok : from Chapter 8 / VIX regime (market_regime.inspect())
-      - breadth_long_ok: from breadth (% above MA50) filter
-      - coppock_long_ok: from Coppock curve direction (if computed)
-      - use_* flags   : whether each filter is active for LONGs
-
-    Behavior:
-      - If *no* filters are enabled → returns True (no gating).
-      - Otherwise → returns logical AND of enabled filters.
+    Basic breakout rule: close above pivot by `break_pct`.
     """
-    flags = []
+    if pivot_price <= 0:
+        return False
+    threshold = pivot_price * (1.0 + params.break_pct)
+    return close_price >= threshold
 
-    if use_ch8:
-        flags.append(bool(market_long_ok))
-    if use_breadth:
-        flags.append(bool(breadth_long_ok))
-    if use_coppock:
-        flags.append(bool(coppock_long_ok))
 
-    if not flags:
-        # No filters enabled → environment gate is effectively off.
+def guard_vs_ma(
+    close_price: float,
+    ma_price: float,
+    params: LongCoreParams,
+) -> bool:
+    """
+    Optional extra guard that price should not be too far below MA30.
+    Typically you want close >= MA30 * (1 - ma_guard).
+    """
+    if ma_price <= 0:
         return True
+    min_allowed = ma_price * (1.0 - params.ma_guard)
+    return close_price >= min_allowed
 
-    return all(flags)
+
+def initial_stop(
+    entry_price: float,
+    atr_value: float,
+    params: LongCoreParams,
+) -> float:
+    """
+    Initial stop = max( entry * (1 - stop_hard), entry - trail_atr * ATR ).
+    """
+    hard_stop = entry_price * (1.0 - params.stop_hard)
+    atr_stop = entry_price - params.trail_atr * atr_value
+    return max(hard_stop, atr_stop)
+
+
+def update_trailing_stop(
+    current_stop: float,
+    close_price: float,
+    atr_value: float,
+    params: LongCoreParams,
+) -> float:
+    """
+    Trailing stop moves up as price rises.
+    New stop = max(old_stop, close - trail_atr * ATR).
+    Never goes DOWN.
+    """
+    candidate = close_price - params.trail_atr * atr_value
+    return max(current_stop, candidate)
+
+
+def stop_hit(
+    stop_price: float,
+    low_price: float,
+) -> bool:
+    """
+    Returns True if intra-day low would have breached the stop.
+    """
+    return low_price <= stop_price
