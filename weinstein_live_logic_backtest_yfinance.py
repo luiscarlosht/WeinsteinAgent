@@ -3,16 +3,16 @@
 """
 Weinstein Live Logic Backtest — yfinance (SIM)
 
-- Shares knobs with config.yaml:
+- Uses config.yaml knobs:
     * backtest.snapshot_mode  (static / historical / auto)  [currently static]
-    * backtest.regime.use_long/use_short
-    * backtest.coppock.use_long/use_short
-    * backtest.breadth.enabled/ma_window/min_long
+    * backtest.regime.use_long / use_short
+    * backtest.coppock.use_long / use_short
+    * backtest.breadth.enabled / ma_window / min_long
     * backtest.long / backtest.short  (break_pct, vol_min, stops, ADX, etc.)
-- Uses yfinance for daily bars
 - Universe from latest weekly equities CSV (static mode)
+- Daily bars from yfinance
 
-CLI example:
+Typical run:
 
 python3 weinstein_live_logic_backtest_yfinance.py \
   --start 2025-11-02 \
@@ -132,7 +132,7 @@ def build_bt_config(cfg_raw: Dict, benchmark_override: Optional[str]) -> Backtes
     bt_long = backtest.get("long", {})
     bt_short = backtest.get("short", {})
 
-    # ADX thresholds — allow them to be set here
+    # ADX thresholds — configured here
     adx_min_long = float(bt_long.get("adx_min_long", 18.0))
     adx_min_short = float(bt_short.get("adx_min_short", 18.0))
 
@@ -188,7 +188,7 @@ def build_bt_config(cfg_raw: Dict, benchmark_override: Optional[str]) -> Backtes
 
 
 # ---------------------------------------------------------------------------
-# Weekly universe loader (shared Stage normalization)
+# Weekly universe loader (Stage normalization)
 # ---------------------------------------------------------------------------
 
 def find_latest_weekly_csv(output_dir: str) -> str:
@@ -201,6 +201,7 @@ def find_latest_weekly_csv(output_dir: str) -> str:
 
 
 def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure we have: Ticker, Close, Stage (1..4)."""
     if df.empty:
         return df
 
@@ -303,9 +304,7 @@ def compute_breadth(series_dict: Dict[str, pd.Series], ma_window: int) -> pd.Ser
 
 
 def compute_coppock_curve(close: pd.Series, w1: int = 11, w2: int = 14, ema: int = 10) -> pd.Series:
-    """
-    Simple Coppock curve on monthly closes.
-    """
+    """Simple Coppock curve on monthly closes."""
     if close.empty:
         return pd.Series(dtype=float)
 
@@ -362,6 +361,7 @@ def fetch_daily_bars(
         out.reset_index(inplace=True)
         date_col = "Date" if "Date" in out.columns else "Datetime"
         out = out.rename(columns={date_col: "Date"})
+        out["Date"] = pd.to_datetime(out["Date"])
         out = out.set_index(["Date", "Ticker"])
         return out
 
@@ -436,12 +436,14 @@ def simulate_backtest(
 
     # Breadth series
     breadth = pd.Series(dtype=float)
-    if bt_cfg.breadth_cfg.enabled:
+    if bt_cfg.breadth_cfg.enabled and close_dict:
         breadth = compute_breadth(close_dict, bt_cfg.breadth_cfg.ma_window)
-        log("Breadth series computed over "
-            f"{len(close_dict)} breadth tickers (MA{bt_cfg.breadth_cfg.ma_window}).")
+        log(
+            "Breadth series computed over "
+            f"{len(close_dict)} breadth tickers (MA{bt_cfg.breadth_cfg.ma_window})."
+        )
     else:
-        log("Breadth filter disabled for backtest.")
+        log("Breadth filter disabled for backtest or no close data for breadth.")
 
     # Benchmark for Coppock
     try:
@@ -451,7 +453,10 @@ def simulate_backtest(
     coppock = pd.Series(dtype=float)
     if not bench.empty and bt_cfg.coppock_cfg.use_long:
         coppock = compute_coppock_curve(bench["Close"])
-        log(f"Coppock curve computed for benchmark {bt_cfg.benchmark} (monthly points={coppock.dropna().shape[0]}).")
+        log(
+            f"Coppock curve computed for benchmark {bt_cfg.benchmark} "
+            f"(monthly points={coppock.dropna().shape[0]})."
+        )
     else:
         log(f"Coppock curve disabled or benchmark {bt_cfg.benchmark} data missing.")
 
@@ -461,32 +466,40 @@ def simulate_backtest(
     equity_curve_rows = []
     trades_rows = []
 
-    # Determine all trading dates between start and end
+    # -------------------------------------------------------------------
+    # Group daily data by calendar date (robust against .xs Date issues)
+    # -------------------------------------------------------------------
     if daily.empty:
         log("⚠️ Daily price DataFrame is empty — no backtest possible.")
         return pd.DataFrame(), pd.DataFrame()
 
-    all_dates = sorted({idx[0].date() for idx in daily.index})
+    daily_reset = daily.reset_index()  # columns: Date, Ticker, OHLCV...
+    daily_reset["TradeDate"] = daily_reset["Date"].dt.date
+
+    grouped_by_date: Dict[dt.date, pd.DataFrame] = {}
+    for trade_date, g in daily_reset.groupby("TradeDate"):
+        grouped_by_date[trade_date] = g.set_index("Ticker")
+
+    all_dates = sorted(grouped_by_date.keys())
     trade_dates = [d for d in all_dates if start <= d <= end]
     if not trade_dates:
         log("⚠️ No trading dates in requested range — nothing to simulate.")
         return pd.DataFrame(), pd.DataFrame()
 
+    # -------------------------------------------------------------------
+    # Main backtest loop
+    # -------------------------------------------------------------------
     for idx, trade_date in enumerate(trade_dates, start=1):
-        # Extract daily slice
-        try:
-            day_slice = daily.xs(trade_date, level="Date")
-        except KeyError:
-            continue
+        day_slice = grouped_by_date[trade_date]
 
-        # Simple day log
+        # Progress log every few days
         if idx % 5 == 0:
             log_sub(
                 f"Progress: {trade_date} — equity ${equity:,.2f}, "
                 f"positions: {len(positions)}, trades so far: {len(trades_rows)}"
             )
 
-        # Update existing positions: mark-to-market + stop exits
+        # Update existing positions (stops)
         to_close: List[Tuple[str, str, float]] = []
         for (side, ticker), pos in positions.items():
             if ticker not in day_slice.index:
@@ -513,7 +526,6 @@ def simulate_backtest(
                     )
                     to_close.append((side, ticker, close_price))
             else:
-                # Short stop
                 stop_price = pos.trail_stop if pos.trail_stop is not None else pos.stop_price
                 if close_price >= stop_price:
                     pnl = (pos.entry_price - close_price) * pos.size
@@ -532,11 +544,10 @@ def simulate_backtest(
                     )
                     to_close.append((side, ticker, close_price))
 
-        # Remove closed positions
         for side, ticker, _ in to_close:
             positions.pop((side, ticker), None)
 
-        # Determine gates for *new* positions
+        # Determine gates for new positions (LONG side for now)
         breadth_ok_long = True
         if bt_cfg.breadth_cfg.enabled and not breadth.empty and trade_date in breadth.index:
             b_val = float(breadth.loc[trade_date])
@@ -555,7 +566,7 @@ def simulate_backtest(
                     coppock_ok_long = False
 
         allow_new_longs = (
-            ("long" in mode or mode == "both")
+            (mode in ("long", "both"))
             and bt_cfg.regime_cfg.use_long
             and breadth_ok_long
             and coppock_ok_long
@@ -564,20 +575,20 @@ def simulate_backtest(
         # New long entries
         if allow_new_longs:
             for ticker in long_universe:
-                if ("long", ticker) in positions:  # already long
+                if ("long", ticker) in positions:
                     continue
                 if ticker not in day_slice.index:
                     continue
                 bar = day_slice.loc[ticker]
-                if any(pd.isna(bar[c]) for c in ["High", "Low", "Close", "Volume"]):
+                if any(pd.isna(bar.get(c, np.nan)) for c in ["High", "Low", "Close", "Volume"]):
                     continue
 
-                # Build indicator history
+                # Indicator history up to trade_date
                 try:
                     hist = daily.xs(ticker, level="Ticker").sort_index()
                 except KeyError:
                     continue
-                hist = hist.loc[:trade_date].tail(200)
+                hist = hist.loc[hist.index.get_level_values("Date") <= pd.Timestamp(trade_date)].tail(200)
                 if hist.shape[0] < 60:
                     continue
 
@@ -597,7 +608,7 @@ def simulate_backtest(
                     )
                     continue
 
-                # Stage conditions (proxy via MA150)
+                # Stage-like condition via MA150
                 if pd.isna(last["MA150"]) or last["Close"] <= last["MA150"] * (1.0 + bt_cfg.long_cfg.ma_guard):
                     continue
 
@@ -615,10 +626,11 @@ def simulate_backtest(
                 if last["Close"] < trigger_price:
                     continue
 
-                # Risk sizing
                 entry_price = float(last["Close"])
                 if entry_price <= 0:
                     continue
+
+                # Risk sizing
                 risk_per_pos = equity * risk_per_trade
                 stop_price = entry_price * (1.0 - bt_cfg.long_cfg.stop_hard)
                 per_share_risk = entry_price - stop_price
@@ -630,7 +642,6 @@ def simulate_backtest(
                 if len([p for p in positions.values() if p.side == "long"]) >= max_long:
                     continue
 
-                # Open long
                 positions[("long", ticker)] = Position(
                     side="long",
                     ticker=ticker,
@@ -641,7 +652,7 @@ def simulate_backtest(
                     trail_stop=None,
                 )
 
-        # End-of-day equity mark: sum of MtM
+        # End-of-day equity mark-to-market
         day_equity = equity
         for (side, ticker), pos in positions.items():
             if ticker not in day_slice.index:
@@ -699,17 +710,21 @@ def save_monthly_pnl(trades: pd.DataFrame, outdir: str, stamp: str) -> None:
     if trades.empty:
         log("No trades for monthly P/L.")
         return
+    trades = trades.copy()
     trades["exit_date"] = pd.to_datetime(trades["exit_date"])
     trades["month"] = trades["exit_date"].dt.to_period("M")
     monthly = trades.groupby("month")["pnl"].agg(["sum", "count"])
     monthly.rename(columns={"sum": "PnL", "count": "Trades"}, inplace=True)
-    monthly["WinRate"] = np.nan
+    monthly["WinRate"] = np.nan  # left blank; can be computed if needed
     path = os.path.join(outdir, f"live_logic_bt_monthly_{stamp}.csv")
     monthly.to_csv(path)
     log(f"Wrote monthly P/L breakdown → {path}")
     log("Monthly P/L summary:")
     for idx, row in monthly.iterrows():
-        print(f"• {idx}: PnL=${row['PnL']:.2f} | Trades={int(row['Trades'])} | WinRate={row['WinRate']!s}")
+        print(
+            f"• {idx}: PnL=${row['PnL']:.2f} | "
+            f"Trades={int(row['Trades'])} | WinRate={row['WinRate']!s}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +782,7 @@ def main() -> None:
 
     weekly_df = load_static_universe(bt_cfg.output_dir)
 
-    # Build total symbol list
+    # Build total symbol list (universe + benchmark)
     tickers = weekly_df["Ticker"].tolist()
     tickers.append(bt_cfg.benchmark)
     tickers = sorted(set(tickers))
