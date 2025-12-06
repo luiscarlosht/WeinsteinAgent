@@ -493,23 +493,47 @@ def simulate_backtest(
         log("⚠️ No trading dates in requested range — nothing to simulate.")
         return pd.DataFrame(), pd.DataFrame()
 
-    total_days = len(trade_dates)
+    # -------------------------------------------------------------------
+    # Precompute per-ticker indicator cache (MA30, MA150, ATR14, VolMA50, ADX14, Pivot60)
+    # -------------------------------------------------------------------
+    indicator_cache: Dict[str, pd.DataFrame] = {}
+    required_cols = {"High", "Low", "Close", "Volume"}
+
+    for ticker in sorted(set(long_universe + short_universe)):
+        try:
+            hist = daily.xs(ticker, level="Ticker").sort_index()
+        except KeyError:
+            continue
+        if hist.empty or not required_cols.issubset(hist.columns):
+            continue
+
+        hist = hist.copy()
+        hist["MA30"] = hist["Close"].rolling(30, min_periods=30).mean()
+        hist["MA150"] = hist["Close"].rolling(150, min_periods=150).mean()
+        # Simple ATR proxy (same as earlier version)
+        hist["ATR14"] = (hist["High"] - hist["Low"]).rolling(14, min_periods=14).mean()
+        hist["VolMA50"] = hist["Volume"].rolling(50, min_periods=50).mean()
+        hist["ADX14"] = compute_adx(hist["High"], hist["Low"], hist["Close"], period=14)
+        # 60-day close high for breakout pivot
+        hist["Pivot60Max"] = hist["Close"].rolling(60, min_periods=60).max()
+        indicator_cache[ticker] = hist
+
+    log(f"Precomputed indicators for {len(indicator_cache)} symbols.")
 
     # -------------------------------------------------------------------
     # Main backtest loop
     # -------------------------------------------------------------------
-    for idx, trade_date in enumerate(trade_dates, start=1):
+    current_month: Optional[int] = None
+
+    for trade_date in trade_dates:
         day_slice = grouped_by_date[trade_date]
 
-        # Progress log once per calendar month (on the LAST trading day of that month)
-        next_is_new_month = idx < total_days and trade_dates[idx].month != trade_date.month
-        is_last_of_month = (idx == total_days) or next_is_new_month
-        if is_last_of_month:
-            pct_done = idx / total_days * 100.0
+        # Monthly progress marker (first trading day each month)
+        if current_month != trade_date.month:
+            current_month = trade_date.month
             log_sub(
                 f"Progress: {trade_date} — equity ${equity:,.2f}, "
-                f"positions: {len(positions)}, trades so far: {len(trades_rows)}, "
-                f"done≈{pct_done:.1f}%"
+                f"positions: {len(positions)}, trades so far: {len(trades_rows)}"
             )
 
         # Update existing positions (stops)
@@ -587,60 +611,54 @@ def simulate_backtest(
 
         # New long entries
         if allow_new_longs:
+            date_key = pd.Timestamp(trade_date)
             for ticker in long_universe:
                 if ("long", ticker) in positions:
                     continue
                 if ticker not in day_slice.index:
                     continue
-                bar = day_slice.loc[ticker]
-                if any(pd.isna(bar.get(c, np.nan)) for c in ["High", "Low", "Close", "Volume"]):
+
+                metrics = indicator_cache.get(ticker)
+                if metrics is None or date_key not in metrics.index:
+                    continue
+                mrow = metrics.loc[date_key]
+
+                # Require enough history for pivot/MA/vol
+                if pd.isna(mrow.get("Pivot60Max")):
                     continue
 
-                # Indicator history up to trade_date
-                try:
-                    hist = daily.xs(ticker, level="Ticker").sort_index()
-                except KeyError:
-                    continue
-                hist = hist.loc[hist.index.get_level_values("Date") <= pd.Timestamp(trade_date)].tail(200)
-                if hist.shape[0] < 60:
-                    continue
+                last_close = float(mrow["Close"])
 
-                hist["MA30"] = hist["Close"].rolling(30).mean()
-                hist["MA150"] = hist["Close"].rolling(150).mean()
-                hist["ATR14"] = (hist["High"] - hist["Low"]).rolling(14).mean()
-                hist["VolMA50"] = hist["Volume"].rolling(50).mean()
-                hist["ADX14"] = compute_adx(hist["High"], hist["Low"], hist["Close"], period=14)
-
-                last = hist.iloc[-1]
-                adx14 = float(last["ADX14"]) if not pd.isna(last["ADX14"]) else np.nan
-
+                # ADX filter
+                adx14 = float(mrow["ADX14"]) if not pd.isna(mrow["ADX14"]) else np.nan
                 if np.isnan(adx14) or adx14 < bt_cfg.long_cfg.adx_min:
                     if bt_cfg.show_adx_skips:
                         log_sub(
-                            f"[SKIP-ADX] {ticker} because ADX14={adx14:.1f} < {bt_cfg.long_cfg.adx_min:.1f} "
-                            f"on {trade_date}"
+                            f"[SKIP-ADX] {ticker} because ADX14={adx14:.1f} < "
+                            f"{bt_cfg.long_cfg.adx_min:.1f} on {trade_date}"
                         )
                     continue
 
                 # Stage-like condition via MA150
-                if pd.isna(last["MA150"]) or last["Close"] <= last["MA150"] * (1.0 + bt_cfg.long_cfg.ma_guard):
+                ma150 = mrow.get("MA150", np.nan)
+                if pd.isna(ma150) or last_close <= ma150 * (1.0 + bt_cfg.long_cfg.ma_guard):
                     continue
 
                 # Volume pace
-                vol_ma50 = float(last["VolMA50"]) if not pd.isna(last["VolMA50"]) else np.nan
+                vol_ma50 = float(mrow["VolMA50"]) if not pd.isna(mrow["VolMA50"]) else np.nan
                 if np.isnan(vol_ma50) or vol_ma50 <= 0:
                     continue
-                vol_pace = last["Volume"] / vol_ma50
+                vol_pace = float(mrow["Volume"]) / vol_ma50
                 if vol_pace < bt_cfg.long_cfg.vol_min:
                     continue
 
-                # Breakout vs 50d high close
-                pivot = hist["Close"].tail(60).max()
+                # Breakout vs 60d high close
+                pivot = float(mrow["Pivot60Max"])
                 trigger_price = pivot * (1.0 + bt_cfg.long_cfg.break_pct)
-                if last["Close"] < trigger_price:
+                if last_close < trigger_price:
                     continue
 
-                entry_price = float(last["Close"])
+                entry_price = last_close
                 if entry_price <= 0:
                     continue
 
