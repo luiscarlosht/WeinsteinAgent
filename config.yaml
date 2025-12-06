@@ -199,7 +199,7 @@ backtest:
 
   # 🧪 SIM experiment: breadth OFF, with a looser 50% threshold ready
   breadth:
-    enabled: false            # ⬅️ SIM currently OFF; you can flip to true later
+    enabled: true             # ⬅️ SIM currently OFF; you can flip to true later
     ma_window: 50
     min_long: 0.50            # when you re-enable breadth, use 50% instead of 60%
 
@@ -210,7 +210,7 @@ backtest:
   long:
     break_pct: 0.004          # ≈0.4% above pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 18.0             # min ADX14 for new longs
+    adx_min: 20.0             # min ADX14 for new longs
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
@@ -218,7 +218,7 @@ backtest:
   short:
     break_pct: 0.004          # ≈0.4% below pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 18.0             # min ADX14 for new shorts
+    adx_min: 20.0             # min ADX14 for new shorts
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
