@@ -206,6 +206,7 @@ backtest:
   # NEW: backtest logging controls
   logging:
     show_adx_skips: false     # default: DON'T spam [SKIP-ADX] lines
+    show_breadth_skips: false   # ⬅️ ADD THIS
 
   long:
     break_pct: 0.004          # ≈0.4% above pivot
