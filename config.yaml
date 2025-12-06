@@ -76,6 +76,9 @@ risk:
 
 # ---- Intraday / PROD knobs (long + short) ----
 intraday:
+  # Optional: if your intraday watcher reads this, it will match Profile B ADX
+  adx_min_long: 18.0
+
   long:
     # Confirms a BUY on ≥ vol_pace_min; NEAR uses ≥ near_vol_pace_min
     vol_pace_min: 1.3          # TRIG min full-day volume vs 50dma
@@ -113,11 +116,11 @@ intraday:
     target1_pct: 0.15              # 15% downside target
     target2_pct: 0.20              # 20% downside target
 
-  # ✅ NEW: PROD breadth + regime knobs (shared for long/short)
+  # ✅ Profile B: breadth ON, looser 50% threshold
   breadth:
-    enabled: false        # start OFF so PROD matches your SIM behavior now
+    enabled: true
     ma_window: 50
-    min_long: 0.50        # when ON, require 50% of universe "healthy" for new longs
+    min_long: 0.50        # require 50% of universe "healthy" for new longs
 
   regime:
     use_long: true        # gate new LONG intraday signals by regime
@@ -190,29 +193,29 @@ backtest:
 
   regime:
     use_long: true            # gate new LONG entries by Chapter 8 regime
-    use_short: false          # gate new SHORT entries by Chapter 8 regime
+    use_short: false          # SHORT regime gate reserved for future tests
 
-  # 🔁 keep Coppock behavior the same as the run that produced your table
+  # Profile B: same Coppock behavior as A
   coppock:
     use_long: true            # LONG: require Coppock(benchmark) > 0
     use_short: false          # SHORT: require Coppock(benchmark) < 0
 
-  # 🧪 SIM experiment: breadth OFF, with a looser 50% threshold ready
+  # Profile B: breadth ON, 50% threshold
   breadth:
-    enabled: true             # ⬅️ SIM currently OFF; you can flip to true later
+    enabled: true
     ma_window: 50
-    min_long: 0.60            # when you re-enable breadth, use 50% instead of 60%
+    min_long: 0.50            # 50% above MA50 → good compromise filter
 
-  # NEW: backtest logging controls
+  # backtest logging controls
   logging:
-    show_adx_skips: false        # existing
-    show_breadth_skips: false    # NEW → hide [SKIP-BREADTH]
-    show_coppock_skips: false    # NEW → hide [SKIP-COPPOCK-*]
+    show_adx_skips: false
+    show_breadth_skips: false
+    show_coppock_skips: false
 
   long:
     break_pct: 0.004          # ≈0.4% above pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 20.0             # min ADX14 for new longs
+    adx_min: 18.0             # ✅ Profile B: ADX 18 for longs
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
@@ -220,7 +223,7 @@ backtest:
   short:
     break_pct: 0.004          # ≈0.4% below pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 20.0             # min ADX14 for new shorts
+    adx_min: 18.0             # ✅ Profile B: ADX 18 for shorts (future sim)
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
