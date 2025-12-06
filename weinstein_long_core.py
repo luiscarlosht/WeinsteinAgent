@@ -3,22 +3,16 @@
 """
 weinstein_long_core.py
 
-Shared "core" logic for Weinstein-style LONG entries and position management.
+Shared LONG-side entry logic for:
+- Intraday PROD watchers
+- Daily SIM backtester (weinstein_live_logic_backtest_yfinance.py)
 
-This module is intentionally "dumb" and stateless — it does NOT know about:
-- market regime
-- breadth
-- ADX filters
-- universe selection
-
-Those gates are applied at the caller level (intraday watcher, backtest engine).
-
-Here you define:
-- LongCoreParams dataclass with main tunables
-- simple helpers to:
-    * check breakout vs pivot
-    * compute initial stops
-    * update trailing stops
+Core idea:
+- One place where we define:
+    * thresholds (breakout %, min distance above MA, vol pace, ADX)
+    * "can we enter?" decision logic
+- Anything that wants to do a Weinstein Stage 2 breakout
+  just calls check_long_entry(...) and inspects the result.
 """
 
 from __future__ import annotations
@@ -26,89 +20,194 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
+
+# We reuse the canonical ADX_MIN from weinstein_indicators so that
+# PROD, SIM, and any other tools stay in sync on the threshold.
+try:
+    from weinstein_indicators import ADX_MIN as DEFAULT_ADX_MIN
+except ImportError:
+    # Fallback, in case the module is missing or renamed.
+    DEFAULT_ADX_MIN = 18.0
+
+
+# -------------------------------------------------------------------
+# Parameter + result models
+# -------------------------------------------------------------------
 
 @dataclass
-class LongCoreParams:
-    """Core tunables for long entries and exits."""
-    break_pct: float = 0.004    # ~0.4% above pivot
-    vol_min: float = 1.30       # min full-day volume vs 50dma
-    stop_hard: float = 0.20     # 20% max loss from entry
-    trail_atr: float = 2.0      # ATR multiple for trailing stop
-    ma_guard: float = 0.03      # guard vs MA30 (~3% cushion)
+class LongEntryParams:
+    """
+    Tunable thresholds for the long entry decision.
+
+    These are "generic" enough that both:
+      - intraday logic (5m/15m) with volume pace
+      - daily SIM logic (daily bars)
+    can share them.
+
+    Attributes:
+        min_break_pct:
+            Required % breakout above the pivot high (e.g. 0.004 = 0.4%).
+        dist_above_ma_min:
+            Optional extra headroom above MA (e.g. 0.01 = 1%).
+            SIM currently sets this to 0.0 (just price > MA).
+        vol_min:
+            Minimum volume multiple vs 50dma (e.g. 1.3).
+        adx_min:
+            Minimum ADX to accept (e.g. 18.0).
+    """
+    min_break_pct: float = 0.004
+    dist_above_ma_min: float = 0.0
+    vol_min: float = 1.30
+    adx_min: float = DEFAULT_ADX_MIN
 
 
-def passes_volume_filter(
-    volume_ratio: float,
-    params: LongCoreParams,
-) -> bool:
+@dataclass
+class LongEntryResult:
     """
-    volume_ratio: today's full-day volume / 50-day avg volume
+    Outcome of the long entry check.
+
+    Attributes:
+        can_enter:
+            True when all gates (RS, MA, pivot, vol, ADX) pass.
+        reason:
+            Short diagnostic string explaining the first reason for rejection
+            (or "ok" if can_enter=True).
+        adx_ok:
+            True when ADX is either:
+              - NaN / missing (we do NOT block in that case), or
+              - >= adx_min
+            False only when ADX is present AND < adx_min.
     """
-    return volume_ratio >= params.vol_min
+    can_enter: bool
+    reason: str
+    adx_ok: bool
 
 
-def is_breakout(
-    close_price: float,
-    pivot_price: float,
-    params: LongCoreParams,
-) -> bool:
-    """
-    Basic breakout rule: close above pivot by `break_pct`.
-    """
-    if pivot_price <= 0:
+# -------------------------------------------------------------------
+# Helper(s)
+# -------------------------------------------------------------------
+
+def _is_nan(x: float) -> bool:
+    try:
+        return bool(np.isnan(x))
+    except Exception:
         return False
-    threshold = pivot_price * (1.0 + params.break_pct)
-    return close_price >= threshold
 
 
-def guard_vs_ma(
-    close_price: float,
-    ma_price: float,
-    params: LongCoreParams,
-) -> bool:
-    """
-    Optional extra guard that price should not be too far below MA30.
-    Typically you want close >= MA30 * (1 - ma_guard).
-    """
-    if ma_price <= 0:
-        return True
-    min_allowed = ma_price * (1.0 - params.ma_guard)
-    return close_price >= min_allowed
+# -------------------------------------------------------------------
+# Core check function (shared between PROD + SIM)
+# -------------------------------------------------------------------
 
+def check_long_entry(
+    *,
+    price: float,
+    ma_val: float,
+    pivot: float,
+    rs_above_ma: bool,
+    vol_mult: float,
+    adx_val: float,
+    # Preferred interface (used by SIM backtester):
+    params: Optional[LongEntryParams] = None,
+    # Backward-compatible knobs (in case some caller passes explicit thresholds):
+    min_break_pct: Optional[float] = None,
+    dist_above_ma_min: Optional[float] = None,
+    vol_min: Optional[float] = None,
+    adx_min: Optional[float] = None,
+) -> LongEntryResult:
+    """
+    Shared Weinstein Stage 2 LONG entry filter.
 
-def initial_stop(
-    entry_price: float,
-    atr_value: float,
-    params: LongCoreParams,
-) -> float:
-    """
-    Initial stop = max( entry * (1 - stop_hard), entry - trail_atr * ATR ).
-    """
-    hard_stop = entry_price * (1.0 - params.stop_hard)
-    atr_stop = entry_price - params.trail_atr * atr_value
-    return max(hard_stop, atr_stop)
+    Inputs:
+        price:
+            Current price (close / last).
+        ma_val:
+            MA(30) (or your equivalent trend MA).
+        pivot:
+            Highest close in lookback window (e.g. 50d).
+        rs_above_ma:
+            True if RS line is above its MA (strong RS).
+        vol_mult:
+            Volume multiple vs 50dma (e.g. 1.3 means 30% above).
+        adx_val:
+            Current ADX (same period as ADX_MIN).
+        params:
+            LongEntryParams object with thresholds.
+        min_break_pct / dist_above_ma_min / vol_min / adx_min:
+            Optional explicit overrides. If provided, they win over params.
 
+    Returns:
+        LongEntryResult(can_enter, reason, adx_ok)
+    """
+    # Effective thresholds
+    if params is None:
+        params = LongEntryParams()
 
-def update_trailing_stop(
-    current_stop: float,
-    close_price: float,
-    atr_value: float,
-    params: LongCoreParams,
-) -> float:
-    """
-    Trailing stop moves up as price rises.
-    New stop = max(old_stop, close - trail_atr * ATR).
-    Never goes DOWN.
-    """
-    candidate = close_price - params.trail_atr * atr_value
-    return max(current_stop, candidate)
+    thr_break = min_break_pct if min_break_pct is not None else params.min_break_pct
+    thr_dist_ma = (
+        dist_above_ma_min
+        if dist_above_ma_min is not None
+        else params.dist_above_ma_min
+    )
+    thr_vol = vol_min if vol_min is not None else params.vol_min
+    thr_adx = adx_min if adx_min is not None else params.adx_min
 
+    # --- Basic NaN guards ---
+    if _is_nan(price) or _is_nan(ma_val) or _is_nan(pivot):
+        return LongEntryResult(
+            can_enter=False,
+            reason="nan_input",
+            adx_ok=True,  # we don't know ADX effect if inputs are NaN
+        )
 
-def stop_hit(
-    stop_price: float,
-    low_price: float,
-) -> bool:
-    """
-    Returns True if intra-day low would have breached the stop.
-    """
-    return low_price <= stop_price
+    # --- RS must be above its MA (your weekly RS filter) ---
+    if not rs_above_ma:
+        return LongEntryResult(
+            can_enter=False,
+            reason="rs_not_above_ma",
+            adx_ok=True,
+        )
+
+    # --- Price must be above MA30 with optional extra headroom ---
+    # If dist_above_ma_min == 0 -> just price > MA.
+    required_ma = ma_val * (1.0 + thr_dist_ma)
+    if price <= required_ma:
+        return LongEntryResult(
+            can_enter=False,
+            reason="price_not_above_ma",
+            adx_ok=True,
+        )
+
+    # --- Breakout vs pivot high (e.g. 0.4% above 50-day high) ---
+    required_pivot_level = pivot * (1.0 + thr_break)
+    if price <= required_pivot_level:
+        return LongEntryResult(
+            can_enter=False,
+            reason="no_breakout_vs_pivot",
+            adx_ok=True,
+        )
+
+    # --- Volume pace filter (e.g. ≥ 1.3× 50dma) ---
+    if _is_nan(vol_mult) or vol_mult < thr_vol:
+        return LongEntryResult(
+            can_enter=False,
+            reason="volume_too_low",
+            adx_ok=True,
+        )
+
+    # --- ADX filter (optional block) ---
+    # If ADX is NaN, we *do not block* (adx_ok=True, can_enter depends on other gates).
+    if not _is_nan(adx_val):
+        if adx_val < thr_adx:
+            return LongEntryResult(
+                can_enter=False,
+                reason="adx_below_min",
+                adx_ok=False,
+            )
+
+    # If we got here, all gates have passed.
+    return LongEntryResult(
+        can_enter=True,
+        reason="ok",
+        adx_ok=True,
+    )
