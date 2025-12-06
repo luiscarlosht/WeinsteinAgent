@@ -75,6 +75,10 @@ NEW:
 - Config-driven ADX logging noise:
     * backtest.logging.show_adx_skips: true/false
       (or use CLI --show-adx-skips)
+
+- Config-driven breadth / Coppock logging noise:
+    * backtest.logging.show_breadth_skips: true/false
+    * backtest.logging.show_coppock_skips: true/false
 """
 
 import argparse
@@ -663,6 +667,8 @@ def backtest(
     coppock_series: Optional[pd.Series] = None,
     breadth_enabled: bool = True,
     show_adx_skips: bool = False,
+    show_breadth_skips: bool = False,
+    show_coppock_skips: bool = False,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", or "both"
@@ -685,6 +691,10 @@ def backtest(
 
     show_adx_skips:
       - if True, log [SKIP-ADX] debug messages for long entries whose ADX filter blocks.
+    show_breadth_skips:
+      - if True, log [SKIP-BREADTH] debug messages when breadth blocks new longs.
+    show_coppock_skips:
+      - if True, log [SKIP-COPPOCK-*] debug messages when Coppock gates block.
     """
     use_snapshots = bool(weekly_snapshots)
 
@@ -863,8 +873,9 @@ def backtest(
                 breadth_ok = breadth_val >= BREADTH_MIN_LONG
             else:
                 breadth_ok = True  # if NaN, don't block
+
         # Optional debug logging when breadth blocks new longs
-        if not breadth_ok:
+        if not breadth_ok and show_breadth_skips:
             log(
                 f"[SKIP-BREADTH] No new LONGs on {dt_.date()} because breadth="
                 f"{breadth_val:.2%} < {BREADTH_MIN_LONG:.0%}",
@@ -880,7 +891,7 @@ def backtest(
 
         if use_coppock_long and not np.isnan(coppock_val):
             coppock_long_ok = coppock_val > 0.0
-            if not coppock_long_ok and show_adx_skips:
+            if not coppock_long_ok and show_coppock_skips:
                 log(
                     f"[SKIP-COPPOCK-LONG] No new LONGs on {dt_.date()} because "
                     f"Coppock({benchmark})={coppock_val:.2f} ≤ 0.",
@@ -889,7 +900,7 @@ def backtest(
 
         if use_coppock_short and not np.isnan(coppock_val):
             coppock_short_ok = coppock_val < 0.0
-            if not coppock_short_ok and show_adx_skips:
+            if not coppock_short_ok and show_coppock_skips:
                 log(
                     f"[SKIP-COPPOCK-SHORT] No new SHORTs on {dt_.date()} because "
                     f"Coppock({benchmark})={coppock_val:.2f} ≥ 0.",
@@ -1334,10 +1345,15 @@ def main():
     BREADTH_MA_WINDOW = int(breadth_cfg.get("ma_window", BREADTH_MA_WINDOW))
     BREADTH_MIN_LONG = float(breadth_cfg.get("min_long", BREADTH_MIN_LONG))
 
-    # ADX logging parameters
+    # Logging parameters
     logging_cfg = bt_cfg.get("logging", {}) or {}
     show_adx_cfg = bool(logging_cfg.get("show_adx_skips", False))
+    show_breadth_cfg = bool(logging_cfg.get("show_breadth_skips", False))
+    show_coppock_cfg = bool(logging_cfg.get("show_coppock_skips", False))
+
     show_adx_skips_effective = args.show_adx_skips or show_adx_cfg
+    show_breadth_skips_effective = show_breadth_cfg
+    show_coppock_skips_effective = show_coppock_cfg
 
     # Resolve start/end range
     if args.year and (args.start or args.end):
@@ -1362,7 +1378,8 @@ def main():
         f"regime_short={use_regime_short_effective}, coppock_long={use_coppock_long_effective}, "
         f"coppock_short={use_coppock_short_effective}, breadth_enabled={breadth_enabled}, "
         f"breadth_ma={BREADTH_MA_WINDOW}, breadth_min_long={BREADTH_MIN_LONG:.2f}, "
-        f"show_adx_skips={show_adx_skips_effective}",
+        f"show_adx_skips={show_adx_skips_effective}, show_breadth_skips={show_breadth_skips_effective}, "
+        f"show_coppock_skips={show_coppock_skips_effective}",
         level="info",
     )
 
@@ -1483,6 +1500,8 @@ def main():
         coppock_series=coppock_series,
         breadth_enabled=breadth_enabled,
         show_adx_skips=show_adx_skips_effective,
+        show_breadth_skips=show_breadth_skips_effective,
+        show_coppock_skips=show_coppock_skips_effective,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
