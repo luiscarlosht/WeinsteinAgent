@@ -195,13 +195,13 @@ backtest:
   # 🔁 keep Coppock behavior the same as the run that produced your table
   coppock:
     use_long: true            # LONG: require Coppock(benchmark) > 0
-    use_short: true           # SHORT: require Coppock(benchmark) < 0
+    use_short: false          # SHORT: require Coppock(benchmark) < 0
 
   # 🧪 SIM experiment: breadth OFF, with a looser 50% threshold ready
   breadth:
     enabled: true             # ⬅️ SIM currently OFF; you can flip to true later
     ma_window: 50
-    min_long: 0.50            # when you re-enable breadth, use 50% instead of 60%
+    min_long: 0.60            # when you re-enable breadth, use 50% instead of 60%
 
   # NEW: backtest logging controls
   logging:
