@@ -9,14 +9,16 @@ Weinstein Live Logic Backtest — yfinance (SIM)
     * backtest.coppock.use_long / use_short
     * backtest.breadth.enabled / ma_window / min_long
     * backtest.long / backtest.short  (break_pct, vol_min, stops, ADX, etc.)
+    * backtest.logging.show_adx_skips  (controls noisy [SKIP-ADX] lines)
 - Universe from latest weekly equities CSV (static mode)
 - Daily bars from yfinance
 
 Typical run:
 
 python3 weinstein_live_logic_backtest_yfinance.py \
-  --start 2025-11-02 \
-  --end   2025-12-03 \
+  --config ./config.yaml \
+  --start 2015-01-01 \
+  --end   2015-12-31 \
   --mode both \
   --capital 10000 \
   --risk-per-trade 0.01 \
@@ -111,6 +113,7 @@ class BacktestGlobalConfig:
     coppock_cfg: BacktestCoppockConfig
     benchmark: str
     output_dir: str
+    show_adx_skips: bool  # NEW: control noisy [SKIP-ADX] logs
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +135,9 @@ def build_bt_config(cfg_raw: Dict, benchmark_override: Optional[str]) -> Backtes
     bt_long = backtest.get("long", {})
     bt_short = backtest.get("short", {})
 
-    # ADX thresholds — configured here
-    adx_min_long = float(bt_long.get("adx_min_long", 18.0))
-    adx_min_short = float(bt_short.get("adx_min_short", 18.0))
+    # ADX thresholds — support both adx_min_long/short and adx_min (your YAML)
+    adx_min_long = float(bt_long.get("adx_min_long", bt_long.get("adx_min", 18.0)))
+    adx_min_short = float(bt_short.get("adx_min_short", bt_short.get("adx_min", 18.0)))
 
     long_cfg = BacktestLongConfig(
         break_pct=float(bt_long.get("break_pct", 0.004)),
@@ -173,6 +176,9 @@ def build_bt_config(cfg_raw: Dict, benchmark_override: Optional[str]) -> Backtes
         min_long=float(bt_breadth.get("min_long", 0.60)),
     )
 
+    bt_logging = backtest.get("logging", {})
+    show_adx_skips = bool(bt_logging.get("show_adx_skips", False))
+
     benchmark = benchmark_override or app.get("benchmark", "SPY")
 
     return BacktestGlobalConfig(
@@ -184,6 +190,7 @@ def build_bt_config(cfg_raw: Dict, benchmark_override: Optional[str]) -> Backtes
         coppock_cfg=coppock_cfg,
         benchmark=benchmark,
         output_dir=reporting.get("output_dir", "./output"),
+        show_adx_skips=show_adx_skips,
     )
 
 
@@ -602,10 +609,11 @@ def simulate_backtest(
                 adx14 = float(last["ADX14"]) if not pd.isna(last["ADX14"]) else np.nan
 
                 if np.isnan(adx14) or adx14 < bt_cfg.long_cfg.adx_min:
-                    log_sub(
-                        f"[SKIP-ADX] {ticker} because ADX14={adx14:.1f} < {bt_cfg.long_cfg.adx_min:.1f} "
-                        f"on {trade_date}"
-                    )
+                    if bt_cfg.show_adx_skips:
+                        log_sub(
+                            f"[SKIP-ADX] {ticker} because ADX14={adx14:.1f} < {bt_cfg.long_cfg.adx_min:.1f} "
+                            f"on {trade_date}"
+                        )
                     continue
 
                 # Stage-like condition via MA150
@@ -748,6 +756,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-long", type=int, default=10, help="Max concurrent long positions")
     p.add_argument("--max-short", type=int, default=10, help="Max concurrent short positions")
     p.add_argument("--benchmark", type=str, default=None, help="Override benchmark symbol")
+    p.add_argument(
+        "--show-adx-skips",
+        action="store_true",
+        help="log a debug line for every ADX-based skip",
+    )
     return p.parse_args()
 
 
@@ -758,6 +771,10 @@ def main() -> None:
 
     cfg_raw = load_yaml_config(args.config)
     bt_cfg = build_bt_config(cfg_raw, args.benchmark)
+
+    # CLI overrides config for show_adx_skips
+    if getattr(args, "show_adx_skips", False):
+        bt_cfg.show_adx_skips = True
 
     log(
         f"Backtest range: {start} → {end} | "
@@ -775,7 +792,8 @@ def main() -> None:
         f"breadth_min_long={bt_cfg.breadth_cfg.min_long:.2f}, "
         f"LONG_BREAK_PCT={bt_cfg.long_cfg.break_pct}, LONG_VOL_MIN={bt_cfg.long_cfg.vol_min}, "
         f"SHORT_BREAK_PCT={bt_cfg.short_cfg.break_pct}, SHORT_VOL_MIN={bt_cfg.short_cfg.vol_min}, "
-        f"ADX_MIN_LONG={bt_cfg.long_cfg.adx_min}, ADX_MIN_SHORT={bt_cfg.short_cfg.adx_min}"
+        f"ADX_MIN_LONG={bt_cfg.long_cfg.adx_min}, ADX_MIN_SHORT={bt_cfg.short_cfg.adx_min}, "
+        f"SHOW_ADX_SKIPS={bt_cfg.show_adx_skips}"
     )
 
     log(f"Using weekly CSV directory: {bt_cfg.output_dir}")
