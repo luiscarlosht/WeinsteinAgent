@@ -113,6 +113,16 @@ intraday:
     target1_pct: 0.15              # 15% downside target
     target2_pct: 0.20              # 20% downside target
 
+  # ✅ NEW: PROD breadth + regime knobs (shared for long/short)
+  breadth:
+    enabled: false        # start OFF so PROD matches your SIM behavior now
+    ma_window: 50
+    min_long: 0.50        # when ON, require 50% of universe "healthy" for new longs
+
+  regime:
+    use_long: true        # gate new LONG intraday signals by regime
+    use_short: false      # leave shorts disabled for now, like SIM
+
 # ---- Crypto weekly block, fed by your Signals tab ----
 crypto:
   enabled: true
@@ -189,7 +199,7 @@ backtest:
 
   # 🧪 SIM experiment: breadth OFF, with a looser 50% threshold ready
   breadth:
-    enabled: false            # ⬅️ turn OFF breadth for this SIM run
+    enabled: false            # ⬅️ SIM currently OFF; you can flip to true later
     ma_window: 50
     min_long: 0.50            # when you re-enable breadth, use 50% instead of 60%
 
