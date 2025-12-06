@@ -190,7 +190,7 @@ backtest:
 
   regime:
     use_long: true            # gate new LONG entries by Chapter 8 regime
-    use_short: true           # gate new SHORT entries by Chapter 8 regime
+    use_short: false          # gate new SHORT entries by Chapter 8 regime
 
   # 🔁 keep Coppock behavior the same as the run that produced your table
   coppock:
