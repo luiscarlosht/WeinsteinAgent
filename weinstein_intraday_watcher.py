@@ -110,7 +110,10 @@ def build_full_config(cfg: Dict) -> FullConfig:
     app = cfg.get("app", {})
     universe = cfg.get("universe", {})
     intraday = cfg.get("intraday", {})
-    intraday_prod = intraday.get("prod", intraday)  # allow nested intraday.prod
+
+    # Allow an optional nested intraday.prod block; if not present,
+    # treat the top-level intraday dict as the source of knobs.
+    intraday_prod = intraday.get("prod", intraday)
 
     backtest = cfg.get("backtest", {})
     regime_bt = backtest.get("regime", {})
@@ -120,7 +123,9 @@ def build_full_config(cfg: Dict) -> FullConfig:
     regime_use_long = bool(intraday_regime.get("use_long", regime_bt.get("use_long", True)))
     regime_use_short = bool(intraday_regime.get("use_short", regime_bt.get("use_short", False)))
 
-    # Breadth knobs for intraday: allow intraday.breadth override, else use backtest.breadth
+    # Breadth knobs for intraday:
+    #  - primary source: intraday.breadth (or intraday.prod.breadth)
+    #  - fallback:       backtest.breadth
     intraday_breadth = intraday_prod.get("breadth", {})
     backtest_breadth = backtest.get("breadth", {})
     breadth_enabled = bool(
@@ -206,9 +211,6 @@ def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
         - 'Close'
         - 'Stage' (numeric 1..4, default 2)
         - 'AvgVolume' (if available)
-
-    We do this by looking for plausible column names and renaming them,
-    then coercing Stage to numeric.
     """
     if df.empty:
         return df
@@ -247,14 +249,11 @@ def normalize_weekly_columns(df: pd.DataFrame) -> pd.DataFrame:
             break
 
     if stage_col_raw is None:
-        # No explicit stage column → default everyone to Stage=2
         df["Stage"] = 2
     else:
         if stage_col_raw != "Stage":
             df.rename(columns={stage_col_raw: "Stage"}, inplace=True)
-        # Coerce any string forms ("Stage 2", "2.0", etc.) into numeric 1..4
         stage_num = pd.to_numeric(df["Stage"], errors="coerce")
-        # Default unknowns to 2 (uptrend candidate) so we don't kill the universe
         stage_num = stage_num.fillna(2)
         stage_num = stage_num.clip(lower=1, upper=4).astype(int)
         df["Stage"] = stage_num
@@ -284,7 +283,6 @@ def load_focus_universe(weekly_csv: str, u_cfg: UniverseConfig) -> pd.DataFrame:
     if "Stage" in df.columns:
         long_mask = df["Stage"].isin([1, 2])
         if long_mask.sum() == 0:
-            # If for some reason nothing is tagged 1/2, fall back to everyone
             log("⚠️ No Stage 1/2 rows found — falling back to full weekly universe.")
         else:
             df = df.loc[long_mask]
@@ -401,7 +399,6 @@ def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
             out = df_raw.copy()
             out["Ticker"] = tickers[0]
         out.reset_index(inplace=True)
-        # yfinance may use "Date" or "Datetime"
         date_col = "Date" if "Date" in out.columns else "Datetime"
         out = out.rename(columns={date_col: "Date"})
         out = out.set_index(["Date", "Ticker"])
@@ -427,6 +424,7 @@ def evaluate_intraday_signals(
         - check latest 60m bar vs pivot + headroom
         - compute intraday volume pace vs 50d daily volume
         - produce BUY / NEAR / none
+
     Returns diagnostics DataFrame with one row per ticker.
     """
     rows = []
@@ -446,7 +444,6 @@ def evaluate_intraday_signals(
         if d.empty:
             continue
 
-        # Guard columns
         needed = ["High", "Low", "Close", "Volume"]
         if not all(c in d.columns for c in needed):
             continue
@@ -493,7 +490,7 @@ def evaluate_intraday_signals(
             )
             continue
 
-        # Pivot = 50d high close
+        # Pivot = 50d high close (using last ~60 days as a robust window)
         pivot_window = d["Close"].tail(60).max()
         if pd.isna(pivot_window):
             rows.append(
@@ -544,19 +541,27 @@ def evaluate_intraday_signals(
             continue
 
         vol_pace = vol_now / vol_ma50
-
         headroom_pct = (price_now / pivot_window - 1.0) * 100.0
 
         # BUY vs NEAR logic
-        signal = "NONE"
-        reason = ""
-
-        if price_now >= pivot_window * (1.0 + cfg.intraday.confirm_headroom_pct / 100.0) and vol_pace >= cfg.intraday.vol_pace_min:
+        if (
+            price_now >= pivot_window * (1.0 + cfg.intraday.confirm_headroom_pct / 100.0)
+            and vol_pace >= cfg.intraday.vol_pace_min
+        ):
             signal = "BUY"
-            reason = f"Price {price_now:.2f} ≥ pivot {pivot_window:.2f} + {cfg.intraday.confirm_headroom_pct:.1f}% & vol pace {vol_pace:.2f}x"
-        elif price_now >= pivot_window * (1.0 - cfg.intraday.near_below_pivot_pct / 100.0) and vol_pace >= cfg.intraday.near_vol_pace_min:
+            reason = (
+                f"Price {price_now:.2f} ≥ pivot {pivot_window:.2f} + "
+                f"{cfg.intraday.confirm_headroom_pct:.1f}% & vol pace {vol_pace:.2f}x"
+            )
+        elif (
+            price_now >= pivot_window * (1.0 - cfg.intraday.near_below_pivot_pct / 100.0)
+            and vol_pace >= cfg.intraday.near_vol_pace_min
+        ):
             signal = "NEAR"
-            reason = f"Price {price_now:.2f} within {cfg.intraday.near_below_pivot_pct:.1f}% of pivot {pivot_window:.2f} & vol pace {vol_pace:.2f}x"
+            reason = (
+                f"Price {price_now:.2f} within {cfg.intraday.near_below_pivot_pct:.1f}% "
+                f"of pivot {pivot_window:.2f} & vol pace {vol_pace:.2f}x"
+            )
         else:
             signal = "NONE"
             reason = f"No breakout. headroom={headroom_pct:.2f}%, vol_pace={vol_pace:.2f}x"
@@ -581,8 +586,7 @@ def evaluate_intraday_signals(
     if not rows:
         return pd.DataFrame()
 
-    diag = pd.DataFrame(rows)
-    return diag
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +665,6 @@ def main() -> None:
     if diag.empty:
         log("No diagnostics rows generated.")
     else:
-        # Log SKIP-ADX in the same style you saw before
         for _, row in diag.iterrows():
             if row["Signal"] == "SKIP-ADX":
                 log_sub(f"[SKIP-ADX] {row['Ticker']} because {row['Reason']}")
