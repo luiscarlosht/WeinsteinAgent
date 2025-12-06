@@ -184,14 +184,16 @@ backtest:
     use_long: true            # gate new LONG entries by Chapter 8 regime
     use_short: true           # gate new SHORT entries by Chapter 8 regime
 
+  # 🔁 keep Coppock behavior the same as the run that produced your table
   coppock:
     use_long: true            # LONG: require Coppock(benchmark) > 0
     use_short: true           # SHORT: require Coppock(benchmark) < 0
 
+  # 🧪 SIM experiment: breadth OFF, with a looser 50% threshold ready
   breadth:
-    enabled: true             # if false → breadth is ignored for backtest
-    ma_window: 50             # MA window for "% above MA50"
-    min_long: 0.60            # require 60% of breadth universe above MA to allow new longs
+    enabled: false            # ⬅️ turn OFF breadth for this SIM run
+    ma_window: 50
+    min_long: 0.50            # when you re-enable breadth, use 50% instead of 60%
 
   long:
     break_pct: 0.004          # ≈0.4% above pivot
