@@ -113,7 +113,7 @@ class BacktestGlobalConfig:
     coppock_cfg: BacktestCoppockConfig
     benchmark: str
     output_dir: str
-    show_adx_skips: bool  # NEW: control noisy [SKIP-ADX] logs
+    show_adx_skips: bool  # control noisy [SKIP-ADX] logs
 
 
 # ---------------------------------------------------------------------------
@@ -493,17 +493,23 @@ def simulate_backtest(
         log("⚠️ No trading dates in requested range — nothing to simulate.")
         return pd.DataFrame(), pd.DataFrame()
 
+    total_days = len(trade_dates)
+
     # -------------------------------------------------------------------
     # Main backtest loop
     # -------------------------------------------------------------------
     for idx, trade_date in enumerate(trade_dates, start=1):
         day_slice = grouped_by_date[trade_date]
 
-        # Progress log every few days
-        if idx % 5 == 0:
+        # Progress log once per calendar month (on the LAST trading day of that month)
+        next_is_new_month = idx < total_days and trade_dates[idx].month != trade_date.month
+        is_last_of_month = (idx == total_days) or next_is_new_month
+        if is_last_of_month:
+            pct_done = idx / total_days * 100.0
             log_sub(
                 f"Progress: {trade_date} — equity ${equity:,.2f}, "
-                f"positions: {len(positions)}, trades so far: {len(trades_rows)}"
+                f"positions: {len(positions)}, trades so far: {len(trades_rows)}, "
+                f"done≈{pct_done:.1f}%"
             )
 
         # Update existing positions (stops)
