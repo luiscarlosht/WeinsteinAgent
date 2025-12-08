@@ -50,7 +50,6 @@ reporting:
   summary_lines: 10
 
   # SECTION ORDER in the email / report:
-  # We place Crypto Weekly right before "Weinstein Weekly – Summary"
   section_order:
     - header
     - buy_triggers
@@ -123,8 +122,9 @@ intraday:
     min_long: 0.50        # ignored when enabled=false; kept for future tests
 
   regime:
-    use_long: true        # gate new LONG intraday signals by regime
-    use_short: false      # leave shorts disabled for now
+    use_long: true        # gate LONG intraday signals by regime
+    use_short: true       # gate SHORT intraday signals by regime
+                          # → market_regime decides which side is active
 
 # ---- Crypto weekly block, fed by your Signals tab ----
 crypto:
@@ -144,7 +144,8 @@ crypto:
 
   # What to compute and show per-coin
   metrics:
-    include: ["stage","short_term_state_wk","price","ma10","ma30","dist_ma_pct","ma_slope_per_wk","rs","rs_ma30","rs_above_ma","rs_slope_per_wk","notes"]
+    include: ["stage","short_term_state_wk","price","ma10","ma30","dist_ma_pct",
+              "ma_slope_per_wk","rs","rs_ma30","rs_above_ma","rs_slope_per_wk","notes"]
     stage_method: "weinstien"
     rs_anchor: "benchmark"
 
@@ -192,13 +193,13 @@ backtest:
   snapshot_mode: "static"     # static | historical | auto
 
   regime:
-    use_long: true            # gate new LONG entries by Chapter 8 regime
-    use_short: false          # SHORT regime gate reserved for future tests
+    use_long: true            # gate LONG entries by Chapter 8 regime
+    use_short: true           # gate SHORT entries by Chapter 8 regime
 
-  # Profile E – same Coppock behavior as others
+  # Profile E – same Coppock behavior, but for BOTH directions
   coppock:
     use_long: true            # LONG: require Coppock(benchmark) > 0
-    use_short: false          # SHORT: require Coppock(benchmark) < 0
+    use_short: true           # SHORT: require Coppock(benchmark) < 0
 
   # Profile E – breadth OFF (Aggressive)
   breadth:
@@ -215,7 +216,7 @@ backtest:
   long:
     break_pct: 0.004          # ≈0.4% above pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 14.0             # ✅ Profile E: ADX 14 for longs (most aggressive)
+    adx_min: 14.0             # ✅ Profile E: ADX 14 for longs (most signals)
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
@@ -223,7 +224,7 @@ backtest:
   short:
     break_pct: 0.004          # ≈0.4% below pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 14.0             # ✅ Profile E: ADX 14 for shorts (future sim)
+    adx_min: 14.0             # ✅ Profile E: ADX 14 for shorts
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
