@@ -75,8 +75,8 @@ risk:
 
 # ---- Intraday / PROD knobs (long + short) ----
 intraday:
-  # Profile E – Aggressive: lowest ADX, breadth OFF
-  adx_min_long: 14.0
+  # Profile C – Balanced (Current): ADX 18, breadth OFF
+  adx_min_long: 18.0
 
   long:
     # Confirms a BUY on ≥ vol_pace_min; NEAR uses ≥ near_vol_pace_min
@@ -115,7 +115,7 @@ intraday:
     target1_pct: 0.15              # 15% downside target
     target2_pct: 0.20              # 20% downside target
 
-  # Profile E – breadth OFF (Aggressive)
+  # Profile C – breadth OFF (Balanced)
   breadth:
     enabled: false
     ma_window: 50
@@ -196,12 +196,12 @@ backtest:
     use_long: true            # gate LONG entries by Chapter 8 regime
     use_short: true           # gate SHORT entries by Chapter 8 regime
 
-  # Profile E – same Coppock behavior, but for BOTH directions
+  # Profile C – Coppock filters for BOTH directions
   coppock:
     use_long: true            # LONG: require Coppock(benchmark) > 0
     use_short: true           # SHORT: require Coppock(benchmark) < 0
 
-  # Profile E – breadth OFF (Aggressive)
+  # Profile C – breadth OFF (Balanced)
   breadth:
     enabled: false
     ma_window: 50
@@ -216,7 +216,7 @@ backtest:
   long:
     break_pct: 0.004          # ≈0.4% above pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 14.0             # ✅ Profile E: ADX 14 for longs (most signals)
+    adx_min: 18.0             # ✅ Profile C: ADX 18 for longs
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
@@ -224,7 +224,7 @@ backtest:
   short:
     break_pct: 0.004          # ≈0.4% below pivot
     vol_min: 1.30             # min full-day volume vs 50dma
-    adx_min: 14.0             # ✅ Profile E: ADX 14 for shorts
+    adx_min: 18.0             # ✅ Profile C: ADX 18 for shorts
     stop_hard: 0.20           # 20% disaster stop
     trail_atr: 2.0            # ATR-based trail
     ma_guard: 0.03            # extra guard vs MA30 (~3%)
