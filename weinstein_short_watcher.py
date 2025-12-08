@@ -248,6 +248,32 @@ def load_ready_short_tickers_from_signals(cfg, sheet_url, service_account_file):
     log(f"READY filter: loaded {len(tickers)} short tickers from Signals tab '{tab_name}'.", level="info")
     return tickers
 
+
+def write_empty_short_csv(path: str) -> None:
+    """
+    When shorts are disabled by regime, write a CSV with headers and zero rows,
+    so short_signal_engine.py can read it without EmptyDataError and simply
+    treat it as "no rows to summarize".
+    """
+    cols = [
+        "ticker",
+        "price",
+        "ma30",
+        "pivot_low",
+        "atr",
+        "pace_full_vs50dma",
+        "pace_intrabar",
+        "elapsed_min",
+        "cond_short_near_now",
+        "cond_short_confirm",
+        "short_state",
+        "short_hits",
+        "short_cooldown",
+    ]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df = pd.DataFrame(columns=cols)
+    df.to_csv(path, index=False)
+
 # ---------------- State helpers ----------------
 def _load_short_state():
     """
@@ -756,7 +782,7 @@ def run(
         level="info",
     )
 
-    # If regime says "no shorts", exit early (optionally writing empty CSV)
+    # If regime says "no shorts", exit early (writing a header-only CSV if requested)
     if not short_ok:
         log(
             "Chapter 8 + VIX regime filter: short side is DISABLED in current regime — "
@@ -765,10 +791,11 @@ def run(
         )
         if log_csv:
             try:
-                pd.DataFrame([]).to_csv(log_csv, index=False)
+                write_empty_short_csv(log_csv)
                 log(f"Wrote empty diagnostics CSV (shorts disabled) → {log_csv}", level="ok")
             except Exception as e:
                 log(f"Failed writing empty diagnostics CSV: {e}", level="warn")
+        log("Short tick complete (shorts disabled by regime).", level="ok")
         return
 
     # Load tickers from Signals tab for READY-TO-CLOSE filtering
