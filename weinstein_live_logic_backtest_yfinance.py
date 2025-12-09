@@ -413,7 +413,7 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     )
     df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
     df = df.sort_values(["weekly_rank", "ticker"])
-    log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
+    #log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
     return df
 
 
