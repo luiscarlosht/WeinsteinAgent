@@ -3,7 +3,7 @@
 """
 weinstein_long_core.py
 
-Shared LONG-side entry logic for:
+Shared LONG-side core logic for:
 - Intraday PROD watchers
 - Daily SIM backtester (weinstein_live_logic_backtest_yfinance.py)
 
@@ -11,14 +11,20 @@ Core idea:
 - One place where we define:
     * thresholds (breakout %, min distance above MA, vol pace, ADX)
     * "can we enter?" decision logic
+    * risk helpers (hard stop / ATR / MA guard / optional targets)
 - Anything that wants to do a Weinstein Stage 2 breakout
   just calls check_long_entry(...) and inspects the result.
+
+This module intentionally mirrors weinstein_short_core.py so that:
+- Entry filters (LONG vs SHORT) live in symmetric LongEntry*/ShortEntry* APIs.
+- Risk/exit helpers (long_stop_level/should_exit_long) are shared
+  between PROD and SIM.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -29,6 +35,24 @@ try:
 except ImportError:
     # Fallback, in case the module is missing or renamed.
     DEFAULT_ADX_MIN = 18.0
+
+
+# -------------------------------------------------------------------
+# Shared LONG-side constants
+# -------------------------------------------------------------------
+
+# Breakout / volume thresholds (aligned with backtester + intraday)
+LONG_BREAK_PCT: float = 0.004   # ≈0.4% above pivot breakout
+LONG_VOL_MIN: float = 1.30      # volume vs 50dma (≈ 1.3×)
+
+# Risk / stop / target mapping (used by both intraday + backtests)
+LONG_HARD_STOP_PCT: float = 0.20    # 20% below entry (disaster stop)
+LONG_TRAIL_ATR_MULT: float = 2.0    # ATR cushion
+LONG_MA_GUARD_PCT: float = 0.03     # 3% below MA guard (MA30 or MA150 depending on caller)
+
+# Optional upside targets, symmetric with short core (-15% / -20% there)
+LONG_TARGET1_PCT: float = 0.15      # 15% upside
+LONG_TARGET2_PCT: float = 0.20      # 20% upside
 
 
 # -------------------------------------------------------------------
@@ -56,9 +80,9 @@ class LongEntryParams:
         adx_min:
             Minimum ADX to accept (e.g. 18.0).
     """
-    min_break_pct: float = 0.004
+    min_break_pct: float = LONG_BREAK_PCT
     dist_above_ma_min: float = 0.0
-    vol_min: float = 1.30
+    vol_min: float = LONG_VOL_MIN
     adx_min: float = DEFAULT_ADX_MIN
 
 
@@ -107,7 +131,7 @@ def check_long_entry(
     rs_above_ma: bool,
     vol_mult: float,
     adx_val: float,
-    # Preferred interface (used by SIM backtester):
+    # Preferred interface (used by SIM backtester and intraday):
     params: Optional[LongEntryParams] = None,
     # Backward-compatible knobs (in case some caller passes explicit thresholds):
     min_break_pct: Optional[float] = None,
@@ -122,7 +146,7 @@ def check_long_entry(
         price:
             Current price (close / last).
         ma_val:
-            MA(30) (or your equivalent trend MA).
+            MA(30) or MA150 depending on caller (trend MA).
         pivot:
             Highest close in lookback window (e.g. 50d).
         rs_above_ma:
@@ -168,7 +192,7 @@ def check_long_entry(
             adx_ok=True,
         )
 
-    # --- Price must be above MA30 with optional extra headroom ---
+    # --- Price must be above MA with optional extra headroom ---
     # If dist_above_ma_min == 0 -> just price > MA.
     required_ma = ma_val * (1.0 + thr_dist_ma)
     if price <= required_ma:
@@ -211,3 +235,103 @@ def check_long_entry(
         reason="ok",
         adx_ok=True,
     )
+
+
+# -------------------------------------------------------------------
+# Shared LONG-side stop / target / exit helpers
+# -------------------------------------------------------------------
+
+def _long_entry_stop_targets(
+    entry: float,
+    ma_val: float,
+    atr: float,
+) -> Tuple[float, float, float, float]:
+    """
+    Convenience helper for callers that want a full "package" of levels.
+
+    Parameters
+    ----------
+    entry : float
+        Entry price (typically current price when the signal fires).
+    ma_val : float
+        Trend MA used for guard (MA30 in SIM, MA150 in intraday, etc.).
+    atr : float
+        ATR value for volatility-based cushion (14d in SIM).
+
+    Returns
+    -------
+    (entry, stop, target1, target2)
+
+      stop    = max(
+                   entry * (1 - LONG_HARD_STOP_PCT),
+                   entry - LONG_TRAIL_ATR_MULT * ATR,
+                   ma_val * (1 - LONG_MA_GUARD_PCT)
+                )
+      target1 = entry * (1 + LONG_TARGET1_PCT)
+      target2 = entry * (1 + LONG_TARGET2_PCT)
+    """
+    if _is_nan(entry):
+        return np.nan, np.nan, np.nan, np.nan
+
+    e = float(entry)
+
+    hard = e * (1.0 - LONG_HARD_STOP_PCT)
+    atr_stop = e - LONG_TRAIL_ATR_MULT * atr if not _is_nan(atr) else np.nan
+    ma_guard = ma_val * (1.0 - LONG_MA_GUARD_PCT) if not _is_nan(ma_val) else np.nan
+
+    cands = [c for c in (hard, atr_stop, ma_guard) if not _is_nan(c)]
+    stop = max(cands) if cands else hard
+
+    t1 = e * (1.0 + LONG_TARGET1_PCT)
+    t2 = e * (1.0 + LONG_TARGET2_PCT)
+    return e, stop, t1, t2
+
+
+def long_stop_level(entry: float, atr: float, ma_val: float) -> float:
+    """
+    Compute an initial stop for a LONG position.
+
+    Generic form used by:
+      - SIM: ma_val = MA30
+      - Intraday PROD: ma_val = MA150 (if you choose to reuse it)
+
+    stop = max(
+        entry * (1 - LONG_HARD_STOP_PCT),
+        entry - LONG_TRAIL_ATR_MULT * ATR,
+        ma_val * (1 - LONG_MA_GUARD_PCT)
+    )
+    """
+    if _is_nan(entry):
+        return np.nan
+
+    hard = entry * (1.0 - LONG_HARD_STOP_PCT)
+    atr_stop = entry - LONG_TRAIL_ATR_MULT * atr if not _is_nan(atr) else np.nan
+    ma_guard = ma_val * (1.0 - LONG_MA_GUARD_PCT) if not _is_nan(ma_val) else np.nan
+
+    cands = [c for c in (hard, atr_stop, ma_guard) if not _is_nan(c)]
+    return max(cands) if cands else hard
+
+
+def should_exit_long(price: float, stop: float, ma_val: float) -> bool:
+    """
+    Exit condition for a LONG:
+
+      1) price <= stop  (hard/ATR/MA guard violated)
+      2) price has broken under MA by ~LONG_MA_GUARD_PCT
+         (extra trend-guard).
+
+    Used directly by the live-logic backtest; you can also reuse this
+    in PROD if you want a shared definition.
+    """
+    if _is_nan(price):
+        return False
+
+    # 1) Stop violation
+    if not _is_nan(stop) and price <= stop:
+        return True
+
+    # 2) Extra guard: under MA by ~3%
+    if not _is_nan(ma_val) and price <= ma_val * (1.0 - LONG_MA_GUARD_PCT):
+        return True
+
+    return False
