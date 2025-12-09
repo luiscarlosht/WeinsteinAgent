@@ -66,7 +66,9 @@ Shared LONG-side core:
     * RS must be strong
     * volume vs 50dma
     * ADX filter (NaN → no block)
-  via weinstein_long_core.check_long_entry / LongEntryParams.
+    * long stop + exit logic
+  via weinstein_long_core.check_long_entry / LongEntryParams /
+       long_stop_level / should_exit_long.
 
 Config-driven backtest behavior (Option C via config.yaml.backtest):
     * snapshot_mode: static | historical | auto
@@ -120,8 +122,13 @@ from weinstein_indicators import (
     compute_breadth_series_above_ma,
 )
 
-# Shared LONG-side core (price/pivot/ADX/volume)
-from weinstein_long_core import LongEntryParams, check_long_entry
+# Shared LONG-side core (price/pivot/ADX/volume + stops/exits)
+from weinstein_long_core import (
+    LongEntryParams,
+    check_long_entry,
+    long_stop_level,
+    should_exit_long,
+)
 
 # Chapter 8 + VIX regime — now with historical helpers for SIM
 from market_regime import (
@@ -185,7 +192,7 @@ WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
 #   data/weekly_snapshots/weinstein_weekly_equities_20190104_1801.csv
 WEEKLY_SNAPSHOT_DIR = "./data/weekly_snapshots"
 
-_SNAPSHOT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
+_SNAPSHOT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d2}|\d{8})")
 
 
 def newest_weekly_csv() -> str:
@@ -406,7 +413,7 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     )
     df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
     df = df.sort_values(["weekly_rank", "ticker"])
-    log(f"{side.UPPER()} universe size: {len(df)} symbols.", level="info")
+    log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
     return df
 
 
@@ -441,9 +448,6 @@ class Trade:
 
 # Long side — tuned more closely to production intraday thresholds
 LONG_BREAK_PCT = 0.004  # ≈0.4% above pivot breakout, matching short break magnitude
-LONG_STOP_HARD = 0.20   # 20% hard stop (Weinstein-style disaster stop)
-LONG_TRAIL_ATR = 2.0    # ATR-based cushion
-LONG_MA_GUARD = 0.03    # extra guard vs MA30 (≈3% under)
 
 # Short side (mirrored)
 SHORT_BREAK_PCT = 0.004  # ≈0.4% below pivot breakdown
@@ -578,29 +582,7 @@ def compute_coppock_from_daily(daily_df: pd.DataFrame, benchmark: str) -> pd.Ser
     return coppock_daily
 
 
-# ---------------- Entry / exit rules ----------------
-
-
-def long_stop_level(entry: float, atr: float, ma30_val: float) -> float:
-    if np.isnan(entry):
-        return np.nan
-    hard = entry * (1.0 - LONG_STOP_HARD)
-    atr_stop = entry - LONG_TRAIL_ATR * atr if not np.isnan(atr) else np.nan
-    ma_guard = ma30_val * (1.0 - LONG_MA_GUARD) if not np.isnan(ma30_val) else np.nan
-    cands = [c for c in [hard, atr_stop, ma_guard] if not np.isnan(c)]
-    return max(cands) if cands else hard
-
-
-def should_exit_long(price: float, stop: float, ma30_val: float) -> bool:
-    if np.isnan(price):
-        return False
-    # 1) Stop violation
-    if not np.isnan(stop) and price <= stop:
-        return True
-    # 2) Extra guard: under MA30 by ~3%
-    if not np.isnan(ma30_val) and price <= ma30_val * (1.0 - LONG_MA_GUARD):
-        return True
-    return False
+# ---------------- Entry / exit rules: SHORT side (local for now) ----------------
 
 
 def should_enter_short(
