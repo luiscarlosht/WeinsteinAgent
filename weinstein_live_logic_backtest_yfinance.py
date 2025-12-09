@@ -79,6 +79,15 @@ NEW:
 - Config-driven breadth / Coppock logging noise:
     * backtest.logging.show_breadth_skips: true/false
     * backtest.logging.show_coppock_skips: true/false
+
+- NEW: AUTO trading mode:
+
+    --mode auto
+        Use Chapter 8 + VIX regime snapshot to pick sides:
+          * both  (long + short)  if long_ok and short_ok
+          * long  if long_ok only
+          * short if short_ok only
+          * none  if neither side is allowed (exits only, no new entries)
 """
 
 import argparse
@@ -671,7 +680,7 @@ def backtest(
     show_coppock_skips: bool = False,
 ) -> Dict[str, object]:
     """
-    mode: "long", "short", or "both"
+    mode: "long", "short", "both", or "none"
 
     If weekly_snapshots is provided and non-empty:
       - uses dynamic weekly universes per date (Option A).
@@ -1246,8 +1255,14 @@ def main():
         "--mode",
         type=str,
         default="both",
-        choices=["long", "short", "both"],
-        help="Enable long-only, short-only, or both",
+        choices=["long", "short", "both", "auto"],
+        help=(
+            "Trading side selection:\n"
+            "  long  - Stage 2 longs only\n"
+            "  short - Stage 4 shorts only\n"
+            "  both  - trade both sides independently\n"
+            "  auto  - infer sides from Chapter 8 + VIX regime snapshot"
+        ),
     )
     ap.add_argument("--quiet", action="store_true")
 
@@ -1367,33 +1382,26 @@ def main():
             raise SystemExit("Provide both --start and --end if not using --year.")
         start, end = args.start, args.end
 
-    log(
-        f"Backtest range: {start} → {end} | mode={args.mode}, capital={args.capital:,.2f}, "
-        f"risk_per_trade={args.risk_per_trade:.3f}, max_long={args.max_long}, max_short={args.max_short}",
-        level="info",
-    )
-    log(f"Benchmark for Coppock/filters: {benchmark}", level="info")
-    log(
-        f"Config: snapshot_mode={snapshot_mode}, regime_long={use_regime_long_effective}, "
-        f"regime_short={use_regime_short_effective}, coppock_long={use_coppock_long_effective}, "
-        f"coppock_short={use_coppock_short_effective}, breadth_enabled={breadth_enabled}, "
-        f"breadth_ma={BREADTH_MA_WINDOW}, breadth_min_long={BREADTH_MIN_LONG:.2f}, "
-        f"show_adx_skips={show_adx_skips_effective}, show_breadth_skips={show_breadth_skips_effective}, "
-        f"show_coppock_skips={show_coppock_skips_effective}",
-        level="info",
-    )
-
     # ---- Optional Chapter 8 + VIX regime gating (single snapshot, applies to full run) ----
     long_regime_ok = True
     short_regime_ok = True
+    effective_mode = args.mode  # what we actually send into backtest
 
-    if use_regime_long_effective or use_regime_short_effective:
+    need_regime = (
+        use_regime_long_effective
+        or use_regime_short_effective
+        or args.mode == "auto"
+    )
+
+    if need_regime:
         if inspect_market_regime is None:
             log(
-                "market_regime.py not available; regime gates disabled "
-                "(allowing new longs/shorts).",
+                "market_regime.py not available; regime-based logic disabled. "
+                "AUTO mode will fall back to 'both'.",
                 level="warn",
             )
+            if args.mode == "auto":
+                effective_mode = "both"
         else:
             try:
                 regime_label, long_ok_flag, short_ok_flag = inspect_market_regime()
@@ -1402,18 +1410,45 @@ def main():
                     f"long_ok={long_ok_flag} short_ok={short_ok_flag}",
                     level="info",
                 )
-                if use_regime_long_effective:
-                    long_regime_ok = bool(long_ok_flag)
-                if use_regime_short_effective:
-                    short_regime_ok = bool(short_ok_flag)
+
+                if args.mode == "auto":
+                    # AUTO: choose sides directly from regime snapshot
+                    if long_ok_flag and short_ok_flag:
+                        effective_mode = "both"
+                    elif long_ok_flag and not short_ok_flag:
+                        effective_mode = "long"
+                    elif not long_ok_flag and short_ok_flag:
+                        effective_mode = "short"
+                    else:
+                        effective_mode = "none"
+
+                    # AUTO uses regime only to pick sides — no extra per-side gate
+                    long_regime_ok = True
+                    short_regime_ok = True
+
+                    log(
+                        f"AUTO mode resolved to effective side='{effective_mode}' "
+                        f"based on regime snapshot.",
+                        level="info",
+                    )
+                else:
+                    # Non-AUTO: keep original gating behavior
+                    effective_mode = args.mode
+                    if use_regime_long_effective:
+                        long_regime_ok = bool(long_ok_flag)
+                    if use_regime_short_effective:
+                        short_regime_ok = bool(short_ok_flag)
+
             except Exception as e:
                 log(
                     f"market_regime.inspect() failed ({e}); "
-                    "regime gates disabled (allowing new longs/shorts).",
+                    "regime-based logic disabled.",
                     level="warn",
                 )
                 long_regime_ok = True
                 short_regime_ok = True
+                if args.mode == "auto":
+                    effective_mode = "both"
 
     # ---- Weekly universe source selection (Option C via snapshot_mode) ----
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
@@ -1475,6 +1510,24 @@ def main():
     if not all_tickers:
         raise RuntimeError("Universe of tickers is empty; cannot run backtest.")
 
+    log(
+        f"Backtest range: {start} → {end} | requested_mode={args.mode}, "
+        f"effective_mode={effective_mode}, capital={args.capital:,.2f}, "
+        f"risk_per_trade={args.risk_per_trade:.3f}, max_long={args.max_long}, "
+        f"max_short={args.max_short}",
+        level="info",
+    )
+    log(f"Benchmark for Coppock/filters: {benchmark}", level="info")
+    log(
+        f"Config: snapshot_mode={snapshot_mode}, regime_long={use_regime_long_effective}, "
+        f"regime_short={use_regime_short_effective}, coppock_long={use_coppock_long_effective}, "
+        f"coppock_short={use_coppock_short_effective}, breadth_enabled={breadth_enabled}, "
+        f"breadth_ma={BREADTH_MA_WINDOW}, breadth_min_long={BREADTH_MIN_LONG:.2f}, "
+        f"show_adx_skips={show_adx_skips_effective}, show_breadth_skips={show_breadth_skips_effective}, "
+        f"show_coppock_skips={show_coppock_skips_effective}",
+        level="info",
+    )
+
     daily_df = download_daily_bars(sorted(all_tickers), start, end)
 
     # Compute Coppock curve for benchmark (daily series)
@@ -1488,7 +1541,7 @@ def main():
         risk_per_trade=args.risk_per_trade,
         max_long=args.max_long,
         max_short=args.max_short,
-        mode=args.mode,
+        mode=effective_mode,
         universe_tickers=sorted(all_tickers),
         weekly_df=weekly_df,
         weekly_snapshots=weekly_snapshots if weekly_snapshots else None,
