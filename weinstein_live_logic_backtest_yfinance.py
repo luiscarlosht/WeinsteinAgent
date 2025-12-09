@@ -33,20 +33,22 @@ Key points:
     * Equity curve PNG
     * Monthly P/L CSV + printed summary
 
-NEW:
-- Optional Chapter 8 + VIX regime gating (via market_regime.inspect):
+Regime + VIX (Chapter 8) — **HISTORICAL**:
+- Uses market_regime.build_historical_regime_table(...) to compute a daily regime
+  table for the test period, based on major indices + VIX:
 
-    --use-regime-long
-        Gate NEW LONG entries by long_ok from inspect().
-    --use-regime-short
-        Gate NEW SHORT entries by short_ok from inspect().
+    regime_table.loc[date] has:
+        regime         ("bull"/"bear"/"neutral"/"unknown")
+        long_ok        (Weinstein+VIX: OK for new LONGS)
+        short_ok       (Weinstein+VIX: OK for new SHORTS)
+        ... plus regime-only and VIX-only gates
 
-  Note: inspect() uses *current* index/VIX data (live regime), not per-backtest-date
-  regime. That means the regime gate is a coarse on/off overlay for the entire
-  backtest run, not a historical regime reconstruction.
+- Backtest then gates **per day** using:
+    --use-regime-long / backtest.regime.use_long
+    --use-regime-short / backtest.regime.use_short
+  and/or AUTO mode (see below).
 
-- Optional benchmark Coppock filter (classic Coppock curve on monthly closes):
-
+Coppock (benchmark) gates:
     --benchmark SPY
         Benchmark symbol to compute Coppock (default: SPY).
     --use-coppock-long
@@ -59,35 +61,37 @@ NEW:
   then forward-filled back to the daily index so each day reuses the latest
   monthly Coppock value.
 
-- Shared LONG-side core:
+Shared LONG-side core:
     * price / MA / pivot breakout
     * RS must be strong
     * volume vs 50dma
     * ADX filter (NaN → no block)
   via weinstein_long_core.check_long_entry / LongEntryParams.
 
-- Config-driven backtest behavior (Option C via config.yaml.backtest):
+Config-driven backtest behavior (Option C via config.yaml.backtest):
     * snapshot_mode: static | historical | auto
     * regime.use_long / regime.use_short gates
     * coppock.use_long / coppock.use_short gates
     * breadth.enabled / breadth.ma_window / breadth.min_long
 
-- Config-driven ADX logging noise:
+Config-driven ADX logging noise:
     * backtest.logging.show_adx_skips: true/false
       (or use CLI --show-adx-skips)
 
-- Config-driven breadth / Coppock logging noise:
+Config-driven breadth / Coppock logging noise:
     * backtest.logging.show_breadth_skips: true/false
     * backtest.logging.show_coppock_skips: true/false
 
-- NEW: AUTO trading mode:
+AUTO trading mode (now **historical regime-aware**):
 
     --mode auto
-        Use Chapter 8 + VIX regime snapshot to pick sides:
-          * both  (long + short)  if long_ok and short_ok
-          * long  if long_ok only
-          * short if short_ok only
-          * none  if neither side is allowed (exits only, no new entries)
+        Use the *daily* Chapter 8 + VIX regime table:
+          * On a given day:
+              - new longs allowed iff long_ok==True
+              - new shorts allowed iff short_ok==True
+          * If both False → no new entries that day (exits only)
+        AUTO mode always evaluates both sides, but regime_table will zero
+        out whichever side is disallowed on that date.
 """
 
 import argparse
@@ -119,11 +123,11 @@ from weinstein_indicators import (
 # Shared LONG-side core (price/pivot/ADX/volume)
 from weinstein_long_core import LongEntryParams, check_long_entry
 
-# Optional: Chapter 8 + VIX regime gating
-try:
-    from market_regime import inspect as inspect_market_regime
-except ImportError:
-    inspect_market_regime = None
+# Chapter 8 + VIX regime — now with historical helpers for SIM
+from market_regime import (
+    MarketRegimeConfig,
+    build_historical_regime_table,
+)
 
 
 # ---------------- Logging helpers ----------------
@@ -402,7 +406,7 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     )
     df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
     df = df.sort_values(["weekly_rank", "ticker"])
-    log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
+    log(f"{side.UPPER()} universe size: {len(df)} symbols.", level="info")
     return df
 
 
@@ -668,8 +672,10 @@ def backtest(
     universe_tickers: List[str],
     weekly_df: Optional[pd.DataFrame] = None,
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None,
-    long_regime_ok: bool = True,
-    short_regime_ok: bool = True,
+    regime_table: Optional[pd.DataFrame] = None,
+    use_regime_long: bool = False,
+    use_regime_short: bool = False,
+    auto_mode: bool = False,
     benchmark: str = "SPY",
     use_coppock_long: bool = False,
     use_coppock_short: bool = False,
@@ -681,15 +687,21 @@ def backtest(
 ) -> Dict[str, object]:
     """
     mode: "long", "short", "both", or "none"
+          (AUTO mode is handled via auto_mode + regime_table; here we just
+           see 'both' and use per-day regime gates to zero out sides.)
 
     If weekly_snapshots is provided and non-empty:
       - uses dynamic weekly universes per date (Option A).
     Else:
       - uses single weekly_df snapshot (current behavior).
 
-    long_regime_ok / short_regime_ok:
-      - coarse on/off gates (e.g. from Chapter 8 + VIX via market_regime.inspect()).
-      - If False, NEW entries of that side are blocked for the entire run.
+    Regime settings:
+      - regime_table: daily DataFrame from market_regime.build_historical_regime_table().
+      - use_regime_long: if True, NEW longs allowed only when regime_table.long_ok is True.
+      - use_regime_short: if True, NEW shorts allowed only when regime_table.short_ok is True.
+      - auto_mode: if True, we *also* respect regime_table.long_ok / short_ok
+                   even if use_regime_long/short are False; AUTO mode is
+                   effectively "both sides, but day-by-day gated by long_ok/short_ok".
 
     Coppock gates:
       - use_coppock_long: if True, NEW longs allowed only when Coppock(benchmark) > 0.
@@ -698,12 +710,8 @@ def backtest(
     breadth_enabled:
       - if False, breadth gate is disabled regardless of BREADTH_* constants.
 
-    show_adx_skips:
-      - if True, log [SKIP-ADX] debug messages for long entries whose ADX filter blocks.
-    show_breadth_skips:
-      - if True, log [SKIP-BREADTH] debug messages when breadth blocks new longs.
-    show_coppock_skips:
-      - if True, log [SKIP-COPPOCK-*] debug messages when Coppock gates block.
+    show_*_skips:
+      - ADX / breadth / Coppock skip logging toggles.
     """
     use_snapshots = bool(weekly_snapshots)
 
@@ -873,6 +881,20 @@ def backtest(
         portfolio.equity = eq
         equity_curve.append({"date": dt_, "equity": eq})
 
+        # ----- daily regime gates (Chapter 8 + VIX, historical) -----
+        long_regime_ok_today = True
+        short_regime_ok_today = True
+        if regime_table is not None and dt_ in regime_table.index:
+            r_row = regime_table.loc[dt_]
+            r_long_ok = bool(r_row.get("long_ok", True))
+            r_short_ok = bool(r_row.get("short_ok", True))
+
+            # If auto_mode: always respect regime long/short OK for both sides.
+            if auto_mode or use_regime_long:
+                long_regime_ok_today = r_long_ok
+            if auto_mode or use_regime_short:
+                short_regime_ok_today = r_short_ok
+
         # Compute breadth gate for this day (for new LONG entries)
         breadth_ok = True
         breadth_val = np.nan
@@ -969,12 +991,12 @@ def backtest(
         n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # LONG entries (gated by breadth_ok + optional regime gate + Coppock gate)
+        # LONG entries (gated by breadth_ok + daily regime + Coppock gate)
         if (
             mode in ("long", "both")
             and n_long_now < max_long
             and breadth_ok
-            and long_regime_ok
+            and long_regime_ok_today
             and coppock_long_ok
         ):
             for _, row in long_universe.iterrows():
@@ -1056,11 +1078,11 @@ def backtest(
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries (gated by regime gate + Coppock gate)
+        # SHORT entries (gated by daily regime + Coppock gate)
         if (
             mode in ("short", "both")
             and n_short_now < max_short
-            and short_regime_ok
+            and short_regime_ok_today
             and coppock_short_ok
         ):
             for _, row in short_universe.iterrows():
@@ -1261,7 +1283,7 @@ def main():
             "  long  - Stage 2 longs only\n"
             "  short - Stage 4 shorts only\n"
             "  both  - trade both sides independently\n"
-            "  auto  - infer sides from Chapter 8 + VIX regime snapshot"
+            "  auto  - use daily market_regime table to gate long/short per day"
         ),
     )
     ap.add_argument("--quiet", action="store_true")
@@ -1274,16 +1296,16 @@ def main():
         help="Path to YAML config (default: ./config.yaml).",
     )
 
-    # NEW: optional Chapter 8 + VIX regime gates
+    # NEW: optional Chapter 8 + VIX regime gates (now historical)
     ap.add_argument(
         "--use-regime-long",
         action="store_true",
-        help="Gate NEW long entries by Chapter 8 + VIX via market_regime.inspect().",
+        help="Gate NEW long entries by daily Chapter 8 + VIX (regime_table.long_ok).",
     )
     ap.add_argument(
         "--use-regime-short",
         action="store_true",
-        help="Gate NEW short entries by Chapter 8 + VIX via market_regime.inspect().",
+        help="Gate NEW short entries by daily Chapter 8 + VIX (regime_table.short_ok).",
     )
 
     # NEW: benchmark + Coppock gates
@@ -1382,73 +1404,18 @@ def main():
             raise SystemExit("Provide both --start and --end if not using --year.")
         start, end = args.start, args.end
 
-    # ---- Optional Chapter 8 + VIX regime gating (single snapshot, applies to full run) ----
-    long_regime_ok = True
-    short_regime_ok = True
-    effective_mode = args.mode  # what we actually send into backtest
-
-    need_regime = (
-        use_regime_long_effective
-        or use_regime_short_effective
-        or args.mode == "auto"
+    # ---- Determine need for regime_table ----
+    auto_mode = (args.mode == "auto")
+    need_regime_table = (
+        auto_mode or use_regime_long_effective or use_regime_short_effective
     )
 
-    if need_regime:
-        if inspect_market_regime is None:
-            log(
-                "market_regime.py not available; regime-based logic disabled. "
-                "AUTO mode will fall back to 'both'.",
-                level="warn",
-            )
-            if args.mode == "auto":
-                effective_mode = "both"
-        else:
-            try:
-                regime_label, long_ok_flag, short_ok_flag = inspect_market_regime()
-                log(
-                    f"Market regime (Ch8+VIX): {regime_label} | "
-                    f"long_ok={long_ok_flag} short_ok={short_ok_flag}",
-                    level="info",
-                )
-
-                if args.mode == "auto":
-                    # AUTO: choose sides directly from regime snapshot
-                    if long_ok_flag and short_ok_flag:
-                        effective_mode = "both"
-                    elif long_ok_flag and not short_ok_flag:
-                        effective_mode = "long"
-                    elif not long_ok_flag and short_ok_flag:
-                        effective_mode = "short"
-                    else:
-                        effective_mode = "none"
-
-                    # AUTO uses regime only to pick sides — no extra per-side gate
-                    long_regime_ok = True
-                    short_regime_ok = True
-
-                    log(
-                        f"AUTO mode resolved to effective side='{effective_mode}' "
-                        f"based on regime snapshot.",
-                        level="info",
-                    )
-                else:
-                    # Non-AUTO: keep original gating behavior
-                    effective_mode = args.mode
-                    if use_regime_long_effective:
-                        long_regime_ok = bool(long_ok_flag)
-                    if use_regime_short_effective:
-                        short_regime_ok = bool(short_ok_flag)
-
-            except Exception as e:
-                log(
-                    f"market_regime.inspect() failed ({e}); "
-                    "regime-based logic disabled.",
-                    level="warn",
-                )
-                long_regime_ok = True
-                short_regime_ok = True
-                if args.mode == "auto":
-                    effective_mode = "both"
+    # Effective mode for backtest: AUTO uses both sides, but regime_table
+    # will gate long/short per day.
+    if auto_mode:
+        effective_mode = "both"
+    else:
+        effective_mode = args.mode
 
     # ---- Weekly universe source selection (Option C via snapshot_mode) ----
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
@@ -1507,6 +1474,17 @@ def main():
     # Ensure benchmark is present in daily data for Coppock computation
     all_tickers.add(benchmark)
 
+    # If we need a regime table, also ensure the index symbols + VIX are present
+    regime_cfg_defaults = MarketRegimeConfig()
+    index_symbols = regime_cfg_defaults.index_symbols
+    vix_symbol = regime_cfg_defaults.vix_symbol
+
+    if need_regime_table:
+        for sym in index_symbols:
+            all_tickers.add(sym)
+        if vix_symbol:
+            all_tickers.add(vix_symbol)
+
     if not all_tickers:
         raise RuntimeError("Universe of tickers is empty; cannot run backtest.")
 
@@ -1524,7 +1502,7 @@ def main():
         f"coppock_short={use_coppock_short_effective}, breadth_enabled={breadth_enabled}, "
         f"breadth_ma={BREADTH_MA_WINDOW}, breadth_min_long={BREADTH_MIN_LONG:.2f}, "
         f"show_adx_skips={show_adx_skips_effective}, show_breadth_skips={show_breadth_skips_effective}, "
-        f"show_coppock_skips={show_coppock_skips_effective}",
+        f"show_coppock_skips={show_coppock_skips_effective}, auto_mode={auto_mode}",
         level="info",
     )
 
@@ -1532,6 +1510,45 @@ def main():
 
     # Compute Coppock curve for benchmark (daily series)
     coppock_series = compute_coppock_from_daily(daily_df, benchmark)
+
+    # Build historical regime table if needed
+    regime_table = None
+    if need_regime_table and isinstance(daily_df.columns, pd.MultiIndex):
+        closes_panel = daily_df["Close"]
+        index_closes: Dict[str, pd.Series] = {}
+        for sym in index_symbols:
+            if sym in closes_panel.columns:
+                index_closes[sym] = closes_panel[sym].dropna()
+
+        vix_close = None
+        if vix_symbol in closes_panel.columns:
+            vix_close = closes_panel[vix_symbol].dropna()
+
+        if index_closes:
+            regime_cfg_obj = MarketRegimeConfig(
+                index_symbols=index_symbols,
+                use_vix_filter=True,
+                vix_symbol=vix_symbol,
+            )
+            log(
+                f"Building historical regime table for indices={index_symbols}, vix={vix_symbol}",
+                level="info",
+            )
+            regime_table = build_historical_regime_table(
+                index_closes=index_closes,
+                vix_close=vix_close,
+                cfg=regime_cfg_obj,
+            )
+            log(
+                f"Historical regime table built with {len(regime_table)} rows.",
+                level="info",
+            )
+        else:
+            log(
+                "No index close series available for regime table; "
+                "regime gating will be effectively disabled.",
+                level="warn",
+            )
 
     result = backtest(
         daily_df=daily_df,
@@ -1545,8 +1562,10 @@ def main():
         universe_tickers=sorted(all_tickers),
         weekly_df=weekly_df,
         weekly_snapshots=weekly_snapshots if weekly_snapshots else None,
-        long_regime_ok=long_regime_ok,
-        short_regime_ok=short_regime_ok,
+        regime_table=regime_table,
+        use_regime_long=use_regime_long_effective,
+        use_regime_short=use_regime_short_effective,
+        auto_mode=auto_mode,
         benchmark=benchmark,
         use_coppock_long=use_coppock_long_effective,
         use_coppock_short=use_coppock_short_effective,
