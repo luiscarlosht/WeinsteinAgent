@@ -325,6 +325,245 @@ def _aggregate_market_regime(metrics: List[IndexMetrics], cfg: MarketRegimeConfi
     return MarketRegime.NEUTRAL
 
 
+# ─────────────────────────────
+# BACKTEST / SIM HELPERS (NO YFINANCE)
+# ─────────────────────────────
+
+def compute_regime_from_closes(
+    index_closes: Dict[str, pd.Series],
+    cfg: Optional[MarketRegimeConfig] = None,
+    *,
+    as_of: Optional[pd.Timestamp] = None,
+) -> MarketRegimeSnapshot:
+    """
+    Compute a *single* market regime snapshot from pre-downloaded
+    index close series (no yfinance calls).
+
+    Used by SIM/backtest when you already have daily bars for indices.
+
+    Args:
+        index_closes: dict {symbol -> pd.Series of closes}, each series:
+                      - indexed by datetime
+                      - already filtered to the desired date range
+        cfg:          optional MarketRegimeConfig
+        as_of:        if given, truncate each series to <= as_of before
+                      computing regime; otherwise it uses the full series.
+
+    Returns:
+        MarketRegimeSnapshot (same type as detect_market_regime()).
+    """
+    if cfg is None:
+        cfg = MarketRegimeConfig()
+
+    # Decide which indices we actually use
+    if cfg.index_symbols:
+        symbols = [s for s in cfg.index_symbols if s in index_closes]
+    else:
+        symbols = sorted(index_closes.keys())
+
+    metrics: List[IndexMetrics] = []
+
+    for sym in symbols:
+        series = index_closes.get(sym)
+        if series is None or series.empty:
+            metrics.append(
+                IndexMetrics(
+                    symbol=sym,
+                    state=IndexState.UNKNOWN,
+                    last_close=float("nan"),
+                    ma_value=float("nan"),
+                    ma_slope_pct=float("nan"),
+                    above_ma=False,
+                    ma_rising=False,
+                    n_days_ma_slope=cfg.ma_slope_days,
+                    ma_window=cfg.ma_window,
+                    data_points=0,
+                )
+            )
+            continue
+
+        series = series.sort_index()
+        if as_of is not None:
+            series = series[series.index <= as_of]
+
+        if series.empty:
+            metrics.append(
+                IndexMetrics(
+                    symbol=sym,
+                    state=IndexState.UNKNOWN,
+                    last_close=float("nan"),
+                    ma_value=float("nan"),
+                    ma_slope_pct=float("nan"),
+                    above_ma=False,
+                    ma_rising=False,
+                    n_days_ma_slope=cfg.ma_slope_days,
+                    ma_window=cfg.ma_window,
+                    data_points=0,
+                )
+            )
+            continue
+
+        m = _classify_index(sym, series, cfg)
+        metrics.append(m)
+
+    regime = _aggregate_market_regime(metrics, cfg)
+
+    if as_of is not None:
+        as_of_ts = pd.Timestamp(as_of)
+    else:
+        # as_of = latest common index date across the inputs
+        latest_dates = [
+            s.index.max()
+            for s in index_closes.values()
+            if isinstance(s, pd.Series) and not s.empty
+        ]
+        as_of_ts = max(latest_dates) if latest_dates else pd.Timestamp.utcnow()
+
+    return MarketRegimeSnapshot(
+        regime=regime,
+        as_of=as_of_ts,
+        index_metrics=metrics,
+    )
+
+
+def build_historical_regime_table(
+    index_closes: Dict[str, pd.Series],
+    vix_close: Optional[pd.Series] = None,
+    cfg: Optional[MarketRegimeConfig] = None,
+) -> pd.DataFrame:
+    """
+    Build a *daily historical* regime table for SIM/backtest.
+
+    Inputs:
+        index_closes: dict {symbol -> pd.Series of daily closes}
+                      Used for the Weinstein index regime.
+        vix_close:    optional pd.Series of VIX closes (same index type).
+                      If provided and cfg.use_vix_filter is True, we apply
+                      the same VIX gates per day as inspect() does "today".
+        cfg:          MarketRegimeConfig (index list, thresholds, etc.)
+
+    Output:
+        DataFrame indexed by date, with columns:
+
+            regime            str  ("bull" / "bear" / "neutral" / "unknown")
+            long_ok           bool (regime+VIX combined gate for new LONGS)
+            short_ok          bool (regime+VIX combined gate for new SHORTS)
+            long_ok_regime    bool (Weinstein regime-only long gate)
+            short_ok_regime   bool (Weinstein regime-only short gate)
+            long_ok_vix       bool (VIX-only long gate; True if VIX filter off)
+            short_ok_vix      bool (VIX-only short gate; True if VIX filter off)
+            vix               float (VIX close for that day, or NaN)
+
+    This is what the backtest can join on and use per-day in its loop.
+    """
+    if cfg is None:
+        cfg = MarketRegimeConfig()
+
+    # Decide which index symbols to use
+    if cfg.index_symbols:
+        symbols = [s for s in cfg.index_symbols if s in index_closes]
+    else:
+        symbols = sorted(index_closes.keys())
+
+    if not symbols:
+        # No indices → empty regime table
+        return pd.DataFrame(
+            columns=[
+                "regime",
+                "long_ok",
+                "short_ok",
+                "long_ok_regime",
+                "short_ok_regime",
+                "long_ok_vix",
+                "short_ok_vix",
+                "vix",
+            ]
+        )
+
+    # Build a common date index: intersection of all index series
+    valid_series: List[pd.Series] = []
+    for sym in symbols:
+        s = index_closes.get(sym)
+        if s is None or s.empty:
+            continue
+        valid_series.append(s.dropna())
+
+    if not valid_series:
+        return pd.DataFrame(
+            columns=[
+                "regime",
+                "long_ok",
+                "short_ok",
+                "long_ok_regime",
+                "short_ok_regime",
+                "long_ok_vix",
+                "short_ok_vix",
+                "vix",
+            ]
+        )
+
+    common_index = valid_series[0].index
+    for s in valid_series[1:]:
+        common_index = common_index.intersection(s.index)
+
+    common_index = common_index.sort_values()
+
+    # If VIX provided, align to common_index as well (for gating)
+    if vix_close is not None and not vix_close.empty:
+        vix_close = vix_close.dropna().sort_index()
+        common_index = common_index.intersection(vix_close.index)
+    else:
+        vix_close = None
+
+    rows = []
+
+    for dt in common_index:
+        # 1) compute regime from indices up to dt
+        truncated = {
+            sym: index_closes[sym].loc[:dt].dropna()
+            for sym in symbols
+            if sym in index_closes
+        }
+        snap = compute_regime_from_closes(truncated, cfg=cfg, as_of=dt)
+        regime = snap.regime
+
+        # Weinstein regime gates
+        long_ok_regime, short_ok_regime = _compute_long_short_flags(regime)
+
+        # 2) VIX gates for this day (if available)
+        vix_val = float("nan")
+        long_ok_vix = True
+        short_ok_vix = True
+
+        if cfg.use_vix_filter and vix_close is not None:
+            vix_slice = vix_close.loc[:dt]
+            if not vix_slice.empty:
+                vix_val = float(vix_slice.iloc[-1])
+                long_ok_vix = vix_val <= cfg.vix_long_max
+                short_ok_vix = vix_val >= cfg.vix_short_min
+
+        # 3) Combined gates (exactly like inspect())
+        long_ok = long_ok_regime and long_ok_vix
+        short_ok = short_ok_regime and short_ok_vix
+
+        rows.append(
+            {
+                "date": dt,
+                "regime": regime.value,
+                "long_ok": bool(long_ok),
+                "short_ok": bool(short_ok),
+                "long_ok_regime": bool(long_ok_regime),
+                "short_ok_regime": bool(short_ok_regime),
+                "long_ok_vix": bool(long_ok_vix),
+                "short_ok_vix": bool(short_ok_vix),
+                "vix": vix_val,
+            }
+        )
+
+    df = pd.DataFrame(rows).set_index("date").sort_index()
+    return df
+
+
 def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegimeSnapshot:
     """
     Main entry point.
