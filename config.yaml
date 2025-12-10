@@ -75,7 +75,7 @@ risk:
 
 # ---- Intraday / PROD knobs (long + short) ----
 intraday:
-  # Profile C – Balanced (Current): ADX 18, breadth OFF
+  # Keep intraday as your current balanced profile (C-style)
   adx_min_long: 18.0
 
   long:
@@ -115,7 +115,7 @@ intraday:
     target1_pct: 0.15              # 15% downside target
     target2_pct: 0.20              # 20% downside target
 
-  # Profile C – breadth OFF (Balanced)
+  # Breadth for intraday (still OFF)
   breadth:
     enabled: false
     ma_window: 50
@@ -188,40 +188,45 @@ formatting:
     watch: "🟡"
     avoid: "🔴"
 
-# ---- Backtest / SIM knobs (Profile E – Aggressive) ----
+# ---- Backtest / SIM knobs (Profile A – Conservative) ----
 backtest:
-  snapshot_mode: "auto"        # you're already doing auto; fine
+  snapshot_mode: "auto"        # use historical weekly snapshots where available
 
   regime:
-    use_long: true             # ✅ TURN BACK ON
-    use_short: true            # ✅ TURN BACK ON (shorts only when regime agrees)
+    use_long: true             # LONGs fully gated by Chapter 8 regime
+    use_short: false           # ❌ no structural shorts for conservative profile
 
+  # Coppock curve filters (on benchmark, e.g., SPY)
   coppock:
-    use_long: true             # ✅ TURN BACK ON
-    use_short: true            # ✅ TURN BACK ON
+    use_long: true             # LONG: require Coppock(benchmark) > 0
+    use_short: false           # SHORT side disabled for Profile A
 
+  # Profile A – breadth ON (extra safety)
   breadth:
-    enabled: false             # ok to keep off for E (aggressive)
+    enabled: true              # ✅ require broad market participation
     ma_window: 50
-    min_long: 0.50
+    min_long: 0.55             # at least 55% of names above MA50 to allow longs
 
+  # backtest logging controls
   logging:
     show_adx_skips: false
     show_breadth_skips: false
     show_coppock_skips: false
 
+  # Long-only, very selective entries
   long:
-    break_pct: 0.0035          # slightly tighter than C, still reasonable
-    vol_min: 1.20              # a bit looser than C (1.30) for aggression
-    adx_min: 16.0              # slightly below C's 18.0 → more trades
-    stop_hard: 0.20
-    trail_atr: 2.0
-    ma_guard: 0.03
+    break_pct: 0.0060          # ≈0.6% above pivot → cleaner breakouts
+    vol_min: 1.50              # require 150% of 50dma volume
+    adx_min: 20.0              # stronger trend than C (which was ~18)
+    stop_hard: 0.20            # 20% disaster stop
+    trail_atr: 2.0             # ATR-based trail
+    ma_guard: 0.03             # extra guard vs MA30 (~3%)
 
+  # Short block is defined but not used (use_short=false)
   short:
-    break_pct: 0.0050          # MORE STRICT than long – avoid casual fading
-    vol_min: 1.40              # require stronger volume to short
-    adx_min: 18.0              # keep shorts to real downtrends
-    stop_hard: 0.18            # a bit tighter disaster stop
+    break_pct: 0.0060          # conservative breakdown requirement
+    vol_min: 1.60              # very strong volume to even consider shorts
+    adx_min: 22.0              # only strongest downtrends
+    stop_hard: 0.18            # slightly tighter disaster stop
     trail_atr: 2.0
-    ma_guard: 0.04             # a bit more cushion around MA for shorts
+    ma_guard: 0.04
