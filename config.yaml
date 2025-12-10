@@ -190,45 +190,38 @@ formatting:
 
 # ---- Backtest / SIM knobs (Profile E – Aggressive) ----
 backtest:
-  # Use historical weekly snapshots when available (falls back to static if needed)
-  snapshot_mode: "auto"       # static | historical | auto
+  snapshot_mode: "auto"        # you're already doing auto; fine
 
   regime:
-    # Profile E: NO Chapter 8 regime gate → always evaluate both sides
-    use_long: false           # do NOT gate longs by regime in SIM
-    use_short: false          # do NOT gate shorts by regime in SIM
+    use_long: true             # ✅ TURN BACK ON
+    use_short: true            # ✅ TURN BACK ON (shorts only when regime agrees)
 
-  # Profile E – Coppock filters OFF (more trades allowed)
   coppock:
-    use_long: false           # LONG: do not require Coppock(benchmark) > 0
-    use_short: false          # SHORT: do not require Coppock(benchmark) < 0
+    use_long: true             # ✅ TURN BACK ON
+    use_short: true            # ✅ TURN BACK ON
 
-  # Profile E – breadth OFF (same as C)
   breadth:
-    enabled: false
+    enabled: false             # ok to keep off for E (aggressive)
     ma_window: 50
-    min_long: 0.50            # not used when enabled=false
+    min_long: 0.50
 
-  # backtest logging controls
   logging:
     show_adx_skips: false
     show_breadth_skips: false
     show_coppock_skips: false
 
-  # LONG-side SIM thresholds (more aggressive than C)
   long:
-    break_pct: 0.002          # ≈0.2% above pivot (C was 0.004)
-    vol_min: 1.10             # min full-day volume vs 50dma (C was 1.30)
-    adx_min: 15.0             # more permissive trend strength (C was 18.0)
-    stop_hard: 0.20           # 20% disaster stop
-    trail_atr: 2.0            # ATR-based trail
-    ma_guard: 0.03            # extra guard vs MA30 (~3%)
+    break_pct: 0.0035          # slightly tighter than C, still reasonable
+    vol_min: 1.20              # a bit looser than C (1.30) for aggression
+    adx_min: 16.0              # slightly below C's 18.0 → more trades
+    stop_hard: 0.20
+    trail_atr: 2.0
+    ma_guard: 0.03
 
-  # SHORT-side SIM thresholds (mirrored, more aggressive)
   short:
-    break_pct: 0.002          # ≈0.2% below pivot
-    vol_min: 1.10             # min full-day volume vs 50dma
-    adx_min: 15.0             # more permissive for shorts
-    stop_hard: 0.20           # 20% disaster stop
-    trail_atr: 2.0            # ATR-based trail
-    ma_guard: 0.03            # extra guard vs MA30 (~3%)
+    break_pct: 0.0050          # MORE STRICT than long – avoid casual fading
+    vol_min: 1.40              # require stronger volume to short
+    adx_min: 18.0              # keep shorts to real downtrends
+    stop_hard: 0.18            # a bit tighter disaster stop
+    trail_atr: 2.0
+    ma_guard: 0.04             # a bit more cushion around MA for shorts
