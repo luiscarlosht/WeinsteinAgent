@@ -24,7 +24,7 @@ Key points:
     * Long: price above MA30, RS strong, breakout > prior 50-day high,
       daily volume ≥ ~1.3× 50-day avg, ADX filter
     * Short: price below MA30, RS weak, breakdown < prior 50-day low,
-      daily volume ≥ ~1.3× 50-day avg
+      daily volume ≥ ~1.3× 50-day avg + ADX filter
 - Risk sizing:
     * Risk per trade = equity * risk_per_trade / per-share-risk
     * Stops use ATR and MA30 guard, similar to your intraday logic
@@ -192,7 +192,7 @@ WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
 #   data/weekly_snapshots/weinstein_weekly_equities_20190104_1801.csv
 WEEKLY_SNAPSHOT_DIR = "./data/weekly_snapshots"
 
-_SNAPSHOT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d2}|\d{8})")
+_SNAPSHOT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
 
 
 def newest_weekly_csv() -> str:
@@ -413,7 +413,6 @@ def build_universe(weekly_df: pd.DataFrame, side: str) -> pd.DataFrame:
     )
     df["ma30"] = pd.to_numeric(df["ma30"], errors="coerce")
     df = df.sort_values(["weekly_rank", "ticker"])
-    #log(f"{side.upper()} universe size: {len(df)} symbols.", level="info")
     return df
 
 
@@ -447,15 +446,19 @@ class Trade:
 # ---------------- Trading logic parameters ----------------
 
 # Long side — tuned more closely to production intraday thresholds
-LONG_BREAK_PCT = 0.004  # ≈0.4% above pivot breakout, matching short break magnitude
+LONG_BREAK_PCT = 0.004  # ≈0.4% above pivot breakout, default; overridden by config.backtest.long.break_pct
 
 # Short side (mirrored)
-SHORT_BREAK_PCT = 0.004  # ≈0.4% below pivot breakdown
+SHORT_BREAK_PCT = 0.004  # ≈0.4% below pivot breakdown, overridden by config.backtest.short.break_pct
 SHORT_STOP_HARD = 0.20
 SHORT_TRAIL_ATR = 2.0
 SHORT_MA_GUARD = 0.03  # extra guard above MA30 (≈3% over)
 
+# Short-side ADX gate (overridden by config.backtest.short.adx_min)
+SHORT_ADX_MIN = 22.0
+
 # Volume filters (approximate your intraday VOL_PACE_MIN 1.3×)
+# Overridden by config.backtest.long.vol_min / config.backtest.short.vol_min
 LONG_VOL_MIN = 1.30
 SHORT_VOL_MIN = 1.30
 
@@ -464,7 +467,7 @@ PIVOT_LOOKBACK_DAYS = 50  # pivot highs/lows over last ~10 weeks
 # Breadth Health filter (Advance/Decline strength)
 # Approximates "% of S&P500 above MA50" by using a breadth universe of tickers.
 BREADTH_MA_WINDOW = 50
-BREADTH_MIN_LONG = 0.60  # require 60% of breadth universe above MA50 to allow new longs
+BREADTH_MIN_LONG = 0.60  # default; overridden by config.backtest.breadth.min_long
 
 
 def _safe_float(x):
@@ -600,10 +603,10 @@ def should_enter_short(
     # Price must be below MA30
     if price > ma30_val:
         return False
-    # Breakdown under pivot low by ≈0.4%
+    # Breakdown under pivot low by SHORT_BREAK_PCT
     if price > pivot_low * (1.0 - SHORT_BREAK_PCT):
         return False
-    # Volume pace gate ~1.3× 50dma, like intraday VOL_PACE_MIN
+    # Volume pace gate vs 50dma
     if not np.isnan(vol_mult) and vol_mult < SHORT_VOL_MIN:
         return False
     return True
@@ -625,7 +628,7 @@ def should_exit_short(price: float, stop: float, ma30_val: float) -> bool:
     # 1) Stop violation
     if not np.isnan(stop) and price >= stop:
         return True
-    # 2) Extra guard: reclaimed MA30 by ~3%
+    # 2) Extra guard: reclaimed MA30 by SHORT_MA_GUARD
     if not np.isnan(ma30_val) and price >= ma30_val * (1.0 + SHORT_MA_GUARD):
         return True
     return False
@@ -1060,7 +1063,7 @@ def backtest(
                 if n_long_now >= max_long:
                     break
 
-        # SHORT entries (gated by daily regime + Coppock gate)
+        # SHORT entries (gated by daily regime + Coppock gate + ADX)
         if (
             mode in ("short", "both")
             and n_short_now < max_short
@@ -1085,6 +1088,26 @@ def backtest(
                 pivot_low = get_pivot_low(daily_df, t, dt_)
                 rs_above_ma = bool(row.get("rs_above_ma", False))
                 vol_mult = volume_vs_50dma(daily_df, t, dt_)
+
+                # Short-side ADX gate
+                adx_series = adx_cache.get(t)
+                if (
+                    adx_series is not None
+                    and not adx_series.empty
+                    and dt_ in adx_series.index
+                ):
+                    adx_val = float(adx_series.loc[dt_])
+                else:
+                    adx_val = np.nan
+
+                if not np.isnan(adx_val) and adx_val < SHORT_ADX_MIN:
+                    if show_adx_skips and not np.isnan(adx_val):
+                        log(
+                            f"[SKIP-ADX-SHORT] {t} because ADX{ADX_WINDOW}="
+                            f"{adx_val:.1f} < {SHORT_ADX_MIN:.1f} on {dt_.date()}",
+                            level="debug",
+                        )
+                    continue
 
                 if not should_enter_short(
                     price, ma_val, pivot_low, rs_above_ma, vol_mult
@@ -1320,7 +1343,7 @@ def main():
     ap.add_argument(
         "--show-adx-skips",
         action="store_true",
-        help="Log [SKIP-ADX] debug messages for long entries blocked by ADX.",
+        help="Log [SKIP-ADX] debug messages for long/short entries blocked by ADX.",
     )
 
     args = ap.parse_args()
@@ -1331,6 +1354,26 @@ def main():
     cfg = load_yaml_config(args.config)
     app_cfg = cfg.get("app", {}) or {}
     bt_cfg = cfg.get("backtest", {}) or {}
+
+    # --- Long/short thresholds from config.backtest ---
+    bt_long_cfg = bt_cfg.get("long", {}) or {}
+    bt_short_cfg = bt_cfg.get("short", {}) or {}
+
+    global LONG_BREAK_PCT, LONG_VOL_MIN
+    global SHORT_BREAK_PCT, SHORT_VOL_MIN, SHORT_STOP_HARD, SHORT_TRAIL_ATR, SHORT_MA_GUARD, SHORT_ADX_MIN, ADX_MIN
+
+    # Long side: breakout %, volume, ADX
+    LONG_BREAK_PCT = float(bt_long_cfg.get("break_pct", LONG_BREAK_PCT))
+    LONG_VOL_MIN = float(bt_long_cfg.get("vol_min", LONG_VOL_MIN))
+    ADX_MIN = float(bt_long_cfg.get("adx_min", ADX_MIN))
+
+    # Short side: breakout %, volume, ADX + risk block
+    SHORT_BREAK_PCT = float(bt_short_cfg.get("break_pct", SHORT_BREAK_PCT))
+    SHORT_VOL_MIN = float(bt_short_cfg.get("vol_min", SHORT_VOL_MIN))
+    SHORT_ADX_MIN = float(bt_short_cfg.get("adx_min", SHORT_ADX_MIN))
+    SHORT_STOP_HARD = float(bt_short_cfg.get("stop_hard", SHORT_STOP_HARD))
+    SHORT_TRAIL_ATR = float(bt_short_cfg.get("trail_atr", SHORT_TRAIL_ATR))
+    SHORT_MA_GUARD = float(bt_short_cfg.get("ma_guard", SHORT_MA_GUARD))
 
     # Benchmark: CLI wins, otherwise config, otherwise default "SPY"
     benchmark_cfg = (app_cfg.get("benchmark") or "SPY").upper()
