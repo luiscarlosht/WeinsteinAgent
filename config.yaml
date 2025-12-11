@@ -207,6 +207,20 @@ backtest:
     ma_window: 50
     min_long: 0.60             # at least 60% of names above MA50 to allow longs (more conservative)
 
+  # NEW: Market-level trend / risk filters (Weinstein-style)
+  market:
+    require_rising_ma30: true  # only trade when SPY 30-week MA is flat-to-rising
+    ma30_slope_min: 0.0        # slope >= 0 (no down-sloping MA30 for new longs)
+    vix_max: 25.0              # suppress new longs when VIX is in panic / crash mode
+
+  # NEW: Industry group filters (Stage 2 confirmation)
+  industry:
+    enabled: true              # require industry confirmation
+    require_stage2: true       # industry must be in Stage 2
+    min_stage2_frac: 0.30      # at least 30% of the group in Stage 2
+    require_rising_ma30: true  # industry 30-week MA must be flat or rising
+    require_rising_rs: true    # industry RS vs benchmark must be improving
+
   # backtest logging controls
   logging:
     show_adx_skips: false
@@ -221,6 +235,8 @@ backtest:
     stop_hard: 0.20            # 20% disaster stop
     trail_atr: 2.0             # ATR-based trail
     ma_guard: 0.03             # extra guard vs MA30 (~3%)
+    require_ma30_rising: true  # only take longs when stock MA30 is flat or rising
+    ma30_slope_min: 0.0        # slope >= 0 for the individual stock
 
   # Short block is defined but not used (use_short=false)
   short:
