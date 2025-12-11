@@ -310,11 +310,12 @@ def pick_snapshot_for_date(
 
 def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
-    Download DAILY OHLCV for tickers via yfinance, with a bit of padding
-    before start to compute ATR and MAs.
+    Download DAILY OHLCV for tickers via yfinance, with a generous padding
+    before start to compute ATR, MAs, and Coppock (needs multi-year history).
     """
     start_dt = datetime.fromisoformat(start)
-    pad_start = (start_dt - timedelta(days=120)).strftime("%Y-%m-%d")
+    # Use ~3 years of padding to safely compute 14-month ROC + 10-month WMA
+    pad_start = (start_dt - timedelta(days=3 * 365)).strftime("%Y-%m-%d")
     log(
         f"Downloading daily bars for {len(tickers)} symbols "
         f"({pad_start} → {end})...",
