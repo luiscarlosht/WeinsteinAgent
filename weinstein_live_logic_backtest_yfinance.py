@@ -75,6 +75,8 @@ Config-driven backtest behavior (Option C via config.yaml.backtest):
     * regime.use_long / regime.use_short gates
     * coppock.use_long / coppock.use_short gates
     * breadth.enabled / breadth.ma_window / breadth.min_long
+    * market.* filters (SPY MA30 slope + VIX cap)
+    * industry.* filters (per-group Stage 2 + slopes)
 
 Config-driven ADX logging noise:
     * backtest.logging.show_adx_skips: true/false
@@ -102,7 +104,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Mapping
 
 import numpy as np
 import pandas as pd
@@ -563,7 +565,7 @@ def compute_coppock_from_daily(daily_df: pd.DataFrame, benchmark: str) -> pd.Ser
         return pd.Series(dtype="float64")
 
     # Monthly closes (month-end)
-    monthly_close = close.resample("M").last()
+    monthly_close = close.resample("ME").last()
 
     # 14-month and 11-month ROC (%)
     roc_14 = monthly_close.pct_change(14) * 100.0
@@ -586,6 +588,164 @@ def compute_coppock_from_daily(daily_df: pd.DataFrame, benchmark: str) -> pd.Ser
         level="info",
     )
     return coppock_daily
+
+
+# ---------------- Market / industry filter helpers ----------------
+
+
+def build_market_ok_series(
+    daily_df: pd.DataFrame,
+    benchmark: str,
+    vix_symbol: Optional[str],
+    market_cfg: Mapping,
+) -> Optional[pd.Series]:
+    """
+    Construct a per-day boolean mask for "market is OK for NEW longs",
+    based on:
+
+      backtest.market.require_rising_ma30 (bool)
+      backtest.market.ma30_slope_min     (float, default 0.0)
+      backtest.market.vix_max            (float, optional)
+
+    - MA30 rising is approximated with a 150-day MA on benchmark daily closes.
+    - Slope is last_ma - prev_ma (1-day difference); compared to ma30_slope_min.
+    - VIX cap blocks days where VIX close > vix_max.
+    """
+    require_ma = bool(market_cfg.get("require_rising_ma30", False))
+    ma30_slope_min = float(market_cfg.get("ma30_slope_min", 0.0))
+    vix_max_raw = market_cfg.get("vix_max", None)
+    vix_max = float(vix_max_raw) if vix_max_raw is not None else None
+
+    if not (require_ma or vix_max is not None):
+        # No market-level gates configured
+        return None
+
+    if not isinstance(daily_df.columns, pd.MultiIndex) or "Close" not in daily_df.columns.levels[0]:
+        log("Market filter: daily_df not in expected MultiIndex Close panel; disabling market gates.", level="warn")
+        return None
+
+    close_panel = daily_df["Close"]
+    idx = close_panel.index
+
+    # --- Benchmark MA30-slope filter ---
+    if benchmark in close_panel.columns and require_ma:
+        bench_close = close_panel[benchmark].dropna()
+        ma = bench_close.rolling(window=150, min_periods=75).mean()
+        # Slope = last - prev
+        slope = ma - ma.shift(1)
+        ma_ok = slope >= ma30_slope_min
+    else:
+        ma_ok = pd.Series(True, index=idx)
+
+    # --- VIX cap filter ---
+    if vix_max is not None and vix_symbol and vix_symbol in close_panel.columns:
+        vix_close = close_panel[vix_symbol].dropna()
+        vix_ok = vix_close <= vix_max
+    else:
+        vix_ok = pd.Series(True, index=idx)
+
+    # Union on index, default True when missing
+    market_ok = pd.Series(True, index=idx)
+    market_ok.loc[ma_ok.index] &= ma_ok
+    market_ok.loc[vix_ok.index] &= vix_ok
+
+    log(
+        f"Market filter active: require_ma30_rising={require_ma}, ma30_slope_min={ma30_slope_min}, "
+        f"vix_max={vix_max}.",
+        level="info",
+    )
+    return market_ok
+
+
+def _row_pick_first(row: Mapping, candidates: List[str]) -> Optional[float]:
+    """
+    Look through possible column names and return the first non-NaN value.
+    Used for industry filters from weekly snapshots.
+    """
+    for col in candidates:
+        if col in row and not pd.isna(row[col]):
+            try:
+                return float(row[col])
+            except Exception:
+                continue
+    return None
+
+
+def industry_ok_from_snapshot(snapshot_row: Mapping, industry_cfg: Mapping) -> bool:
+    """
+    Industry / group confirmation filter based on a weekly snapshot row and
+    config.backtest.industry, which may contain:
+
+      enabled: bool
+      require_stage2: bool
+      min_stage2_frac: float
+      require_rising_ma30: bool
+      require_rising_rs: bool
+
+    Column candidates (adjust if your weekly snapshots use different names):
+
+      Stage:
+        - 'industry_stage'
+        - 'group_stage'
+        - 'sector_stage'
+
+      % in Stage 2:
+        - 'industry_stage2_frac'
+        - 'group_stage2_frac'
+
+      MA30 slope:
+        - 'industry_ma30_slope_per_wk'
+        - 'group_ma30_slope_per_wk'
+
+      RS slope:
+        - 'industry_rs_slope_per_wk'
+        - 'group_rs_slope_per_wk'
+    """
+    if not bool(industry_cfg.get("enabled", False)):
+        return True
+
+    require_stage2 = bool(industry_cfg.get("require_stage2", False))
+    min_stage2_frac = float(industry_cfg.get("min_stage2_frac", 0.0))
+    require_rising_ma30 = bool(industry_cfg.get("require_rising_ma30", False))
+    require_rising_rs = bool(industry_cfg.get("require_rising_rs", False))
+
+    # --- Stage 2 requirement ---
+    if require_stage2:
+        stage_val = None
+        for col in ["industry_stage", "group_stage", "sector_stage"]:
+            if col in snapshot_row and not pd.isna(snapshot_row[col]):
+                stage_val = str(snapshot_row[col])
+                break
+        if stage_val is not None:
+            if "Stage 2" not in stage_val:
+                return False
+        # If we have no stage info, don't block.
+
+    # --- Fraction of group in Stage 2 ---
+    if min_stage2_frac > 0.0:
+        frac = _row_pick_first(snapshot_row, ["industry_stage2_frac", "group_stage2_frac"])
+        if frac is not None and frac < min_stage2_frac:
+            return False
+
+    # --- Industry MA30 slope ---
+    if require_rising_ma30:
+        slope_ma = _row_pick_first(
+            snapshot_row,
+            ["industry_ma30_slope_per_wk", "group_ma30_slope_per_wk"],
+        )
+        if slope_ma is not None and slope_ma < 0.0:
+            return False
+
+    # --- Industry RS slope vs benchmark ---
+    if require_rising_rs:
+        slope_rs = _row_pick_first(
+            snapshot_row,
+            ["industry_rs_slope_per_wk", "group_rs_slope_per_wk"],
+        )
+        if slope_rs is not None and slope_rs < 0.0:
+            return False
+
+    return True
 
 
 # ---------------- Entry / exit rules: SHORT side (local for now) ----------------
@@ -673,6 +833,9 @@ def backtest(
     show_breadth_skips: bool = False,
     show_coppock_skips: bool = False,
     long_logic_cfg: Optional[Dict[str, object]] = None,
+    market_cfg: Optional[Dict[str, object]] = None,
+    industry_cfg: Optional[Dict[str, object]] = None,
+    vix_symbol: Optional[str] = None,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", "both", or "none"
@@ -699,14 +862,22 @@ def backtest(
     breadth_enabled:
       - if False, breadth gate is disabled regardless of BREADTH_* constants.
 
-    show_*_skips:
-      - ADX / breadth / Coppock skip logging toggles.
+    market_cfg:
+      - backtest.market dict, used for MA30 slope + VIX cap on the whole market.
+
+    industry_cfg:
+      - backtest.industry dict, used for per-group confirmation from snapshots.
 
     long_logic_cfg:
       - config.backtest.long dict, used here for MA30 slope filters (and any
         future shared long-side filters that should match PROD).
+
+    show_*_skips:
+      - ADX / breadth / Coppock skip logging toggles.
     """
     long_logic_cfg = long_logic_cfg or {}
+    market_cfg = market_cfg or {}
+    industry_cfg = industry_cfg or {}
 
     use_snapshots = bool(weekly_snapshots)
 
@@ -751,6 +922,16 @@ def backtest(
     if coppock_series is None or coppock_series.empty:
         log("Coppock series is empty; Coppock gates will be effectively disabled.", level="warn")
         coppock_series = None
+
+    # ----- Market-wide filter (SPY MA30 slope + VIX cap) -----
+    market_ok_series = None
+    if market_cfg:
+        market_ok_series = build_market_ok_series(
+            daily_df=daily_df,
+            benchmark=benchmark,
+            vix_symbol=vix_symbol,
+            market_cfg=market_cfg,
+        )
 
     all_dates = daily_df.index
     all_dates = [d for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
@@ -885,6 +1066,13 @@ def backtest(
             if auto_mode or use_regime_short:
                 short_regime_ok_today = r_short_ok
 
+        # Market-wide filter (SPY MA30 slope + VIX cap) for NEW longs
+        market_ok_today = True
+        if market_ok_series is not None and dt_ in market_ok_series.index:
+            val = market_ok_series.loc[dt_]
+            if not pd.isna(val):
+                market_ok_today = bool(val)
+
         # Compute breadth gate for this day (for new LONG entries)
         breadth_ok = True
         breadth_val = np.nan
@@ -981,10 +1169,11 @@ def backtest(
         n_long_now = sum(1 for p in portfolio.positions.values() if p.side == "long")
         n_short_now = sum(1 for p in portfolio.positions.values() if p.side == "short")
 
-        # LONG entries (gated by breadth_ok + daily regime + Coppock gate)
+        # LONG entries (gated by market_ok + breadth_ok + daily regime + Coppock gate)
         if (
             mode in ("long", "both")
             and n_long_now < max_long
+            and market_ok_today
             and breadth_ok
             and long_regime_ok_today
             and coppock_long_ok
@@ -997,6 +1186,10 @@ def backtest(
 
                 # MA30 slope / trend filter from weekly snapshot
                 if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
+                    continue
+
+                # Industry / group confirmation (Stage 2, group slopes)
+                if not industry_ok_from_snapshot(row, industry_cfg):
                     continue
 
                 price = price_today.get(t, np.nan)
@@ -1368,6 +1561,8 @@ def main():
     # --- Long/short thresholds from config.backtest ---
     bt_long_cfg = bt_cfg.get("long", {}) or {}
     bt_short_cfg = bt_cfg.get("short", {}) or {}
+    market_cfg = bt_cfg.get("market", {}) or {}
+    industry_cfg = bt_cfg.get("industry", {}) or {}
 
     global LONG_BREAK_PCT, LONG_VOL_MIN
     global SHORT_BREAK_PCT, SHORT_VOL_MIN, SHORT_STOP_HARD, SHORT_TRAIL_ATR, SHORT_MA_GUARD, SHORT_ADX_MIN, ADX_MIN
@@ -1610,6 +1805,9 @@ def main():
         show_breadth_skips=show_breadth_skips_effective,
         show_coppock_skips=show_coppock_skips_effective,
         long_logic_cfg=bt_long_cfg,
+        market_cfg=market_cfg,
+        industry_cfg=industry_cfg,
+        vix_symbol=vix_symbol,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
