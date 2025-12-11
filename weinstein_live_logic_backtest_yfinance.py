@@ -811,11 +811,11 @@ def backtest(
                     current_long_universe = build_universe(wdf, side="long")
                     current_short_universe = build_universe(wdf, side="short")
                     current_snapshot_date = snap_date
-                    log(
-                        f"Using weekly snapshot as of {snap_date} for {dt_.date()} — "
-                        f"long_univ={len(current_long_universe)}, short_univ={len(current_short_universe)}",
-                        level="debug",
-                    )
+                    #log(
+                    #    f"Using weekly snapshot as of {snap_date} for {dt_.date()} — "
+                    #    f"long_univ={len(current_long_universe)}, short_univ={len(current_short_universe)}",
+                    #    level="debug",
+                    #)
                 long_universe = (
                     current_long_universe
                     if current_long_universe is not None
