@@ -130,6 +130,9 @@ from weinstein_long_core import (
     should_exit_long,
 )
 
+# MA30 slope + other shared filters
+from weinstein_filters import stock_ma30_slope_ok_from_snapshot
+
 # Chapter 8 + VIX regime — now with historical helpers for SIM
 from market_regime import (
     MarketRegimeConfig,
@@ -669,6 +672,7 @@ def backtest(
     show_adx_skips: bool = False,
     show_breadth_skips: bool = False,
     show_coppock_skips: bool = False,
+    long_logic_cfg: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """
     mode: "long", "short", "both", or "none"
@@ -697,7 +701,13 @@ def backtest(
 
     show_*_skips:
       - ADX / breadth / Coppock skip logging toggles.
+
+    long_logic_cfg:
+      - config.backtest.long dict, used here for MA30 slope filters (and any
+        future shared long-side filters that should match PROD).
     """
+    long_logic_cfg = long_logic_cfg or {}
+
     use_snapshots = bool(weekly_snapshots)
 
     # Precompute static universes for fallback mode
@@ -811,11 +821,6 @@ def backtest(
                     current_long_universe = build_universe(wdf, side="long")
                     current_short_universe = build_universe(wdf, side="short")
                     current_snapshot_date = snap_date
-                    #log(
-                    #    f"Using weekly snapshot as of {snap_date} for {dt_.date()} — "
-                    #    f"long_univ={len(current_long_universe)}, short_univ={len(current_short_universe)}",
-                    #    level="debug",
-                    #)
                 long_universe = (
                     current_long_universe
                     if current_long_universe is not None
@@ -989,6 +994,11 @@ def backtest(
                 pos_key = f"{t}_long"
                 if pos_key in portfolio.positions:
                     continue
+
+                # MA30 slope / trend filter from weekly snapshot
+                if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
+                    continue
+
                 price = price_today.get(t, np.nan)
                 if np.isnan(price):
                     continue
@@ -1599,6 +1609,7 @@ def main():
         show_adx_skips=show_adx_skips_effective,
         show_breadth_skips=show_breadth_skips_effective,
         show_coppock_skips=show_coppock_skips_effective,
+        long_logic_cfg=bt_long_cfg,
     )
 
     portfolio: Portfolio = result["portfolio"]  # type: ignore
