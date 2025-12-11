@@ -5,7 +5,7 @@ app:
   include_charts: true
   ordering:
     account_size: 5000        # used only for sizing; not sent anywhere
-    risk_per_trade_pct: 0.01  # 1% of account per trade
+    risk_per_trade_pct: 0.005 # 0.5% of account per trade (more conservative)
     take_profit_R: [1.0, 2.0] # targets in R multiples
     round_qty_to: 1           # equities: 1 share; crypto: set to 0.000001
 
@@ -205,7 +205,7 @@ backtest:
   breadth:
     enabled: true              # ✅ require broad market participation
     ma_window: 50
-    min_long: 0.55             # at least 55% of names above MA50 to allow longs
+    min_long: 0.60             # at least 60% of names above MA50 to allow longs (more conservative)
 
   # backtest logging controls
   logging:
