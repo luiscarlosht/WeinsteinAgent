@@ -3,13 +3,16 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-Full restored version with:
-- Complete backtest engine
-- Market regime filters
-- Coppock filters
-- Breadth filters
-- MA30 slope filters
-- ✅ Industry filters (single source of truth)
+Fixed version of your pasted file:
+- main() parses CLI args and calls backtest()
+- loads weekly report and/or historical snapshots (snapshot-mode)
+- downloads daily bars via yfinance
+- fixes ATR (True Range, uses prev close)
+- ATR is time-varying (series per date), not a single constant
+- adds basic exits + trade log so it behaves like a backtest
+- ✅ Industry filters (single source of truth) remain wired:
+    enrich_with_industry_and_stats(...)
+    industry_ok_from_row(...)
 """
 
 import argparse
@@ -147,9 +150,9 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
     if not os.path.isdir(snapshot_dir):
         return []
 
-    out = []
+    out: List[Tuple[date, pd.DataFrame]] = []
     for fname in os.listdir(snapshot_dir):
-        if not fname.startswith(WEEKLY_FILE_PREFIX):
+        if not (fname.startswith(WEEKLY_FILE_PREFIX) and fname.endswith(".csv")):
             continue
         d = _parse_snapshot_date_from_name(fname)
         if not d:
@@ -158,6 +161,8 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
         out.append((d, df))
 
     out.sort(key=lambda x: x[0])
+    if out:
+        log(f"Loaded {len(out)} weekly snapshots ({out[0][0]} → {out[-1][0]}).", level="info")
     return out
 
 
@@ -175,6 +180,67 @@ def pick_snapshot_for_date(
 
 
 # =========================
+# DAILY DATA HELPERS
+# =========================
+
+def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
+    """
+    Download daily OHLCV using yfinance.
+    Adds padding before start so rolling indicators have enough history.
+    """
+    start_dt = datetime.fromisoformat(start)
+    pad_start = (start_dt - timedelta(days=365)).strftime("%Y-%m-%d")
+
+    log(f"Downloading daily bars for {len(tickers)} tickers ({pad_start} → {end})...", level="step")
+    df = yf.download(
+        tickers=sorted(set(tickers)),
+        start=pad_start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+    )
+    if df is None or df.empty:
+        raise RuntimeError("No daily data returned from yfinance.")
+
+    # Ensure MultiIndex columns: (field, ticker)
+    if not isinstance(df.columns, pd.MultiIndex):
+        # single-ticker edge case
+        df.columns = pd.MultiIndex.from_product([df.columns, ["SINGLE"]])
+
+    log("Daily download complete.", level="ok")
+    return df
+
+
+def get_panel(daily_df: pd.DataFrame, field: str, ticker: str) -> pd.Series:
+    try:
+        return daily_df[(field, ticker)].dropna()
+    except Exception:
+        return pd.Series(dtype="float64")
+
+
+def compute_atr_series_from_ohlc(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    n: int = 14
+) -> pd.Series:
+    """
+    ATR using True Range:
+      TR = max(High-Low, abs(High-prevClose), abs(Low-prevClose))
+    ATR = SMA(TR, n)
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1
+    ).max(axis=1)
+    atr = tr.rolling(n, min_periods=n).mean()
+    return atr
+
+
+# =========================
 # BACKTEST DATA STRUCTURES
 # =========================
 
@@ -186,15 +252,15 @@ class Position:
     entry_price: float
     stop: float
     atr: float
-    opened: datetime
+    opened: pd.Timestamp
 
 
 @dataclass
 class Trade:
     ticker: str
     side: str
-    entry_date: datetime
-    exit_date: datetime
+    entry_date: pd.Timestamp
+    exit_date: pd.Timestamp
     entry_price: float
     exit_price: float
     qty: int
@@ -224,10 +290,11 @@ def backtest(
     industry_cfg: Mapping,
 ):
 
-    industry_filter_cfg = IndustryFilterConfig(**industry_cfg)
+    # --- industry filter config ---
+    industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
 
-    # Enrich weekly data
-    if weekly_df is not None:
+    # Enrich weekly universe / snapshots with industry stats
+    if weekly_df is not None and not weekly_df.empty:
         weekly_df = enrich_with_industry_and_stats(weekly_df, cfg=industry_filter_cfg)
 
     if weekly_snapshots:
@@ -236,86 +303,168 @@ def backtest(
             for d, df in weekly_snapshots
         ]
 
-    portfolio_cash = capital
-    positions: Dict[str, Position] = {}
-    trades: List[Trade] = []
-
-    all_dates = daily_df.index
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
 
-    ma_cache = {
-        t: daily_df[("Close", t)].rolling(30).mean()
-        for t in universe_tickers
-        if ("Close", t) in daily_df.columns
-    }
+    # Portfolio state
+    portfolio_cash = float(capital)
+    positions: Dict[str, Position] = {}
+    trades: List[Trade] = []
 
-    atr_cache = {
-        t: daily_df[("High", t)]
-            .combine(daily_df[("Low", t)], lambda h, l: h - l)
-            .rolling(14).mean().iloc[-1]
-        for t in universe_tickers
-        if ("High", t) in daily_df.columns
-    }
+    # Precompute MA30 + ATR series per ticker (time-varying)
+    ma_cache: Dict[str, pd.Series] = {}
+    atr_series_cache: Dict[str, pd.Series] = {}
 
+    for t in universe_tickers:
+        close = get_panel(daily_df, "Close", t)
+        high = get_panel(daily_df, "High", t)
+        low = get_panel(daily_df, "Low", t)
+
+        if close.empty or high.empty or low.empty:
+            continue
+
+        ma_cache[t] = close.rolling(30, min_periods=30).mean()
+        atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
+
+    # Long params (kept, even if your trimmed entry loop isn't using check_long_entry yet)
     long_params = LongEntryParams(
-        min_break_pct=long_logic_cfg.get("break_pct", 0.004),
+        min_break_pct=float(long_logic_cfg.get("break_pct", 0.004)),
         dist_above_ma_min=0.0,
-        vol_min=long_logic_cfg.get("vol_min", 1.3),
-        adx_min=long_logic_cfg.get("adx_min", ADX_MIN),
+        vol_min=float(long_logic_cfg.get("vol_min", 1.3)),
+        adx_min=float(long_logic_cfg.get("adx_min", ADX_MIN)),
     )
+
+    # Use Close panel index as our date set
+    all_dates = daily_df.index
+    all_dates = [pd.Timestamp(d) for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
 
     for dt in all_dates:
         if dt < start_dt or dt > end_dt:
             continue
 
-        snap = (
-            pick_snapshot_for_date(weekly_snapshots, dt)
-            if weekly_snapshots
-            else None
-        )
+        # Pick universe for this date
+        snap = pick_snapshot_for_date(weekly_snapshots, dt) if weekly_snapshots else None
         universe = snap[1] if snap else weekly_df
-        if universe is None:
+        if universe is None or universe.empty:
+            continue
+
+        # -----------------
+        # EXITS (basic)
+        # -----------------
+        to_close: List[str] = []
+        for key, pos in positions.items():
+            t = pos.ticker
+            # Need today's price + MA30
+            if (("Close", t) not in daily_df.columns) or (t not in ma_cache):
+                continue
+            if dt not in ma_cache[t].index:
+                continue
+
+            price = daily_df.loc[dt, ("Close", t)]
+            if pd.isna(price):
+                continue
+            ma_val = ma_cache[t].loc[dt]
+
+            if should_exit_long(float(price), float(pos.stop), float(ma_val) if not pd.isna(ma_val) else np.nan):
+                exit_price = float(price)
+                pnl = pos.qty * (exit_price - pos.entry_price)
+                pnl_pct = pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
+                portfolio_cash += pnl
+
+                trades.append(
+                    Trade(
+                        ticker=t,
+                        side="long",
+                        entry_date=pos.opened,
+                        exit_date=dt,
+                        entry_price=pos.entry_price,
+                        exit_price=exit_price,
+                        qty=pos.qty,
+                        pnl=pnl,
+                        pnl_pct=pnl_pct,
+                    )
+                )
+                to_close.append(key)
+
+        for key in to_close:
+            del positions[key]
+
+        # -----------------
+        # ENTRIES (trimmed)
+        # -----------------
+        if mode not in ("long", "both", "auto"):
+            continue
+
+        n_long_now = sum(1 for p in positions.values() if p.side == "long")
+        if n_long_now >= max_long:
             continue
 
         for _, row in universe.iterrows():
-            t = row["ticker"]
-            if f"{t}_long" in positions:
+            if n_long_now >= max_long:
+                break
+
+            t = str(row.get("ticker", "")).upper().strip()
+            if not t:
                 continue
 
+            pos_key = f"{t}_long"
+            if pos_key in positions:
+                continue
+
+            # Weekly MA30 slope filter
             if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
                 continue
 
-            # ✅ INDUSTRY FILTER (THIS IS THE CRITICAL LINE)
+            # ✅ Industry filter (single source of truth)
             if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                 continue
 
+            # Need today's Close + MA + ATR
             if ("Close", t) not in daily_df.columns:
                 continue
+            if t not in ma_cache or t not in atr_series_cache:
+                continue
+            if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
+                continue
 
-            price = float(daily_df.loc[dt, ("Close", t)])
+            price = daily_df.loc[dt, ("Close", t)]
             ma_val = ma_cache[t].loc[dt]
-            atr = atr_cache.get(t, np.nan)
-            stop = long_stop_level(price, atr, ma_val)
+            atr_val = atr_series_cache[t].loc[dt]
 
-            risk_amt = portfolio_cash * risk_per_trade
-            per_share_risk = price - stop
+            if pd.isna(price) or pd.isna(ma_val) or pd.isna(atr_val):
+                continue
+
+            price_f = float(price)
+            ma_f = float(ma_val)
+            atr_f = float(atr_val)
+
+            # Must be above MA30 for a basic long (keeps it sane)
+            if price_f <= ma_f:
+                continue
+
+            stop = long_stop_level(price_f, atr_f, ma_f)
+            if np.isnan(stop) or stop >= price_f:
+                continue
+
+            risk_amt = portfolio_cash * float(risk_per_trade)
+            per_share_risk = price_f - float(stop)
             if per_share_risk <= 0:
                 continue
 
-            qty = int(risk_amt / per_share_risk)
+            qty = int(math.floor(risk_amt / per_share_risk))
             if qty <= 0:
                 continue
 
-            positions[f"{t}_long"] = Position(
+            positions[pos_key] = Position(
                 ticker=t,
                 side="long",
                 qty=qty,
-                entry_price=price,
-                stop=stop,
-                atr=atr,
-                opened=dt,
+                entry_price=price_f,
+                stop=float(stop),
+                atr=atr_f,
+                opened=pd.Timestamp(dt),
             )
+            n_long_now += 1
 
     return {
         "positions": positions,
@@ -329,9 +478,28 @@ def backtest(
 # =========================
 
 def main():
-    cfg = load_yaml_config("./config.yaml")
+    global VERBOSE
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", type=str, required=True, help="YYYY-MM-DD")
+    ap.add_argument("--end", type=str, required=True, help="YYYY-MM-DD")
+    ap.add_argument("--mode", type=str, default="auto", choices=["long", "both", "auto", "none"])
+    ap.add_argument("--capital", type=float, default=10000.0)
+    ap.add_argument("--risk-per-trade", type=float, default=0.01)
+    ap.add_argument("--max-long", type=int, default=10)
+    ap.add_argument("--snapshot-mode", type=str, choices=["static", "historical", "auto"], default="auto")
+    ap.add_argument("--config", type=str, default="./config.yaml")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    VERBOSE = not args.quiet
+
+    cfg = load_yaml_config(args.config)
+    app_cfg = cfg.get("app", {}) or {}
     bt_cfg = cfg.get("backtest", {}) or {}
 
+    bt_long_cfg = bt_cfg.get("long", {}) or {}
+    market_cfg = bt_cfg.get("market", {}) or {}
     industry_cfg = bt_cfg.get("industry", {}) or {}
 
     log(
@@ -340,7 +508,69 @@ def main():
         level="info",
     )
 
-    # (CLI parsing omitted for brevity — unchanged from your repo)
+    # -------- Universe selection (static / historical / auto) --------
+    weekly_df: Optional[pd.DataFrame] = None
+    weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
+    all_tickers: set[str] = set()
+
+    if args.snapshot_mode == "historical":
+        weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
+        if not weekly_snapshots:
+            raise SystemExit("snapshot_mode=historical but no snapshots found.")
+        for _, df in weekly_snapshots:
+            if "ticker" in df.columns:
+                all_tickers.update(df["ticker"].astype(str).str.upper())
+
+    elif args.snapshot_mode == "auto":
+        tmp = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
+        if tmp:
+            weekly_snapshots = tmp
+            for _, df in weekly_snapshots:
+                if "ticker" in df.columns:
+                    all_tickers.update(df["ticker"].astype(str).str.upper())
+            log(f"[auto] Using snapshots (unique tickers={len(all_tickers)}).", level="info")
+        else:
+            weekly_df = load_weekly_report()
+            all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
+            log(f"[auto] No snapshots; using latest weekly (tickers={len(all_tickers)}).", level="info")
+
+    else:
+        weekly_df = load_weekly_report()
+        all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
+        log(f"snapshot_mode=static: tickers={len(all_tickers)}.", level="info")
+
+    if not all_tickers:
+        raise SystemExit("No tickers found in weekly universe.")
+
+    # Download daily bars
+    daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
+
+    # NOTE: This trimmed file does not build regime_table / coppock / breadth
+    # (your pasted version didn't include the full engine). Keep placeholder:
+    regime_table = None
+
+    result = backtest(
+        daily_df=daily_df,
+        start=args.start,
+        end=args.end,
+        capital=args.capital,
+        risk_per_trade=args.risk_per_trade,
+        max_long=args.max_long,
+        mode=args.mode,
+        universe_tickers=sorted(all_tickers),
+        weekly_df=weekly_df,
+        weekly_snapshots=weekly_snapshots,
+        regime_table=regime_table,
+        long_logic_cfg=bt_long_cfg,
+        market_cfg=market_cfg,
+        industry_cfg=industry_cfg,
+    )
+
+    log(
+        f"Done. Open positions={len(result['positions'])}, trades={len(result['trades'])}, "
+        f"final_equity=${result['final_equity']:,.2f}",
+        level="ok",
+    )
 
 
 if __name__ == "__main__":
