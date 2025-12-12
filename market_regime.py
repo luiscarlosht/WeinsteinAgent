@@ -4,7 +4,8 @@
 """
 market_regime.py
 
-Weinstein Chapter 8 style market regime filter + VIX regime filter (v2).
+Weinstein Chapter 8 style market regime filter + VIX regime filter (v2)
++ Fast-crash LONG block (v3).
 
 Goal:
   - Use the behavior of the major indices vs. their 200-day moving averages
@@ -12,7 +13,8 @@ Goal:
   - Add a VIX-based volatility filter to prevent:
         * New LONGS when volatility is too high
         * New SHORTS when volatility is too low
-  - This is a coarse "market is in gear or not" filter, not a stock-selection tool.
+  - Add a "fast crash" guard to block NEW longs during violent drawdowns
+    (e.g. COVID-style air pocket), even if the 200d-MA regime is still neutral.
 
 Core Weinstein-style ideas (Chapter 8, adapted for automation):
   - Look at major market averages (e.g. S&P 500, Nasdaq, Dow).
@@ -26,11 +28,18 @@ VIX Regime Filter (v2):
   - Download VIX (^VIX) daily closes.
   - Apply simple hard thresholds:
 
-      * NO new longs if VIX > 22
-      * NO new shorts if VIX < 15
+      * NO new longs if VIX > vix_long_max
+      * NO new shorts if VIX < vix_short_min
 
-  - In “normal / good” years VIX spends a lot of time < 20, so
-    this mainly filters out high-volatility chop and low-vol short traps.
+Fast crash guard (v3):
+  - Optionally detect a rapid drawdown on a primary index (default: ^GSPC):
+        * If primary index drops by >= fast_crash_drop_pct
+          over the last fast_crash_lookback_days trading days,
+          then we force "no new longs" at the regime layer:
+              long_ok_regime = False
+    This is applied both:
+      - Live (inspect()/detect_market_regime)
+      - Backtest (build_historical_regime_table)
 
 We implement:
   - Download recent daily data for the chosen indices via yfinance.
@@ -38,6 +47,7 @@ We implement:
   - Classify each index as BULLISH / BEARISH / NEUTRAL.
   - Aggregate to a single market regime: BULL, BEAR, NEUTRAL, UNKNOWN.
   - Download VIX, compute last close, and derive VIX long/short gates.
+  - Detect fast crash from primary index closes.
 
 Tiny helper for intraday / short watchers
 -----------------------------------------
@@ -53,9 +63,10 @@ about all the internals:
 
 The final long_ok / short_ok are:
 
-  1) Weinstein regime gates:
+  1) Weinstein regime gates (+ fast crash override):
         - LONGS:
-            * Allowed in BULL and NEUTRAL.
+            * Allowed in BULL and NEUTRAL,
+              BUT blocked if fast_crash flag is True.
         - SHORTS:
             * Allowed ONLY in BEAR.
         - UNKNOWN:
@@ -63,9 +74,9 @@ The final long_ok / short_ok are:
 
   2) AND VIX gates:
         - LONGS:
-            * Allowed only if VIX <= 22
+            * Allowed only if VIX <= vix_long_max
         - SHORTS:
-            * Allowed only if VIX >= 15
+            * Allowed only if VIX >= vix_short_min
 
 So:
     long_ok  = long_ok_from_regime  AND long_ok_from_vix
@@ -163,10 +174,22 @@ class MarketRegimeConfig:
     # Min VIX to allow new shorts. If VIX < vix_short_min → block new shorts.
     vix_short_min: float = 12.0
 
+    # ── Fast crash detection (COVID-style air pockets) ─────────────
+    # If enabled, detect rapid percentage drop on a primary index
+    # over a short lookback and hard-block new longs at the regime layer.
+    fast_crash_enabled: bool = True
+    fast_crash_lookback_days: int = 10
+    fast_crash_drop_pct: float = 0.10  # 10% drop over lookback window
+    fast_crash_primary_index: Optional[str] = None
+
     def __post_init__(self):
         if self.index_symbols is None:
             # Default major US indices: S&P 500, Nasdaq-100, Dow, Russell 2000
             self.index_symbols = ["^GSPC", "^NDX", "^DJI", "^RUT"]
+
+        # Default primary index for fast crash detection: first index symbol
+        if self.fast_crash_primary_index is None and self.index_symbols:
+            self.fast_crash_primary_index = self.index_symbols[0]
 
 
 @dataclass
@@ -174,12 +197,14 @@ class MarketRegimeSnapshot:
     regime: MarketRegime
     as_of: pd.Timestamp
     index_metrics: List[IndexMetrics]
+    fast_crash: bool = False
 
     def to_dict(self) -> Dict:
         return {
             "regime": self.regime.value,
             "as_of": self.as_of.isoformat(),
             "indices": [asdict(m) for m in self.index_metrics],
+            "fast_crash": bool(self.fast_crash),
         }
 
 
@@ -325,6 +350,52 @@ def _aggregate_market_regime(metrics: List[IndexMetrics], cfg: MarketRegimeConfi
     return MarketRegime.NEUTRAL
 
 
+def _detect_fast_crash(
+    index_closes: Dict[str, pd.Series],
+    cfg: MarketRegimeConfig,
+    *,
+    as_of: Optional[pd.Timestamp] = None,
+) -> bool:
+    """
+    Detect a rapid "air pocket" style drawdown on the primary index.
+
+    Logic (when enabled):
+      - Pick cfg.fast_crash_primary_index (e.g. ^GSPC).
+      - Take closes up to `as_of` (or full series if None).
+      - Look at last N+1 points (N = fast_crash_lookback_days).
+      - If pct change from first to last <= -fast_crash_drop_pct → True.
+
+    This is intentionally simple and only used to *block new longs*
+    when the market is in a sudden downdraft.
+    """
+    if not cfg.fast_crash_enabled:
+        return False
+
+    primary = cfg.fast_crash_primary_index
+    if not primary:
+        return False
+
+    series = index_closes.get(primary)
+    if series is None or series.empty:
+        return False
+
+    s = series.sort_index()
+    if as_of is not None:
+        s = s[s.index <= as_of]
+    if len(s) < cfg.fast_crash_lookback_days + 1:
+        return False
+
+    window = int(cfg.fast_crash_lookback_days)
+    recent = s.iloc[-(window + 1):]
+    start = float(recent.iloc[0])
+    end = float(recent.iloc[-1])
+    if start <= 0:
+        return False
+
+    drop = (end / start) - 1.0
+    return drop <= -float(cfg.fast_crash_drop_pct)
+
+
 # ─────────────────────────────
 # BACKTEST / SIM HELPERS (NO YFINANCE)
 # ─────────────────────────────
@@ -408,6 +479,9 @@ def compute_regime_from_closes(
 
     regime = _aggregate_market_regime(metrics, cfg)
 
+    # Fast crash flag for this snapshot (primary index only)
+    fast_crash = _detect_fast_crash(index_closes, cfg, as_of=as_of)
+
     if as_of is not None:
         as_of_ts = pd.Timestamp(as_of)
     else:
@@ -423,6 +497,7 @@ def compute_regime_from_closes(
         regime=regime,
         as_of=as_of_ts,
         index_metrics=metrics,
+        fast_crash=fast_crash,
     )
 
 
@@ -448,11 +523,12 @@ def build_historical_regime_table(
             regime            str  ("bull" / "bear" / "neutral" / "unknown")
             long_ok           bool (regime+VIX combined gate for new LONGS)
             short_ok          bool (regime+VIX combined gate for new SHORTS)
-            long_ok_regime    bool (Weinstein regime-only long gate)
+            long_ok_regime    bool (Weinstein regime-only long gate, incl. fast crash override)
             short_ok_regime   bool (Weinstein regime-only short gate)
             long_ok_vix       bool (VIX-only long gate; True if VIX filter off)
             short_ok_vix      bool (VIX-only short gate; True if VIX filter off)
             vix               float (VIX close for that day, or NaN)
+            fast_crash        bool  (True when primary index drawdown triggers guard)
 
     This is what the backtest can join on and use per-day in its loop.
     """
@@ -477,6 +553,7 @@ def build_historical_regime_table(
                 "long_ok_vix",
                 "short_ok_vix",
                 "vix",
+                "fast_crash",
             ]
         )
 
@@ -499,6 +576,7 @@ def build_historical_regime_table(
                 "long_ok_vix",
                 "short_ok_vix",
                 "vix",
+                "fast_crash",
             ]
         )
 
@@ -526,9 +604,14 @@ def build_historical_regime_table(
         }
         snap = compute_regime_from_closes(truncated, cfg=cfg, as_of=dt)
         regime = snap.regime
+        fast_crash_today = bool(snap.fast_crash)
 
         # Weinstein regime gates
         long_ok_regime, short_ok_regime = _compute_long_short_flags(regime)
+
+        # Fast crash guard overrides regime long gate
+        if fast_crash_today:
+            long_ok_regime = False
 
         # 2) VIX gates for this day (if available)
         vix_val = float("nan")
@@ -557,6 +640,7 @@ def build_historical_regime_table(
                 "long_ok_vix": bool(long_ok_vix),
                 "short_ok_vix": bool(short_ok_vix),
                 "vix": vix_val,
+                "fast_crash": bool(fast_crash_today),
             }
         )
 
@@ -571,6 +655,7 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
     Returns a MarketRegimeSnapshot with:
       - overall regime (BULL / BEAR / NEUTRAL / UNKNOWN)
       - per-index metrics (state, last_close, MA, slope, etc.)
+      - fast_crash flag (rapid drawdown on primary index)
 
     This is what we will call from intraday / short watchers to gate new entries
     on the Weinstein side. VIX gating is applied at the `inspect()` level.
@@ -585,6 +670,7 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
             regime=MarketRegime.UNKNOWN,
             as_of=now,
             index_metrics=[],
+            fast_crash=False,
         )
 
     data = _download_index_data(cfg.index_symbols, cfg)
@@ -612,6 +698,9 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
     regime = _aggregate_market_regime(metrics, cfg)
     as_of = pd.Timestamp.now(tz="UTC")
 
+    # Fast crash flag on the downloaded index closes
+    fast_crash = _detect_fast_crash(data, cfg, as_of=None)
+
     if cfg.verbose:
         print("Market regime snapshot as of", as_of.isoformat())
         for m in metrics:
@@ -622,11 +711,17 @@ def detect_market_regime(cfg: Optional[MarketRegimeConfig] = None) -> MarketRegi
                 f"above_ma={m.above_ma}  ma_rising={m.ma_rising}  n={m.data_points}"
             )
         print(f"→ Overall regime: {regime.value.upper()}")
+        if cfg.fast_crash_enabled:
+            print(
+                f"→ Fast crash ({cfg.fast_crash_primary_index}, "
+                f"{cfg.fast_crash_lookback_days}d, {cfg.fast_crash_drop_pct:.0%}): {fast_crash}"
+            )
 
     return MarketRegimeSnapshot(
         regime=regime,
         as_of=as_of,
         index_metrics=metrics,
+        fast_crash=fast_crash,
     )
 
 
@@ -708,6 +803,7 @@ def _compute_long_short_flags(regime: MarketRegime) -> Tuple[bool, bool]:
 
     - LONGS:
         * Allowed in BULL and NEUTRAL.
+          (Fast crash can still override long_ok_regime elsewhere.)
     - SHORTS:
         * Allowed ONLY in BEAR.
     - UNKNOWN:
@@ -739,7 +835,8 @@ def inspect(cfg: Optional[MarketRegimeConfig] = None) -> Tuple[str, bool, bool]:
 
     Logic:
         1) Compute Weinstein regime and base long_ok/short_ok.
-        2) Compute VIX gates and AND them with the regime gates.
+        2) Apply fast crash override: if fast_crash is True, long_ok_regime=False.
+        3) Compute VIX gates and AND them with the regime gates.
     """
     # Use same config for both regime and VIX gating
     if cfg is None:
@@ -747,9 +844,14 @@ def inspect(cfg: Optional[MarketRegimeConfig] = None) -> Tuple[str, bool, bool]:
 
     snap = detect_market_regime(cfg)
     regime = snap.regime
+    fast_crash = bool(getattr(snap, "fast_crash", False))
 
     # Weinstein regime gates
     long_ok_regime, short_ok_regime = _compute_long_short_flags(regime)
+
+    # Fast crash override at the regime layer
+    if fast_crash:
+        long_ok_regime = False
 
     # VIX gates
     _, long_ok_vix, short_ok_vix = _compute_vix_gates(cfg)
@@ -820,6 +922,7 @@ def _parse_args() -> argparse.Namespace:
         default=400,
         help="Number of calendar days of history to request from yfinance, default=400.",
     )
+
     # VIX-related CLI toggles (optional)
     ap.add_argument(
         "--no-vix-filter",
@@ -844,6 +947,32 @@ def _parse_args() -> argparse.Namespace:
         default=15.0,
         help="Min VIX to allow new shorts (default=15.0). If VIX < this, shorts are blocked.",
     )
+
+    # Fast crash CLI toggles (optional)
+    ap.add_argument(
+        "--no-fast-crash",
+        action="store_true",
+        help="Disable fast crash guard (no special long block during violent drawdowns).",
+    )
+    ap.add_argument(
+        "--fast-crash-lookback-days",
+        type=int,
+        default=10,
+        help="Fast crash lookback in trading days (default=10).",
+    )
+    ap.add_argument(
+        "--fast-crash-drop-pct",
+        type=float,
+        default=0.10,
+        help="Fast crash drop threshold as a fraction (default=0.10 for 10%%).",
+    )
+    ap.add_argument(
+        "--fast-crash-primary-index",
+        type=str,
+        default=None,
+        help="Primary index symbol for fast crash detection (default: first of indices).",
+    )
+
     ap.add_argument(
         "--quiet",
         action="store_true",
@@ -868,12 +997,21 @@ def main() -> None:
         vix_long_max=args.vix_long_max,
         vix_short_min=args.vix_short_min,
         vix_history_days=args.history_days,
+        fast_crash_enabled=not args.no_fast_crash,
+        fast_crash_lookback_days=args.fast_crash_lookback_days,
+        fast_crash_drop_pct=args.fast_crash_drop_pct,
+        fast_crash_primary_index=args.fast_crash_primary_index,
     )
 
     snap = detect_market_regime(cfg)
 
     # Weinstein regime gates
     long_ok_regime, short_ok_regime = _compute_long_short_flags(snap.regime)
+
+    # Fast crash override at the regime layer
+    fast_crash = bool(getattr(snap, "fast_crash", False))
+    if fast_crash:
+        long_ok_regime = False
 
     # VIX gates
     vix_last, long_ok_vix, short_ok_vix = _compute_vix_gates(cfg)
@@ -890,6 +1028,13 @@ def main() -> None:
         print()
         print("Final regime:", snap.regime.value.upper())
         print()
+
+        if cfg.fast_crash_enabled:
+            print(
+                f"Fast crash ({cfg.fast_crash_primary_index}, "
+                f"{cfg.fast_crash_lookback_days}d, {cfg.fast_crash_drop_pct:.0%}): {fast_crash}"
+            )
+            print()
 
         if not np.isnan(vix_last):
             print(
