@@ -3,23 +3,22 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-This version:
-- Keeps your current “trimmed” backtest engine (entries/exits as-is)
-- ✅ Restores MONTHLY progress logging (·· Progress: ...)
-- ✅ Restores final summary (“Backtest complete…”) with P/L and %
-- ✅ Writes outputs:
-    - Trades CSV
-    - Equity curve PNG
-    - Monthly breakdown CSV
-- ✅ Keeps Industry filters wiring (single source of truth)
+This version (LONG FIXES):
+- ✅ Proper cash accounting: subtract entry cost, add exit proceeds
+- ✅ Equity = cash + market value of open positions (mark-to-market)
+- ✅ Risk sizing uses EQUITY (not cash_like)
+- ✅ Caps:
+    - max_leverage (default 1.0)
+    - max_pos_frac per position (default 0.25)
+- ✅ Restores monthly progress logging
+- ✅ Final summary + outputs:
+    - trades CSV
+    - equity curve PNG
+    - monthly breakdown CSV
+- ✅ Keeps Industry filters (single source of truth)
 
-NOTE (important):
-Your current cash/equity accounting does NOT subtract position cost on entry
-(and only adds realized PnL on exit). To avoid changing results, the equity curve
-here is computed as:
-    equity = portfolio_cash + sum(unrealized_pnl)
-where unrealized_pnl = qty * (current_price - entry_price)
-This matches your existing “final_equity = portfolio_cash” behavior.
+NOTE:
+This still runs LONG only (no shorts yet). We’ll add SHORT after LONG is stable.
 """
 
 import argparse
@@ -211,9 +210,7 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
     if df is None or df.empty:
         raise RuntimeError("No daily data returned from yfinance.")
 
-    # Ensure MultiIndex columns: (field, ticker)
     if not isinstance(df.columns, pd.MultiIndex):
-        # single-ticker edge case
         df.columns = pd.MultiIndex.from_product([df.columns, ["SINGLE"]])
 
     log("Daily download complete.", level="ok")
@@ -273,26 +270,17 @@ def _safe_close(daily_df: pd.DataFrame, dt: pd.Timestamp, ticker: str) -> float:
     return np.nan
 
 
-def _compute_equity_like_current_engine(
-    daily_df: pd.DataFrame,
-    dt: pd.Timestamp,
-    cash_like: float,
-    positions: Dict[str, "Position"],
-) -> float:
-    """
-    Keeps compatibility with your current engine accounting:
-    - cash_like starts at capital
-    - you do NOT subtract entry cost on entry
-    - you ADD realized PnL on exit
-    Therefore, mark-to-market equity should be:
-        cash_like + sum(unrealized_pnl)
-    """
-    eq = float(cash_like)
+def _positions_market_value(daily_df: pd.DataFrame, dt: pd.Timestamp, positions: Dict[str, "Position"]) -> float:
+    mv = 0.0
     for _, p in positions.items():
         px = _safe_close(daily_df, dt, p.ticker)
         if pd.notna(px):
-            eq += float(p.qty) * (float(px) - float(p.entry_price))
-    return float(eq)
+            mv += float(p.qty) * float(px)
+    return float(mv)
+
+
+def _equity(daily_df: pd.DataFrame, dt: pd.Timestamp, cash: float, positions: Dict[str, "Position"]) -> float:
+    return float(cash) + _positions_market_value(daily_df, dt, positions)
 
 
 def _trades_to_df(trades: List["Trade"]) -> pd.DataFrame:
@@ -335,7 +323,6 @@ def _monthly_breakdown(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.D
 
     tdf = trades_df.copy()
     tdf["month"] = tdf["exit_date"].dt.to_period("M").astype(str)
-
     g = tdf.groupby("month", dropna=False)
 
     out = pd.DataFrame({
@@ -444,12 +431,13 @@ def backtest(
     long_logic_cfg: Mapping,
     market_cfg: Mapping,
     industry_cfg: Mapping,
+    # NEW knobs (Weinstein-ish, safety first)
+    max_leverage: float = 1.0,
+    max_pos_frac: float = 0.25,
 ):
 
-    # --- industry filter config ---
     industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
 
-    # Enrich weekly universe / snapshots with industry stats
     if weekly_df is not None and not weekly_df.empty:
         weekly_df = enrich_with_industry_and_stats(weekly_df, cfg=industry_filter_cfg)
 
@@ -462,16 +450,13 @@ def backtest(
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
 
-    # Portfolio state
-    portfolio_cash = float(capital)
+    cash = float(capital)
     positions: Dict[str, Position] = {}
     trades: List[Trade] = []
 
-    # Equity curve + monthly progress
     equity_curve: List[Tuple[pd.Timestamp, float]] = []
     last_progress_month: Optional[str] = None
 
-    # Precompute MA30 + ATR series per ticker (time-varying)
     ma_cache: Dict[str, pd.Series] = {}
     atr_series_cache: Dict[str, pd.Series] = {}
 
@@ -479,42 +464,35 @@ def backtest(
         close = get_panel(daily_df, "Close", t)
         high = get_panel(daily_df, "High", t)
         low = get_panel(daily_df, "Low", t)
-
         if close.empty or high.empty or low.empty:
             continue
-
         ma_cache[t] = close.rolling(30, min_periods=30).mean()
         atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
 
-    # Long params (kept, even if your trimmed entry loop isn't using check_long_entry yet)
-    long_params = LongEntryParams(
+    _ = LongEntryParams(
         min_break_pct=float(long_logic_cfg.get("break_pct", 0.004)),
         dist_above_ma_min=0.0,
         vol_min=float(long_logic_cfg.get("vol_min", 1.3)),
         adx_min=float(long_logic_cfg.get("adx_min", ADX_MIN)),
     )
 
-    # Use daily_df index as our date set
-    all_dates = daily_df.index
-    all_dates = [pd.Timestamp(d) for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
+    all_dates = [pd.Timestamp(d) for d in daily_df.index if isinstance(d, (pd.Timestamp, datetime))]
 
     for dt in all_dates:
         if dt < start_dt or dt > end_dt:
             continue
 
-        # Pick universe for this date
         snap = pick_snapshot_for_date(weekly_snapshots, dt) if weekly_snapshots else None
         universe = snap[1] if snap else weekly_df
         if universe is None or universe.empty:
             continue
 
-        # -----------------
-        # EXITS (basic)
-        # -----------------
+        # ==============
+        # EXITS
+        # ==============
         to_close: List[str] = []
         for key, pos in positions.items():
             t = pos.ticker
-
             if (("Close", t) not in daily_df.columns) or (t not in ma_cache):
                 continue
             if dt not in ma_cache[t].index:
@@ -523,16 +501,18 @@ def backtest(
             price = daily_df.loc[dt, ("Close", t)]
             if pd.isna(price):
                 continue
-
             ma_val = ma_cache[t].loc[dt]
 
             if should_exit_long(float(price), float(pos.stop), float(ma_val) if not pd.isna(ma_val) else np.nan):
                 exit_price = float(price)
-                pnl = pos.qty * (exit_price - pos.entry_price)
-                pnl_pct = pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
+                proceeds = float(pos.qty) * exit_price
+                entry_cost = float(pos.qty) * float(pos.entry_price)
 
-                # Keep your current accounting: add realized PnL only
-                portfolio_cash += pnl
+                pnl = proceeds - entry_cost
+                pnl_pct = pnl / entry_cost if entry_cost > 0 else 0.0
+
+                # ✅ Real accounting
+                cash += proceeds
 
                 trades.append(
                     Trade(
@@ -552,17 +532,21 @@ def backtest(
         for key in to_close:
             del positions[key]
 
-        # -----------------
-        # ENTRIES (trimmed)
-        # -----------------
+        # ==============
+        # ENTRIES (LONG only for now)
+        # ==============
         if mode not in ("long", "both", "auto"):
-            # still record equity/progress for completeness
-            eq = _compute_equity_like_current_engine(daily_df, dt, portfolio_cash, positions)
+            eq = _equity(daily_df, dt, cash, positions)
             equity_curve.append((dt, eq))
             continue
 
         n_long_now = sum(1 for p in positions.values() if p.side == "long")
-        if n_long_now < max_long:
+
+        eq_now = _equity(daily_df, dt, cash, positions)
+        # Buying power capped by leverage
+        buying_power = max(0.0, float(max_leverage) * eq_now - _positions_market_value(daily_df, dt, positions))
+
+        if n_long_now < max_long and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_long_now >= max_long:
                     break
@@ -570,20 +554,16 @@ def backtest(
                 t = str(row.get("ticker", "")).upper().strip()
                 if not t:
                     continue
-
                 pos_key = f"{t}_long"
                 if pos_key in positions:
                     continue
 
-                # Weekly MA30 slope filter
                 if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
                     continue
 
-                # ✅ Industry filter (single source of truth)
                 if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                     continue
 
-                # Need today's Close + MA + ATR
                 if ("Close", t) not in daily_df.columns:
                     continue
                 if t not in ma_cache or t not in atr_series_cache:
@@ -594,7 +574,6 @@ def backtest(
                 price = daily_df.loc[dt, ("Close", t)]
                 ma_val = ma_cache[t].loc[dt]
                 atr_val = atr_series_cache[t].loc[dt]
-
                 if pd.isna(price) or pd.isna(ma_val) or pd.isna(atr_val):
                     continue
 
@@ -602,7 +581,6 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
-                # Must be above MA30 for a basic long (keeps it sane)
                 if price_f <= ma_f:
                     continue
 
@@ -610,14 +588,35 @@ def backtest(
                 if np.isnan(stop) or stop >= price_f:
                     continue
 
-                risk_amt = portfolio_cash * float(risk_per_trade)
                 per_share_risk = price_f - float(stop)
                 if per_share_risk <= 0:
                     continue
 
-                qty = int(math.floor(risk_amt / per_share_risk))
+                # Risk sizing uses equity
+                risk_amt = float(eq_now) * float(risk_per_trade)
+
+                qty_risk = int(math.floor(risk_amt / per_share_risk))
+                if qty_risk <= 0:
+                    continue
+
+                # Cap per-position value
+                max_pos_value = float(max_pos_frac) * float(eq_now)
+                qty_cap_pos = int(math.floor(max_pos_value / price_f)) if price_f > 0 else 0
+
+                # Cap by buying power (and cash if leverage=1)
+                qty_cap_bp = int(math.floor(buying_power / price_f)) if price_f > 0 else 0
+
+                qty = max(0, min(qty_risk, qty_cap_pos, qty_cap_bp))
                 if qty <= 0:
                     continue
+
+                cost = float(qty) * price_f
+                if cost <= 0 or cost > buying_power + 1e-9:
+                    continue
+
+                # ✅ Real accounting on entry
+                cash -= cost
+                buying_power -= cost
 
                 positions[pos_key] = Position(
                     ticker=t,
@@ -630,16 +629,15 @@ def backtest(
                 )
                 n_long_now += 1
 
-        # -----------------
-        # END-OF-DAY EQUITY + MONTHLY PROGRESS
-        # -----------------
-        eq = _compute_equity_like_current_engine(daily_df, dt, portfolio_cash, positions)
+        # ==============
+        # EQUITY + MONTHLY PROGRESS
+        # ==============
+        eq = _equity(daily_df, dt, cash, positions)
         equity_curve.append((dt, eq))
 
         month_key = dt.strftime("%Y-%m")
         if last_progress_month is None:
             last_progress_month = month_key
-
         if month_key != last_progress_month:
             last_progress_month = month_key
             log(
@@ -647,14 +645,14 @@ def backtest(
                 level="debug",
             )
 
-    final_eq = float(equity_curve[-1][1]) if equity_curve else float(portfolio_cash)
+    final_eq = float(equity_curve[-1][1]) if equity_curve else _equity(daily_df, end_dt, cash, positions)
 
     return {
         "positions": positions,
         "trades": trades,
         "final_equity": final_eq,
         "equity_curve": equity_curve,
-        "cash_like": portfolio_cash,
+        "cash": cash,
     }
 
 
@@ -675,8 +673,12 @@ def main():
     ap.add_argument("--snapshot-mode", type=str, choices=["static", "historical", "auto"], default="auto")
     ap.add_argument("--config", type=str, default="./config.yaml")
     ap.add_argument("--quiet", action="store_true")
-    args = ap.parse_args()
 
+    # Safety knobs
+    ap.add_argument("--max-leverage", type=float, default=1.0)
+    ap.add_argument("--max-pos-frac", type=float, default=0.25)
+
+    args = ap.parse_args()
     VERBOSE = not args.quiet
 
     cfg = load_yaml_config(args.config)
@@ -726,11 +728,9 @@ def main():
     if not all_tickers:
         raise SystemExit("No tickers found in weekly universe.")
 
-    # Download daily bars
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
-    # Placeholder (this trimmed engine doesn't build regime/coppock/breadth tables)
-    regime_table = None
+    regime_table = None  # still placeholder
 
     result = backtest(
         daily_df=daily_df,
@@ -747,6 +747,8 @@ def main():
         long_logic_cfg=bt_long_cfg,
         market_cfg=market_cfg,
         industry_cfg=industry_cfg,
+        max_leverage=float(args.max_leverage),
+        max_pos_frac=float(args.max_pos_frac),
     )
 
     final_eq = float(result["final_equity"])
