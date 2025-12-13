@@ -193,13 +193,13 @@ backtest:
   snapshot_mode: "auto"        # use historical weekly snapshots where available
 
   regime:
-    use_long: true             # LONGs fully gated by Chapter 8 regime
-    use_short: false           # ❌ no structural shorts for conservative profile
+    use_long: true             # LONGs gated by Chapter 8 regime
+    use_short: true            # ✅ enable structural shorts for the BOTH test
 
   # Coppock curve filters (on benchmark, e.g., SPY)
   coppock:
     use_long: true             # LONG: require Coppock(benchmark) > 0
-    use_short: false           # SHORT side disabled for Profile A
+    use_short: false           # keep short-side coppock OFF for now (can enable later)
 
   # Profile A – breadth ON (extra safety)
   breadth:
@@ -209,9 +209,13 @@ backtest:
 
   # NEW: Market-level trend / risk filters (Weinstein-style)
   market:
-    require_rising_ma30: true  # only trade when SPY 30-week MA is flat-to-rising
+    require_rising_ma30: true  # only trade when SPY 30-week MA is flat-to-rising (for longs)
     ma30_slope_min: 0.0        # slope >= 0 (no down-sloping MA30 for new longs)
     vix_max: 25.0              # suppress new longs when VIX is in panic / crash mode
+
+    # ✅ NEXT STEP (short market gate)
+    require_falling_ma30: true     # only open NEW shorts when SPY MA150 slope is falling
+    ma30_slope_min_short: 0.0      # slope <= -0.0 (i.e., negative)
 
   # NEW: Industry group filters (Stage 2 confirmation)
   industry:
@@ -238,7 +242,7 @@ backtest:
     require_ma30_rising: true  # only take longs when stock MA30 is flat or rising
     ma30_slope_min: 0.0        # slope >= 0 for the individual stock
 
-  # Short block is defined but not used (use_short=false)
+  # ✅ Shorts enabled for BOTH test (still conservative)
   short:
     break_pct: 0.0060          # conservative breakdown requirement
     vol_min: 1.60              # very strong volume to even consider shorts
