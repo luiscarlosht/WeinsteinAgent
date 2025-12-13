@@ -3,10 +3,10 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-This version (LONG FIXES):
+This version (LONG FIXES + MORE WEINSTEIN-ALIGNED):
 - ✅ Proper cash accounting: subtract entry cost, add exit proceeds
 - ✅ Equity = cash + market value of open positions (mark-to-market)
-- ✅ Risk sizing uses EQUITY (not cash_like)
+- ✅ Risk sizing uses EQUITY
 - ✅ Caps:
     - max_leverage (default 1.0)
     - max_pos_frac per position (default 0.25)
@@ -16,9 +16,13 @@ This version (LONG FIXES):
     - equity curve PNG
     - monthly breakdown CSV
 - ✅ Keeps Industry filters (single source of truth)
+- ✅ Adds Stage 2 gate (from snapshot row) for LONG entries
+- ✅ Adds optional market gate (Weinstein Chapter 8-ish):
+    - SPY 30-week proxy (150d) MA slope >= ma30_slope_min if require_rising_ma30=True
+    - Optional VIX filter if vix_max is set (adds ^VIX to download set)
 
 NOTE:
-This still runs LONG only (no shorts yet). We’ll add SHORT after LONG is stable.
+Still LONG only (no structural shorts yet). We’ll add SHORT after LONG is stable.
 """
 
 import argparse
@@ -197,9 +201,10 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
     start_dt = datetime.fromisoformat(start)
     pad_start = (start_dt - timedelta(days=365)).strftime("%Y-%m-%d")
 
+    tickers = sorted(set(tickers))
     log(f"Downloading daily bars for {len(tickers)} tickers ({pad_start} → {end})...", level="step")
     df = yf.download(
-        tickers=sorted(set(tickers)),
+        tickers=tickers,
         start=pad_start,
         end=end,
         interval="1d",
@@ -210,6 +215,7 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
     if df is None or df.empty:
         raise RuntimeError("No daily data returned from yfinance.")
 
+    # Ensure MultiIndex columns: (field, ticker)
     if not isinstance(df.columns, pd.MultiIndex):
         df.columns = pd.MultiIndex.from_product([df.columns, ["SINGLE"]])
 
@@ -384,6 +390,92 @@ def _write_reports(*, tag: str, trades: List["Trade"], equity_curve: List[Tuple[
 
 
 # =========================
+# WEINSTEIN HELPERS
+# =========================
+
+def _is_stage2(row: pd.Series) -> bool:
+    """
+    Accepts common representations in the weekly snapshot:
+      - stage == 2
+      - "Stage 2", "stage 2", "stage2"
+      - sometimes "2.0"
+    """
+    v = row.get("stage", None)
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return False
+
+    # numeric
+    try:
+        fv = float(v)
+        if abs(fv - 2.0) < 1e-9:
+            return True
+    except Exception:
+        pass
+
+    s = str(v).strip().lower()
+    if s in ("2", "2.0", "stage2", "stage 2"):
+        return True
+    if "stage" in s and "2" in s and "stage 4" not in s and "stage 3" not in s and "stage 1" not in s:
+        # rough but safe
+        return True
+    return False
+
+
+def _market_allows_longs(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
+    """
+    Simple Chapter 8-ish gate:
+      - require_rising_ma30: SPY MA150 slope over ~1 week >= ma30_slope_min
+      - vix_max: if enabled, require ^VIX <= vix_max
+    Conservative behavior:
+      - If we cannot compute required series for dt, return False (don’t open new longs).
+    """
+    require_rising = bool(market_cfg.get("require_rising_ma30", False))
+    ma30_slope_min = float(market_cfg.get("ma30_slope_min", 0.0))
+
+    vix_max = market_cfg.get("vix_max", None)
+    try:
+        vix_max = float(vix_max) if vix_max is not None else None
+    except Exception:
+        vix_max = None
+
+    if vix_max is not None:
+        if ("Close", "^VIX") not in daily_df.columns:
+            return False
+        if dt not in daily_df.index:
+            return False
+        vix = daily_df.loc[dt, ("Close", "^VIX")]
+        if pd.isna(vix):
+            return False
+        if float(vix) > float(vix_max):
+            return False
+
+    if require_rising:
+        if ("Close", "SPY") not in daily_df.columns:
+            return False
+        spy = daily_df[("Close", "SPY")].dropna()
+        if dt not in spy.index:
+            return False
+
+        # 30-week proxy ~ 150 trading days
+        ma150 = spy.rolling(150, min_periods=150).mean()
+        if dt not in ma150.index:
+            return False
+        if pd.isna(ma150.loc[dt]):
+            return False
+
+        # slope over 5 trading days (about 1 week)
+        prev = ma150.shift(5)
+        if dt not in prev.index or pd.isna(prev.loc[dt]):
+            return False
+
+        slope = float(ma150.loc[dt] - prev.loc[dt])
+        if slope < float(ma30_slope_min):
+            return False
+
+    return True
+
+
+# =========================
 # BACKTEST DATA STRUCTURES
 # =========================
 
@@ -435,7 +527,6 @@ def backtest(
     max_leverage: float = 1.0,
     max_pos_frac: float = 0.25,
 ):
-
     industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
 
     if weekly_df is not None and not weekly_df.empty:
@@ -469,6 +560,7 @@ def backtest(
         ma_cache[t] = close.rolling(30, min_periods=30).mean()
         atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
 
+    # Keep params ready (we’ll wire check_long_entry later if desired)
     _ = LongEntryParams(
         min_break_pct=float(long_logic_cfg.get("break_pct", 0.004)),
         dist_above_ma_min=0.0,
@@ -535,18 +627,21 @@ def backtest(
         # ==============
         # ENTRIES (LONG only for now)
         # ==============
+        eq_now = _equity(daily_df, dt, cash, positions)
+
+        # Market gate (applies only to NEW entries)
+        allow_new_longs = _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True
+
         if mode not in ("long", "both", "auto"):
-            eq = _equity(daily_df, dt, cash, positions)
-            equity_curve.append((dt, eq))
+            equity_curve.append((dt, eq_now))
             continue
 
         n_long_now = sum(1 for p in positions.values() if p.side == "long")
 
-        eq_now = _equity(daily_df, dt, cash, positions)
         # Buying power capped by leverage
         buying_power = max(0.0, float(max_leverage) * eq_now - _positions_market_value(daily_df, dt, positions))
 
-        if n_long_now < max_long and buying_power > 0:
+        if allow_new_longs and n_long_now < max_long and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_long_now >= max_long:
                     break
@@ -558,12 +653,19 @@ def backtest(
                 if pos_key in positions:
                     continue
 
+                # ✅ Weinstein: stock must be Stage 2 (from snapshot)
+                if not _is_stage2(row):
+                    continue
+
+                # Weekly MA30 slope filter (your existing gate)
                 if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
                     continue
 
+                # ✅ Industry confirmation
                 if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                     continue
 
+                # Need today's Close + MA + ATR
                 if ("Close", t) not in daily_df.columns:
                     continue
                 if t not in ma_cache or t not in atr_series_cache:
@@ -581,6 +683,7 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
+                # basic sanity (we’ll replace with true pivot breakout later)
                 if price_f <= ma_f:
                     continue
 
@@ -594,7 +697,6 @@ def backtest(
 
                 # Risk sizing uses equity
                 risk_amt = float(eq_now) * float(risk_per_trade)
-
                 qty_risk = int(math.floor(risk_amt / per_share_risk))
                 if qty_risk <= 0:
                     continue
@@ -727,6 +829,12 @@ def main():
 
     if not all_tickers:
         raise SystemExit("No tickers found in weekly universe.")
+
+    # Ensure benchmark series exist for market filters if enabled
+    if bool(market_cfg.get("require_rising_ma30", False)):
+        all_tickers.add("SPY")
+    if market_cfg.get("vix_max", None) is not None:
+        all_tickers.add("^VIX")
 
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
