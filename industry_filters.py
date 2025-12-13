@@ -90,7 +90,9 @@ def enrich_with_industry_and_stats(
     out = df.copy()
 
     # ---- Attach industry / sector (cached, cheap) ----
-    if cfg.industry_col not in out.columns or cfg.sector_col not in out.columns:
+    # NOTE: attach_industry currently only guarantees industry_col.
+    # sector_col is kept in the config for future expansion / compatibility.
+    if cfg.industry_col not in out.columns:
         out = attach_industry(
             out,
             ticker_col=cfg.ticker_col,
@@ -129,15 +131,26 @@ def enrich_with_industry_and_stats(
     if cfg.rs_slope_col in out.columns:
         out[cfg.rs_slope_col] = pd.to_numeric(out[cfg.rs_slope_col], errors="coerce")
 
+    # Group by industry
     g = out.groupby(cfg.industry_col, dropna=False)
-
     stats = pd.DataFrame(index=g.size().index)
 
-    # Fraction of members in Stage 2
-    # (Note: this may emit a pandas FutureWarning depending on pandas version;
-    # it is harmless. We can refactor later if you want it silent.)
-    stats[cfg.out_industry_stage2_frac_col] = g.apply(
-        lambda x: float(is_stage2.loc[x.index].mean())
+    # -----------------------------
+    # ✅ FIX 1: silence pandas FutureWarning
+    # Avoid groupby.apply on the grouping columns by computing stage2 fraction
+    # with a temporary DF + groupby.mean.
+    # -----------------------------
+    tmp = pd.DataFrame(
+        {
+            cfg.industry_col: out[cfg.industry_col].values,
+            "_is_stage2": is_stage2.values,
+        },
+        index=out.index,
+    )
+    stats[cfg.out_industry_stage2_frac_col] = (
+        tmp.groupby(cfg.industry_col, dropna=False)["_is_stage2"]
+        .mean()
+        .astype(float)
     )
 
     # Median slopes (robust to outliers)
@@ -160,9 +173,9 @@ def enrich_with_industry_and_stats(
     )
 
     # -----------------------------
-    # ✅ FIX: avoid pandas "columns overlap but no suffix specified"
+    # ✅ FIX 2: avoid pandas "columns overlap but no suffix specified"
     # when snapshots already have industry_* columns.
-    # We drop the existing output columns, then join the newly computed ones.
+    # Drop existing output columns, then join the newly computed ones.
     # -----------------------------
     overlap_cols = [c for c in out_cols if c in out.columns]
     if overlap_cols:
