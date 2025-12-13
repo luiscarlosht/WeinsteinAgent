@@ -76,6 +76,10 @@ def enrich_with_industry_and_stats(
     Defensive behavior:
     - Missing ticker / industry / slope data never blocks downstream logic
     - Stats default to NaN if unavailable
+
+    Important:
+    - This function is designed to be IDPOTENT: you can run it on snapshots that
+      already have industry_* columns, and it will overwrite them safely.
     """
     if cfg is None:
         cfg = IndustryFilterConfig()
@@ -96,13 +100,14 @@ def enrich_with_industry_and_stats(
 
     out[cfg.industry_col] = out.get(cfg.industry_col, "").fillna("").astype(str)
 
-    # Ensure expected output columns exist
-    for c in [
+    # Ensure expected output columns exist (so downstream code can reference them)
+    out_cols = [
         cfg.out_industry_stage_col,
         cfg.out_industry_stage2_frac_col,
         cfg.out_industry_ma30_slope_col,
         cfg.out_industry_rs_slope_col,
-    ]:
+    ]
+    for c in out_cols:
         if c not in out.columns:
             out[c] = np.nan
 
@@ -129,6 +134,8 @@ def enrich_with_industry_and_stats(
     stats = pd.DataFrame(index=g.size().index)
 
     # Fraction of members in Stage 2
+    # (Note: this may emit a pandas FutureWarning depending on pandas version;
+    # it is harmless. We can refactor later if you want it silent.)
     stats[cfg.out_industry_stage2_frac_col] = g.apply(
         lambda x: float(is_stage2.loc[x.index].mean())
     )
@@ -145,12 +152,21 @@ def enrich_with_industry_and_stats(
         else np.nan
     )
 
-    # Derived industry stage label (config-driven)
+    # Derived industry stage label (threshold uses cfg.min_stage2_frac)
     stats[cfg.out_industry_stage_col] = np.where(
         stats[cfg.out_industry_stage2_frac_col] >= float(cfg.min_stage2_frac),
         "Stage 2 (Uptrend)",
         "Other",
     )
+
+    # -----------------------------
+    # ✅ FIX: avoid pandas "columns overlap but no suffix specified"
+    # when snapshots already have industry_* columns.
+    # We drop the existing output columns, then join the newly computed ones.
+    # -----------------------------
+    overlap_cols = [c for c in out_cols if c in out.columns]
+    if overlap_cols:
+        out = out.drop(columns=overlap_cols)
 
     # Attach back to rows
     out = out.join(stats, on=cfg.industry_col)
