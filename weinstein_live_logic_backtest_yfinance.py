@@ -3,16 +3,23 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-Fixed version of your pasted file:
-- main() parses CLI args and calls backtest()
-- loads weekly report and/or historical snapshots (snapshot-mode)
-- downloads daily bars via yfinance
-- fixes ATR (True Range, uses prev close)
-- ATR is time-varying (series per date), not a single constant
-- adds basic exits + trade log so it behaves like a backtest
-- ✅ Industry filters (single source of truth) remain wired:
-    enrich_with_industry_and_stats(...)
-    industry_ok_from_row(...)
+This version:
+- Keeps your current “trimmed” backtest engine (entries/exits as-is)
+- ✅ Restores MONTHLY progress logging (·· Progress: ...)
+- ✅ Restores final summary (“Backtest complete…”) with P/L and %
+- ✅ Writes outputs:
+    - Trades CSV
+    - Equity curve PNG
+    - Monthly breakdown CSV
+- ✅ Keeps Industry filters wiring (single source of truth)
+
+NOTE (important):
+Your current cash/equity accounting does NOT subtract position cost on entry
+(and only adds realized PnL on exit). To avoid changing results, the equity curve
+here is computed as:
+    equity = portfolio_cash + sum(unrealized_pnl)
+where unrealized_pnl = qty * (current_price - entry_price)
+This matches your existing “final_equity = portfolio_cash” behavior.
 """
 
 import argparse
@@ -241,6 +248,155 @@ def compute_atr_series_from_ohlc(
 
 
 # =========================
+# REPORTING / OUTPUT
+# =========================
+
+OUTPUT_DIR = "./output"
+
+
+def _now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _ensure_outdir(path: str = OUTPUT_DIR):
+    os.makedirs(path, exist_ok=True)
+
+
+def _safe_close(daily_df: pd.DataFrame, dt: pd.Timestamp, ticker: str) -> float:
+    try:
+        if ("Close", ticker) in daily_df.columns and dt in daily_df.index:
+            v = daily_df.loc[dt, ("Close", ticker)]
+            if pd.notna(v):
+                return float(v)
+    except Exception:
+        pass
+    return np.nan
+
+
+def _compute_equity_like_current_engine(
+    daily_df: pd.DataFrame,
+    dt: pd.Timestamp,
+    cash_like: float,
+    positions: Dict[str, "Position"],
+) -> float:
+    """
+    Keeps compatibility with your current engine accounting:
+    - cash_like starts at capital
+    - you do NOT subtract entry cost on entry
+    - you ADD realized PnL on exit
+    Therefore, mark-to-market equity should be:
+        cash_like + sum(unrealized_pnl)
+    """
+    eq = float(cash_like)
+    for _, p in positions.items():
+        px = _safe_close(daily_df, dt, p.ticker)
+        if pd.notna(px):
+            eq += float(p.qty) * (float(px) - float(p.entry_price))
+    return float(eq)
+
+
+def _trades_to_df(trades: List["Trade"]) -> pd.DataFrame:
+    if not trades:
+        return pd.DataFrame(
+            columns=[
+                "ticker", "side", "entry_date", "exit_date",
+                "entry_price", "exit_price", "qty", "pnl", "pnl_pct",
+            ]
+        )
+    rows = []
+    for t in trades:
+        rows.append({
+            "ticker": t.ticker,
+            "side": t.side,
+            "entry_date": pd.to_datetime(t.entry_date),
+            "exit_date": pd.to_datetime(t.exit_date),
+            "entry_price": float(t.entry_price),
+            "exit_price": float(t.exit_price),
+            "qty": int(t.qty),
+            "pnl": float(t.pnl),
+            "pnl_pct": float(t.pnl_pct),
+        })
+    df = pd.DataFrame(rows).sort_values(["exit_date", "ticker"]).reset_index(drop=True)
+    return df
+
+
+def _equity_to_df(equity_curve: List[Tuple[pd.Timestamp, float]]) -> pd.DataFrame:
+    if not equity_curve:
+        return pd.DataFrame(columns=["date", "equity"])
+    df = pd.DataFrame(equity_curve, columns=["date", "equity"])
+    df["date"] = pd.to_datetime(df["date"])
+    df["equity"] = pd.to_numeric(df["equity"], errors="coerce")
+    return df
+
+
+def _monthly_breakdown(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.DataFrame:
+    if trades_df.empty:
+        return pd.DataFrame(columns=["month", "pnl", "trades", "win_rate", "equity_end"])
+
+    tdf = trades_df.copy()
+    tdf["month"] = tdf["exit_date"].dt.to_period("M").astype(str)
+
+    g = tdf.groupby("month", dropna=False)
+
+    out = pd.DataFrame({
+        "pnl": g["pnl"].sum(),
+        "trades": g.size(),
+        "win_rate": (g["pnl"].apply(lambda s: float((s > 0).mean())) * 100.0),
+    }).reset_index()
+
+    equity_end_map = {}
+    if not equity_df.empty:
+        edf = equity_df.copy()
+        edf["month"] = edf["date"].dt.to_period("M").astype(str)
+        equity_end = edf.sort_values("date").groupby("month", as_index=False).tail(1)
+        equity_end_map = dict(zip(equity_end["month"], equity_end["equity"]))
+
+    out["equity_end"] = out["month"].map(equity_end_map)
+    return out.sort_values("month").reset_index(drop=True)
+
+
+def _write_reports(*, tag: str, trades: List["Trade"], equity_curve: List[Tuple[pd.Timestamp, float]]):
+    _ensure_outdir(OUTPUT_DIR)
+
+    trades_df = _trades_to_df(trades)
+    equity_df = _equity_to_df(equity_curve)
+    monthly_df = _monthly_breakdown(trades_df, equity_df)
+
+    trades_path = os.path.join(OUTPUT_DIR, f"live_logic_bt_trades_{tag}.csv")
+    equity_png = os.path.join(OUTPUT_DIR, f"live_logic_bt_equity_{tag}.png")
+    monthly_path = os.path.join(OUTPUT_DIR, f"live_logic_bt_monthly_{tag}.csv")
+
+    trades_df.to_csv(trades_path, index=False)
+    monthly_df.to_csv(monthly_path, index=False)
+
+    if not equity_df.empty:
+        plt.figure()
+        plt.plot(equity_df["date"], equity_df["equity"])
+        plt.title("Equity Curve")
+        plt.xlabel("Date")
+        plt.ylabel("Equity")
+        plt.tight_layout()
+        plt.savefig(equity_png, dpi=140)
+        plt.close()
+
+    log(f"Wrote trade log → {trades_path}", level="ok")
+    if not equity_df.empty:
+        log(f"Wrote equity curve PNG → {equity_png}", level="ok")
+    log(f"Wrote monthly P/L breakdown → {monthly_path}", level="ok")
+
+    if not monthly_df.empty:
+        log("Monthly P/L summary:", level="info")
+        for _, r in monthly_df.iterrows():
+            m = r["month"]
+            pnl = float(r["pnl"])
+            tr = int(r["trades"])
+            wr = float(r["win_rate"])
+            eq = r.get("equity_end", np.nan)
+            eq_s = f"${float(eq):,.2f}" if pd.notna(eq) else "$nan"
+            log(f"  {m}: PnL=${pnl:,.2f} | Trades={tr} | WinRate={wr:5.1f}% | Equity={eq_s}", level="info")
+
+
+# =========================
 # BACKTEST DATA STRUCTURES
 # =========================
 
@@ -311,6 +467,10 @@ def backtest(
     positions: Dict[str, Position] = {}
     trades: List[Trade] = []
 
+    # Equity curve + monthly progress
+    equity_curve: List[Tuple[pd.Timestamp, float]] = []
+    last_progress_month: Optional[str] = None
+
     # Precompute MA30 + ATR series per ticker (time-varying)
     ma_cache: Dict[str, pd.Series] = {}
     atr_series_cache: Dict[str, pd.Series] = {}
@@ -334,7 +494,7 @@ def backtest(
         adx_min=float(long_logic_cfg.get("adx_min", ADX_MIN)),
     )
 
-    # Use Close panel index as our date set
+    # Use daily_df index as our date set
     all_dates = daily_df.index
     all_dates = [pd.Timestamp(d) for d in all_dates if isinstance(d, (pd.Timestamp, datetime))]
 
@@ -354,7 +514,7 @@ def backtest(
         to_close: List[str] = []
         for key, pos in positions.items():
             t = pos.ticker
-            # Need today's price + MA30
+
             if (("Close", t) not in daily_df.columns) or (t not in ma_cache):
                 continue
             if dt not in ma_cache[t].index:
@@ -363,12 +523,15 @@ def backtest(
             price = daily_df.loc[dt, ("Close", t)]
             if pd.isna(price):
                 continue
+
             ma_val = ma_cache[t].loc[dt]
 
             if should_exit_long(float(price), float(pos.stop), float(ma_val) if not pd.isna(ma_val) else np.nan):
                 exit_price = float(price)
                 pnl = pos.qty * (exit_price - pos.entry_price)
                 pnl_pct = pnl / (pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
+
+                # Keep your current accounting: add realized PnL only
                 portfolio_cash += pnl
 
                 trades.append(
@@ -393,83 +556,105 @@ def backtest(
         # ENTRIES (trimmed)
         # -----------------
         if mode not in ("long", "both", "auto"):
+            # still record equity/progress for completeness
+            eq = _compute_equity_like_current_engine(daily_df, dt, portfolio_cash, positions)
+            equity_curve.append((dt, eq))
             continue
 
         n_long_now = sum(1 for p in positions.values() if p.side == "long")
-        if n_long_now >= max_long:
-            continue
+        if n_long_now < max_long:
+            for _, row in universe.iterrows():
+                if n_long_now >= max_long:
+                    break
 
-        for _, row in universe.iterrows():
-            if n_long_now >= max_long:
-                break
+                t = str(row.get("ticker", "")).upper().strip()
+                if not t:
+                    continue
 
-            t = str(row.get("ticker", "")).upper().strip()
-            if not t:
-                continue
+                pos_key = f"{t}_long"
+                if pos_key in positions:
+                    continue
 
-            pos_key = f"{t}_long"
-            if pos_key in positions:
-                continue
+                # Weekly MA30 slope filter
+                if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
+                    continue
 
-            # Weekly MA30 slope filter
-            if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
-                continue
+                # ✅ Industry filter (single source of truth)
+                if not industry_ok_from_row(row, cfg=industry_filter_cfg):
+                    continue
 
-            # ✅ Industry filter (single source of truth)
-            if not industry_ok_from_row(row, cfg=industry_filter_cfg):
-                continue
+                # Need today's Close + MA + ATR
+                if ("Close", t) not in daily_df.columns:
+                    continue
+                if t not in ma_cache or t not in atr_series_cache:
+                    continue
+                if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
+                    continue
 
-            # Need today's Close + MA + ATR
-            if ("Close", t) not in daily_df.columns:
-                continue
-            if t not in ma_cache or t not in atr_series_cache:
-                continue
-            if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
-                continue
+                price = daily_df.loc[dt, ("Close", t)]
+                ma_val = ma_cache[t].loc[dt]
+                atr_val = atr_series_cache[t].loc[dt]
 
-            price = daily_df.loc[dt, ("Close", t)]
-            ma_val = ma_cache[t].loc[dt]
-            atr_val = atr_series_cache[t].loc[dt]
+                if pd.isna(price) or pd.isna(ma_val) or pd.isna(atr_val):
+                    continue
 
-            if pd.isna(price) or pd.isna(ma_val) or pd.isna(atr_val):
-                continue
+                price_f = float(price)
+                ma_f = float(ma_val)
+                atr_f = float(atr_val)
 
-            price_f = float(price)
-            ma_f = float(ma_val)
-            atr_f = float(atr_val)
+                # Must be above MA30 for a basic long (keeps it sane)
+                if price_f <= ma_f:
+                    continue
 
-            # Must be above MA30 for a basic long (keeps it sane)
-            if price_f <= ma_f:
-                continue
+                stop = long_stop_level(price_f, atr_f, ma_f)
+                if np.isnan(stop) or stop >= price_f:
+                    continue
 
-            stop = long_stop_level(price_f, atr_f, ma_f)
-            if np.isnan(stop) or stop >= price_f:
-                continue
+                risk_amt = portfolio_cash * float(risk_per_trade)
+                per_share_risk = price_f - float(stop)
+                if per_share_risk <= 0:
+                    continue
 
-            risk_amt = portfolio_cash * float(risk_per_trade)
-            per_share_risk = price_f - float(stop)
-            if per_share_risk <= 0:
-                continue
+                qty = int(math.floor(risk_amt / per_share_risk))
+                if qty <= 0:
+                    continue
 
-            qty = int(math.floor(risk_amt / per_share_risk))
-            if qty <= 0:
-                continue
+                positions[pos_key] = Position(
+                    ticker=t,
+                    side="long",
+                    qty=qty,
+                    entry_price=price_f,
+                    stop=float(stop),
+                    atr=atr_f,
+                    opened=pd.Timestamp(dt),
+                )
+                n_long_now += 1
 
-            positions[pos_key] = Position(
-                ticker=t,
-                side="long",
-                qty=qty,
-                entry_price=price_f,
-                stop=float(stop),
-                atr=atr_f,
-                opened=pd.Timestamp(dt),
+        # -----------------
+        # END-OF-DAY EQUITY + MONTHLY PROGRESS
+        # -----------------
+        eq = _compute_equity_like_current_engine(daily_df, dt, portfolio_cash, positions)
+        equity_curve.append((dt, eq))
+
+        month_key = dt.strftime("%Y-%m")
+        if last_progress_month is None:
+            last_progress_month = month_key
+
+        if month_key != last_progress_month:
+            last_progress_month = month_key
+            log(
+                f"Progress: {dt.date()} — equity ${eq:,.2f}, positions: {len(positions)}, trades so far: {len(trades)}",
+                level="debug",
             )
-            n_long_now += 1
+
+    final_eq = float(equity_curve[-1][1]) if equity_curve else float(portfolio_cash)
 
     return {
         "positions": positions,
         "trades": trades,
-        "final_equity": portfolio_cash,
+        "final_equity": final_eq,
+        "equity_curve": equity_curve,
+        "cash_like": portfolio_cash,
     }
 
 
@@ -495,7 +680,6 @@ def main():
     VERBOSE = not args.quiet
 
     cfg = load_yaml_config(args.config)
-    app_cfg = cfg.get("app", {}) or {}
     bt_cfg = cfg.get("backtest", {}) or {}
 
     bt_long_cfg = bt_cfg.get("long", {}) or {}
@@ -545,8 +729,7 @@ def main():
     # Download daily bars
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
-    # NOTE: This trimmed file does not build regime_table / coppock / breadth
-    # (your pasted version didn't include the full engine). Keep placeholder:
+    # Placeholder (this trimmed engine doesn't build regime/coppock/breadth tables)
     regime_table = None
 
     result = backtest(
@@ -566,9 +749,24 @@ def main():
         industry_cfg=industry_cfg,
     )
 
+    final_eq = float(result["final_equity"])
+    pnl = final_eq - float(args.capital)
+    pnl_pct = (pnl / float(args.capital) * 100.0) if float(args.capital) != 0 else 0.0
+    trades = result.get("trades", []) or []
+    equity_curve = result.get("equity_curve", []) or []
+
     log(
-        f"Done. Open positions={len(result['positions'])}, trades={len(result['trades'])}, "
-        f"final_equity=${result['final_equity']:,.2f}",
+        f"Backtest complete. Final equity: ${final_eq:,.2f} "
+        f"(P/L ${pnl:,.2f}, {pnl_pct:,.2f}%) — Trades: {len(trades)}",
+        level="ok",
+    )
+
+    tag = _now_tag()
+    _write_reports(tag=tag, trades=trades, equity_curve=equity_curve)
+
+    log(
+        f"Done. Open positions={len(result['positions'])}, trades={len(trades)}, "
+        f"final_equity=${final_eq:,.2f}",
         level="ok",
     )
 
