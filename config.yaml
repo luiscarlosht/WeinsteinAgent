@@ -212,7 +212,7 @@ backtest:
 
   regime:
     use_long: true             # LONGs gated by Chapter 8 regime
-    use_short: false           # ✅ Option A: keep structural shorts OFF for now
+    use_short: true            # ✅ Option A: keep structural shorts OFF for now
 
   # Coppock curve filters (on benchmark, e.g., SPY)
   coppock:
