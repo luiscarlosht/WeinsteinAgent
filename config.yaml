@@ -4,25 +4,19 @@ app:
   benchmark: SPY
   include_charts: true
   ordering:
-    account_size: 5000        # used only for sizing; not sent anywhere
-    risk_per_trade_pct: 0.005 # 0.5% of account per trade (more conservative)
-    take_profit_R: [1.0, 2.0] # targets in R multiples
-    round_qty_to: 1           # equities: 1 share; crypto: set to 0.000001
+    account_size: 5000
+    risk_per_trade_pct: 0.005
+    take_profit_R: [1.0, 2.0]
+    round_qty_to: 1
 
 sheets:
-  # Primary Google Sheet
   url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
   sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
-
-  # Tabs used by the app
   open_positions_tab: "Open_Positions"
   signals_tab: "Signals"
-
-  # Where local CSV/PDFs land
   output_dir: "./output"
 
 google:
-  # Service account that the code uses to read the sheet
   service_account_json: "/home/luiscarlosht/WeinsteinAgent/creds/gcp_service_account.json"
   client_email: "500633565449-compute@developer.gserviceaccount.com"
 
@@ -39,214 +33,146 @@ notifications:
       host: "smtp.gmail.com"
       port_ssl: 587
       username: "luiscarlosht@gmail.com"
-      # replace with your actual app password locally
       app_password: "REPLACE_WITH_YOUR_GMAIL_APP_PASSWORD"
 
 reporting:
-  # Files the job writes
   output_dir: "/home/luiscarlosht/WeinsteinAgent/output"
   include_pdf: true
   include_csv: true
   summary_lines: 10
-
-  # SECTION ORDER in the email / report:
   section_order:
     - header
     - buy_triggers
     - near_triggers
     - sell_triggers
     - charts
-    - sell_risk_triggers         # keeps your "Sell / Risk Triggers" + Snapshot
+    - sell_risk_triggers
     - snapshot
-    - crypto_weekly_from_signals # <-- crypto summary from Signals goes here
-    - weekly_summary             # "Weinstein Weekly – Summary" comes after crypto
+    - crypto_weekly_from_signals
+    - weekly_summary
 
 universe:
   mode: "sp500"
   extra: ["NVDA","ANET","PANW","CRWD","RTX","VUG","SOXX"]
   min_price: 5
   min_avg_volume: 1000000
-  buffett_mode: "hybrid"   # options: "signals_only" | "hybrid" | "sp500_only"
+  buffett_mode: "hybrid"
 
 risk:
   max_position_pct: 10
   tranche_plan: [30,30,20,20]
   stop_below_ma_pct: 5
 
-# ---- Intraday / PROD knobs (long + short) ----
+# =========================
+# INTRADAY (unchanged)
+# =========================
 intraday:
-  # Keep intraday as your current balanced profile (C-style)
   adx_min_long: 18.0
 
   long:
-    # Confirms a BUY on ≥ vol_pace_min; NEAR uses ≥ near_vol_pace_min
-    vol_pace_min: 1.3          # TRIG min full-day volume vs 50dma
-    near_vol_pace_min: 1.0     # NEAR min full-day volume vs 50dma
+    vol_pace_min: 1.3
+    near_vol_pace_min: 1.0
     sell_intrabar_vol_pace_min: 1.2
-
-    # Text/logic thresholds (used by long intraday watcher)
-    confirm_headroom_pct: 0.4      # "% over pivot" headroom for confirm
-    near_below_pivot_pct: 0.3      # NEAR = within this % below pivot
-    crack_ma_pct: 0.5              # SELL trigger = below MA150 by this %
-    min_elapsed_minutes: 40        # 60m bars elapsed requirement
-    ma_proxy_length: 150           # MA150 as 30-wk proxy
+    confirm_headroom_pct: 0.4
+    near_below_pivot_pct: 0.3
+    crack_ma_pct: 0.5
+    min_elapsed_minutes: 40
+    ma_proxy_length: 150
 
   short:
-    # Core short trigger shape — these override weinstein_short_core defaults
-    break_pct: 0.004                # ≈0.4% below pivot/MA required for TRIG
-    near_above_pivot_pct: 0.01      # NEAR zone just above breakdown
-    vol_pace_min: 1.3               # TRIG: projected full-day vol vs 50dma
-    near_vol_pace_min: 1.0          # NEAR: projected full-day vol vs 50dma
+    break_pct: 0.004
+    near_above_pivot_pct: 0.01
+    vol_pace_min: 1.3
+    near_vol_pace_min: 1.0
+    intrabar_confirm_min_elapsed: 30
+    intrabar_volpace_min: 1.2
+    near_hits_window: 5
+    near_hits_min: 3
+    cooldown_scans: 4
+    ready_above_ma_pct: 0.005
+    stop_hard_pct: 0.20
+    trail_atr_mult: 2.0
+    ma_guard_pct: 0.03
+    target1_pct: 0.15
+    target2_pct: 0.20
 
-    # 60m intrabar confirmations
-    intrabar_confirm_min_elapsed: 30  # minutes elapsed in current bar
-    intrabar_volpace_min: 1.2         # intrabar volume pace vs recent bars
-
-    # Stateful promotion knobs (NEAR → ARMED → TRIGGERED → COOLDOWN)
-    near_hits_window: 5            # window of scans to accumulate hits
-    near_hits_min: 3               # hits needed in window to ARM
-    cooldown_scans: 4              # cooldown scans after a TRIGGER
-
-    # READY-to-close + risk “order block” text
-    ready_above_ma_pct: 0.005      # ≈0.5% above MA150 to call READY-to-close
-    stop_hard_pct: 0.20            # 20% disaster stop (short side)
-    trail_atr_mult: 2.0            # ATR×2.0 trail
-    ma_guard_pct: 0.03             # MA150 +3% as guard for stops
-    target1_pct: 0.15              # 15% downside target
-    target2_pct: 0.20              # 20% downside target
-
-  # Breadth for intraday (still OFF)
   breadth:
     enabled: false
-    ma_window: 50
-    min_long: 0.50        # ignored when enabled=false; kept for future tests
 
   regime:
-    use_long: true        # gate LONG intraday signals by regime
-    use_short: true       # gate SHORT intraday signals by regime
-                          # → market_regime decides which side is active
+    use_long: true
+    use_short: true
 
-# ---- Crypto weekly block, fed by your Signals tab ----
-crypto:
-  enabled: true
-  benchmark: "BTC-USD"
-
-  # Pull the crypto watchlist from the Signals tab, not from a static list
-  source: "signals"                 # options: "signals" | "list"
-
-  # How to find crypto rows inside "Signals"
-  signals_filter:
-    include_directions: ["BUY"]     # only the names you’re actively watching/holding as BUY signals
-    include_timeframes: ["short","mid","long"]  # consider all, or narrow if you want
-    ticker_regex: "-USD$"           # treat rows whose Ticker ends with "-USD" as crypto
-    allow_blank_price: true
-    min_unique: 1
-
-  # What to compute and show per-coin
-  metrics:
-    include: ["stage","short_term_state_wk","price","ma10","ma30","dist_ma_pct",
-              "ma_slope_per_wk","rs","rs_ma30","rs_above_ma","rs_slope_per_wk","notes"]
-    stage_method: "weinstien"
-    rs_anchor: "benchmark"
-
-  sparkline:
-    enabled: true
-    lookback_days: 21
-    width_px: 80
-    height_px: 20
-    pad_px: 2
-    ma_windows: [10,30]
-    show_markers: false
-
-  table:
-    title: "Crypto Weekly — Benchmark: BTC-USD"
-    uppercase_signals: true
-    buy_label: "Buy"
-    watch_label: "Watch"
-    avoid_label: "Avoid"
-    show_summary_line: true
-
-# ---- Email section visibility toggles ----
-sections:
-  header: true
-  buy_triggers: true
-  near_triggers: true
-  sell_triggers: true
-  charts: true
-  sell_risk_triggers: true
-  snapshot: true
-  crypto_weekly_from_signals: true
-  weekly_summary: true
-
-# ---- Optional formatting niceties ----
-formatting:
-  number_format:
-    percent: "0.00'%'"             # e.g., -3.66%
-    price: "0.00"
-  emoji:
-    buy: "✅"
-    watch: "🟡"
-    avoid: "🔴"
-
-# ---- Backtest / SIM knobs (Profile A – Conservative) ----
+# =========================
+# BACKTEST / SIM (KEY AREA)
+# =========================
 backtest:
-  snapshot_mode: "auto"        # use historical weekly snapshots where available
+  snapshot_mode: "auto"
 
+  # ✅ MASTER SWITCHES
   regime:
-    use_long: true             # LONGs gated by Chapter 8 regime
-    use_short: true            # ✅ enable structural shorts for the BOTH test
+    use_long: true
+    use_short: true   # <<< THIS IS REQUIRED
 
-  # Coppock curve filters (on benchmark, e.g., SPY)
+  # Coppock (keep shorts free for now)
   coppock:
-    use_long: true             # LONG: require Coppock(benchmark) > 0
-    use_short: false           # keep short-side coppock OFF for now (can enable later)
+    use_long: true
+    use_short: false
 
-  # Profile A – breadth ON (extra safety)
+  # Breadth: only gates LONGS
   breadth:
-    enabled: true              # ✅ require broad market participation
+    enabled: true
     ma_window: 50
-    min_long: 0.60             # at least 60% of names above MA50 to allow longs (more conservative)
+    min_long: 0.60
 
-  # NEW: Market-level trend / risk filters (Weinstein-style)
+  # =====================
+  # MARKET REGIME GATES
+  # =====================
   market:
-    require_rising_ma30: true  # only trade when SPY 30-week MA is flat-to-rising (for longs)
-    ma30_slope_min: 0.0        # slope >= 0 (no down-sloping MA30 for new longs)
-    vix_max: 25.0              # suppress new longs when VIX is in panic / crash mode
+    # LONG gate
+    require_rising_ma30: true
+    ma30_slope_min: 0.0
+    vix_max: 25.0
 
-    # ✅ NEXT STEP (short market gate)
-    require_falling_ma30: true     # only open NEW shorts when SPY MA150 slope is falling
-    ma30_slope_min_short: 0.0      # slope <= -0.0 (i.e., negative)
+    # SHORT gate (NEW)
+    require_falling_ma30: true
+    ma30_slope_min_short: 0.0
 
-  # NEW: Industry group filters (Stage 2 confirmation)
+  # =====================
+  # INDUSTRY FILTERS
+  # =====================
   industry:
-    enabled: true              # require industry confirmation
-    require_stage2: true       # industry must be in Stage 2
-    min_stage2_frac: 0.30      # at least 30% of the group in Stage 2
-    require_rising_ma30: true  # industry 30-week MA must be flat or rising
-    require_rising_rs: true    # industry RS vs benchmark must be improving
+    enabled: true
+    require_stage2: true
+    min_stage2_frac: 0.30
+    require_rising_ma30: true
+    require_rising_rs: true
 
-  # backtest logging controls
   logging:
     show_adx_skips: false
     show_breadth_skips: false
     show_coppock_skips: false
 
-  # Long-only, very selective entries
+  # =====================
+  # LONG LOGIC
+  # =====================
   long:
-    break_pct: 0.0060          # ≈0.6% above pivot → cleaner breakouts
-    vol_min: 1.50              # require 150% of 50dma volume
-    adx_min: 20.0              # stronger trend than C (which was ~18)
-    stop_hard: 0.20            # 20% disaster stop
-    trail_atr: 2.0             # ATR-based trail
-    ma_guard: 0.03             # extra guard vs MA30 (~3%)
-    require_ma30_rising: true  # only take longs when stock MA30 is flat or rising
-    ma30_slope_min: 0.0        # slope >= 0 for the individual stock
+    break_pct: 0.0060
+    vol_min: 1.50
+    adx_min: 20.0
+    stop_hard: 0.20
+    trail_atr: 2.0
+    ma_guard: 0.03
+    require_ma30_rising: true
+    ma30_slope_min: 0.0
 
-  # ✅ Shorts enabled for BOTH test (still conservative)
+  # =====================
+  # SHORT LOGIC (ACTIVE)
+  # =====================
   short:
-    break_pct: 0.0060          # conservative breakdown requirement
-    vol_min: 1.60              # very strong volume to even consider shorts
-    adx_min: 22.0              # only strongest downtrends
-    stop_hard: 0.18            # slightly tighter disaster stop
+    break_pct: 0.0060
+    vol_min: 1.60
+    adx_min: 22.0
+    stop_hard: 0.18
     trail_atr: 2.0
     ma_guard: 0.04
