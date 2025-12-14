@@ -33,12 +33,12 @@ notifications:
 
     # Primary recipients list (used by the main email sender)
     recipients:
-      - "luiscarloshernandez@gmail.com"
+      - "luiscarloshernandez@hotmail.com"
       - "luiscarlosht@gmail.com"
 
     # Compatibility alias (used by fallback sender expecting email.to)
     to:
-      - "luiscarloshernandez@gmail.com"
+      - "luiscarloshernandez@hotmail.com"
       - "luiscarlosht@gmail.com"
 
     subject_prefix: "Weinstein Report READY"
