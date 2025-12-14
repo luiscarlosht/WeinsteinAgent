@@ -30,17 +30,24 @@ notifications:
   email:
     enabled: true
     sender: "luiscarlosht@gmail.com"
+
+    # Primary recipients list (used by the main email sender)
     recipients:
-      - "luiscarloshernandez@hotmail.com"
+      - "luiscarloshernandez@gmail.com"
       - "luiscarlosht@gmail.com"
+
+    # Compatibility alias (used by fallback sender expecting email.to)
+    to:
+      - "luiscarloshernandez@gmail.com"
+      - "luiscarlosht@gmail.com"
+
     subject_prefix: "Weinstein Report READY"
     provider: "smtp"
     smtp:
-      host: "smtp.gmail.com"
+      host: "smtp.mail.me.com"
       port_ssl: 587
       username: "luiscarlosht@gmail.com"
-      # replace with your actual app password locally
-      app_password: "REPLACE_WITH_YOUR_GMAIL_APP_PASSWORD"
+      app_password: "qnamoxtmakhnvlml"
 
 reporting:
   # Files the job writes
@@ -201,7 +208,7 @@ formatting:
 
 # ---- Backtest / SIM knobs (Option A: LONG-only until shorts are fully wired) ----
 backtest:
-  snapshot_mode: "auto"        # use historical weekly snapshots where available
+  snapshot_mode: "auto"        # use historical weekly weekly snapshots where available
 
   regime:
     use_long: true             # LONGs gated by Chapter 8 regime
