@@ -30,9 +30,12 @@ This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT SKELETON + METRICS):
     - Optional VIX filter (longs suppressed when ^VIX > vix_max)
       (shorts: if vix_max is set, we DO NOT block shorts; only used to suppress new longs)
 
-NOTES / EXPECTATIONS:
-- Long-only Weinstein systems tend to shine in bull years (e.g., 2017) and be flat/choppy in sideways years (2015/2016).
-- Short rules here are intentionally conservative and should be refined after long baseline is frozen.
+PATCHES (Dec 14, 2025):
+- ✅ Fix misleading config load warning: logs the actual path that failed.
+- ✅ Wire config backtest.regime.use_long/use_short into do_longs/do_shorts
+  so "mode both" + "use_short true" really enables shorts, and you can disable
+  either side via config cleanly.
+- ✅ Add one-line DEBUG gate print (quiet unless VERBOSE) to prove why shorts are/aren't opening.
 """
 
 import argparse
@@ -118,8 +121,9 @@ def load_yaml_config(path: str = "./config.yaml") -> dict:
     try:
         with open(path, "r") as f:
             return yaml.safe_load(f) or {}
-    except Exception:
-        log("Failed to load config.yaml — using defaults.", level="warn")
+    except Exception as e:
+        # ✅ PATCH: log the actual file that failed (not hardcoded "config.yaml")
+        log(f"Failed to load {path} — using defaults. ({type(e).__name__}: {e})", level="warn")
         return {}
 
 
@@ -526,14 +530,12 @@ def _stage_num(row: pd.Series) -> Optional[int]:
         fv = float(v)
         if np.isnan(fv):
             return None
-        # allow 2.0, 4.0, etc.
         iv = int(round(fv))
         if iv in (1, 2, 3, 4):
             return iv
     except Exception:
         pass
     s = str(v).strip().lower()
-    # common strings
     if s in ("1", "1.0", "stage1", "stage 1"):
         return 1
     if s in ("2", "2.0", "stage2", "stage 2"):
@@ -542,7 +544,6 @@ def _stage_num(row: pd.Series) -> Optional[int]:
         return 3
     if s in ("4", "4.0", "stage4", "stage 4"):
         return 4
-    # fuzzy fallback
     if "stage" in s:
         for k in ("1", "2", "3", "4"):
             if k in s:
@@ -661,7 +662,6 @@ def short_stop_level(price: float, atr: float, ma: float, *, stop_hard_pct: floa
     if atr > 0 and trail_atr > 0:
         cands.append(price + atr * trail_atr)
 
-    # keep only stops above current price
     cands = [x for x in cands if np.isfinite(x) and x > price]
     if not cands:
         return np.nan
@@ -731,6 +731,8 @@ def backtest(
     short_logic_cfg: Mapping,
     market_cfg: Mapping,
     industry_cfg: Mapping,
+    # ✅ PATCH: wire config backtest.regime into enabling sides
+    regime_cfg: Mapping,
     # Safety knobs
     max_leverage: float = 1.0,
     max_pos_frac: float = 0.25,
@@ -769,7 +771,6 @@ def backtest(
         ma_cache[t] = close.rolling(30, min_periods=30).mean()
         atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
 
-    # (kept; not used yet)
     _ = LongEntryParams(
         min_break_pct=float(long_logic_cfg.get("break_pct", 0.004)),
         dist_above_ma_min=0.0,
@@ -781,6 +782,10 @@ def backtest(
     sh_stop_hard = float(short_logic_cfg.get("stop_hard", short_logic_cfg.get("stop_hard_pct", 0.20)))
     sh_trail_atr = float(short_logic_cfg.get("trail_atr", 2.0))
     sh_ma_guard = float(short_logic_cfg.get("ma_guard", 0.03))
+
+    # ✅ PATCH: side toggles from config (default True)
+    use_long = bool((regime_cfg or {}).get("use_long", True))
+    use_short = bool((regime_cfg or {}).get("use_short", True))
 
     all_dates = [pd.Timestamp(d) for d in daily_df.index if isinstance(d, (pd.Timestamp, datetime))]
 
@@ -794,7 +799,7 @@ def backtest(
             continue
 
         # ==============
-        # UPDATE TRAILING STOPS (optional but recommended)
+        # UPDATE TRAILING STOPS
         # ==============
         for key, pos in list(positions.items()):
             t = pos.ticker
@@ -818,13 +823,16 @@ def backtest(
             if pos.side == "long":
                 new_stop = long_stop_level(px_f, atr_f, ma_f)
                 if np.isfinite(new_stop):
-                    # for longs, trail upward only
                     pos.stop = float(max(pos.stop, new_stop))
                 pos.atr = atr_f
             else:
-                new_stop = short_stop_level(px_f, atr_f, ma_f, stop_hard_pct=sh_stop_hard, trail_atr=sh_trail_atr, ma_guard=sh_ma_guard)
+                new_stop = short_stop_level(
+                    px_f, atr_f, ma_f,
+                    stop_hard_pct=sh_stop_hard,
+                    trail_atr=sh_trail_atr,
+                    ma_guard=sh_ma_guard
+                )
                 if np.isfinite(new_stop):
-                    # for shorts, trail downward only (tighten)
                     pos.stop = float(min(pos.stop, new_stop))
                 pos.atr = atr_f
 
@@ -874,11 +882,10 @@ def backtest(
                     )
                     to_close.append(key)
             else:
-                # short exit: cover
                 if should_exit_short(px_f, float(pos.stop), ma_f):
                     cover_price = px_f
-                    cover_cost = float(pos.qty) * cover_price     # pay to buy back
-                    entry_proceeds = float(pos.qty) * float(pos.entry_price)  # received when shorted
+                    cover_cost = float(pos.qty) * cover_price
+                    entry_proceeds = float(pos.qty) * float(pos.entry_price)
 
                     pnl = entry_proceeds - cover_cost
                     pnl_pct = pnl / entry_proceeds if entry_proceeds > 0 else 0.0
@@ -911,15 +918,23 @@ def backtest(
         allow_new_longs = _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True
         allow_new_shorts = _market_allows_shorts(daily_df, dt, market_cfg) if market_cfg else True
 
-        # Buying power under gross exposure + leverage
         gross_expo = _gross_exposure(daily_df, dt, positions)
         buying_power = max(0.0, float(max_leverage) * eq_now - gross_expo)
 
-        do_longs = mode in ("long", "both", "auto")
-        do_shorts = mode in ("both", "auto")  # (auto includes shorts if you configure it / want it)
+        # ✅ PATCH: include config backtest.regime toggles
+        do_longs = (mode in ("long", "both", "auto")) and use_long
+        do_shorts = (mode in ("both", "auto")) and use_short
 
         n_long_now = sum(1 for p in positions.values() if p.side == "long")
         n_short_now = sum(1 for p in positions.values() if p.side == "short")
+
+        # ✅ PATCH: one-line debug to prove gates (shows why shorts are 0)
+        log(
+            f"GATES {dt.date()}: do_longs={do_longs} allow_new_longs={allow_new_longs} "
+            f"do_shorts={do_shorts} allow_new_shorts={allow_new_shorts} "
+            f"bp=${buying_power:,.0f} eq=${eq_now:,.0f} L={n_long_now}/{max_long} S={n_short_now}/{max_short}",
+            level="debug",
+        )
 
         # ---- LONG ENTRIES ----
         if do_longs and allow_new_longs and n_long_now < max_long and buying_power > 0:
@@ -933,15 +948,12 @@ def backtest(
                 if pos_key in positions:
                     continue
 
-                # ✅ Weinstein: Stage 2 only
                 if not _is_stage2(row):
                     continue
 
-                # Weekly MA30 slope filter
                 if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
                     continue
 
-                # ✅ Industry confirmation
                 if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                     continue
 
@@ -1005,7 +1017,6 @@ def backtest(
                 n_long_now += 1
 
         # ---- SHORT ENTRIES ----
-        # Weinstein-correct shape: Stage 4 + industry confirm + market weakness gate
         if do_shorts and allow_new_shorts and n_short_now < max_short and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_short_now >= max_short:
@@ -1017,16 +1028,12 @@ def backtest(
                 if pos_key in positions:
                     continue
 
-                # ✅ Weinstein: Stage 4 only
                 if not _is_stage4(row):
                     continue
 
-                # You can reuse slope filter but invert it later; for now, require it to FAIL the long slope test (proxy)
-                # i.e., if the stock is strongly rising by weekly slope rules, skip shorting it.
                 if stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
                     continue
 
-                # ✅ Industry confirmation (same function; assumes its logic aligns; if not, add a "short" flavor later)
                 if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                     continue
 
@@ -1047,11 +1054,15 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
-                # Simple Stage4-ish daily proxy: price below MA
                 if price_f >= ma_f:
                     continue
 
-                stop = short_stop_level(price_f, atr_f, ma_f, stop_hard_pct=sh_stop_hard, trail_atr=sh_trail_atr, ma_guard=sh_ma_guard)
+                stop = short_stop_level(
+                    price_f, atr_f, ma_f,
+                    stop_hard_pct=sh_stop_hard,
+                    trail_atr=sh_trail_atr,
+                    ma_guard=sh_ma_guard
+                )
                 if np.isnan(stop) or stop <= price_f:
                     continue
 
@@ -1072,7 +1083,6 @@ def backtest(
                 if qty <= 0:
                     continue
 
-                # On short entry: you RECEIVE proceeds; we still count exposure against buying power
                 proceeds = float(qty) * price_f
                 if proceeds <= 0 or proceeds > buying_power + 1e-9:
                     continue
@@ -1148,6 +1158,7 @@ def main():
     cfg = load_yaml_config(args.config)
     bt_cfg = cfg.get("backtest", {}) or {}
 
+    bt_regime_cfg = bt_cfg.get("regime", {}) or {}   # ✅ PATCH: wired into backtest()
     bt_long_cfg = bt_cfg.get("long", {}) or {}
     bt_short_cfg = bt_cfg.get("short", {}) or {}
     market_cfg = bt_cfg.get("market", {}) or {}
@@ -1220,6 +1231,7 @@ def main():
         short_logic_cfg=bt_short_cfg,
         market_cfg=market_cfg,
         industry_cfg=industry_cfg,
+        regime_cfg=bt_regime_cfg,  # ✅ PATCH: new param
         max_leverage=float(args.max_leverage),
         max_pos_frac=float(args.max_pos_frac),
     )
