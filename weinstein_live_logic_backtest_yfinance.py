@@ -3,7 +3,7 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT SKELETON + METRICS):
+This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORTS ENABLED + METRICS):
 - ✅ Proper cash accounting: subtract entry cost, add exit proceeds
 - ✅ Equity = cash + market value of open positions (mark-to-market)
 - ✅ Risk sizing uses EQUITY
@@ -21,24 +21,19 @@ This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT SKELETON + METRICS):
 - ✅ Adds SHORTS (Weinstein-style, conservative):
     - Stage 4 gate (from snapshot)
     - Market gate for shorts (optional)
-    - Industry confirmation (NOW short-safe)
+    - Industry confirmation (side-aware if supported by the function)
     - Cash + liability accounting for shorts
     - Stop + trailing stop skeleton for shorts (ATR/MA guard)
-- ✅ Adds optional market gate (Weinstein Chapter 8-ish):
-    - SPY 30-week proxy (150d) MA slope >= ma30_slope_min for longs if require_rising_ma30=True
-    - SPY MA slope <= -ma30_slope_min_short for shorts if require_falling_ma30=True
-    - Optional VIX filter (longs suppressed when ^VIX > vix_max)
-      (shorts: if vix_max is set, we DO NOT block shorts; only used to suppress new longs)
-
-NOTES / EXPECTATIONS:
-- Long-only Weinstein systems tend to shine in bull years and be flat/choppy in sideways years.
-- Short rules here are intentionally conservative and should be refined after long baseline is frozen.
+- ✅ Adds short MA30 slope gate:
+    - Uses snapshot MA30 slope column (tries multiple names)
+    - Controlled by backtest.short.require_falling_ma30 + backtest.short.ma30_slope_max
 """
 
 import argparse
 import os
 import math
 import re
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List, Tuple, Mapping, Any
@@ -531,19 +526,25 @@ def _stage_num(row: pd.Series) -> Optional[int]:
             return iv
     except Exception:
         pass
+
     s = str(v).strip().lower()
-    if s in ("1", "1.0", "stage1", "stage 1"):
-        return 1
-    if s in ("2", "2.0", "stage2", "stage 2"):
-        return 2
-    if s in ("3", "3.0", "stage3", "stage 3"):
-        return 3
-    if s in ("4", "4.0", "stage4", "stage 4"):
-        return 4
     if "stage" in s:
-        for k in ("1", "2", "3", "4"):
-            if k in s:
-                return int(k)
+        if "1" in s:
+            return 1
+        if "2" in s:
+            return 2
+        if "3" in s:
+            return 3
+        if "4" in s:
+            return 4
+    if s in ("1", "1.0"):
+        return 1
+    if s in ("2", "2.0"):
+        return 2
+    if s in ("3", "3.0"):
+        return 3
+    if s in ("4", "4.0"):
+        return 4
     return None
 
 
@@ -553,6 +554,67 @@ def _is_stage2(row: pd.Series) -> bool:
 
 def _is_stage4(row: pd.Series) -> bool:
     return _stage_num(row) == 4
+
+
+def _snapshot_ma30_slope(row: pd.Series) -> Optional[float]:
+    """
+    Try common names for MA30 slope in weekly snapshots.
+    Your snapshots show values like "stage 4 (downtrend)", so stage is a string.
+    We use other numeric columns for slope if present.
+    """
+    candidates = [
+        "ma30_slope_per_wk",
+        "ma_slope_per_wk",
+        "ma30_slope",
+        "ma_slope",
+        "slope_ma30",
+        "slope_ma",
+    ]
+    for c in candidates:
+        if c in row.index:
+            v = row.get(c, None)
+            try:
+                fv = float(v)
+                if np.isfinite(fv):
+                    return fv
+            except Exception:
+                continue
+    return None
+
+
+def _short_slope_ok_from_snapshot(row: pd.Series, short_cfg: Mapping) -> bool:
+    """
+    Short gate:
+      - require_falling_ma30 (default True): require slope <= ma30_slope_max (default 0.0)
+      - If cannot compute slope, return False (conservative: do not short).
+    """
+    require = bool(short_cfg.get("require_falling_ma30", True))
+    if not require:
+        return True
+
+    slope_max = short_cfg.get("ma30_slope_max", 0.0)
+    try:
+        slope_max = float(slope_max)
+    except Exception:
+        slope_max = 0.0
+
+    slope = _snapshot_ma30_slope(row)
+    if slope is None:
+        return False
+
+    return float(slope) <= float(slope_max)
+
+
+def _industry_ok(row: pd.Series, *, cfg: IndustryFilterConfig, side: str) -> bool:
+    """
+    Backwards-compatible wrapper:
+      - If industry_ok_from_row supports `side=...`, use it.
+      - Else call the legacy signature.
+    """
+    try:
+        return bool(industry_ok_from_row(row, cfg=cfg, side=side))
+    except TypeError:
+        return bool(industry_ok_from_row(row, cfg=cfg))
 
 
 def _market_allows_longs(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
@@ -625,51 +687,16 @@ def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: 
 
 
 # =========================
-# INDUSTRY FILTER WRAPPER (PATCH)
-# =========================
-
-def industry_ok_for_side(row: pd.Series, *, cfg: IndustryFilterConfig, side: str) -> bool:
-    """
-    The upstream industry_ok_from_row() is tuned for LONG confirmation and often includes:
-      - require_stage2
-      - require_rising_ma30
-      - require_rising_rs
-
-    That is correct for LONGS, but will suppress SHORTS completely when require_stage2=True.
-    This wrapper keeps LONG behavior identical, but makes SHORT behavior "short-safe" by
-    disabling Stage-2-only requirements when side == "short".
-    """
-    if side != "short":
-        return industry_ok_from_row(row, cfg=cfg)
-
-    # Create a modified config for shorts by copying attrs when possible.
-    # We avoid importing dataclasses.replace because we don't know if IndustryFilterConfig is a dataclass in your repo.
-    try:
-        d = dict(getattr(cfg, "__dict__", {}))
-    except Exception:
-        d = {}
-
-    # These keys are common in your config.yaml and typical implementations:
-    # - require_stage2: should be False for shorts
-    # - require_rising_ma30 / require_rising_rs: should be False for shorts
-    for k in ("require_stage2", "require_rising_ma30", "require_rising_rs"):
-        if k in d:
-            d[k] = False
-
-    try:
-        cfg_short = IndustryFilterConfig(**d)
-    except Exception:
-        # Fallback: if we cannot rebuild, at least don't block shorts on the industry gate.
-        return True
-
-    return industry_ok_from_row(row, cfg=cfg_short)
-
-
-# =========================
 # SHORT HELPERS
 # =========================
 
 def short_stop_level(price: float, atr: float, ma: float, *, stop_hard_pct: float, trail_atr: float, ma_guard: float) -> float:
+    """
+    Initial/trailing stop for short:
+      - hard stop: entry * (1 + stop_hard_pct)
+      - MA guard:  ma * (1 + ma_guard)
+      - ATR trail: price + ATR*trail_atr
+    """
     cands = []
     if price > 0 and stop_hard_pct > 0:
         cands.append(price * (1.0 + stop_hard_pct))
@@ -742,8 +769,6 @@ def backtest(
     short_logic_cfg: Mapping,
     market_cfg: Mapping,
     industry_cfg: Mapping,
-    use_long: bool = True,
-    use_short: bool = True,
     max_leverage: float = 1.0,
     max_pos_frac: float = 0.25,
 ):
@@ -771,6 +796,7 @@ def backtest(
     ma_cache: Dict[str, pd.Series] = {}
     atr_series_cache: Dict[str, pd.Series] = {}
 
+    # Precompute MA30 proxy (30d) + ATR
     for t in universe_tickers:
         close = get_panel(daily_df, "Close", t)
         high = get_panel(daily_df, "High", t)
@@ -920,9 +946,8 @@ def backtest(
         gross_expo = _gross_exposure(daily_df, dt, positions)
         buying_power = max(0.0, float(max_leverage) * eq_now - gross_expo)
 
-        # Modes: long / short / both / auto / none
-        do_longs = (mode in ("long", "both", "auto")) and bool(use_long)
-        do_shorts = (mode in ("short", "both", "auto")) and bool(use_short)
+        do_longs = mode in ("long", "both", "auto")
+        do_shorts = mode in ("short", "both", "auto")
 
         n_long_now = sum(1 for p in positions.values() if p.side == "long")
         n_short_now = sum(1 for p in positions.values() if p.side == "short")
@@ -945,7 +970,7 @@ def backtest(
                 if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
                     continue
 
-                if not industry_ok_for_side(row, cfg=industry_filter_cfg, side="long"):
+                if not _industry_ok(row, cfg=industry_filter_cfg, side="long"):
                     continue
 
                 if ("Close", t) not in daily_df.columns:
@@ -1022,12 +1047,11 @@ def backtest(
                 if not _is_stage4(row):
                     continue
 
-                # Skip "strong long trend" names
-                if stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
+                # ✅ FIX: real short slope gate (do NOT use the long slope function here)
+                if not _short_slope_ok_from_snapshot(row, short_logic_cfg):
                     continue
 
-                # ✅ PATCH: industry gate for shorts must not require Stage 2
-                if not industry_ok_for_side(row, cfg=industry_filter_cfg, side="short"):
+                if not _industry_ok(row, cfg=industry_filter_cfg, side="short"):
                     continue
 
                 if ("Close", t) not in daily_df.columns:
@@ -1047,6 +1071,7 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
+                # Stage4-ish daily proxy: price below MA
                 if price_f >= ma_f:
                     continue
 
@@ -1145,22 +1170,20 @@ def main():
     cfg = load_yaml_config(args.config)
     bt_cfg = cfg.get("backtest", {}) or {}
 
+    # Regime toggles (keep simple here; you already log these elsewhere)
+    regime_cfg = bt_cfg.get("regime", {}) or {}
+    use_long = bool(regime_cfg.get("use_long", True))
+    use_short = bool(regime_cfg.get("use_short", True))
+    log(f"Regime toggles: use_long={use_long}, use_short={use_short} | mode={args.mode}", level="info")
+
     bt_long_cfg = bt_cfg.get("long", {}) or {}
     bt_short_cfg = bt_cfg.get("short", {}) or {}
     market_cfg = bt_cfg.get("market", {}) or {}
     industry_cfg = bt_cfg.get("industry", {}) or {}
-    regime_cfg = bt_cfg.get("regime", {}) or {}
-
-    use_long = bool(regime_cfg.get("use_long", True))
-    use_short = bool(regime_cfg.get("use_short", False))
 
     log(
         f"Industry filters enabled={industry_cfg.get('enabled', False)} "
         f"min_stage2_frac={industry_cfg.get('min_stage2_frac', 'n/a')}",
-        level="info",
-    )
-    log(
-        f"Regime toggles: use_long={use_long}, use_short={use_short} | mode={args.mode}",
         level="info",
     )
 
@@ -1204,7 +1227,33 @@ def main():
 
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
-    regime_table = None  # placeholder (still)
+    regime_table = None  # placeholder
+
+    # Apply regime toggles to mode
+    mode = args.mode
+    if mode == "auto":
+        # auto = trade allowed sides by toggles
+        if use_long and use_short:
+            mode = "both"
+        elif use_long and not use_short:
+            mode = "long"
+        elif use_short and not use_long:
+            mode = "short"
+        else:
+            mode = "none"
+    else:
+        # explicit modes still respect toggles
+        if mode == "long" and not use_long:
+            mode = "none"
+        if mode == "short" and not use_short:
+            mode = "none"
+        if mode == "both":
+            if not use_long and not use_short:
+                mode = "none"
+            elif use_long and not use_short:
+                mode = "long"
+            elif use_short and not use_long:
+                mode = "short"
 
     result = backtest(
         daily_df=daily_df,
@@ -1214,7 +1263,7 @@ def main():
         risk_per_trade=args.risk_per_trade,
         max_long=args.max_long,
         max_short=args.max_short,
-        mode=args.mode,
+        mode=mode,
         universe_tickers=sorted(all_tickers),
         weekly_df=weekly_df,
         weekly_snapshots=weekly_snapshots,
@@ -1223,8 +1272,6 @@ def main():
         short_logic_cfg=bt_short_cfg,
         market_cfg=market_cfg,
         industry_cfg=industry_cfg,
-        use_long=use_long,
-        use_short=use_short,
         max_leverage=float(args.max_leverage),
         max_pos_frac=float(args.max_pos_frac),
     )
