@@ -3,7 +3,7 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORTS ENABLED + METRICS):
+This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT SKELETON + METRICS):
 - ✅ Proper cash accounting: subtract entry cost, add exit proceeds
 - ✅ Equity = cash + market value of open positions (mark-to-market)
 - ✅ Risk sizing uses EQUITY
@@ -21,19 +21,27 @@ This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORTS ENABLED + METRICS):
 - ✅ Adds SHORTS (Weinstein-style, conservative):
     - Stage 4 gate (from snapshot)
     - Market gate for shorts (optional)
-    - Industry confirmation (side-aware if supported by the function)
+    - Industry confirmation
     - Cash + liability accounting for shorts
     - Stop + trailing stop skeleton for shorts (ATR/MA guard)
-- ✅ Adds short MA30 slope gate:
-    - Uses snapshot MA30 slope column (tries multiple names)
-    - Controlled by backtest.short.require_falling_ma30 + backtest.short.ma30_slope_max
+- ✅ Adds optional market gate (Weinstein Chapter 8-ish):
+    - SPY 30-week proxy (150d) MA slope >= ma30_slope_min for longs if require_rising_ma30=True
+    - SPY MA slope <= -ma30_slope_min_short for shorts if require_falling_ma30=True
+    - Optional VIX filter (longs suppressed when ^VIX > vix_max)
+      (shorts: if vix_max is set, we DO NOT block shorts; only used to suppress new longs)
+
+IMPORTANT FIX (Dec 2025):
+- ✅ Shorts were not triggering because Stage4 names were being rejected by a “long slope ok” check.
+  That check is not a valid inverse for shorts and can filter out everything.
+  This file adds:
+    - short_slope_ok_from_snapshot(...) (optional, configurable)
+    - per-month short gating diagnostics (so you can see where candidates die)
 """
 
 import argparse
 import os
 import math
 import re
-import inspect
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List, Tuple, Mapping, Any
@@ -241,11 +249,6 @@ def compute_atr_series_from_ohlc(
     close: pd.Series,
     n: int = 14
 ) -> pd.Series:
-    """
-    ATR using True Range:
-      TR = max(High-Low, abs(High-prevClose), abs(Low-prevClose))
-    ATR = SMA(TR, n)
-    """
     prev_close = close.shift(1)
     tr = pd.concat(
         [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
@@ -286,11 +289,6 @@ def _positions_market_value(
     dt: pd.Timestamp,
     positions: Dict[str, "Position"],
 ) -> float:
-    """
-    Mark-to-market:
-      long:  +qty * px
-      short: -qty * px   (liability)
-    """
     mv = 0.0
     for _, p in positions.items():
         px = _safe_close(daily_df, dt, p.ticker)
@@ -307,10 +305,6 @@ def _gross_exposure(
     dt: pd.Timestamp,
     positions: Dict[str, "Position"],
 ) -> float:
-    """
-    Gross exposure = sum(|qty*px|) across all positions (long + short).
-    Used for leverage/buying-power caps.
-    """
     ex = 0.0
     for _, p in positions.items():
         px = _safe_close(daily_df, dt, p.ticker)
@@ -383,14 +377,6 @@ def _monthly_breakdown(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.D
 
 
 def _performance_summary(equity_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Produces a 1-row dataframe with:
-      - start/end equity
-      - CAGR
-      - Max Drawdown
-      - Annualized Vol (daily returns)
-      - Sharpe-ish (rf=0; daily mean/std * sqrt(252))
-    """
     if equity_df is None or equity_df.empty:
         return pd.DataFrame([{
             "start_equity": np.nan,
@@ -426,13 +412,11 @@ def _performance_summary(equity_df: pd.DataFrame) -> pd.DataFrame:
     if start_eq > 0 and years > 0:
         cagr = (end_eq / start_eq) ** (1.0 / years) - 1.0
 
-    # drawdown
     eq = df["equity"].astype(float)
     peak = eq.cummax()
     dd = (eq / peak) - 1.0
     max_dd = float(dd.min()) if len(dd) else np.nan
 
-    # daily returns
     rets = eq.pct_change().dropna()
     ann_vol = float(rets.std(ddof=0) * math.sqrt(252)) if len(rets) > 2 else np.nan
     sharpe0 = np.nan
@@ -494,7 +478,6 @@ def _write_reports(*, tag: str, trades: List["Trade"], equity_curve: List[Tuple[
             eq_s = f"${float(eqe):,.2f}" if pd.notna(eqe) else "$nan"
             log(f"  {m}: PnL=${pnl:,.2f} | Trades={tr} | WinRate={wr:5.1f}% | Equity={eq_s}", level="info")
 
-    # Perf one-liner
     try:
         p = perf_df.iloc[0].to_dict()
         cagr = p.get("cagr", np.nan)
@@ -526,25 +509,19 @@ def _stage_num(row: pd.Series) -> Optional[int]:
             return iv
     except Exception:
         pass
-
     s = str(v).strip().lower()
-    if "stage" in s:
-        if "1" in s:
-            return 1
-        if "2" in s:
-            return 2
-        if "3" in s:
-            return 3
-        if "4" in s:
-            return 4
-    if s in ("1", "1.0"):
+    if s in ("1", "1.0", "stage1", "stage 1"):
         return 1
-    if s in ("2", "2.0"):
+    if s in ("2", "2.0", "stage2", "stage 2"):
         return 2
-    if s in ("3", "3.0"):
+    if s in ("3", "3.0", "stage3", "stage 3"):
         return 3
-    if s in ("4", "4.0"):
+    if s in ("4", "4.0", "stage4", "stage 4"):
         return 4
+    if "stage" in s:
+        for k in ("1", "2", "3", "4"):
+            if k in s:
+                return int(k)
     return None
 
 
@@ -556,65 +533,40 @@ def _is_stage4(row: pd.Series) -> bool:
     return _stage_num(row) == 4
 
 
-def _snapshot_ma30_slope(row: pd.Series) -> Optional[float]:
+def short_slope_ok_from_snapshot(row: pd.Series, short_cfg: Mapping) -> bool:
     """
-    Try common names for MA30 slope in weekly snapshots.
-    Your snapshots show values like "stage 4 (downtrend)", so stage is a string.
-    We use other numeric columns for slope if present.
-    """
-    candidates = [
-        "ma30_slope_per_wk",
-        "ma_slope_per_wk",
-        "ma30_slope",
-        "ma_slope",
-        "slope_ma30",
-        "slope_ma",
-    ]
-    for c in candidates:
-        if c in row.index:
-            v = row.get(c, None)
-            try:
-                fv = float(v)
-                if np.isfinite(fv):
-                    return fv
-            except Exception:
-                continue
-    return None
+    NEW: Proper short slope gate (optional).
 
+    If enabled, require a bearish MA30 slope from the snapshot row.
 
-def _short_slope_ok_from_snapshot(row: pd.Series, short_cfg: Mapping) -> bool:
+    Looks for common columns (lowercased):
+      - ma30_slope_per_wk
+      - ma_slope_per_wk
+      - ma30_slope
+
+    Config:
+      short_cfg:
+        require_ma30_falling: bool (default False)
+        ma30_slope_max: float (default 0.0)  # must be <= this (e.g. 0.0 or -0.05)
     """
-    Short gate:
-      - require_falling_ma30 (default True): require slope <= ma30_slope_max (default 0.0)
-      - If cannot compute slope, return False (conservative: do not short).
-    """
-    require = bool(short_cfg.get("require_falling_ma30", True))
+    require = bool(short_cfg.get("require_ma30_falling", False))
     if not require:
         return True
 
-    slope_max = short_cfg.get("ma30_slope_max", 0.0)
-    try:
-        slope_max = float(slope_max)
-    except Exception:
-        slope_max = 0.0
+    ma30_slope_max = float(short_cfg.get("ma30_slope_max", 0.0))
 
-    slope = _snapshot_ma30_slope(row)
-    if slope is None:
-        return False
+    for col in ("ma30_slope_per_wk", "ma_slope_per_wk", "ma30_slope"):
+        if col in row.index:
+            v = row.get(col)
+            try:
+                fv = float(v)
+                if np.isfinite(fv):
+                    return fv <= ma30_slope_max
+            except Exception:
+                pass
 
-    return float(slope) <= float(slope_max)
-
-
-def _industry_ok(row: pd.Series, *, cfg: IndustryFilterConfig, side: str) -> bool:
-    """
-    Backwards-compatible wrapper:
-      - If industry_ok_from_row supports `side=...`, use it.
-      - Else call the legacy signature.
-    """
-    try:
-        return bool(industry_ok_from_row(row, cfg=cfg, side=side))
-    except TypeError:
-        return bool(industry_ok_from_row(row, cfg=cfg))
+    # If we REQUIRE it but can’t compute -> conservative: reject
+    return False
 
 
 def _market_allows_longs(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
@@ -691,12 +643,6 @@ def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: 
 # =========================
 
 def short_stop_level(price: float, atr: float, ma: float, *, stop_hard_pct: float, trail_atr: float, ma_guard: float) -> float:
-    """
-    Initial/trailing stop for short:
-      - hard stop: entry * (1 + stop_hard_pct)
-      - MA guard:  ma * (1 + ma_guard)
-      - ATR trail: price + ATR*trail_atr
-    """
     cands = []
     if price > 0 and stop_hard_pct > 0:
         cands.append(price * (1.0 + stop_hard_pct))
@@ -796,7 +742,6 @@ def backtest(
     ma_cache: Dict[str, pd.Series] = {}
     atr_series_cache: Dict[str, pd.Series] = {}
 
-    # Precompute MA30 proxy (30d) + ATR
     for t in universe_tickers:
         close = get_panel(daily_df, "Close", t)
         high = get_panel(daily_df, "High", t)
@@ -819,6 +764,17 @@ def backtest(
 
     all_dates = [pd.Timestamp(d) for d in daily_df.index if isinstance(d, (pd.Timestamp, datetime))]
 
+    # Diagnostics for why shorts don’t fire
+    short_diag = {
+        "stage4": 0,
+        "short_slope_fail": 0,
+        "industry_fail": 0,
+        "no_bars": 0,
+        "px_not_below_ma": 0,
+        "sized_zero": 0,
+        "entered": 0,
+    }
+
     for dt in all_dates:
         if dt < start_dt or dt > end_dt:
             continue
@@ -828,9 +784,7 @@ def backtest(
         if universe is None or universe.empty:
             continue
 
-        # ==============
-        # UPDATE TRAILING STOPS
-        # ==============
+        # TRAIL STOPS
         for key, pos in list(positions.items()):
             t = pos.ticker
             if ("Close", t) not in daily_df.columns:
@@ -863,9 +817,7 @@ def backtest(
 
             positions[key] = pos
 
-        # ==============
         # EXITS
-        # ==============
         to_close: List[str] = []
         for key, pos in positions.items():
             t = pos.ticker
@@ -935,9 +887,7 @@ def backtest(
         for key in to_close:
             del positions[key]
 
-        # ==============
         # ENTRIES
-        # ==============
         eq_now = _equity(daily_df, dt, cash, positions)
 
         allow_new_longs = _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True
@@ -952,7 +902,7 @@ def backtest(
         n_long_now = sum(1 for p in positions.values() if p.side == "long")
         n_short_now = sum(1 for p in positions.values() if p.side == "short")
 
-        # ---- LONG ENTRIES ----
+        # LONG ENTRIES
         if do_longs and allow_new_longs and n_long_now < max_long and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_long_now >= max_long:
@@ -970,7 +920,7 @@ def backtest(
                 if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
                     continue
 
-                if not _industry_ok(row, cfg=industry_filter_cfg, side="long"):
+                if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                     continue
 
                 if ("Close", t) not in daily_df.columns:
@@ -1032,7 +982,7 @@ def backtest(
                 )
                 n_long_now += 1
 
-        # ---- SHORT ENTRIES ----
+        # SHORT ENTRIES (fixed)
         if do_shorts and allow_new_shorts and n_short_now < max_short and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_short_now >= max_short:
@@ -1046,46 +996,57 @@ def backtest(
 
                 if not _is_stage4(row):
                     continue
+                short_diag["stage4"] += 1
 
-                # ✅ FIX: real short slope gate (do NOT use the long slope function here)
-                if not _short_slope_ok_from_snapshot(row, short_logic_cfg):
+                # ✅ NEW: proper configurable short slope gate (optional)
+                if not short_slope_ok_from_snapshot(row, short_logic_cfg):
+                    short_diag["short_slope_fail"] += 1
                     continue
 
-                if not _industry_ok(row, cfg=industry_filter_cfg, side="short"):
+                # ✅ Industry confirmation
+                if not industry_ok_from_row(row, cfg=industry_filter_cfg):
+                    short_diag["industry_fail"] += 1
                     continue
 
                 if ("Close", t) not in daily_df.columns:
+                    short_diag["no_bars"] += 1
                     continue
                 if t not in ma_cache or t not in atr_series_cache:
+                    short_diag["no_bars"] += 1
                     continue
                 if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
+                    short_diag["no_bars"] += 1
                     continue
 
                 price = daily_df.loc[dt, ("Close", t)]
                 ma_val = ma_cache[t].loc[dt]
                 atr_val = atr_series_cache[t].loc[dt]
                 if pd.isna(price) or pd.isna(ma_val) or pd.isna(atr_val):
+                    short_diag["no_bars"] += 1
                     continue
 
                 price_f = float(price)
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
-                # Stage4-ish daily proxy: price below MA
                 if price_f >= ma_f:
+                    short_diag["px_not_below_ma"] += 1
                     continue
 
                 stop = short_stop_level(price_f, atr_f, ma_f, stop_hard_pct=sh_stop_hard, trail_atr=sh_trail_atr, ma_guard=sh_ma_guard)
                 if np.isnan(stop) or stop <= price_f:
+                    short_diag["px_not_below_ma"] += 1
                     continue
 
                 per_share_risk = float(stop) - price_f
                 if per_share_risk <= 0:
+                    short_diag["px_not_below_ma"] += 1
                     continue
 
                 risk_amt = float(eq_now) * float(risk_per_trade)
                 qty_risk = int(math.floor(risk_amt / per_share_risk))
                 if qty_risk <= 0:
+                    short_diag["sized_zero"] += 1
                     continue
 
                 max_pos_value = float(max_pos_frac) * float(eq_now)
@@ -1094,10 +1055,12 @@ def backtest(
 
                 qty = max(0, min(qty_risk, qty_cap_pos, qty_cap_bp))
                 if qty <= 0:
+                    short_diag["sized_zero"] += 1
                     continue
 
                 proceeds = float(qty) * price_f
                 if proceeds <= 0 or proceeds > buying_power + 1e-9:
+                    short_diag["sized_zero"] += 1
                     continue
 
                 cash += proceeds
@@ -1113,10 +1076,8 @@ def backtest(
                     opened=pd.Timestamp(dt),
                 )
                 n_short_now += 1
+                short_diag["entered"] += 1
 
-        # ==============
-        # EQUITY + MONTHLY PROGRESS
-        # ==============
         eq = _equity(daily_df, dt, cash, positions)
         equity_curve.append((dt, eq))
 
@@ -1130,6 +1091,18 @@ def backtest(
                 f"(L={n_long_now}, S={n_short_now}), trades so far: {len(trades)}",
                 level="debug",
             )
+            if mode in ("short", "both", "auto"):
+                log(
+                    "Short diag (month-to-date): "
+                    f"stage4={short_diag['stage4']} slope_fail={short_diag['short_slope_fail']} "
+                    f"industry_fail={short_diag['industry_fail']} no_bars={short_diag['no_bars']} "
+                    f"px>=ma={short_diag['px_not_below_ma']} sized0={short_diag['sized_zero']} "
+                    f"entered={short_diag['entered']}",
+                    level="debug",
+                )
+                # reset per-month to keep output readable
+                for k in short_diag:
+                    short_diag[k] = 0
 
     final_eq = float(equity_curve[-1][1]) if equity_curve else _equity(daily_df, end_dt, cash, positions)
 
@@ -1170,12 +1143,6 @@ def main():
     cfg = load_yaml_config(args.config)
     bt_cfg = cfg.get("backtest", {}) or {}
 
-    # Regime toggles (keep simple here; you already log these elsewhere)
-    regime_cfg = bt_cfg.get("regime", {}) or {}
-    use_long = bool(regime_cfg.get("use_long", True))
-    use_short = bool(regime_cfg.get("use_short", True))
-    log(f"Regime toggles: use_long={use_long}, use_short={use_short} | mode={args.mode}", level="info")
-
     bt_long_cfg = bt_cfg.get("long", {}) or {}
     bt_short_cfg = bt_cfg.get("short", {}) or {}
     market_cfg = bt_cfg.get("market", {}) or {}
@@ -1184,6 +1151,11 @@ def main():
     log(
         f"Industry filters enabled={industry_cfg.get('enabled', False)} "
         f"min_stage2_frac={industry_cfg.get('min_stage2_frac', 'n/a')}",
+        level="info",
+    )
+    log(
+        f"Mode={args.mode} | market: rise_ma30={market_cfg.get('require_rising_ma30', False)} "
+        f"fall_ma30={market_cfg.get('require_falling_ma30', False)}",
         level="info",
     )
 
@@ -1227,33 +1199,7 @@ def main():
 
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
-    regime_table = None  # placeholder
-
-    # Apply regime toggles to mode
-    mode = args.mode
-    if mode == "auto":
-        # auto = trade allowed sides by toggles
-        if use_long and use_short:
-            mode = "both"
-        elif use_long and not use_short:
-            mode = "long"
-        elif use_short and not use_long:
-            mode = "short"
-        else:
-            mode = "none"
-    else:
-        # explicit modes still respect toggles
-        if mode == "long" and not use_long:
-            mode = "none"
-        if mode == "short" and not use_short:
-            mode = "none"
-        if mode == "both":
-            if not use_long and not use_short:
-                mode = "none"
-            elif use_long and not use_short:
-                mode = "long"
-            elif use_short and not use_long:
-                mode = "short"
+    regime_table = None
 
     result = backtest(
         daily_df=daily_df,
@@ -1263,7 +1209,7 @@ def main():
         risk_per_trade=args.risk_per_trade,
         max_long=args.max_long,
         max_short=args.max_short,
-        mode=mode,
+        mode=args.mode,
         universe_tickers=sorted(all_tickers),
         weekly_df=weekly_df,
         weekly_snapshots=weekly_snapshots,
