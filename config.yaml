@@ -258,6 +258,8 @@ backtest:
 
   # Short block is defined but not used in Option A (use_short=false)
   short:
+    require_falling_ma30: true
+    ma30_slope_max: 0.0     # <= 0 means flat-to-falling is OK for shorts
     break_pct: 0.0060
     vol_min: 1.60
     adx_min: 22.0
