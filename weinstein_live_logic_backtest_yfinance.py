@@ -28,7 +28,7 @@ This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT SKELETON + METRICS):
     - SPY 30-week proxy (150d) MA slope >= ma30_slope_min for longs if require_rising_ma30=True
     - SPY MA slope <= -ma30_slope_min_short for shorts if require_falling_ma30=True
     - Optional VIX filter (longs suppressed when ^VIX > vix_max)
-      (shorts: if vix_max is set, we DO NOT block shorts; only used to suppress new longs)
+      (shorts: highlighting: vix_max is not used to block shorts)
 
 IMPORTANT FIX (Dec 2025):
 - ✅ Shorts were not triggering because Stage4 names were being rejected by a “long slope ok” check.
@@ -36,6 +36,13 @@ IMPORTANT FIX (Dec 2025):
   This file adds:
     - short_slope_ok_from_snapshot(...) (optional, configurable)
     - per-month short gating diagnostics (so you can see where candidates die)
+
+NEW (Dec 2025):
+- ✅ Optional "failed rally" short entry gate:
+    - require_failed_rally: True/False
+    - failed_rally_lookback: e.g. 10 days
+    - failed_rally_pct: e.g. 0.02 (2% below recent lookback high)
+  This tries to short rollovers after a bounce, not just any Stage4 drift.
 """
 
 import argparse
@@ -44,7 +51,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
-from typing import Dict, Optional, List, Tuple, Mapping, Any
+from typing import Dict, Optional, List, Tuple, Mapping
 
 import numpy as np
 import pandas as pd
@@ -174,6 +181,12 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
         return []
 
     out: List[Tuple[date, pd.DataFrame]] = []
+    for fname in os.listdir(snapshot_dir):
+        if not (fname.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")):
+            # NOTE: keep original prefix check behavior, but ensure correct var name.
+            pass
+
+    out = []
     for fname in os.listdir(snapshot_dir):
         if not (fname.startswith(WEEKLY_FILE_PREFIX) and fname.endswith(".csv")):
             continue
@@ -535,19 +548,11 @@ def _is_stage4(row: pd.Series) -> bool:
 
 def short_slope_ok_from_snapshot(row: pd.Series, short_cfg: Mapping) -> bool:
     """
-    NEW: Proper short slope gate (optional).
+    Proper short slope gate (optional).
 
-    If enabled, require a bearish MA30 slope from the snapshot row.
-
-    Looks for common columns (lowercased):
-      - ma30_slope_per_wk
-      - ma_slope_per_wk
-      - ma30_slope
-
-    Config:
-      short_cfg:
-        require_ma30_falling: bool (default False)
-        ma30_slope_max: float (default 0.0)  # must be <= this (e.g. 0.0 or -0.05)
+    Config (under backtest.short):
+      require_ma30_falling: bool (default False)
+      ma30_slope_max: float (default 0.0)  # must be <= this (e.g. 0.0 or -0.05)
     """
     require = bool(short_cfg.get("require_ma30_falling", False))
     if not require:
@@ -565,8 +570,50 @@ def short_slope_ok_from_snapshot(row: pd.Series, short_cfg: Mapping) -> bool:
             except Exception:
                 pass
 
-    # If we REQUIRE it but can’t compute -> conservative: reject
     return False
+
+
+def short_failed_rally_ok(
+    close_series: pd.Series,
+    dt: pd.Timestamp,
+    short_cfg: Mapping,
+) -> bool:
+    """
+    Optional short entry gate: "failed rally" (rollover) filter.
+
+    If enabled (backtest.short.require_failed_rally=True):
+      require close <= rolling_max(close, lookback) * (1 - failed_rally_pct)
+
+    Config (under backtest.short):
+      require_failed_rally: bool (default False)
+      failed_rally_lookback: int (default 10)
+      failed_rally_pct: float (default 0.02)  # 2% below recent lookback high
+    """
+    if not bool(short_cfg.get("require_failed_rally", False)):
+        return True
+
+    lookback = int(short_cfg.get("failed_rally_lookback", 10))
+    pct = float(short_cfg.get("failed_rally_pct", 0.02))
+
+    if lookback < 2 or pct <= 0:
+        # if misconfigured but enabled, be conservative (reject)
+        return False
+
+    if close_series is None or close_series.empty:
+        return False
+    if dt not in close_series.index:
+        return False
+
+    roll_hi = close_series.rolling(lookback, min_periods=lookback).max()
+    if dt not in roll_hi.index or pd.isna(roll_hi.loc[dt]):
+        return False
+
+    px = float(close_series.loc[dt])
+    hi = float(roll_hi.loc[dt])
+    if not np.isfinite(px) or not np.isfinite(hi) or hi <= 0:
+        return False
+
+    return px <= hi * (1.0 - pct)
 
 
 def _market_allows_longs(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
@@ -739,6 +786,8 @@ def backtest(
     equity_curve: List[Tuple[pd.Timestamp, float]] = []
     last_progress_month: Optional[str] = None
 
+    # caches
+    close_cache: Dict[str, pd.Series] = {}
     ma_cache: Dict[str, pd.Series] = {}
     atr_series_cache: Dict[str, pd.Series] = {}
 
@@ -748,6 +797,7 @@ def backtest(
         low = get_panel(daily_df, "Low", t)
         if close.empty or high.empty or low.empty:
             continue
+        close_cache[t] = close
         ma_cache[t] = close.rolling(30, min_periods=30).mean()
         atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
 
@@ -764,10 +814,11 @@ def backtest(
 
     all_dates = [pd.Timestamp(d) for d in daily_df.index if isinstance(d, (pd.Timestamp, datetime))]
 
-    # Diagnostics for why shorts don’t fire
+    # Diagnostics for why shorts don’t fire (month-to-date)
     short_diag = {
         "stage4": 0,
         "short_slope_fail": 0,
+        "failed_rally_fail": 0,
         "industry_fail": 0,
         "no_bars": 0,
         "px_not_below_ma": 0,
@@ -810,7 +861,12 @@ def backtest(
                     pos.stop = float(max(pos.stop, new_stop))
                 pos.atr = atr_f
             else:
-                new_stop = short_stop_level(px_f, atr_f, ma_f, stop_hard_pct=sh_stop_hard, trail_atr=sh_trail_atr, ma_guard=sh_ma_guard)
+                new_stop = short_stop_level(
+                    px_f, atr_f, ma_f,
+                    stop_hard_pct=sh_stop_hard,
+                    trail_atr=sh_trail_atr,
+                    ma_guard=sh_ma_guard,
+                )
                 if np.isfinite(new_stop):
                     pos.stop = float(min(pos.stop, new_stop))
                 pos.atr = atr_f
@@ -982,7 +1038,7 @@ def backtest(
                 )
                 n_long_now += 1
 
-        # SHORT ENTRIES (fixed)
+        # SHORT ENTRIES (with optional "failed rally" gate)
         if do_shorts and allow_new_shorts and n_short_now < max_short and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_short_now >= max_short:
@@ -998,7 +1054,6 @@ def backtest(
                     continue
                 short_diag["stage4"] += 1
 
-                # ✅ NEW: proper configurable short slope gate (optional)
                 if not short_slope_ok_from_snapshot(row, short_logic_cfg):
                     short_diag["short_slope_fail"] += 1
                     continue
@@ -1011,11 +1066,16 @@ def backtest(
                 if ("Close", t) not in daily_df.columns:
                     short_diag["no_bars"] += 1
                     continue
-                if t not in ma_cache or t not in atr_series_cache:
+                if t not in ma_cache or t not in atr_series_cache or t not in close_cache:
                     short_diag["no_bars"] += 1
                     continue
                 if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
                     short_diag["no_bars"] += 1
+                    continue
+
+                # ✅ Optional failed-rally filter (this is what you asked "where is it?")
+                if not short_failed_rally_ok(close_cache[t], dt, short_logic_cfg):
+                    short_diag["failed_rally_fail"] += 1
                     continue
 
                 price = daily_df.loc[dt, ("Close", t)]
@@ -1033,7 +1093,12 @@ def backtest(
                     short_diag["px_not_below_ma"] += 1
                     continue
 
-                stop = short_stop_level(price_f, atr_f, ma_f, stop_hard_pct=sh_stop_hard, trail_atr=sh_trail_atr, ma_guard=sh_ma_guard)
+                stop = short_stop_level(
+                    price_f, atr_f, ma_f,
+                    stop_hard_pct=sh_stop_hard,
+                    trail_atr=sh_trail_atr,
+                    ma_guard=sh_ma_guard,
+                )
                 if np.isnan(stop) or stop <= price_f:
                     short_diag["px_not_below_ma"] += 1
                     continue
@@ -1094,13 +1159,16 @@ def backtest(
             if mode in ("short", "both", "auto"):
                 log(
                     "Short diag (month-to-date): "
-                    f"stage4={short_diag['stage4']} slope_fail={short_diag['short_slope_fail']} "
-                    f"industry_fail={short_diag['industry_fail']} no_bars={short_diag['no_bars']} "
-                    f"px>=ma={short_diag['px_not_below_ma']} sized0={short_diag['sized_zero']} "
+                    f"stage4={short_diag['stage4']} "
+                    f"slope_fail={short_diag['short_slope_fail']} "
+                    f"failed_rally_fail={short_diag['failed_rally_fail']} "
+                    f"industry_fail={short_diag['industry_fail']} "
+                    f"no_bars={short_diag['no_bars']} "
+                    f"px>=ma={short_diag['px_not_below_ma']} "
+                    f"sized0={short_diag['sized_zero']} "
                     f"entered={short_diag['entered']}",
                     level="debug",
                 )
-                # reset per-month to keep output readable
                 for k in short_diag:
                     short_diag[k] = 0
 
