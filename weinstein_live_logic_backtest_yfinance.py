@@ -182,7 +182,7 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
 
     out: List[Tuple[date, pd.DataFrame]] = []
     for fname in os.listdir(snapshot_dir):
-        if not (fname.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")):
+        if not (fname.startswith(WEEKLY_FILE_PREFIX) and fname.endswith(".csv")):
             # NOTE: keep original prefix check behavior, but ensure correct var name.
             pass
 
