@@ -232,7 +232,7 @@ backtest:
     vix_max: 25.0              # suppress new longs when VIX is in panic/crash mode
     # ✅ NEW: market gate for shorts (SPY must be falling)
     ma30_slope_min_short: 0.0
-    require_falling_ma30: false
+    require_falling_ma30: true
     
   # Industry group filters (Stage 2 confirmation)
   industry:
