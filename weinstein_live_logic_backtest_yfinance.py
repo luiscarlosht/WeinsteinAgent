@@ -666,6 +666,7 @@ def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: 
 
     if ("Close", "SPY") not in daily_df.columns:
         return False
+
     spy = daily_df[("Close", "SPY")].dropna()
     if dt not in spy.index:
         return False
@@ -674,12 +675,19 @@ def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: 
     if dt not in ma150.index or pd.isna(ma150.loc[dt]):
         return False
 
+    # ✅ NEW: require SPY below the MA proxy (your missing condition)
+    if float(spy.loc[dt]) >= float(ma150.loc[dt]):
+        return False
+
+    # slope proxy (5 trading days)
     prev = ma150.shift(5)
     if dt not in prev.index or pd.isna(prev.loc[dt]):
         return False
 
     slope = float(ma150.loc[dt] - prev.loc[dt])
-    if slope > -float(ma30_slope_min_short):
+
+    # ✅ cleaner: “falling” means slope <= threshold (0.0 by default)
+    if slope > float(ma30_slope_min_short):
         return False
 
     return True
