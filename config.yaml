@@ -70,7 +70,7 @@ reporting:
 
 universe:
   mode: "sp500"
-  extra: ["NVDA","ANET","PANW","CRWD","RTX","VUG","SOXX"]
+  extra: ["NVDA","ANET","PANW","CRWD","RTX","SOXX"]
   min_price: 5
   min_avg_volume: 1000000
   buffett_mode: "hybrid"   # options: "signals_only" | "hybrid" | "sp500_only"
@@ -236,7 +236,7 @@ backtest:
     
   # Industry group filters (Stage 2 confirmation)
   industry:
-    enabled: true
+    enabled: false
     require_stage2: true
     min_stage2_frac: 0.30
     require_rising_ma30: true
