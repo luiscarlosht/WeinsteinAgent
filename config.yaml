@@ -271,4 +271,4 @@ backtest:
     # NEW: optional failed-rally filter (short rollovers after a bounce)
     require_failed_rally: true
     failed_rally_lookback: 10
-    failed_rally_pct: 0.02
+    failed_rally_pct: 0.015 # was 0.02
