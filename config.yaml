@@ -262,7 +262,7 @@ backtest:
   # Short block is defined but not used in Option A (use_short=false)
   short:
     ma30_slope_max: 0.0     # <= 0 means flat-to-falling is OK for shorts
-    break_pct: 0.003
+    break_pct: 0.006
     vol_min: 1.10
     adx_min: 22.0
     stop_hard: 0.18
@@ -272,4 +272,4 @@ backtest:
     require_failed_rally: false
     failed_rally_lookback: 10
     failed_rally_pct: 0.02
-    pivot_lookback_days: 20 # MUST be >= 10
+    pivot_lookback_days: 50 # MUST be >= 10
