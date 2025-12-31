@@ -49,6 +49,10 @@ NEW (Dec 2025 - your request):
     - vol_mult vs 50d avg volume (uses config backtest.short.vol_min)
     - weak RS gate (snapshot rs_above_ma must be False when present)
   This makes your config change `vol_min: 1.10` actually matter.
+
+CRITICAL BUGFIX (Dec 31, 2025):
+- ✅ Pivot low for breakdown must EXCLUDE today's close; otherwise pivot==px on new lows
+  and breakdown can never trigger. (This was causing no_breakdown to dominate and 0 trades.)
 """
 
 import argparse
@@ -1148,9 +1152,10 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
-                # Pivot low: last N closes (daily proxy)
+                # Pivot low: last N PRIOR closes (exclude today's close!)
                 cs = close_cache[t]
-                tail = cs.loc[:dt].tail(sh_pivot_lb)
+                hist = cs.loc[:dt].iloc[:-1]  # <-- critical fix: exclude current bar
+                tail = hist.tail(sh_pivot_lb)
                 if len(tail) < sh_pivot_lb:
                     short_diag["no_bars"] += 1
                     continue
