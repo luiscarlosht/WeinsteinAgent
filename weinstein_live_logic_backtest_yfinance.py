@@ -3,7 +3,7 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT SKELETON + METRICS):
+This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT CORE + METRICS):
 - ✅ Proper cash accounting: subtract entry cost, add exit proceeds
 - ✅ Equity = cash + market value of open positions (mark-to-market)
 - ✅ Risk sizing uses EQUITY
@@ -24,16 +24,16 @@ This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT SKELETON + METRICS):
     - Industry confirmation
     - Cash + liability accounting for shorts
     - Stop + trailing stop skeleton for shorts (ATR/MA guard)
-- ✅ Adds optional market gate (Weinstein Chapter 8-ish):
+
+- ✅ Market gate (Weinstein Chapter 8-ish):
     - SPY 30-week proxy (150d) MA slope >= ma30_slope_min for longs if require_rising_ma30=True
-    - SPY MA slope <= -ma30_slope_min_short for shorts if require_falling_ma30=True
+    - SPY 30-week proxy slope <= ma30_slope_min_short for shorts if require_falling_ma30=True
+    - (and SPY below MA150 proxy for shorts)
     - Optional VIX filter (longs suppressed when ^VIX > vix_max)
-      (shorts: highlighting: vix_max is not used to block shorts)
 
 IMPORTANT FIX (Dec 2025):
 - ✅ Shorts were not triggering because Stage4 names were being rejected by a “long slope ok” check.
-  That check is not a valid inverse for shorts and can filter out everything.
-  This file adds:
+  This file keeps:
     - short_slope_ok_from_snapshot(...) (optional, configurable)
     - per-month short gating diagnostics (so you can see where candidates die)
 
@@ -42,7 +42,13 @@ NEW (Dec 2025):
     - require_failed_rally: True/False
     - failed_rally_lookback: e.g. 10 days
     - failed_rally_pct: e.g. 0.02 (2% below recent lookback high)
-  This tries to short rollovers after a bounce, not just any Stage4 drift.
+
+NEW (Dec 2025 - your request):
+- ✅ Wire SHORT entry to use:
+    - pivot low breakdown (daily proxy, last N closes)
+    - vol_mult vs 50d avg volume (uses config backtest.short.vol_min)
+    - weak RS gate (snapshot rs_above_ma must be False when present)
+  This makes your config change `vol_min: 1.10` actually matter.
 """
 
 import argparse
@@ -79,6 +85,11 @@ from weinstein_long_core import (
     check_long_entry,    # (kept for future wiring)
     long_stop_level,
     should_exit_long,
+)
+
+from weinstein_short_core import (
+    check_short_entry,
+    ShortEntryParams,
 )
 
 from weinstein_filters import stock_ma30_slope_ok_from_snapshot
@@ -183,7 +194,6 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
     out: List[Tuple[date, pd.DataFrame]] = []
     for fname in os.listdir(snapshot_dir):
         if not (fname.startswith(WEEKLY_FILE_PREFIX) and fname.endswith(".csv")):
-            # NOTE: keep original prefix check behavior, but ensure correct var name.
             pass
 
     out = []
@@ -596,7 +606,6 @@ def short_failed_rally_ok(
     pct = float(short_cfg.get("failed_rally_pct", 0.02))
 
     if lookback < 2 or pct <= 0:
-        # if misconfigured but enabled, be conservative (reject)
         return False
 
     if close_series is None or close_series.empty:
@@ -675,22 +684,46 @@ def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: 
     if dt not in ma150.index or pd.isna(ma150.loc[dt]):
         return False
 
-    # ✅ NEW: require SPY below the MA proxy (your missing condition)
+    # ✅ Require SPY below MA proxy for shorts
     if float(spy.loc[dt]) >= float(ma150.loc[dt]):
         return False
 
-    # slope proxy (5 trading days)
     prev = ma150.shift(5)
     if dt not in prev.index or pd.isna(prev.loc[dt]):
         return False
 
     slope = float(ma150.loc[dt] - prev.loc[dt])
 
-    # ✅ cleaner: “falling” means slope <= threshold (0.0 by default)
+    # ✅ “falling” means slope <= threshold (0.0 default)
     if slope > float(ma30_slope_min_short):
         return False
 
     return True
+
+
+def _parse_boolish(v) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and np.isfinite(v):
+        return bool(int(v))
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "y", "t"):
+        return True
+    if s in ("false", "0", "no", "n", "f"):
+        return False
+    return None
+
+
+def _get_snapshot_rs_above_ma(row: pd.Series) -> Optional[bool]:
+    # try common column names; return None if not found / not parseable
+    for col in ("rs_above_ma", "rs_above_ma30", "rs_above"):
+        if col in row.index:
+            b = _parse_boolish(row.get(col))
+            if b is not None:
+                return b
+    return None
 
 
 # =========================
@@ -796,18 +829,26 @@ def backtest(
 
     # caches
     close_cache: Dict[str, pd.Series] = {}
+    vol_cache: Dict[str, pd.Series] = {}
     ma_cache: Dict[str, pd.Series] = {}
     atr_series_cache: Dict[str, pd.Series] = {}
+    vol_mult_cache: Dict[str, pd.Series] = {}
 
     for t in universe_tickers:
         close = get_panel(daily_df, "Close", t)
         high = get_panel(daily_df, "High", t)
         low = get_panel(daily_df, "Low", t)
-        if close.empty or high.empty or low.empty:
+        vol = get_panel(daily_df, "Volume", t)
+        if close.empty or high.empty or low.empty or vol.empty:
             continue
+
         close_cache[t] = close
+        vol_cache[t] = vol
         ma_cache[t] = close.rolling(30, min_periods=30).mean()
         atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
+
+        v50 = vol.rolling(50, min_periods=50).mean()
+        vol_mult_cache[t] = vol / v50
 
     _ = LongEntryParams(
         min_break_pct=float(long_logic_cfg.get("break_pct", 0.004)),
@@ -820,6 +861,13 @@ def backtest(
     sh_trail_atr = float(short_logic_cfg.get("trail_atr", 2.0))
     sh_ma_guard = float(short_logic_cfg.get("ma_guard", 0.03))
 
+    # Short entry gates (wired)
+    sh_break_pct = float(short_logic_cfg.get("break_pct", 0.006))
+    sh_vol_min = float(short_logic_cfg.get("vol_min", 1.10))
+    sh_pivot_lb = int(short_logic_cfg.get("pivot_lookback_days", short_logic_cfg.get("pivot_lookback", 50)))
+    if sh_pivot_lb < 10:
+        sh_pivot_lb = 50
+
     all_dates = [pd.Timestamp(d) for d in daily_df.index if isinstance(d, (pd.Timestamp, datetime))]
 
     # Diagnostics for why shorts don’t fire (month-to-date)
@@ -830,6 +878,9 @@ def backtest(
         "industry_fail": 0,
         "no_bars": 0,
         "px_not_below_ma": 0,
+        "no_breakdown": 0,
+        "vol_too_low": 0,
+        "rs_too_strong": 0,
         "sized_zero": 0,
         "entered": 0,
     }
@@ -1046,7 +1097,7 @@ def backtest(
                 )
                 n_long_now += 1
 
-        # SHORT ENTRIES (with optional "failed rally" gate)
+        # SHORT ENTRIES (now wired to pivot + vol_min + weak RS + optional failed rally)
         if do_shorts and allow_new_shorts and n_short_now < max_short and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_short_now >= max_short:
@@ -1066,7 +1117,7 @@ def backtest(
                     short_diag["short_slope_fail"] += 1
                     continue
 
-                # ✅ Industry confirmation
+                # ✅ Industry confirmation (respects backtest.industry.enabled)
                 if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                     short_diag["industry_fail"] += 1
                     continue
@@ -1074,14 +1125,14 @@ def backtest(
                 if ("Close", t) not in daily_df.columns:
                     short_diag["no_bars"] += 1
                     continue
-                if t not in ma_cache or t not in atr_series_cache or t not in close_cache:
+                if t not in ma_cache or t not in atr_series_cache or t not in close_cache or t not in vol_cache or t not in vol_mult_cache:
                     short_diag["no_bars"] += 1
                     continue
-                if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
+                if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index or dt not in close_cache[t].index:
                     short_diag["no_bars"] += 1
                     continue
 
-                # ✅ Optional failed-rally filter (this is what you asked "where is it?")
+                # ✅ Optional failed-rally filter
                 if not short_failed_rally_ok(close_cache[t], dt, short_logic_cfg):
                     short_diag["failed_rally_fail"] += 1
                     continue
@@ -1097,8 +1148,46 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
-                if price_f >= ma_f:
-                    short_diag["px_not_below_ma"] += 1
+                # Pivot low: last N closes (daily proxy)
+                cs = close_cache[t]
+                tail = cs.loc[:dt].tail(sh_pivot_lb)
+                if len(tail) < sh_pivot_lb:
+                    short_diag["no_bars"] += 1
+                    continue
+                pivot_low = float(tail.min())
+
+                # Volume multiple vs 50d avg
+                vm = vol_mult_cache[t]
+                if dt not in vm.index or pd.isna(vm.loc[dt]):
+                    short_diag["no_bars"] += 1
+                    continue
+                vol_mult = float(vm.loc[dt])
+
+                # Weak RS gate (only if available in snapshot row; else default to False == "not strong")
+                rs_above_ma = _get_snapshot_rs_above_ma(row)
+                if rs_above_ma is None:
+                    rs_above_ma = False
+
+                res = check_short_entry(
+                    price=price_f,
+                    ma_val=ma_f,
+                    pivot_low=pivot_low,
+                    rs_above_ma=bool(rs_above_ma),
+                    vol_mult=vol_mult,
+                    params=ShortEntryParams(min_break_pct=sh_break_pct, vol_min=sh_vol_min),
+                )
+
+                if not res.can_enter:
+                    if res.reason == "price_not_below_ma":
+                        short_diag["px_not_below_ma"] += 1
+                    elif res.reason == "no_breakdown_vs_pivot":
+                        short_diag["no_breakdown"] += 1
+                    elif res.reason == "volume_too_low":
+                        short_diag["vol_too_low"] += 1
+                    elif res.reason == "rs_too_strong_for_short":
+                        short_diag["rs_too_strong"] += 1
+                    else:
+                        short_diag["no_bars"] += 1
                     continue
 
                 stop = short_stop_level(
@@ -1172,12 +1261,15 @@ def backtest(
                     f"failed_rally_fail={short_diag['failed_rally_fail']} "
                     f"industry_fail={short_diag['industry_fail']} "
                     f"no_bars={short_diag['no_bars']} "
-                    f"px>=ma={short_diag['px_not_below_ma']} "
+                    f"px_not_below_ma={short_diag['px_not_below_ma']} "
+                    f"no_breakdown={short_diag['no_breakdown']} "
+                    f"vol_low={short_diag['vol_too_low']} "
+                    f"rs_strong={short_diag['rs_too_strong']} "
                     f"sized0={short_diag['sized_zero']} "
                     f"entered={short_diag['entered']}",
                     level="debug",
                 )
-                for k in short_diag:
+                for k in list(short_diag.keys()):
                     short_diag[k] = 0
 
     final_eq = float(equity_curve[-1][1]) if equity_curve else _equity(daily_df, end_dt, cash, positions)
@@ -1234,6 +1326,13 @@ def main():
         f"fall_ma30={market_cfg.get('require_falling_ma30', False)}",
         level="info",
     )
+    if args.mode in ("short", "both", "auto"):
+        log(
+            f"Short entry gates: break_pct={bt_short_cfg.get('break_pct', 'n/a')} "
+            f"vol_min={bt_short_cfg.get('vol_min', 'n/a')} "
+            f"pivot_lb={bt_short_cfg.get('pivot_lookback_days', bt_short_cfg.get('pivot_lookback', 50))}",
+            level="info",
+        )
 
     weekly_df: Optional[pd.DataFrame] = None
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
