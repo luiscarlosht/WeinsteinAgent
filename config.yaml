@@ -263,7 +263,7 @@ backtest:
   short:
     ma30_slope_max: 0.0     # <= 0 means flat-to-falling is OK for shorts
     break_pct: 0.0060
-    vol_min: 1.60
+    vol_min: 1.10
     adx_min: 22.0
     stop_hard: 0.18
     trail_atr: 2.0
