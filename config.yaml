@@ -269,6 +269,6 @@ backtest:
     trail_atr: 2.0
     ma_guard: 0.04
     # NEW: optional failed-rally filter (short rollovers after a bounce)
-    require_failed_rally: true
+    require_failed_rally: false
     failed_rally_lookback: 10
     failed_rally_pct: 0.02
