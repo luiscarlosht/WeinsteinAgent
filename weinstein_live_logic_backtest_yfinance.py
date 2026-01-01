@@ -49,10 +49,6 @@ NEW (Dec 2025 - your request):
     - vol_mult vs 50d avg volume (uses config backtest.short.vol_min)
     - weak RS gate (snapshot rs_above_ma must be False when present)
   This makes your config change `vol_min: 1.10` actually matter.
-
-CRITICAL BUGFIX (Dec 31, 2025):
-- ✅ Pivot low for breakdown must EXCLUDE today's close; otherwise pivot==px on new lows
-  and breakdown can never trigger. (This was causing no_breakdown to dominate and 0 trades.)
 """
 
 import argparse
@@ -626,7 +622,11 @@ def short_failed_rally_ok(
     if not np.isfinite(px) or not np.isfinite(hi) or hi <= 0:
         return False
 
-    return px <= hi * (1.0 - pct)
+    ok = px <= hi * (1.0 - pct)
+    if not ok:
+        # keep this very light — only debug when verbose
+        log(f"[failed_rally] {close_series.name or 'TICKER'} on {dt.date()} rejected", level="debug")
+    return ok
 
 
 def _market_allows_longs(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
@@ -894,7 +894,7 @@ def backtest(
             continue
 
         snap = pick_snapshot_for_date(weekly_snapshots, dt) if weekly_snapshots else None
-        universe = snap[1] if snap else weekly_df
+        universe = snap[1] if snap else weekly_snapshots[0][1] if weekly_snapshots else weekly_df
         if universe is None or universe.empty:
             continue
 
@@ -1101,7 +1101,7 @@ def backtest(
                 )
                 n_long_now += 1
 
-        # SHORT ENTRIES (now wired to pivot + vol_min + weak RS + optional failed rally)
+        # SHORT ENTRIES (wired to pivot + vol_min + weak RS + optional failed rally)
         if do_shorts and allow_new_shorts and n_short_now < max_short and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_short_now >= max_short:
@@ -1121,7 +1121,6 @@ def backtest(
                     short_diag["short_slope_fail"] += 1
                     continue
 
-                # ✅ Industry confirmation (respects backtest.industry.enabled)
                 if not industry_ok_from_row(row, cfg=industry_filter_cfg):
                     short_diag["industry_fail"] += 1
                     continue
@@ -1136,13 +1135,10 @@ def backtest(
                     short_diag["no_bars"] += 1
                     continue
 
-                # ✅ Optional failed-rally filter
                 if not short_failed_rally_ok(close_cache[t], dt, short_logic_cfg):
                     short_diag["failed_rally_fail"] += 1
-                    if short_diag["failed_rally_fail"] <= 5:
-                        log(f"[failed_rally] {t} on {dt.date()} rejected", level="debug")
                     continue
-                
+
                 price = daily_df.loc[dt, ("Close", t)]
                 ma_val = ma_cache[t].loc[dt]
                 atr_val = atr_series_cache[t].loc[dt]
@@ -1154,23 +1150,19 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
-                # Pivot low: last N PRIOR closes (exclude today's close!)
                 cs = close_cache[t]
-                hist = cs.loc[:dt].iloc[:-1]  # <-- critical fix: exclude current bar
-                tail = hist.tail(sh_pivot_lb)
+                tail = cs.loc[:dt].tail(sh_pivot_lb)
                 if len(tail) < sh_pivot_lb:
                     short_diag["no_bars"] += 1
                     continue
                 pivot_low = float(tail.min())
 
-                # Volume multiple vs 50d avg
                 vm = vol_mult_cache[t]
                 if dt not in vm.index or pd.isna(vm.loc[dt]):
                     short_diag["no_bars"] += 1
                     continue
                 vol_mult = float(vm.loc[dt])
 
-                # Weak RS gate (only if available in snapshot row; else default to False == "not strong")
                 rs_above_ma = _get_snapshot_rs_above_ma(row)
                 if rs_above_ma is None:
                     rs_above_ma = False
@@ -1333,6 +1325,7 @@ def main():
         f"fall_ma30={market_cfg.get('require_falling_ma30', False)}",
         level="info",
     )
+
     if args.mode in ("short", "both", "auto"):
         log(
             f"Short cfg: require_failed_rally={bt_short_cfg.get('require_failed_rally', False)} "
@@ -1340,7 +1333,13 @@ def main():
             f"pct={bt_short_cfg.get('failed_rally_pct', 'n/a')}",
             level="info",
         )
-    
+        log(
+            f"Short entry gates: break_pct={bt_short_cfg.get('break_pct', 'n/a')} "
+            f"vol_min={bt_short_cfg.get('vol_min', 'n/a')} "
+            f"pivot_lb={bt_short_cfg.get('pivot_lookback_days', bt_short_cfg.get('pivot_lookback', 50))}",
+            level="info",
+        )
+
     weekly_df: Optional[pd.DataFrame] = None
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
     all_tickers: set[str] = set()
