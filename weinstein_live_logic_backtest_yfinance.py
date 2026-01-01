@@ -1333,12 +1333,12 @@ def main():
     )
     if args.mode in ("short", "both", "auto"):
         log(
-            f"Short entry gates: break_pct={bt_short_cfg.get('break_pct', 'n/a')} "
-            f"vol_min={bt_short_cfg.get('vol_min', 'n/a')} "
-            f"pivot_lb={bt_short_cfg.get('pivot_lookback_days', bt_short_cfg.get('pivot_lookback', 50))}",
+            f"Short cfg: require_failed_rally={bt_short_cfg.get('require_failed_rally', False)} "
+            f"lookback={bt_short_cfg.get('failed_rally_lookback', 'n/a')} "
+            f"pct={bt_short_cfg.get('failed_rally_pct', 'n/a')}",
             level="info",
         )
-
+    
     weekly_df: Optional[pd.DataFrame] = None
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
     all_tickers: set[str] = set()
