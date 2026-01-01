@@ -227,7 +227,7 @@ backtest:
 
   # Market-level trend / risk filters (Weinstein-style)
   market:
-    require_rising_ma30: true  # only trade when SPY 30-week MA is flat-to-rising (for longs)
+    require_rising_ma30: false  # only trade when SPY 30-week MA is flat-to-rising (for longs)
     ma30_slope_min: 0.0        # slope >= 0
     vix_max: 25.0              # suppress new longs when VIX is in panic/crash mode
     # ✅ NEW: market gate for shorts (SPY must be falling)
@@ -262,14 +262,14 @@ backtest:
   # Short block is defined but not used in Option A (use_short=false)
   short:
     ma30_slope_max: 0.0     # <= 0 means flat-to-falling is OK for shorts
-    break_pct: 0.006
+    break_pct: 0.002
     vol_min: 1.10
     adx_min: 22.0
     stop_hard: 0.18
     trail_atr: 2.0
     ma_guard: 0.04
     # NEW: optional failed-rally filter (short rollovers after a bounce)
-    require_failed_rally: true
+    require_failed_rally: false
     failed_rally_lookback: 10
     failed_rally_pct: 0.02
-    pivot_lookback_days: 50 # MUST be >= 10
+    pivot_lookback_days: 20 # MUST be >= 10
