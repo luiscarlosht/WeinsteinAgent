@@ -49,6 +49,11 @@ NEW (Dec 2025 - your request):
     - vol_mult vs 50d avg volume (uses config backtest.short.vol_min)
     - weak RS gate (snapshot rs_above_ma must be False when present)
   This makes your config change `vol_min: 1.10` actually matter.
+
+FIX (Jan 2026):
+- ✅ yfinance output can be MultiIndex or single-level columns depending on ticker count.
+  This file normalizes to MultiIndex columns (field, ticker) reliably.
+- ✅ failed_rally debug prints the actual ticker symbol (not a ('Close', 'TICKER') tuple)
 """
 
 import argparse
@@ -194,11 +199,6 @@ def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
     out: List[Tuple[date, pd.DataFrame]] = []
     for fname in os.listdir(snapshot_dir):
         if not (fname.startswith(WEEKLY_FILE_PREFIX) and fname.endswith(".csv")):
-            pass
-
-    out = []
-    for fname in os.listdir(snapshot_dir):
-        if not (fname.startswith(WEEKLY_FILE_PREFIX) and fname.endswith(".csv")):
             continue
         d = _parse_snapshot_date_from_name(fname)
         if not d:
@@ -229,6 +229,26 @@ def pick_snapshot_for_date(
 # DAILY DATA HELPERS
 # =========================
 
+def _normalize_yf_columns_to_multiindex(df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+    """
+    Normalize yfinance output to MultiIndex columns (field, ticker).
+    yfinance sometimes returns:
+      - MultiIndex when multiple tickers
+      - Single-level columns when one ticker
+    """
+    if df is None or df.empty:
+        return df
+
+    if isinstance(df.columns, pd.MultiIndex):
+        return df
+
+    # single ticker case: columns are fields only
+    # choose the only ticker if possible; else label as "SINGLE"
+    t = tickers[0] if tickers and isinstance(tickers[0], str) and tickers[0].strip() else "SINGLE"
+    df.columns = pd.MultiIndex.from_product([list(df.columns), [t]])
+    return df
+
+
 def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
     Download daily OHLCV using yfinance.
@@ -239,6 +259,7 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
 
     tickers = sorted(set([t for t in tickers if isinstance(t, str) and t.strip()]))
     log(f"Downloading daily bars for {len(tickers)} tickers ({pad_start} → {end})...", level="step")
+
     df = yf.download(
         tickers=tickers,
         start=pad_start,
@@ -251,9 +272,7 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
     if df is None or df.empty:
         raise RuntimeError("No daily data returned from yfinance.")
 
-    # Ensure MultiIndex columns: (field, ticker)
-    if not isinstance(df.columns, pd.MultiIndex):
-        df.columns = pd.MultiIndex.from_product([df.columns, ["SINGLE"]])
+    df = _normalize_yf_columns_to_multiindex(df, tickers)
 
     log("Daily download complete.", level="ok")
     return df
@@ -261,7 +280,11 @@ def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFram
 
 def get_panel(daily_df: pd.DataFrame, field: str, ticker: str) -> pd.Series:
     try:
-        return daily_df[(field, ticker)].dropna()
+        s = daily_df[(field, ticker)].dropna()
+        # normalize name so logs don’t show ('Close','TICKER')
+        if isinstance(s.name, tuple):
+            s = s.rename(ticker)
+        return s
     except Exception:
         return pd.Series(dtype="float64")
 
@@ -587,6 +610,8 @@ def short_failed_rally_ok(
     close_series: pd.Series,
     dt: pd.Timestamp,
     short_cfg: Mapping,
+    *,
+    ticker: Optional[str] = None,
 ) -> bool:
     """
     Optional short entry gate: "failed rally" (rollover) filter.
@@ -624,8 +649,8 @@ def short_failed_rally_ok(
 
     ok = px <= hi * (1.0 - pct)
     if not ok:
-        # keep this very light — only debug when verbose
-        log(f"[failed_rally] {close_series.name or 'TICKER'} on {dt.date()} rejected", level="debug")
+        t = ticker or (str(close_series.name) if close_series.name is not None else "TICKER")
+        log(f"[failed_rally] {t} on {dt.date()} rejected", level="debug")
     return ok
 
 
@@ -872,7 +897,7 @@ def backtest(
     if sh_pivot_lb < 10:
         sh_pivot_lb = 50
 
-    all_dates = [pd.Timestamp(d) for d in daily_df.index if isinstance(d, (pd.Timestamp, datetime))]
+    all_dates = list(pd.to_datetime(daily_df.index))
 
     # Diagnostics for why shorts don’t fire (month-to-date)
     short_diag = {
@@ -894,7 +919,7 @@ def backtest(
             continue
 
         snap = pick_snapshot_for_date(weekly_snapshots, dt) if weekly_snapshots else None
-        universe = snap[1] if snap else weekly_snapshots[0][1] if weekly_snapshots else weekly_df
+        universe = snap[1] if snap else (weekly_snapshots[0][1] if weekly_snapshots else weekly_df)
         if universe is None or universe.empty:
             continue
 
@@ -1135,7 +1160,7 @@ def backtest(
                     short_diag["no_bars"] += 1
                     continue
 
-                if not short_failed_rally_ok(close_cache[t], dt, short_logic_cfg):
+                if not short_failed_rally_ok(close_cache[t], dt, short_logic_cfg, ticker=t):
                     short_diag["failed_rally_fail"] += 1
                     continue
 
