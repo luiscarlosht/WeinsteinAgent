@@ -1139,8 +1139,10 @@ def backtest(
                 # ✅ Optional failed-rally filter
                 if not short_failed_rally_ok(close_cache[t], dt, short_logic_cfg):
                     short_diag["failed_rally_fail"] += 1
+                    if short_diag["failed_rally_fail"] <= 5:
+                        log(f"[failed_rally] {t} on {dt.date()} rejected", level="debug")
                     continue
-
+                
                 price = daily_df.loc[dt, ("Close", t)]
                 ma_val = ma_cache[t].loc[dt]
                 atr_val = atr_series_cache[t].loc[dt]
