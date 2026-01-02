@@ -3,19 +3,60 @@
 """
 Weinstein Live Logic Backtest (daily approximation of intraday watchers)
 
-FIXES (Jan 2026):
-- ✅ Wire backtest.regime.use_long / use_short into actual entry permissions.
-- ✅ Make short market gate less “year-blocking” by adding configurable short_gate_mode:
-      - "either" (default): slope falling OR price below MA150
-      - "both": slope falling AND price below MA150  (old behavior)
-      - "slope": slope only
-      - "below_ma": price only
-- ✅ Add monthly debug print showing allow_new_longs/allow_new_shorts.
+This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT CORE + METRICS):
+- ✅ Proper cash accounting: subtract entry cost, add exit proceeds
+- ✅ Equity = cash + market value of open positions (mark-to-market)
+- ✅ Risk sizing uses EQUITY
+- ✅ Caps:
+    - max_leverage (default 1.0)
+    - max_pos_frac per position (default 0.25)
+- ✅ Restores monthly progress logging
+- ✅ Final summary + outputs:
+    - trades CSV
+    - equity curve PNG
+    - monthly breakdown CSV
+    - performance summary CSV (CAGR / MaxDD / Vol / Sharpe-ish)
+- ✅ Keeps Industry filters (single source of truth)
+- ✅ Adds Stage 2 gate (from snapshot row) for LONG entries
+- ✅ Adds SHORTS (Weinstein-style, conservative):
+    - Stage 4 gate (from snapshot)
+    - Market gate for shorts (optional)
+    - Industry confirmation
+    - Cash + liability accounting for shorts
+    - Stop + trailing stop skeleton for shorts (ATR/MA guard)
 
-Notes:
-- Your current config:
-    backtest.market.require_falling_ma30: true
-  combined with old "both" behavior often blocks all shorts for long stretches.
+- ✅ Market gate (Weinstein Chapter 8-ish):
+    - SPY 30-week proxy (150d) MA slope >= ma30_slope_min for longs if require_rising_ma30=True
+    - SPY 30-week proxy slope <= ma30_slope_min_short for shorts if require_falling_ma30=True
+    - Optional short_gate_mode: "either"|"both"|"below_ma"|"slope"
+    - Optional VIX filter (longs suppressed when ^VIX > vix_max)
+
+IMPORTANT FIX (Dec 2025):
+- ✅ Shorts were not triggering because Stage4 names were being rejected by a “long slope ok” check.
+  This file keeps:
+    - short_slope_ok_from_snapshot(...) (optional, configurable)
+    - per-month short gating diagnostics (so you can see where candidates die)
+
+NEW (Dec 2025):
+- ✅ Optional "failed rally" short entry gate:
+    - require_failed_rally: True/False
+    - failed_rally_lookback: e.g. 10 days
+    - failed_rally_pct: e.g. 0.02 (2% below recent lookback high)
+
+NEW (Dec 2025 - your request):
+- ✅ Wire SHORT entry to use:
+    - pivot low breakdown (daily proxy, last N closes)
+    - vol_mult vs 50d avg volume (uses config backtest.short.vol_min)
+    - weak RS gate (snapshot rs_above_ma must be False when present)
+
+FIX (Jan 2026):
+- ✅ yfinance output can be MultiIndex or single-level columns depending on ticker count.
+  This file normalizes to MultiIndex columns (field, ticker) reliably.
+- ✅ failed_rally debug prints the actual ticker symbol (not a ('Close', 'TICKER') tuple)
+
+FIX (Jan 2026 - CRITICAL):
+- ✅ Short pivot_low was mistakenly computed INCLUDING today's close, making breakdown impossible.
+  Now pivot_low is computed from PRIOR closes only (exclude current day).
 """
 
 import argparse
@@ -472,6 +513,17 @@ def _write_reports(*, tag: str, trades: List["Trade"], equity_curve: List[Tuple[
     log(f"Wrote monthly P/L breakdown → {monthly_path}", level="ok")
     log(f"Wrote performance summary → {perf_path}", level="ok")
 
+    if not monthly_df.empty:
+        log("Monthly P/L summary:", level="info")
+        for _, r in monthly_df.iterrows():
+            m = r["month"]
+            pnl = float(r["pnl"])
+            tr = int(r["trades"])
+            wr = float(r["win_rate"])
+            eqe = r.get("equity_end", np.nan)
+            eq_s = f"${float(eqe):,.2f}" if pd.notna(eqe) else "$nan"
+            log(f"  {m}: PnL=${pnl:,.2f} | Trades={tr} | WinRate={wr:5.1f}% | Equity={eq_s}", level="info")
+
     try:
         p = perf_df.iloc[0].to_dict()
         cagr = p.get("cagr", np.nan)
@@ -528,6 +580,13 @@ def _is_stage4(row: pd.Series) -> bool:
 
 
 def short_slope_ok_from_snapshot(row: pd.Series, short_cfg: Mapping) -> bool:
+    """
+    Proper short slope gate (optional).
+
+    Config (under backtest.short):
+      require_ma30_falling: bool (default False)
+      ma30_slope_max: float (default 0.0)  # must be <= this (e.g. 0.0 or -0.05)
+    """
     require = bool(short_cfg.get("require_ma30_falling", False))
     if not require:
         return True
@@ -554,6 +613,12 @@ def short_failed_rally_ok(
     *,
     ticker: Optional[str] = None,
 ) -> bool:
+    """
+    Optional short entry gate: "failed rally" (rollover) filter.
+
+    If enabled (backtest.short.require_failed_rally=True):
+      require close <= rolling_max(close, lookback) * (1 - failed_rally_pct)
+    """
     if not bool(short_cfg.get("require_failed_rally", False)):
         return True
 
@@ -562,7 +627,6 @@ def short_failed_rally_ok(
 
     if lookback < 2 or pct <= 0:
         return False
-
     if close_series is None or close_series.empty:
         return False
     if dt not in close_series.index:
@@ -627,21 +691,21 @@ def _market_allows_longs(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: M
 
 def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
     """
-    Short market gate. Still controlled by:
-      backtest.market.require_falling_ma30: true/false
-
-    NEW: backtest.market.short_gate_mode (default "either"):
-      - "either": allow if (SPY < MA150) OR (MA150 slope <= threshold)
-      - "both":   allow if (SPY < MA150) AND (MA150 slope <= threshold)   <-- old behavior
-      - "below_ma": only SPY < MA150
-      - "slope":    only slope <= threshold
+    Optional short market gate. Supports:
+      short_gate_mode: "either"|"both"|"below_ma"|"slope"
+    Uses:
+      require_falling_ma30: bool
+      ma30_slope_min_short: float (0.0 default; falling if slope <= threshold)
     """
     require_falling = bool(market_cfg.get("require_falling_ma30", False))
-    ma30_slope_min_short = float(market_cfg.get("ma30_slope_min_short", 0.0))
-    short_gate_mode = str(market_cfg.get("short_gate_mode", "either")).strip().lower()
-
     if not require_falling:
         return True
+
+    gate_mode = str(market_cfg.get("short_gate_mode", "both")).strip().lower()
+    if gate_mode not in ("either", "both", "below_ma", "slope"):
+        gate_mode = "both"
+
+    ma30_slope_min_short = float(market_cfg.get("ma30_slope_min_short", 0.0))
 
     if ("Close", "SPY") not in daily_df.columns:
         return False
@@ -663,15 +727,13 @@ def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: 
     slope = float(ma150.loc[dt] - prev.loc[dt])
     slope_falling = slope <= float(ma30_slope_min_short)
 
-    if short_gate_mode == "both":
-        return bool(below_ma and slope_falling)
-    if short_gate_mode == "below_ma":
+    if gate_mode == "below_ma":
         return bool(below_ma)
-    if short_gate_mode == "slope":
+    if gate_mode == "slope":
         return bool(slope_falling)
-
-    # default: "either"
-    return bool(below_ma or slope_falling)
+    if gate_mode == "either":
+        return bool(below_ma or slope_falling)
+    return bool(below_ma and slope_falling)  # "both"
 
 
 def _parse_boolish(v) -> Optional[bool]:
@@ -771,7 +833,6 @@ def backtest(
     weekly_df: Optional[pd.DataFrame],
     weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]],
     regime_table: Optional[pd.DataFrame],
-    regime_cfg: Mapping,              # ✅ NEW
     long_logic_cfg: Mapping,
     short_logic_cfg: Mapping,
     market_cfg: Mapping,
@@ -834,6 +895,7 @@ def backtest(
     sh_trail_atr = float(short_logic_cfg.get("trail_atr", 2.0))
     sh_ma_guard = float(short_logic_cfg.get("ma_guard", 0.03))
 
+    # Short entry gates (wired)
     sh_break_pct = float(short_logic_cfg.get("break_pct", 0.006))
     sh_vol_min = float(short_logic_cfg.get("vol_min", 1.10))
     sh_pivot_lb = int(short_logic_cfg.get("pivot_lookback_days", short_logic_cfg.get("pivot_lookback", 50)))
@@ -842,12 +904,14 @@ def backtest(
 
     all_dates = list(pd.to_datetime(daily_df.index))
 
+    # Diagnostics for why shorts don’t fire (month-to-date)
     short_diag = {
         "stage4": 0,
         "short_slope_fail": 0,
         "failed_rally_fail": 0,
         "industry_fail": 0,
         "no_bars": 0,
+        "pivot_window_too_small": 0,
         "px_not_below_ma": 0,
         "no_breakdown": 0,
         "vol_too_low": 0,
@@ -855,10 +919,6 @@ def backtest(
         "sized_zero": 0,
         "entered": 0,
     }
-
-    # ✅ NEW: regime toggles actually used
-    regime_use_long = bool((regime_cfg or {}).get("use_long", True))
-    regime_use_short = bool((regime_cfg or {}).get("use_short", True))
 
     for dt in all_dates:
         if dt < start_dt or dt > end_dt:
@@ -955,7 +1015,7 @@ def backtest(
                     entry_proceeds = float(pos.qty) * float(pos.entry_price)
 
                     pnl = entry_proceeds - cover_cost
-                    pnl_pct = pnl / entry_proceeds if entry_proceeds > 0 else 0.0
+                    pnl_pct = pnl / entry_proceeds if entry_proceeds > 1e-12 else 0.0
 
                     cash -= cover_cost
 
@@ -986,12 +1046,8 @@ def backtest(
         gross_expo = _gross_exposure(daily_df, dt, positions)
         buying_power = max(0.0, float(max_leverage) * eq_now - gross_expo)
 
-        # ✅ MODE + REGIME TOGGLES
-        mode_allows_long = mode in ("long", "both", "auto")
-        mode_allows_short = mode in ("short", "both", "auto")
-
-        do_longs = bool(mode_allows_long and regime_use_long)
-        do_shorts = bool(mode_allows_short and regime_use_short)
+        do_longs = mode in ("long", "both", "auto")
+        do_shorts = mode in ("short", "both", "auto")
 
         n_long_now = sum(1 for p in positions.values() if p.side == "long")
         n_short_now = sum(1 for p in positions.values() if p.side == "short")
@@ -1076,7 +1132,7 @@ def backtest(
                 )
                 n_long_now += 1
 
-        # SHORT ENTRIES (wired)
+        # SHORT ENTRIES (pivot + vol_min + weak RS + optional failed rally)
         if do_shorts and allow_new_shorts and n_short_now < max_short and buying_power > 0:
             for _, row in universe.iterrows():
                 if n_short_now >= max_short:
@@ -1125,12 +1181,17 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
+                # ✅ FIX: pivot_low must be from PRIOR closes only (exclude today)
                 cs = close_cache[t]
-                tail = cs.loc[:dt].tail(sh_pivot_lb)
-                if len(tail) < sh_pivot_lb:
-                    short_diag["no_bars"] += 1
+                prior = cs.loc[:dt]
+                if len(prior) < (sh_pivot_lb + 1):
+                    short_diag["pivot_window_too_small"] += 1
                     continue
-                pivot_low = float(tail.min())
+                prior_tail = prior.iloc[:-1].tail(sh_pivot_lb)  # exclude current day
+                if len(prior_tail) < sh_pivot_lb:
+                    short_diag["pivot_window_too_small"] += 1
+                    continue
+                pivot_low = float(prior_tail.min())
 
                 vm = vol_mult_cache[t]
                 if dt not in vm.index or pd.isna(vm.loc[dt]):
@@ -1227,11 +1288,6 @@ def backtest(
                 f"(L={n_long_now}, S={n_short_now}), trades so far: {len(trades)}",
                 level="debug",
             )
-            log(
-                f"[market gates] allow_new_longs={allow_new_longs} allow_new_shorts={allow_new_shorts} "
-                f"(short_gate_mode={str(market_cfg.get('short_gate_mode','either')).lower()})",
-                level="debug",
-            )
 
             if mode in ("short", "both", "auto"):
                 log(
@@ -1241,6 +1297,7 @@ def backtest(
                     f"failed_rally_fail={short_diag['failed_rally_fail']} "
                     f"industry_fail={short_diag['industry_fail']} "
                     f"no_bars={short_diag['no_bars']} "
+                    f"pivot_small={short_diag['pivot_window_too_small']} "
                     f"px_not_below_ma={short_diag['px_not_below_ma']} "
                     f"no_breakdown={short_diag['no_breakdown']} "
                     f"vol_low={short_diag['vol_too_low']} "
@@ -1291,11 +1348,11 @@ def main():
     cfg = load_yaml_config(args.config)
     bt_cfg = cfg.get("backtest", {}) or {}
 
-    bt_regime_cfg = bt_cfg.get("regime", {}) or {}     # ✅ NEW
     bt_long_cfg = bt_cfg.get("long", {}) or {}
     bt_short_cfg = bt_cfg.get("short", {}) or {}
     market_cfg = bt_cfg.get("market", {}) or {}
     industry_cfg = bt_cfg.get("industry", {}) or {}
+    regime_cfg = bt_cfg.get("regime", {}) or {}
 
     log(
         f"Industry filters enabled={industry_cfg.get('enabled', False)} "
@@ -1308,10 +1365,11 @@ def main():
         level="info",
     )
     log(
-        f"Backtest regime toggles: use_long={bt_regime_cfg.get('use_long', True)} "
-        f"use_short={bt_regime_cfg.get('use_short', True)}",
+        f"Backtest regime toggles: use_long={regime_cfg.get('use_long', True)} "
+        f"use_short={regime_cfg.get('use_short', True)}",
         level="info",
     )
+
     if args.mode in ("short", "both", "auto"):
         log(
             f"Short cfg: require_failed_rally={bt_short_cfg.get('require_failed_rally', False)} "
@@ -1326,7 +1384,7 @@ def main():
             level="info",
         )
         log(
-            f"Short market gate: short_gate_mode={market_cfg.get('short_gate_mode', 'either')}",
+            f"Short market gate: short_gate_mode={market_cfg.get('short_gate_mode', 'both')}",
             level="info",
         )
 
@@ -1385,7 +1443,6 @@ def main():
         weekly_df=weekly_df,
         weekly_snapshots=weekly_snapshots,
         regime_table=regime_table,
-        regime_cfg=bt_regime_cfg,       # ✅ NEW
         long_logic_cfg=bt_long_cfg,
         short_logic_cfg=bt_short_cfg,
         market_cfg=market_cfg,
