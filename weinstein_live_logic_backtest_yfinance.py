@@ -57,6 +57,11 @@ FIX (Jan 2026):
 FIX (Jan 2026 - CRITICAL):
 - ✅ Short pivot_low was mistakenly computed INCLUDING today's close, making breakdown impossible.
   Now pivot_low is computed from PRIOR closes only (exclude current day).
+
+ADDED (Jan 2026 - your request from today):
+- ✅ SHORT exits use MA150 proxy (Weinstein-aligned) instead of MA30:
+    - We still use stop first
+    - If MA150 isn't available yet, we fall back to MA30
 """
 
 import argparse
@@ -864,7 +869,8 @@ def backtest(
     # caches
     close_cache: Dict[str, pd.Series] = {}
     vol_cache: Dict[str, pd.Series] = {}
-    ma_cache: Dict[str, pd.Series] = {}
+    ma_cache: Dict[str, pd.Series] = {}         # MA30 (for longs)
+    ma150_cache: Dict[str, pd.Series] = {}      # MA150 proxy (for shorts + market context)
     atr_series_cache: Dict[str, pd.Series] = {}
     vol_mult_cache: Dict[str, pd.Series] = {}
 
@@ -879,6 +885,7 @@ def backtest(
         close_cache[t] = close
         vol_cache[t] = vol
         ma_cache[t] = close.rolling(30, min_periods=30).mean()
+        ma150_cache[t] = close.rolling(150, min_periods=150).mean()
         atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
 
         v50 = vol.rolling(50, min_periods=50).mean()
@@ -940,7 +947,7 @@ def backtest(
                 continue
 
             px = daily_df.loc[dt, ("Close", t)]
-            ma = ma_cache[t].loc[dt]
+            ma = ma_cache[t].loc[dt]  # MA30 used for stop mechanics (consistent w/ prior logic)
             atr = atr_series_cache[t].loc[dt]
             if pd.isna(px) or pd.isna(ma) or pd.isna(atr):
                 continue
@@ -979,11 +986,13 @@ def backtest(
             price = daily_df.loc[dt, ("Close", t)]
             if pd.isna(price):
                 continue
-            ma_val = ma_cache[t].loc[dt]
-            ma_f = float(ma_val) if pd.notna(ma_val) else np.nan
+
             px_f = float(price)
 
             if pos.side == "long":
+                ma_val = ma_cache[t].loc[dt]
+                ma_f = float(ma_val) if pd.notna(ma_val) else np.nan
+
                 if should_exit_long(px_f, float(pos.stop), ma_f):
                     exit_price = px_f
                     proceeds = float(pos.qty) * exit_price
@@ -1009,6 +1018,15 @@ def backtest(
                     )
                     to_close.append(key)
             else:
+                # ✅ SHORT exits: use MA150 if available, else fallback to MA30
+                ma_exit = np.nan
+                if t in ma150_cache and dt in ma150_cache[t].index:
+                    ma_exit = ma150_cache[t].loc[dt]
+                if pd.isna(ma_exit):
+                    ma_exit = ma_cache[t].loc[dt]
+
+                ma_f = float(ma_exit) if pd.notna(ma_exit) else np.nan
+
                 if should_exit_short(px_f, float(pos.stop), ma_f):
                     cover_price = px_f
                     cover_cost = float(pos.qty) * cover_price
