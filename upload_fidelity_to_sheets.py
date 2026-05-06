@@ -22,6 +22,7 @@ import os
 import sys
 import argparse
 import glob
+import csv
 from typing import Optional, List
 
 import numpy as np
@@ -132,13 +133,75 @@ def chunked_update(ws, values: List[List[str]]):
         ws.update(values[start_row - 1 : end_row], range_name=rng)
         start_row = end_row + 1
 
+def _detect_header_row(csv_path: str, required_any: list[str]) -> int:
+    """Return the 0-based row number that looks like the real Fidelity header.
+
+    Fidelity exports sometimes add BOM/blank/legal-disclaimer rows or slightly
+    malformed rows. This keeps the import resilient instead of trusting row 1.
+    """
+    required = {x.lower() for x in required_any}
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        for i, row in enumerate(reader):
+            cells = {str(c).strip().lower() for c in row if str(c).strip()}
+            if cells & required:
+                return i
+    return 0
+
+def read_fidelity_csv(csv_path: str, worksheet_name: str) -> pd.DataFrame:
+    """Read Fidelity Holdings/Transactions exports without column shifting.
+
+    Key fixes:
+    - encoding='utf-8-sig' removes Fidelity's BOM.
+    - skiprows/header detection handles blank rows before Account History header.
+    - index_col=False prevents the extra trailing comma in Positions from
+      becoming an accidental index and shifting every column left.
+    - drops legal disclaimer/footer rows that do not contain an account number.
+    - removes fully empty extra columns if Fidelity adds one in the future.
+    """
+    tab = (worksheet_name or "").lower()
+    if "transaction" in tab or "txn" in tab:
+        header_row = _detect_header_row(csv_path, ["Run Date", "Action", "Settlement Date"])
+    else:
+        header_row = _detect_header_row(csv_path, ["Account Number", "Symbol", "Current Value"])
+
+    df = pd.read_csv(
+        csv_path,
+        encoding="utf-8-sig",
+        skiprows=header_row,
+        index_col=False,
+        engine="python",
+        on_bad_lines="skip",
+    )
+
+    # Drop unnamed empty columns caused by trailing delimiters.
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
+
+    # Normalize column names.
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+
+    # Drop completely blank rows.
+    df = df.dropna(how="all")
+
+    # Drop Fidelity footer/disclaimer rows; keep only rows with a real account number when present.
+    if "Account Number" in df.columns:
+        df = df[df["Account Number"].astype(str).str.strip().str.match(r"^[A-Z0-9]+$", na=False)]
+    elif "Run Date" in df.columns:
+        df = df[df["Run Date"].astype(str).str.strip().str.match(r"^\d{1,2}/\d{1,2}/\d{4}$", na=False)]
+
+    return df.reset_index(drop=True)
+
 def upload_csv_to_sheet(csv_path: str, gc, sheet_url: str, worksheet_name: str):
     print(f"📤 Uploading '{csv_path}' -> tab '{worksheet_name}'")
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    # Read CSV (let pandas infer)
-    df = pd.read_csv(csv_path)
+    # Read Fidelity CSV robustly.
+    df = read_fidelity_csv(csv_path, worksheet_name)
+
+    print(f"   Parsed rows={len(df)}, cols={len(df.columns)}")
+    if len(df.columns):
+        print(f"   Columns: {', '.join(map(str, df.columns[:8]))}{'...' if len(df.columns) > 8 else ''}")
 
     # Sanitize for Sheets/JSON
     df_clean = sanitize_for_sheets(df)
