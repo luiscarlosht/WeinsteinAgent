@@ -24,9 +24,16 @@ from datetime import datetime
 import pandas as pd
 
 
-def _stage_rank_value(stage: str) -> int:
-    """Map stage label to a numeric rank: lower is better."""
-    s = (stage or "").strip()
+def _stage_rank_value(stage) -> int:
+    """Map stage label to a numeric rank: lower is better.
+
+    Handles pandas NaN/None safely; Fidelity/Yahoo-derived weekly outputs can
+    contain blank stage values, which pandas reads as float NaN.
+    """
+    if stage is None or pd.isna(stage):
+        s = ""
+    else:
+        s = str(stage).strip()
     if s.startswith("Stage 2"):   # Uptrend
         return 0
     if s.startswith("Stage 1"):   # Basing
@@ -122,9 +129,10 @@ def run_scan(universe: str, benchmark: str, out_dir: str, max_rows_email: int = 
     trimmed = df_sorted.head(int(max_rows_email)).copy()
 
     # Basic counts
-    buy_count = int((df["buy_signal"] == "BUY").sum())
-    watch_count = int((df["buy_signal"] == "WATCH").sum())
-    avoid_count = int((df["buy_signal"] == "AVOID").sum())
+    buy_signal = df["buy_signal"].fillna("").astype(str).str.upper().str.strip()
+    buy_count = int((buy_signal == "BUY").sum())
+    watch_count = int((buy_signal == "WATCH").sum())
+    avoid_count = int((buy_signal == "AVOID").sum())
     total = int(len(df))
 
     summary_line = (
