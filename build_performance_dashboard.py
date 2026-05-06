@@ -132,23 +132,60 @@ def _sleep_for_retry(attempt: int) -> None:
     time.sleep(wait)
 
 
-def open_ws(gc, sheet_url: str, tab: str, retries: int = 6):
-    """Open a worksheet, creating it when missing, with retry/backoff for API 429s.
+# Cache Google Sheets objects during one script run.
+# This prevents repeated gc.open_by_url() / worksheet() metadata reads,
+# which were causing Sheets API 429 quota errors during the weekly pipeline.
+_SPREADSHEET_CACHE = {}
+_WORKSHEET_CACHE = {}
 
-    gspread's worksheet() and add_worksheet() calls internally fetch sheet
-    metadata. During the weekly pipeline, several tabs are opened back-to-back,
-    which can trigger Google Sheets per-minute read quota errors. This wrapper
-    retries only those temporary quota errors and still raises real failures.
+
+def get_spreadsheet(gc, sheet_url: str, retries: int = 8):
+    """Open the spreadsheet once per process and reuse it.
+
+    IMPORTANT: gc.open_by_url() itself calls fetch_sheet_metadata(), so if we
+    call it repeatedly for every tab, we can hit the Google Sheets read quota
+    even before worksheet() is reached.
     """
+    if sheet_url in _SPREADSHEET_CACHE:
+        return _SPREADSHEET_CACHE[sheet_url]
+
+    last_err = None
+    for attempt in range(retries):
+        try:
+            sh = gc.open_by_url(sheet_url)
+            _SPREADSHEET_CACHE[sheet_url] = sh
+            return sh
+        except APIError as e:
+            last_err = e
+            if _is_quota_error(e) and attempt < retries - 1:
+                _sleep_for_retry(attempt)
+                continue
+            raise
+
+    raise RuntimeError("Failed opening spreadsheet after retries") from last_err
+
+
+def open_ws(gc, sheet_url: str, tab: str, retries: int = 8):
+    """Open/create a worksheet once per process and reuse it.
+
+    This caches both the Spreadsheet object and Worksheet object. It also keeps
+    retry/backoff for temporary Google Sheets 429 quota/rate-limit errors.
+    """
+    key = (sheet_url, tab)
+    if key in _WORKSHEET_CACHE:
+        return _WORKSHEET_CACHE[key]
+
+    sh = get_spreadsheet(gc, sheet_url, retries=retries)
     last_err = None
 
     for attempt in range(retries):
         try:
-            sh = gc.open_by_url(sheet_url)
             try:
-                return sh.worksheet(tab)
+                ws = sh.worksheet(tab)
             except gspread.WorksheetNotFound:
-                return sh.add_worksheet(title=tab, rows=2000, cols=26)
+                ws = sh.add_worksheet(title=tab, rows=2000, cols=26)
+            _WORKSHEET_CACHE[key] = ws
+            return ws
 
         except APIError as e:
             last_err = e
