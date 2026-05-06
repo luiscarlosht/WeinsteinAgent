@@ -40,12 +40,14 @@ import argparse
 import math
 import os
 import re
+import time
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 import yaml
 
@@ -112,12 +114,50 @@ def auth_gspread(service_account_file: str):
     creds = Credentials.from_service_account_file(service_account_file, scopes=DEFAULT_SCOPES)
     return gspread.authorize(creds)
 
-def open_ws(gc, sheet_url: str, tab: str):
-    sh = gc.open_by_url(sheet_url)
-    try:
-        return sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=tab, rows=2000, cols=26)
+def _is_quota_error(exc: Exception) -> bool:
+    """Return True for Google Sheets quota/rate-limit errors."""
+    text = str(exc).lower()
+    return (
+        "429" in text
+        or "quota exceeded" in text
+        or "rate limit" in text
+        or "read requests per minute" in text
+    )
+
+
+def _sleep_for_retry(attempt: int) -> None:
+    """Exponential backoff with a small cap so weekly jobs recover from 429s."""
+    wait = min((2 ** attempt) + 1, 60)
+    print(f"⚠️ Google Sheets quota/rate limit hit. Sleeping {wait}s before retry...")
+    time.sleep(wait)
+
+
+def open_ws(gc, sheet_url: str, tab: str, retries: int = 6):
+    """Open a worksheet, creating it when missing, with retry/backoff for API 429s.
+
+    gspread's worksheet() and add_worksheet() calls internally fetch sheet
+    metadata. During the weekly pipeline, several tabs are opened back-to-back,
+    which can trigger Google Sheets per-minute read quota errors. This wrapper
+    retries only those temporary quota errors and still raises real failures.
+    """
+    last_err = None
+
+    for attempt in range(retries):
+        try:
+            sh = gc.open_by_url(sheet_url)
+            try:
+                return sh.worksheet(tab)
+            except gspread.WorksheetNotFound:
+                return sh.add_worksheet(title=tab, rows=2000, cols=26)
+
+        except APIError as e:
+            last_err = e
+            if _is_quota_error(e) and attempt < retries - 1:
+                _sleep_for_retry(attempt)
+                continue
+            raise
+
+    raise RuntimeError(f"Failed opening worksheet after retries: {tab}") from last_err
 
 def strip_strings_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
