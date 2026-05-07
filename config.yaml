@@ -83,7 +83,7 @@ risk:
 # ---- Intraday / PROD knobs (long + short) ----
 intraday:
   # Keep intraday as your current balanced profile (C-style)
-  adx_min_long: 18.0
+  adx_min_long: 14.0
 
   long:
     # Confirms a BUY on ≥ vol_pace_min; NEAR uses ≥ near_vol_pace_min
