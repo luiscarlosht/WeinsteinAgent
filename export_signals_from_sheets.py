@@ -1,6 +1,5 @@
 # Replace your entire export_signals_from_sheets.py file with the version below.
 
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
