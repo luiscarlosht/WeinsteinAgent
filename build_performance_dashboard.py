@@ -661,6 +661,15 @@ def add_live_price_formulas(open_df: pd.DataFrame, mapping: Dict[str, Dict[str, 
     if "OpenQty" not in out.columns or "EntryPrice" not in out.columns or "Ticker" not in out.columns:
         return out
 
+    # Normalize/replace live-calculated columns.
+    # Broker-holdings fallback rows may already include PriceNow and Unrealized%.
+    # In that case, remove them first so we can reinsert the formula columns in
+    # the expected position without pandas raising:
+    #   ValueError: cannot insert PriceNow, already exists
+    for col in ["PriceNow", "Unrealized%"]:
+        if col in out.columns:
+            out = out.drop(columns=[col])
+
     # Insert blank columns so we know final layout (Ticker, OpenQty, EntryPrice, PriceNow, Unrealized%, ...)
     out.insert(out.columns.get_loc("EntryPrice") + 1, "PriceNow", "")
     out.insert(out.columns.get_loc("PriceNow") + 1, "Unrealized%", "")
