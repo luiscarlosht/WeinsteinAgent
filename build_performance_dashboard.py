@@ -1287,6 +1287,139 @@ def build_snapshot_from_open_detail(open_detail_df: pd.DataFrame, mapping: dict 
     snap = df[cols].copy()
     return snap
 
+
+def _parse_percent_any(x):
+    """Parse Fidelity percent strings like '+5.38%' into 5.38."""
+    if x is None:
+        return np.nan
+    if isinstance(x, str):
+        x = x.replace("%", "").replace("+", "").replace(",", "").strip()
+        if x == "":
+            return np.nan
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+
+def build_snapshot_from_holdings(holdings_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build Open_Positions_Snapshot directly from the broker Holdings tab.
+
+    This protects the weekly account summary from disappearing when the recent
+    Fidelity transaction export does not contain enough buy history to rebuild
+    open lots by FIFO. Holdings is the source of truth for the current account.
+    """
+    cols = [
+        "Symbol", "Description", "Quantity", "Last Price", "Current Value",
+        "Cost Basis Total", "Average Cost Basis", "Total Gain/Loss Dollar",
+        "Total Gain/Loss Percent",
+    ]
+
+    if holdings_df is None or holdings_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = holdings_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Fidelity currently provides these exact column names, but keep a small
+    # fallback map so minor header changes do not break the account summary.
+    def pick(*names):
+        lower = {str(c).strip().lower(): c for c in df.columns}
+        for n in names:
+            if n.lower() in lower:
+                return lower[n.lower()]
+        return None
+
+    sym_col = pick("Symbol", "Ticker", "Security", "Symbol/CUSIP")
+    desc_col = pick("Description", "Security Description", "Name")
+    qty_col = pick("Quantity", "Qty", "Shares")
+    last_col = pick("Last Price", "Last", "Price")
+    current_col = pick("Current Value", "Market Value", "Value")
+    cost_col = pick("Cost Basis Total", "Total Cost Basis", "Cost Basis")
+    avg_col = pick("Average Cost Basis", "Average Cost", "Avg Cost", "Cost Basis Per Share")
+    gl_dol_col = pick("Total Gain/Loss Dollar", "Total Gain/Loss $", "Gain/Loss Dollar")
+    gl_pct_col = pick("Total Gain/Loss Percent", "Total Gain/Loss %", "Gain/Loss Percent")
+    type_col = pick("Type")
+
+    if not sym_col or not qty_col:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.DataFrame()
+    out["Symbol"] = df[sym_col].map(base_symbol_from_string)
+    out["Description"] = df[desc_col].astype(str).str.strip() if desc_col else ""
+    out["Quantity"] = df[qty_col].map(to_float_any)
+
+    # Drop cash/money-market rows and non-position rows.
+    type_s = df[type_col].astype(str).str.upper() if type_col else pd.Series([""] * len(df), index=df.index)
+    desc_s = out["Description"].astype(str).str.upper()
+    sym_s = out["Symbol"].astype(str).str.upper()
+    is_cash = (
+        type_s.str.contains("CASH", na=False)
+        | sym_s.str.contains("FCASH|SPAXX|FDRXX|CORE", regex=True, na=False)
+        | desc_s.str.contains("HELD IN FCASH|HELD IN MONEY MARKET|MONEY MARKET", regex=True, na=False)
+    )
+    out = out[(out["Symbol"] != "") & (~is_cash) & (out["Quantity"].fillna(0) != 0)].copy()
+
+    # Align remaining rows to original df indexes for value extraction.
+    src = df.loc[out.index]
+
+    out["Last Price"] = src[last_col].map(to_float_any) if last_col else np.nan
+    out["Current Value"] = src[current_col].map(to_float_any) if current_col else np.nan
+    out["Cost Basis Total"] = src[cost_col].map(to_float_any) if cost_col else np.nan
+    out["Average Cost Basis"] = src[avg_col].map(to_float_any) if avg_col else np.nan
+    out["Total Gain/Loss Dollar"] = src[gl_dol_col].map(to_float_any) if gl_dol_col else np.nan
+    out["Total Gain/Loss Percent"] = src[gl_pct_col].map(_parse_percent_any) if gl_pct_col else np.nan
+
+    # Compute any missing values from available Qty/Price/Cost fields.
+    abs_qty = out["Quantity"].abs()
+    missing_current = out["Current Value"].isna() & out["Last Price"].notna()
+    out.loc[missing_current, "Current Value"] = abs_qty[missing_current] * out.loc[missing_current, "Last Price"]
+
+    missing_cost = out["Cost Basis Total"].isna() & out["Average Cost Basis"].notna()
+    out.loc[missing_cost, "Cost Basis Total"] = abs_qty[missing_cost] * out.loc[missing_cost, "Average Cost Basis"]
+
+    missing_avg = out["Average Cost Basis"].isna() & out["Cost Basis Total"].notna() & (abs_qty != 0)
+    out.loc[missing_avg, "Average Cost Basis"] = out.loc[missing_avg, "Cost Basis Total"] / abs_qty[missing_avg]
+
+    missing_gl = out["Total Gain/Loss Dollar"].isna() & out["Current Value"].notna() & out["Cost Basis Total"].notna()
+    is_short = out["Quantity"] < 0
+    out.loc[missing_gl & is_short, "Total Gain/Loss Dollar"] = (
+        out.loc[missing_gl & is_short, "Cost Basis Total"] - out.loc[missing_gl & is_short, "Current Value"]
+    )
+    out.loc[missing_gl & (~is_short), "Total Gain/Loss Dollar"] = (
+        out.loc[missing_gl & (~is_short), "Current Value"] - out.loc[missing_gl & (~is_short), "Cost Basis Total"]
+    )
+
+    missing_pct = out["Total Gain/Loss Percent"].isna() & out["Total Gain/Loss Dollar"].notna() & (out["Cost Basis Total"].fillna(0) != 0)
+    out.loc[missing_pct, "Total Gain/Loss Percent"] = out.loc[missing_pct, "Total Gain/Loss Dollar"] / out.loc[missing_pct, "Cost Basis Total"] * 100.0
+
+    return out[cols].sort_values("Symbol", ignore_index=True)
+
+
+def build_open_positions_from_holdings(holdings_df: pd.DataFrame) -> pd.DataFrame:
+    """Fallback Open_Positions from current Fidelity Holdings when FIFO open lots are empty."""
+    snap = build_snapshot_from_holdings(holdings_df)
+    if snap.empty:
+        return pd.DataFrame(columns=[
+            "Ticker", "OpenQty", "EntryPrice", "PriceNow", "Unrealized%",
+            "EntryTimeUTC", "DaysOpen", "Source", "Timeframe", "SignalTimeUTC", "SignalPrice",
+        ])
+
+    out = pd.DataFrame()
+    out["Ticker"] = snap["Symbol"]
+    out["OpenQty"] = snap["Quantity"]
+    out["EntryPrice"] = snap["Average Cost Basis"]
+    out["PriceNow"] = snap["Last Price"]
+    out["Unrealized%"] = snap["Total Gain/Loss Percent"]
+    out["EntryTimeUTC"] = pd.NaT
+    out["DaysOpen"] = ""
+    out["Source"] = "(broker holdings)"
+    out["Timeframe"] = "portfolio"
+    out["SignalTimeUTC"] = pd.NaT
+    out["SignalPrice"] = ""
+    return out
+
 def write_weekly_report_tab(ws_weekly, snapshot_tab_name: str = TAB_SNAPSHOT):
     metrics = pd.DataFrame([
         ["Total Gain/Loss ($)", f"=IFERROR(SUM('{snapshot_tab_name}'!H2:H),0)"],
@@ -1468,6 +1601,18 @@ def main():
     # Add open shorts from Holdings (negative quantity rows) into Open_Positions
     open_df = append_shorts_from_holdings_to_open(open_df, df_h)
 
+    # If the recent Fidelity transaction export does not include enough buy
+    # history to reconstruct open lots, do not overwrite account tabs as empty.
+    # Fall back to current broker Holdings so Open_Positions, Snapshot, Weekly_Report,
+    # and the weekly email account summary still represent the real account.
+    used_holdings_fallback_for_open = False
+    if open_df.empty:
+        holdings_open_df = build_open_positions_from_holdings(df_h)
+        if not holdings_open_df.empty:
+            open_df = holdings_open_df
+            used_holdings_fallback_for_open = True
+            print(f"ℹ️ Open lots were empty; using broker Holdings fallback for {len(open_df)} open positions.")
+
     # Live price formulas to Open_Positions (equities + shorts)
     if (not args.no_live) and (not open_df.empty) and (price_source == "sheets"):
         mapping = read_mapping(gc, sheet_url)
@@ -1563,7 +1708,15 @@ def main():
     # Snapshot + Weekly + CSVs
     try:
         mapping = read_mapping(gc, sheet_url)
-        snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping=mapping, price_source=price_source)
+
+        # Prefer broker Holdings for the account snapshot/summary. It is the
+        # current account source of truth and prevents the weekly email summary
+        # from disappearing when transaction history is partial. If Holdings is
+        # unavailable, fall back to reconstructed open lots.
+        snapshot_df = build_snapshot_from_holdings(df_h)
+        if snapshot_df.empty:
+            snapshot_df = build_snapshot_from_open_detail(open_detail_df, mapping=mapping, price_source=price_source)
+
         ws_snapshot = open_ws(gc, sheet_url, TAB_SNAPSHOT)
         write_tab(ws_snapshot, snapshot_df)
 
