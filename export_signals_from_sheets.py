@@ -1,3 +1,6 @@
+# Replace your entire export_signals_from_sheets.py file with the version below.
+
+```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -36,9 +39,11 @@ def load_cfg(path: str) -> dict:
         return yaml.safe_load(f) or {}
 
 
+
 def resolve_sheet_url(cfg: dict) -> Optional[str]:
     sheets = cfg.get("sheets", {}) or {}
     return sheets.get("url") or sheets.get("sheet_url") or os.getenv("SHEET_URL")
+
 
 
 def resolve_service_account_file(cfg: dict) -> str:
@@ -50,9 +55,11 @@ def resolve_service_account_file(cfg: dict) -> str:
     )
 
 
+
 def resolve_tab_name(cfg: dict, key: str, default_name: str) -> str:
     sheets = cfg.get("sheets", {}) or {}
     return sheets.get(key, default_name)
+
 
 
 def _is_quota_error(exc: Exception) -> bool:
@@ -65,10 +72,12 @@ def _is_quota_error(exc: Exception) -> bool:
     )
 
 
+
 def _sleep_for_retry(attempt: int) -> None:
     wait = min((2 ** attempt) + 1, 60)
     print(f"⚠️ Google Sheets quota/rate limit hit. Sleeping {wait}s before retry...")
     time.sleep(wait)
+
 
 
 def auth_gspread(service_account_file: str):
@@ -76,6 +85,7 @@ def auth_gspread(service_account_file: str):
     creds = Credentials.from_service_account_file(service_account_file, scopes=DEFAULT_SCOPES)
     print("🔑 Authorizing service account…")
     return gspread.authorize(creds)
+
 
 
 def open_ws(gc, sheet_url: str, tab: str, retries: int = 8):
@@ -95,6 +105,7 @@ def open_ws(gc, sheet_url: str, tab: str, retries: int = 8):
     raise RuntimeError(f"Failed opening worksheet '{tab}' after retries") from last_err
 
 
+
 def strip_strings_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -102,6 +113,7 @@ def strip_strings_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in out.columns:
         out[c] = out[c].map(lambda x: x.strip() if isinstance(x, str) else x)
     return out
+
 
 
 def read_tab(ws) -> pd.DataFrame:
@@ -115,8 +127,10 @@ def read_tab(ws) -> pd.DataFrame:
     return strip_strings_df(df)
 
 
+
 def _norm_col_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
+
 
 
 def find_col(df: pd.DataFrame, candidates: Iterable[str], startswith: Iterable[str] = ()) -> Optional[str]:
@@ -139,8 +153,10 @@ def find_col(df: pd.DataFrame, candidates: Iterable[str], startswith: Iterable[s
     return None
 
 
+
 def empty_output() -> pd.DataFrame:
     return pd.DataFrame(columns=OUTPUT_COLUMNS)
+
 
 
 def is_crypto_ticker(s: str) -> bool:
@@ -148,6 +164,39 @@ def is_crypto_ticker(s: str) -> bool:
         return False
     u = str(s).strip().upper()
     return "BTC" in u or "ETH" in u or "SOL" in u
+
+
+
+def is_invalid_fidelity_symbol(s: str) -> bool:
+    if s is None:
+        return True
+
+    u = str(s).strip().upper()
+
+    if not u:
+        return True
+
+    invalid_exact = {
+        "FCASH",
+        "FCASH**",
+        "SPAXX",
+        "SPAXX**",
+        "CORE",
+        "CASH",
+    }
+
+    if u in invalid_exact:
+        return True
+
+    if u.startswith("$"):
+        return True
+
+    if re.fullmatch(r"[0-9A-Z]{8,12}", u):
+        if any(ch.isdigit() for ch in u):
+            return True
+
+    return False
+
 
 
 def normalize_signal_to_side(value: object) -> str:
@@ -165,11 +214,13 @@ def normalize_signal_to_side(value: object) -> str:
     return ""
 
 
+
 def clean_price(value: object):
     try:
         return float(str(value).replace("$", "").replace(",", ""))
     except Exception:
         return ""
+
 
 
 def build_signals_log(
@@ -244,6 +295,7 @@ def build_signals_log(
 
     out = out[~out["ticker"].str.startswith("-")].copy()
     out = out[~out["ticker"].map(is_crypto_ticker)].copy()
+    out = out[~out["ticker"].map(is_invalid_fidelity_symbol)].copy()
 
     print(f"⚠️ TEMP DEBUG MODE: exporting all {len(out)} rows without strict date filtering.")
 
@@ -264,6 +316,7 @@ def build_signals_log(
     out.reset_index(drop=True, inplace=True)
 
     return out
+
 
 
 def main():
@@ -308,3 +361,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
