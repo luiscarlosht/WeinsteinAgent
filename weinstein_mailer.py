@@ -209,7 +209,11 @@ def send_email(
     msg["To"] = ", ".join(recipients)
 
     if text_body is None:
-        text_body = "Your Weinstein report is attached in HTML format."
+        text_body = (
+            "Your Weinstein report is included as HTML. "
+            "Open this email in an HTML-capable client to see the BUY / NEAR / SELL sections, "
+            "Structure column, diagnostics table, and charts."
+        )
 
     msg.set_content(text_body)
     if html_body:
