@@ -70,6 +70,10 @@ class IntradayConfig:
     min_elapsed_minutes: int
     ma_proxy_length: int
     adx_min_long: float
+    daily_history_period: str
+    stage_above_ma_pct: float
+    dist_above_ma_min: float
+    pivot_lookback_days: int
     breadth_enabled: bool
     breadth_ma_window: int
     breadth_min_long: float
@@ -184,6 +188,10 @@ def build_full_config(cfg: Dict) -> FullConfig:
         min_elapsed_minutes=int(intraday_prod.get("min_elapsed_minutes", 40)),
         ma_proxy_length=int(intraday_prod.get("ma_proxy_length", 150)),
         adx_min_long=adx_min_long,
+        daily_history_period=str(intraday_prod.get("daily_history_period", "18mo")),
+        stage_above_ma_pct=float(intraday_prod.get("stage_above_ma_pct", 0.005)),
+        dist_above_ma_min=float(intraday_prod.get("dist_above_ma_min", 0.005)),
+        pivot_lookback_days=int(intraday_prod.get("pivot_lookback_days", 60)),
         breadth_enabled=breadth_enabled,
         breadth_ma_window=breadth_ma,
         breadth_min_long=breadth_min_long,
@@ -356,10 +364,10 @@ def compute_breadth(weekly_df: pd.DataFrame, ma_window: int = 50) -> float:
 # Intraday scanning
 # ---------------------------------------------------------------------------
 
-def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_price_data(tickers: List[str], daily_history_period: str = "18mo") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Download:
-        - daily OHLCV (6 months) for pivots / MAs
+        - daily OHLCV (configurable history period) for pivots / MAs
         - 60m bars (60 days) for intraday signals
     Returns:
         daily:  multi-index (Date, Ticker)
@@ -373,7 +381,7 @@ def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Daily
     daily = yf.download(
         tickers_str,
-        period="18mo",
+        period=daily_history_period,
         interval="1d",
         group_by="ticker",
         auto_adjust=False,
@@ -480,18 +488,21 @@ def evaluate_intraday_signals(
             )
             continue
 
-        if not (last["Close"] > last["MA150"] * 1.005):
+        if not (last["Close"] > last["MA150"] * (1.0 + cfg.intraday.stage_above_ma_pct)):
             rows.append(
                 dict(
                     Ticker=ticker,
                     Signal="SKIP-STAGE",
-                    Reason=f"Close not sufficiently above MA150 +0.5% ({last['Close']:.2f} vs {last['MA150']:.2f})",
+                    Reason=(
+                        f"Close not sufficiently above MA150 +{cfg.intraday.stage_above_ma_pct * 100:.2f}% "
+                        f"({last['Close']:.2f} vs {last['MA150']:.2f})"
+                    ),
                 )
             )
             continue
 
         # Pivot = 50d high close (using last ~60 days as a robust window)
-        pivot_window = d["Close"].tail(60).max()
+        pivot_window = d["Close"].tail(cfg.intraday.pivot_lookback_days).max()
         if pd.isna(pivot_window):
             rows.append(
                 dict(
@@ -546,7 +557,7 @@ def evaluate_intraday_signals(
         # BUY vs NEAR logic is delegated to CORE so PROD and SIM stay aligned.
         core_params = LongEntryParams(
             min_break_pct=cfg.intraday.confirm_headroom_pct / 100.0,
-            dist_above_ma_min=0.02,
+            dist_above_ma_min=cfg.intraday.dist_above_ma_min,
             vol_min=cfg.intraday.vol_pace_min,
             adx_min=cfg.intraday.adx_min_long,
         )
@@ -609,7 +620,9 @@ def main() -> None:
             cfg.intraday.near_vol_pace_min = min(cfg.intraday.near_vol_pace_min, 0.60)
             cfg.intraday.confirm_headroom_pct = min(cfg.intraday.confirm_headroom_pct, 0.05)
             cfg.intraday.near_below_pivot_pct = max(cfg.intraday.near_below_pivot_pct, 1.5)
-            log("⚠️ TEST-EASE enabled: relaxed ADX/volume/pivot thresholds for validation only.")
+            cfg.intraday.stage_above_ma_pct = min(cfg.intraday.stage_above_ma_pct, 0.0)
+            cfg.intraday.dist_above_ma_min = min(cfg.intraday.dist_above_ma_min, 0.0)
+            log("⚠️ TEST-EASE enabled: relaxed ADX/volume/pivot/MA thresholds for validation only.")
     except Exception as e:
         print(f"❌ Failed to load config: {e}")
         raise SystemExit(1)
@@ -640,7 +653,7 @@ def main() -> None:
     tickers = focus_df["Ticker"].tolist()
 
     log_step("Downloading intraday + daily bars...")
-    daily, intraday = fetch_price_data(tickers)
+    daily, intraday = fetch_price_data(tickers, cfg.intraday.daily_history_period)
     log("Price data downloaded.")
 
     # Breadth proxy (optional)
