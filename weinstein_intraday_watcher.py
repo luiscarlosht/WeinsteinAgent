@@ -373,7 +373,7 @@ def fetch_price_data(tickers: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Daily
     daily = yf.download(
         tickers_str,
-        period="6mo",
+        period="18mo",
         interval="1d",
         group_by="ticker",
         auto_adjust=False,
