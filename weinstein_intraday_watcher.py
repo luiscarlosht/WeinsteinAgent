@@ -13,7 +13,7 @@ Weinstein Intraday Watcher (PROD) — uses config.yaml
     * Intraday breakout logic using 60m bars
 - Saves:
     * intraday_debug.csv   → detailed per-ticker diagnostics
-    * intraday_watch_*.html (simple HTML summary)
+    * intraday_watch_*.html (polished HTML/email-style summary)
 
 CLI:
     python3 weinstein_intraday_watcher.py \
@@ -25,6 +25,7 @@ import argparse
 import datetime as dt
 import glob
 import os
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -450,8 +451,27 @@ def evaluate_intraday_signals(
         return pd.DataFrame()
 
     tickers = focus_df["Ticker"].tolist()
+    focus_by_ticker = focus_df.set_index("Ticker").to_dict(orient="index") if "Ticker" in focus_df.columns else {}
+
+    def _stage_num_for(t: str) -> int:
+        try:
+            raw = focus_by_ticker.get(t, {}).get("Stage", 2)
+            return int(float(raw))
+        except Exception:
+            return 2
+
+    def _stage_structure(stage_num: int) -> str:
+        labels = {
+            1: "Stage 1 (Base)",
+            2: "Stage 2 (Uptrend)",
+            3: "Stage 3 (Topping)",
+            4: "Stage 4 (Downtrend)",
+        }
+        return labels.get(stage_num, f"Stage {stage_num}")
 
     for ticker in tickers:
+        stage_num = _stage_num_for(ticker)
+        structure = _stage_structure(stage_num)
         try:
             d = daily.xs(ticker, level="Ticker")
         except KeyError:
@@ -482,6 +502,8 @@ def evaluate_intraday_signals(
             rows.append(
                 dict(
                     Ticker=ticker,
+                    Structure="Unknown / insufficient MA history",
+                    Stage=stage_num,
                     Signal="SKIP-MA",
                     Reason="MA150 not available",
                 )
@@ -492,6 +514,8 @@ def evaluate_intraday_signals(
             rows.append(
                 dict(
                     Ticker=ticker,
+                    Structure="Not Stage 2 / below MA150",
+                    Stage=stage_num,
                     Signal="SKIP-STAGE",
                     Reason=(
                         f"Close not sufficiently above MA150 +{cfg.intraday.stage_above_ma_pct * 100:.2f}% "
@@ -507,6 +531,8 @@ def evaluate_intraday_signals(
             rows.append(
                 dict(
                     Ticker=ticker,
+                    Structure=structure,
+                    Stage=stage_num,
                     Signal="SKIP-PIVOT",
                     Reason="No 50d pivot",
                 )
@@ -520,6 +546,8 @@ def evaluate_intraday_signals(
             rows.append(
                 dict(
                     Ticker=ticker,
+                    Structure=structure,
+                    Stage=stage_num,
                     Signal="SKIP-INTRADAY",
                     Reason="No intraday data",
                 )
@@ -530,6 +558,8 @@ def evaluate_intraday_signals(
             rows.append(
                 dict(
                     Ticker=ticker,
+                    Structure=structure,
+                    Stage=stage_num,
                     Signal="SKIP-INTRADAY",
                     Reason="Empty intraday series",
                 )
@@ -545,6 +575,8 @@ def evaluate_intraday_signals(
             rows.append(
                 dict(
                     Ticker=ticker,
+                    Structure=structure,
+                    Stage=stage_num,
                     Signal="SKIP-DATA",
                     Reason="Missing price/vol/VolMA50",
                 )
@@ -620,6 +652,8 @@ def evaluate_intraday_signals(
         rows.append(
             dict(
                 Ticker=ticker,
+                Structure=structure,
+                Stage=stage_num,
                 Signal=signal,
                 Reason=reason,
                 PriceNow=price_now,
@@ -633,6 +667,8 @@ def evaluate_intraday_signals(
                 ATR14=float(last["ATR14"]) if not pd.isna(last["ATR14"]) else np.nan,
                 # Lowercase compatibility columns consumed by tools/signal_engine.py
                 ticker=ticker,
+                structure=structure,
+                stage=stage_num,
                 signal=signal,
                 reason=reason,
                 price=price_now,
@@ -675,10 +711,21 @@ def _fmt_num(value, digits: int = 2, suffix: str = "") -> str:
 
 
 def _stage_label(row: pd.Series) -> str:
+    for col in ("Structure", "structure"):
+        if col in row and not pd.isna(row.get(col)):
+            val = str(row.get(col)).strip()
+            if val and val.lower() != "nan":
+                return val
     for col in ("Stage", "stage", "WeeklyStage", "weekly_stage"):
         if col in row and not pd.isna(row.get(col)):
             try:
-                return f"Stage {int(float(row.get(col)))}"
+                stage_num = int(float(row.get(col)))
+                return {
+                    1: "Stage 1 (Base)",
+                    2: "Stage 2 (Uptrend)",
+                    3: "Stage 3 (Topping)",
+                    4: "Stage 4 (Downtrend)",
+                }.get(stage_num, f"Stage {stage_num}")
             except Exception:
                 return str(row.get(col))
     return "Stage 2 (Uptrend)"
@@ -827,15 +874,17 @@ def build_intraday_report_html(
         f"<tr><td>Confirmed BUY</td><td>{len(buys)}</td></tr>",
         f"<tr><td>NEAR-TRIGGER</td><td>{len(nears)}</td></tr>",
         f"<tr><td>SELL-TRIGGER</td><td>{len(sells)}</td></tr>",
-        f"<tr><td>NONE / structurally valid but no trigger</td><td>{none_count}</td></tr>",
+        f"<tr><td>Stage 1/2 structure, no trigger yet</td><td>{none_count}</td></tr>",
         f"<tr><td>SKIP-STAGE</td><td>{skip_stage}</td></tr>",
         f"<tr><td>SKIP-ADX</td><td>{skip_adx}</td></tr>",
         f"<tr><td>SKIP-DATA / SKIP-MA / SKIP-INTRADAY</td><td>{skip_data}</td></tr>",
         "</tbody></table>",
         "<ul>",
+        "<li><b>Structure</b> shows the Weinstein stage/context of the ticker.</li>",
+        "<li><b>Signal</b> shows the trading action state: BUY, NEAR, SELL, NONE, or SKIP-*.</li>",
+        "<li>NONE means the ticker has acceptable structure but has not produced a trigger yet.</li>",
         "<li>BUY remains strict: confirmed breakout plus participation confirmation.</li>",
         "<li>NEAR-TRIGGER is the early watchlist layer: structurally valid setups that may become actionable if volume expands.</li>",
-        "<li>Low volume pace environments may produce elevated NEAR activity with limited BUY confirmation.</li>",
         "<li>Signals are filtered through the Chapter 8 market/regime model and optional breadth health gate.</li>",
         "</ul>",
         "<hr>",
@@ -845,7 +894,7 @@ def build_intraday_report_html(
     if diag.empty:
         sections.append("<p>No diagnostics rows generated.</p>")
     else:
-        preferred_cols = ["Ticker", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "CloseDaily", "MA150", "ATR14"]
+        preferred_cols = ["Ticker", "Structure", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "CloseDaily", "MA150", "ATR14"]
         cols = [c for c in preferred_cols if c in diag.columns]
         table_df = diag[cols].copy() if cols else diag.copy()
         sections.append(table_df.to_html(index=False, escape=False))
@@ -956,8 +1005,10 @@ def main() -> None:
     log(f"Wrote diagnostics CSV → {out_csv}")
 
     # Polished HTML/email-style report
+    # Keep filenames/logs in the VM local timezone, but show report time in Dallas/Central time.
+    now_ct = dt.datetime.now(ZoneInfo("America/Chicago"))
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    ts_display = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts_display = now_ct.strftime("%Y-%m-%d %H:%M CT")
     html_path = os.path.join(cfg.app.output_dir, f"intraday_watch_{ts}.html")
     try:
         html = build_intraday_report_html(
