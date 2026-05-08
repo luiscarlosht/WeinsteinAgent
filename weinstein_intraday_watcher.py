@@ -33,6 +33,8 @@ import pandas as pd
 import yfinance as yf
 import yaml
 
+from weinstein_long_core import LongEntryParams, evaluate_long_signal
+
 
 # ---------------------------------------------------------------------------
 # Small helpers for logging
@@ -111,9 +113,16 @@ def build_full_config(cfg: Dict) -> FullConfig:
     universe = cfg.get("universe", {})
     intraday = cfg.get("intraday", {})
 
-    # Allow an optional nested intraday.prod block; if not present,
-    # treat the top-level intraday dict as the source of knobs.
-    intraday_prod = intraday.get("prod", intraday)
+    # Intraday knobs can be stored in either:
+    #   intraday.prod  (new explicit prod block)
+    #   intraday.long  (your current config style)
+    #   intraday       (legacy flat style)
+    # Merge them so changing config.yaml actually affects PROD.
+    intraday_prod = dict(intraday)
+    if isinstance(intraday.get("long"), dict):
+        intraday_prod.update(intraday.get("long", {}))
+    if isinstance(intraday.get("prod"), dict):
+        intraday_prod.update(intraday.get("prod", {}))
 
     backtest = cfg.get("backtest", {})
     regime_bt = backtest.get("regime", {})
@@ -458,16 +467,7 @@ def evaluate_intraday_signals(
         last = d.iloc[-1]
         adx14 = float(last["ADX14"]) if not pd.isna(last["ADX14"]) else np.nan
 
-        # ADX gate
-        if np.isnan(adx14) or adx14 < cfg.intraday.adx_min_long:
-            rows.append(
-                dict(
-                    Ticker=ticker,
-                    Signal="SKIP-ADX",
-                    Reason=f"ADX14={adx14:.1f} < {cfg.intraday.adx_min_long}",
-                )
-            )
-            continue
+        # ADX is evaluated by shared CORE below so PROD and SIM use one gate.
 
         # Stage-like filter: price above MA150 and MA150 rising
         if pd.isna(last["MA150"]):
@@ -543,28 +543,26 @@ def evaluate_intraday_signals(
         vol_pace = vol_now / vol_ma50
         headroom_pct = (price_now / pivot_window - 1.0) * 100.0
 
-        # BUY vs NEAR logic
-        if (
-            price_now >= pivot_window * (1.0 + cfg.intraday.confirm_headroom_pct / 100.0)
-            and vol_pace >= cfg.intraday.vol_pace_min
-        ):
-            signal = "BUY"
-            reason = (
-                f"Price {price_now:.2f} ≥ pivot {pivot_window:.2f} + "
-                f"{cfg.intraday.confirm_headroom_pct:.1f}% & vol pace {vol_pace:.2f}x"
-            )
-        elif (
-            price_now >= pivot_window * (1.0 - cfg.intraday.near_below_pivot_pct / 100.0)
-            and vol_pace >= cfg.intraday.near_vol_pace_min
-        ):
-            signal = "NEAR"
-            reason = (
-                f"Price {price_now:.2f} within {cfg.intraday.near_below_pivot_pct:.1f}% "
-                f"of pivot {pivot_window:.2f} & vol pace {vol_pace:.2f}x"
-            )
-        else:
-            signal = "NONE"
-            reason = f"No breakout. headroom={headroom_pct:.2f}%, vol_pace={vol_pace:.2f}x"
+        # BUY vs NEAR logic is delegated to CORE so PROD and SIM stay aligned.
+        core_params = LongEntryParams(
+            min_break_pct=cfg.intraday.confirm_headroom_pct / 100.0,
+            dist_above_ma_min=0.02,
+            vol_min=cfg.intraday.vol_pace_min,
+            adx_min=cfg.intraday.adx_min_long,
+        )
+        core_result = evaluate_long_signal(
+            price=price_now,
+            ma_val=float(last["MA150"]),
+            pivot=float(pivot_window),
+            rs_above_ma=True,  # weekly universe already handled RS/stage quality upstream
+            vol_mult=vol_pace,
+            adx_val=adx14,
+            params=core_params,
+            near_below_pivot_pct=cfg.intraday.near_below_pivot_pct / 100.0,
+            near_vol_min=cfg.intraday.near_vol_pace_min,
+        )
+        signal = core_result.signal
+        reason = core_result.reason
 
         rows.append(
             dict(
@@ -597,11 +595,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Weinstein Intraday Watcher (PROD)")
     parser.add_argument("--config", type=str, default="./config.yaml", help="Path to config.yaml")
     parser.add_argument("--log-csv", type=str, default="./output/intraday_debug.csv", help="Diagnostics CSV output")
+    parser.add_argument("--test-ease", action="store_true", help="Temporarily relax PROD thresholds for validation/tuning")
     args = parser.parse_args()
 
     try:
         cfg_raw = load_yaml_config(args.config)
         cfg = build_full_config(cfg_raw)
+        if args.test_ease:
+            # Validation mode only: useful to prove the pipeline can emit NEAR/BUY
+            # without permanently changing config.yaml.
+            cfg.intraday.adx_min_long = min(cfg.intraday.adx_min_long, 12.0)
+            cfg.intraday.vol_pace_min = min(cfg.intraday.vol_pace_min, 0.85)
+            cfg.intraday.near_vol_pace_min = min(cfg.intraday.near_vol_pace_min, 0.60)
+            cfg.intraday.confirm_headroom_pct = min(cfg.intraday.confirm_headroom_pct, 0.05)
+            cfg.intraday.near_below_pivot_pct = max(cfg.intraday.near_below_pivot_pct, 1.5)
+            log("⚠️ TEST-EASE enabled: relaxed ADX/volume/pivot thresholds for validation only.")
     except Exception as e:
         print(f"❌ Failed to load config: {e}")
         raise SystemExit(1)
