@@ -157,6 +157,50 @@ def load_yaml_config(path: str = "./config.yaml") -> dict:
         return {}
 
 
+def build_sim_long_config(cfg: Mapping) -> dict:
+    """
+    Build the LONG config used by SIM.
+
+    Priority:
+      1) backtest.long base values
+      2) intraday.long overrides for shared PROD/SIM knobs
+      3) intraday top-level adx_min_long fallback
+
+    This allows you to tune common strategy knobs from config.yaml and have
+    PROD + SIM react consistently.
+    """
+    bt_cfg = cfg.get("backtest", {}) or {}
+    intraday_cfg = cfg.get("intraday", {}) or {}
+
+    out = dict(bt_cfg.get("long", {}) or {})
+
+    intraday_long = intraday_cfg.get("long", {}) or {}
+
+    same_name_keys = [
+        "stage_above_ma_pct",
+        "dist_above_ma_min",
+        "pivot_lookback_days",
+        "pivot_lookback",
+        "adx_min_long",
+        "adx_min",
+        "default_rs_above_ma",
+    ]
+    for key in same_name_keys:
+        if key in intraday_long:
+            out[key] = intraday_long[key]
+
+    if "confirm_headroom_pct" in intraday_long:
+        out["break_pct"] = float(intraday_long["confirm_headroom_pct"]) / 100.0
+
+    if "vol_pace_min" in intraday_long:
+        out["vol_min"] = intraday_long["vol_pace_min"]
+
+    if "adx_min_long" in intraday_cfg and "adx_min_long" not in out:
+        out["adx_min_long"] = intraday_cfg["adx_min_long"]
+
+    return out
+
+
 # =========================
 # WEEKLY / SNAPSHOT HELPERS
 # =========================
@@ -1404,7 +1448,7 @@ def main():
     cfg = load_yaml_config(args.config)
     bt_cfg = cfg.get("backtest", {}) or {}
 
-    bt_long_cfg = bt_cfg.get("long", {}) or {}
+    bt_long_cfg = build_sim_long_config(cfg)
     bt_short_cfg = bt_cfg.get("short", {}) or {}
     market_cfg = bt_cfg.get("market", {}) or {}
     industry_cfg = bt_cfg.get("industry", {}) or {}
@@ -1418,6 +1462,15 @@ def main():
     log(
         f"Mode={args.mode} | market: rise_ma30={market_cfg.get('require_rising_ma30', False)} "
         f"fall_ma30={market_cfg.get('require_falling_ma30', False)}",
+        level="info",
+    )
+    log(
+        "Long cfg: "
+        f"break_pct={bt_long_cfg.get('break_pct', 'n/a')} "
+        f"vol_min={bt_long_cfg.get('vol_min', 'n/a')} "
+        f"adx_min_long={bt_long_cfg.get('adx_min_long', bt_long_cfg.get('adx_min', 'n/a'))} "
+        f"dist_above_ma_min={bt_long_cfg.get('dist_above_ma_min', 'n/a')} "
+        f"pivot_lb={bt_long_cfg.get('pivot_lookback_days', bt_long_cfg.get('pivot_lookback', 'n/a'))}",
         level="info",
     )
     log(
