@@ -86,17 +86,27 @@ intraday:
   adx_min_long: 14.0
 
   long:
-    # Confirms a BUY on ≥ vol_pace_min; NEAR uses ≥ near_vol_pace_min
-    vol_pace_min: 1.3          # TRIG min full-day volume vs 50dma
-    near_vol_pace_min: 1.0     # NEAR min full-day volume vs 50dma
+    # Data horizon / trend proxy
+    daily_history_period: "18mo"  # enough daily bars to compute MA150 reliably
+    ma_proxy_length: 150           # MA150 as 30-wk proxy
+
+    # Stage / trend confirmation
+    stage_above_ma_pct: 0.005      # require Close > MA150 by 0.5% before CORE check
+    dist_above_ma_min: 0.005       # CORE MA confirmation; 0.5% above MA used for BUY/NEAR
+
+    # Pivot / breakout confirmation
+    pivot_lookback_days: 60        # pivot = highest close over this many daily bars
+    confirm_headroom_pct: 0.4      # BUY = this % over pivot
+    near_below_pivot_pct: 0.3      # NEAR = within this % below pivot
+
+    # Volume confirmation
+    vol_pace_min: 1.3              # BUY min full-day volume vs 50dma
+    near_vol_pace_min: 1.0         # NEAR min full-day volume vs 50dma
     sell_intrabar_vol_pace_min: 1.2
 
-    # Text/logic thresholds (used by long intraday watcher)
-    confirm_headroom_pct: 0.4      # "% over pivot" headroom for confirm
-    near_below_pivot_pct: 0.3      # NEAR = within this % below pivot
+    # Other PROD thresholds
     crack_ma_pct: 0.5              # SELL trigger = below MA150 by this %
     min_elapsed_minutes: 40        # 60m bars elapsed requirement
-    ma_proxy_length: 150           # MA150 as 30-wk proxy
 
   short:
     # Core short trigger shape — these override weinstein_short_core defaults
@@ -258,9 +268,13 @@ backtest:
 
   # Long-only, very selective entries
   long:
+    # SIM knobs. These are now explicit so SIM tuning stays visible in config.
     break_pct: 0.0060
     vol_min: 1.50
     adx_min: 20.0
+    dist_above_ma_min: 0.005
+    pivot_lookback_days: 60
+    default_rs_above_ma: true
     stop_hard: 0.20
     trail_atr: 2.0
     ma_guard: 0.03
