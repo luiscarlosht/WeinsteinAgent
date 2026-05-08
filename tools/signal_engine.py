@@ -332,6 +332,7 @@ def main():
     # 3) Promote states
     state = load_state(args.state) or {}
     buy_triggers: List[Dict[str, Any]] = []
+    near_buy_events: List[Dict[str, Any]] = []
     sell_triggers: List[Dict[str, Any]] = []
 
     # Process by last seen per ticker (keep the last row for each)
@@ -369,6 +370,19 @@ def main():
 
         if buy_state == "IDLE" and near_buy:
             buy_state = "NEAR"
+            # Hybrid behavior: log a NEAR_BUY event immediately when a ticker
+            # newly enters the NEAR state. BUY remains strict and still requires
+            # ARMED + confirmation below.
+            near_buy_events.append({
+                "ts": ts_now(),
+                "ticker": t,
+                "side": "NEAR_BUY",
+                "price": px if not math.isnan(px) else "",
+                "reason": str(r.get("reason", "near_setup")) or "near_setup",
+                "near_hits": near_count,
+                "state_before": prev_buy,
+                "state_after": "NEAR",
+            })
         elif buy_state in ("IDLE", "NEAR") and near_count >= NEAR_HITS_MIN:
             buy_state = "ARMED"
 
@@ -443,7 +457,7 @@ def main():
     # 4) Write signals & state
     wrote_any = False
     if args.write_signals:
-        for s in buy_triggers + sell_triggers:
+        for s in near_buy_events + buy_triggers + sell_triggers:
             append_signal_row(args.write_signals, s)
             wrote_any = True
 
@@ -463,8 +477,8 @@ def main():
             print(f"{t:6} {st.get('buy_state',''):10} {st.get('sell_state',''):10} {nh:8} {sh:8} {lp:>10}")
 
     # 6) Final line
-    b, s = len(buy_triggers), len(sell_triggers)
-    log(f"Done. Emitted {b} BUY and {s} SELL signals.", level="ok")
+    nb, b, s = len(near_buy_events), len(buy_triggers), len(sell_triggers)
+    log(f"Done. Emitted {nb} NEAR_BUY, {b} BUY and {s} SELL signals.", level="ok")
     if wrote_any:
         log(f"Signals appended → {args.write_signals}", level="ok")
 
