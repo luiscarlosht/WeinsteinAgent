@@ -365,13 +365,28 @@ def main():
             st["last_structure"] = structure
         st["last_seen"]  = ts_now()
 
-        # --- Determine NEAR flags (prefer watcher output; fallback to inference)
-        near_buy = bool(r.get("cond_near_now", False))
-        near_sell = bool(r.get("sell_near_now", False))
-        if not near_buy or not near_sell:
-            d_buy, d_sell = derive_near_flags(r, args.bps_threshold)
-            near_buy = near_buy or d_buy
-            near_sell = near_sell or d_sell
+        # --- Determine NEAR flags
+        # IMPORTANT:
+        # If the watcher provides cond_near_now / sell_near_now, treat those as
+        # the source of truth. The watcher has the current config-driven rules
+        # for NEAR, including near_vol_pace_min and hybrid CORE behavior.
+        #
+        # Only use derive_near_flags() as a legacy fallback for old CSV files
+        # that do not contain these explicit columns. This prevents the signal
+        # engine from emitting NEAR_BUY events that do not appear in the HTML
+        # Near-Triggers section.
+        has_buy_near_col = "cond_near_now" in r.index
+        has_sell_near_col = "sell_near_now" in r.index
+
+        if has_buy_near_col:
+            near_buy = bool(r.get("cond_near_now", False))
+        else:
+            near_buy, _ = derive_near_flags(r, args.bps_threshold)
+
+        if has_sell_near_col:
+            near_sell = bool(r.get("sell_near_now", False))
+        else:
+            _, near_sell = derive_near_flags(r, args.bps_threshold)
 
         # --- BUY progression
         st["near_hits"], near_count = update_hits(st.get("near_hits", []), near_buy, NEAR_HITS_WINDOW)
