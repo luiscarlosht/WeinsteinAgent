@@ -196,6 +196,12 @@ def load_intraday_debug(csv_path: str) -> Optional[pd.DataFrame]:
         if core not in df.columns:
             df[core] = np.nan
 
+    # Normalize presentation/context columns if watcher provides them.
+    if "Structure" in df.columns and "structure" not in df.columns:
+        df["structure"] = df["Structure"]
+    if "Stage" in df.columns and "stage" not in df.columns:
+        df["stage"] = df["Stage"]
+
     # Drop rows without ticker or price
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
     df = df.dropna(subset=["ticker"])
@@ -211,6 +217,7 @@ def default_ticker_state() -> Dict[str, Any]:
         "sell_hits": [],
         "sell_cooldown": 0,
         "last_price": None,
+        "last_structure": None,
         "last_seen": None,
     }
 
@@ -352,7 +359,10 @@ def main():
         prev_sell = st.get("sell_state", "IDLE")
 
         px = safe_float(r.get("price"))
+        structure = str(r.get("structure", r.get("Structure", ""))).strip()
         st["last_price"] = px
+        if structure and structure.lower() != "nan":
+            st["last_structure"] = structure
         st["last_seen"]  = ts_now()
 
         # --- Determine NEAR flags (prefer watcher output; fallback to inference)
@@ -378,7 +388,7 @@ def main():
                 "ticker": t,
                 "side": "NEAR_BUY",
                 "price": px if not math.isnan(px) else "",
-                "reason": str(r.get("reason", "near_setup")) or "near_setup",
+                "reason": ((f"{structure}; " if structure and structure.lower() != "nan" else "") + (str(r.get("reason", "near_setup")) or "near_setup")),
                 "near_hits": near_count,
                 "state_before": prev_buy,
                 "state_after": "NEAR",
@@ -397,7 +407,7 @@ def main():
                 "ticker": t,
                 "side": "BUY",
                 "price": px if not math.isnan(px) else "",
-                "reason": "confirm_over_pivot_ma",
+                "reason": ((f"{structure}; " if structure and structure.lower() != "nan" else "") + "confirm_over_pivot_ma"),
                 "near_hits": near_count,
                 "state_before": prev_buy,
                 "state_after": new_state,
@@ -434,7 +444,7 @@ def main():
                 "ticker": t,
                 "side": "SELL",
                 "price": px if not math.isnan(px) else "",
-                "reason": "confirmed_below_ma",
+                "reason": ((f"{structure}; " if structure and structure.lower() != "nan" else "") + "confirmed_below_ma"),
                 "near_hits": sell_hit_count,
                 "state_before": prev_sell,
                 "state_after": new_state,
