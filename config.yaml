@@ -92,10 +92,10 @@ intraday:
 
     # Stage / trend confirmation
     stage_above_ma_pct: 0.01      # require Close > MA150 by 0.5% before CORE check
-    dist_above_ma_min: 0.01       # CORE MA confirmation; 0.5% above MA used for BUY/NEAR
+    dist_above_ma_min: 0.005      # CORE MA confirmation; 0.5% above MA used for BUY/NEAR
 
     # Pivot / breakout confirmation
-    pivot_lookback_days: 60        # pivot = highest close over this many daily bars
+    pivot_lookback_days: 40        # pivot = highest close over this many daily bars
     confirm_headroom_pct: 0.4      # BUY = this % over pivot
     near_below_pivot_pct: 0.3      # NEAR = within this % below pivot
 
