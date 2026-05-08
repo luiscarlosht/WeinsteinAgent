@@ -108,6 +108,111 @@ class LongEntryResult:
     adx_ok: bool
 
 
+
+
+@dataclass
+class LongSignalResult:
+    """Unified LONG decision result for both PROD and SIM diagnostics.
+
+    signal values:
+      - BUY: full breakout/volume/ADX confirmation passed
+      - NEAR: close to pivot with enough early volume pace
+      - NONE/SKIP-*: not actionable, with a diagnostic reason
+    """
+    signal: str
+    reason: str
+    can_enter: bool = False
+    adx_ok: bool = True
+
+
+def evaluate_long_signal(
+    *,
+    price: float,
+    ma_val: float,
+    pivot: float,
+    rs_above_ma: bool = True,
+    vol_mult: float = np.nan,
+    adx_val: float = np.nan,
+    params: Optional[LongEntryParams] = None,
+    near_below_pivot_pct: float = 0.003,
+    near_vol_min: float = 1.0,
+) -> LongSignalResult:
+    """Return BUY/NEAR/NONE/SKIP using one shared LONG entry definition.
+
+    This is the bridge function PROD and SIM should call.
+
+    BUY delegates to check_long_entry(), so all hard entry gates live in one
+    place. NEAR uses a softer pivot/volume zone but still requires sane MA/RS
+    context.
+    """
+    if params is None:
+        params = LongEntryParams()
+
+    buy = check_long_entry(
+        price=price,
+        ma_val=ma_val,
+        pivot=pivot,
+        rs_above_ma=rs_above_ma,
+        vol_mult=vol_mult,
+        adx_val=adx_val,
+        params=params,
+    )
+    if buy.can_enter:
+        return LongSignalResult(
+            signal="BUY",
+            reason=(
+                f"BUY: price={price:.2f} pivot={pivot:.2f} "
+                f"break>={params.min_break_pct*100:.2f}% vol={vol_mult:.2f}x "
+                f"adx={adx_val:.1f}"
+            ),
+            can_enter=True,
+            adx_ok=buy.adx_ok,
+        )
+
+    # Preserve explicit ADX diagnostics because this is a common tuning blocker.
+    if buy.reason == "adx_below_min":
+        return LongSignalResult(
+            signal="SKIP-ADX",
+            reason=f"ADX14={adx_val:.1f} < {params.adx_min}",
+            can_enter=False,
+            adx_ok=False,
+        )
+
+    # NEAR logic: close to pivot with softer volume. Still require RS and MA.
+    if _is_nan(price) or _is_nan(ma_val) or _is_nan(pivot):
+        return LongSignalResult("SKIP-DATA", "nan_input", False, buy.adx_ok)
+
+    if not rs_above_ma:
+        return LongSignalResult("SKIP-RS", "rs_not_above_ma", False, buy.adx_ok)
+
+    if price <= ma_val * (1.0 + params.dist_above_ma_min):
+        return LongSignalResult("SKIP-MA", "price_not_above_ma", False, buy.adx_ok)
+
+    near_level = pivot * (1.0 - near_below_pivot_pct)
+    if price >= near_level and (not _is_nan(vol_mult)) and vol_mult >= near_vol_min:
+        return LongSignalResult(
+            signal="NEAR",
+            reason=(
+                f"NEAR: price={price:.2f} within {near_below_pivot_pct*100:.2f}% "
+                f"of pivot={pivot:.2f}; vol={vol_mult:.2f}x"
+            ),
+            can_enter=False,
+            adx_ok=buy.adx_ok,
+        )
+
+    if buy.reason == "no_breakout_vs_pivot":
+        try:
+            headroom_pct = (price / pivot - 1.0) * 100.0
+            return LongSignalResult("NONE", f"No breakout. headroom={headroom_pct:.2f}%, vol={vol_mult:.2f}x", False, buy.adx_ok)
+        except Exception:
+            return LongSignalResult("NONE", "no_breakout_vs_pivot", False, buy.adx_ok)
+
+    if buy.reason == "volume_too_low":
+        return LongSignalResult("SKIP-VOL", f"volume_too_low vol={vol_mult:.2f}x < {params.vol_min}", False, buy.adx_ok)
+
+    return LongSignalResult("NONE", buy.reason, False, buy.adx_ok)
+
+
 # -------------------------------------------------------------------
 # Helper(s)
 # -------------------------------------------------------------------
