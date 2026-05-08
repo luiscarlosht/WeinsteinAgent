@@ -83,7 +83,7 @@ risk:
 # ---- Intraday / PROD knobs (long + short) ----
 intraday:
   # Keep intraday as your current balanced profile (C-style)
-  adx_min_long: 14.0
+  adx_min_long: 18.0
 
   long:
     # Data horizon / trend proxy
@@ -91,7 +91,7 @@ intraday:
     ma_proxy_length: 150           # MA150 as 30-wk proxy
 
     # Stage / trend confirmation
-    stage_above_ma_pct: 0.005      # require Close > MA150 by 0.5% before CORE check
+    stage_above_ma_pct: 0.01      # require Close > MA150 by 0.5% before CORE check
     dist_above_ma_min: 0.005       # CORE MA confirmation; 0.5% above MA used for BUY/NEAR
 
     # Pivot / breakout confirmation
