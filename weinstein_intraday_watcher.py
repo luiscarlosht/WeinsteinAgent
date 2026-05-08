@@ -25,9 +25,11 @@ import argparse
 import datetime as dt
 import glob
 import os
+import re
+import html
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -701,6 +703,203 @@ def evaluate_intraday_signals(
 # HTML / Email-style report rendering
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Portfolio holdings helpers
+# ---------------------------------------------------------------------------
+
+INVALID_HOLDING_SYMBOLS = {
+    "", "--", "N/A", "NA", "CASH", "CORE", "SPAXX", "FDRXX", "FCASH", "QIMHQ",
+    "PENDINGACTIVITY", "PENDING", "MARGINCREDITBALANCE", "MMKT"
+}
+
+
+def _clean_symbol(x) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    s = str(x).strip().upper()
+    s = s.replace("$", "")
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("/", "-")
+    return s
+
+
+def _parse_money_like(x) -> float:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    s = str(x).strip()
+    if not s or s.lower() == "nan" or s in ("--", "N/A"):
+        return np.nan
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.replace("$", "").replace(",", "").replace("%", "").replace("(", "").replace(")", "")
+    try:
+        v = float(s)
+        return -v if neg else v
+    except Exception:
+        return np.nan
+
+
+def _first_present_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+    lower = {str(c).strip().lower(): c for c in df.columns}
+    for n in names:
+        if n.lower() in lower:
+            return lower[n.lower()]
+    return None
+
+
+def _normalize_holdings_df(raw: pd.DataFrame) -> pd.DataFrame:
+    """Return normalized holdings columns: Ticker, Quantity, Value, GainPct, Account."""
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"])
+    df = raw.copy()
+    sym_col = _first_present_col(df, ["Ticker", "Symbol", "symbol", "ticker"])
+    if not sym_col:
+        return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"])
+    qty_col = _first_present_col(df, ["Quantity", "Qty", "Shares", "quantity"])
+    val_col = _first_present_col(df, ["Current Value", "Value", "Market Value", "current_value", "value"])
+    gain_col = _first_present_col(df, ["Total Gain/Loss Percent", "GainPct", "Gain %", "Unrealized %", "UnrealizedPct"])
+    acct_col = _first_present_col(df, ["Account Name", "Account", "Account Number", "account"])
+    out = pd.DataFrame()
+    out["Ticker"] = df[sym_col].map(_clean_symbol)
+    out["Quantity"] = df[qty_col].map(_parse_money_like) if qty_col else np.nan
+    out["Value"] = df[val_col].map(_parse_money_like) if val_col else np.nan
+    out["GainPct"] = df[gain_col].map(_parse_money_like) if gain_col else np.nan
+    out["Account"] = df[acct_col].astype(str) if acct_col else ""
+    out = out[~out["Ticker"].isin(INVALID_HOLDING_SYMBOLS)].copy()
+    out = out[out["Ticker"].str.match(r"^[A-Z0-9.\-]{1,12}$", na=False)].copy()
+    if out.empty:
+        return out
+    grouped = out.groupby("Ticker", as_index=False).agg(
+        Quantity=("Quantity", "sum"),
+        Value=("Value", "sum"),
+        GainPct=("GainPct", "mean"),
+        Account=("Account", lambda s: ", ".join(sorted({x for x in s.astype(str) if x and x != "nan"}))[:80]),
+    )
+    return grouped.sort_values("Value", ascending=False, na_position="last")
+
+
+def _read_gsheet_tab(cfg_raw: Dict, tab_name: str) -> Optional[pd.DataFrame]:
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception:
+        try:
+            import gspread
+            from oauth2client.service_account import ServiceAccountCredentials
+        except Exception:
+            return None
+    try:
+        sheets_cfg = cfg_raw.get("sheets", {}) or {}
+        google_cfg = cfg_raw.get("google", {}) or {}
+        sheet_url = sheets_cfg.get("url") or sheets_cfg.get("sheet_url")
+        creds_json = google_cfg.get("service_account_json")
+        if not sheet_url or not creds_json:
+            return None
+        creds_json = os.path.expanduser(str(creds_json))
+        if not os.path.exists(creds_json):
+            return None
+        scope = ["https://www.googleapis.com/auth/spreadsheets.readonly", "https://www.googleapis.com/auth/drive.readonly"]
+        try:
+            creds = Credentials.from_service_account_file(creds_json, scopes=scope)
+            gc = gspread.authorize(creds)
+        except Exception:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_json, scope)
+            gc = gspread.authorize(creds)
+        sh = gc.open_by_url(sheet_url)
+        ws = sh.worksheet(tab_name)
+        return pd.DataFrame(ws.get_all_records())
+    except Exception:
+        return None
+
+
+def load_portfolio_holdings(cfg_raw: Dict, output_dir: str = "./output") -> Tuple[pd.DataFrame, str]:
+    sheets_cfg = cfg_raw.get("sheets", {}) or {}
+    open_tab = sheets_cfg.get("open_positions_tab", "Open_Positions")
+    for tab in [open_tab, "Holdings", "Portfolio", "Positions"]:
+        raw = _read_gsheet_tab(cfg_raw, tab)
+        norm = _normalize_holdings_df(raw) if raw is not None else pd.DataFrame()
+        if not norm.empty:
+            return norm, f"Google Sheet tab '{tab}'"
+    patterns = ["Portfolio_Positions*.csv", "*Portfolio*Positions*.csv", "holdings*.csv", "Holdings*.csv", os.path.join(output_dir, "Portfolio_Positions*.csv"), os.path.join(output_dir, "holdings*.csv")]
+    candidates = []
+    for pat in patterns:
+        candidates.extend(glob.glob(pat))
+    candidates = sorted(set(candidates), key=os.path.getmtime, reverse=True)
+    for path in candidates:
+        try:
+            raw = pd.read_csv(path, engine="python")
+            norm = _normalize_holdings_df(raw)
+            if not norm.empty:
+                return norm, f"local CSV '{path}'"
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"]), "no holdings source found"
+
+
+def _portfolio_action(row: pd.Series) -> Tuple[str, str]:
+    signal = str(row.get("Signal", "")).upper()
+    structure = str(row.get("Structure", ""))
+    reason = str(row.get("Reason", ""))
+    price = _parse_money_like(row.get("PriceNow"))
+    ma150 = _parse_money_like(row.get("MA150"))
+    headroom = _parse_money_like(row.get("HeadroomPct"))
+    vol = _parse_money_like(row.get("VolPace"))
+    if signal in ("SELL", "SELLTRIG", "SELL-TRIGGER"):
+        return "SELL / reduce review", "Confirmed sell trigger from scanner."
+    if signal.startswith("SKIP-DATA") or signal in ("NOT-SCANNED", "SKIP-INTRADAY", "SKIP-MA"):
+        return "Review manually", "Owned ticker was not fully evaluated by the intraday scanner."
+    if signal == "SKIP-STAGE" or (not np.isnan(price) and not np.isnan(ma150) and price < ma150):
+        return "Risk review", "Owned ticker is below/weak versus MA150 structure."
+    if signal == "BUY":
+        return "Add/hold candidate", "Confirmed breakout while already owned."
+    if signal in ("NEAR", "NEAR_BUY", "NEAR-TRIGGER"):
+        return "Hold / watch closely", "Near-trigger while already owned; watch for breakout confirmation."
+    if "Stage 2" in structure:
+        if not np.isnan(headroom) and headroom >= -1.0:
+            if not np.isnan(vol) and vol < 1.0:
+                return "Hold / needs volume", "Stage 2 and near pivot, but volume pace is weak."
+            return "Hold / near pivot", "Stage 2 and close to pivot, but no trigger yet."
+        return "Hold / no trigger", "Stage 2 structure, but not close enough to pivot yet."
+    return "Monitor", reason or "No specific action signal."
+
+
+def build_portfolio_review_section(diag: pd.DataFrame, holdings: Optional[pd.DataFrame], holdings_source: str, limit: int = 40) -> str:
+    html_parts = ["<hr>", "<h4>Portfolio Holdings Review</h4>"]
+    if holdings is None or holdings.empty:
+        html_parts.append(f"<p class=\"note\">No owned-position data found ({html.escape(str(holdings_source))}). To enable this section, keep the Open_Positions or Holdings tab populated, or place a Portfolio_Positions*.csv file in the repo/output folder.</p>")
+        return "\n".join(html_parts)
+    if diag is None or diag.empty or "Ticker" not in diag.columns:
+        html_parts.append("<p class=\"note\">Holdings were found, but scanner diagnostics were empty.</p>")
+        return "\n".join(html_parts)
+    d = diag.copy(); d["Ticker"] = d["Ticker"].map(_clean_symbol)
+    h = holdings.copy(); h["Ticker"] = h["Ticker"].map(_clean_symbol)
+    merged = h.merge(d, on="Ticker", how="left", suffixes=("_Held", ""))
+    merged["Signal"] = merged["Signal"].fillna("NOT-SCANNED")
+    merged["Structure"] = merged["Structure"].fillna("Not in current scanner universe")
+    merged["Reason"] = merged["Reason"].fillna("Ticker not present in current intraday diagnostics")
+    actions = merged.apply(_portfolio_action, axis=1, result_type="expand")
+    merged["PortfolioAction"] = actions[0]
+    merged["PortfolioNote"] = actions[1]
+    priority = {"SELL / reduce review": 0, "Risk review": 1, "Review manually": 2, "Hold / watch closely": 3, "Add/hold candidate": 4, "Hold / needs volume": 5, "Hold / near pivot": 6, "Hold / no trigger": 7, "Monitor": 8}
+    merged["_priority"] = merged["PortfolioAction"].map(priority).fillna(9)
+    merged["_value"] = pd.to_numeric(merged.get("Value"), errors="coerce").fillna(0)
+    merged = merged.sort_values(["_priority", "_value"], ascending=[True, False])
+    counts = merged["PortfolioAction"].value_counts().to_dict()
+    html_parts.append(f"<p class=\"note\">Source: {html.escape(str(holdings_source))}. Reviewed {len(merged)} owned tickers against the current intraday scanner state.</p>")
+    html_parts.append("<table class=\"summary\"><thead><tr><th>Portfolio Action</th><th>Count</th></tr></thead><tbody>")
+    for action, count in sorted(counts.items(), key=lambda kv: priority.get(kv[0], 9)):
+        html_parts.append(f"<tr><td>{html.escape(str(action))}</td><td>{int(count)}</td></tr>")
+    html_parts.append("</tbody></table>")
+    display_cols = ["Ticker", "PortfolioAction", "PortfolioNote", "Structure", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "MA150", "Quantity", "Value", "GainPct"]
+    show = merged[[c for c in display_cols if c in merged.columns]].head(limit).copy()
+    show = show.rename(columns={"PortfolioAction": "Recommendation", "PortfolioNote": "Portfolio Note", "HeadroomPct": "Pivot Distance %", "VolPace": "Vol Pace", "GainPct": "Gain %"})
+    html_parts.append(show.to_html(index=False, escape=False))
+    if len(merged) > limit:
+        html_parts.append(f"<p class=\"note\">Showing top {limit} of {len(merged)} owned tickers by action priority/value.</p>")
+    html_parts.append("<p class=\"note\">Portfolio recommendations are rule-based scanner labels for review, not automatic orders.</p>")
+    return "\n".join(html_parts)
+
 def _fmt_num(value, digits: int = 2, suffix: str = "") -> str:
     try:
         if value is None or pd.isna(value):
@@ -807,6 +1006,8 @@ def build_intraday_report_html(
     breadth_pct: float,
     breadth_long_ok: bool,
     long_ok: bool,
+    holdings: Optional[pd.DataFrame] = None,
+    holdings_source: str = "",
 ) -> str:
     """Build the polished intraday HTML/email-style report."""
     if diag is None:
@@ -868,6 +1069,7 @@ def build_intraday_report_html(
         _ordered_section("Near-Triggers (ranked)", nears, "NEAR", "No NEAR-TRIGGER setups at this scan."),
         "<hr>",
         _ordered_section("Sell Triggers (ranked)", sells, "SELL", "No SELL-TRIGGER signals."),
+        build_portfolio_review_section(diag, holdings, holdings_source),
         "<hr>",
         "<h4>Scanner Diagnostics</h4>",
         "<table class=\"summary\"><thead><tr><th>Metric</th><th>Count</th></tr></thead><tbody>",
@@ -1006,6 +1208,18 @@ def main() -> None:
 
     # Polished HTML/email-style report
     # Keep filenames/logs in the VM local timezone, but show report time in Dallas/Central time.
+    # Load owned portfolio positions for the portfolio review section.
+    # This is best-effort: report generation continues even if holdings are unavailable.
+    try:
+        holdings_df, holdings_source = load_portfolio_holdings(cfg_raw, cfg.app.output_dir)
+        if holdings_df.empty:
+            log(f"Portfolio holdings review: no holdings loaded ({holdings_source}).")
+        else:
+            log(f"Portfolio holdings review: loaded {len(holdings_df)} owned tickers from {holdings_source}.")
+    except Exception as e:
+        holdings_df, holdings_source = pd.DataFrame(), f"holdings load error: {e}"
+        log(f"Portfolio holdings review skipped: {e}")
+
     now_ct = dt.datetime.now(ZoneInfo("America/Chicago"))
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     ts_display = now_ct.strftime("%Y-%m-%d %H:%M CT")
@@ -1018,6 +1232,8 @@ def main() -> None:
             breadth_pct=breadth_pct,
             breadth_long_ok=breadth_long_ok,
             long_ok=long_ok,
+            holdings=holdings_df,
+            holdings_source=holdings_source,
         )
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html)
