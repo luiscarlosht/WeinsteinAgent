@@ -480,12 +480,12 @@ def evaluate_intraday_signals(
             )
             continue
 
-        if not (last["Close"] > last["MA150"] * 1.02):
+        if not (last["Close"] > last["MA150"] * 1.005):
             rows.append(
                 dict(
                     Ticker=ticker,
                     Signal="SKIP-STAGE",
-                    Reason=f"Close not sufficiently above MA150 ({last['Close']:.2f} vs {last['MA150']:.2f})",
+                    Reason=f"Close not sufficiently above MA150 +0.5% ({last['Close']:.2f} vs {last['MA150']:.2f})",
                 )
             )
             continue
