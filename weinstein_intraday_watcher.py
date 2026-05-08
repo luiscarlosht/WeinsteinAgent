@@ -575,6 +575,48 @@ def evaluate_intraday_signals(
         signal = core_result.signal
         reason = core_result.reason
 
+        # ------------------------------------------------------------------
+        # HYBRID NEAR layer
+        # ------------------------------------------------------------------
+        # BUY remains strict and CORE-driven.
+        # NEAR is intentionally softer, closer to the original Nov/Dec scanner:
+        #   - Stage/MA structure must already be OK because we reached this point
+        #   - ticker must be close to the pivot OR already over pivot but not BUY-confirmed
+        #   - near volume uses near_vol_pace_min, not the stricter BUY vol_pace_min
+        #   - ADX does NOT block NEAR; ADX only blocks strict BUY
+        # This restores the useful "watchlist forming" behavior without making
+        # production BUY alerts noisy.
+        near_zone_pct = cfg.intraday.near_below_pivot_pct / 100.0
+        soft_near_price_ok = price_now >= float(pivot_window) * (1.0 - near_zone_pct)
+        soft_near_vol_ok = (not np.isnan(vol_pace)) and vol_pace >= cfg.intraday.near_vol_pace_min
+        soft_near_now = bool(signal != "BUY" and soft_near_price_ok and soft_near_vol_ok)
+
+        if soft_near_now:
+            signal = "NEAR"
+            if price_now >= float(pivot_window):
+                reason = (
+                    f"NEAR: px={price_now:.2f} is over pivot={float(pivot_window):.2f} "
+                    f"but not fully BUY-confirmed; headroom={headroom_pct:.2f}%, "
+                    f"vol={vol_pace:.2f}x, adx={adx14:.1f}"
+                )
+            else:
+                reason = (
+                    f"NEAR: px={price_now:.2f} within "
+                    f"{cfg.intraday.near_below_pivot_pct:.2f}% of pivot={float(pivot_window):.2f}; "
+                    f"headroom={headroom_pct:.2f}%, vol={vol_pace:.2f}x, adx={adx14:.1f}"
+                )
+
+        buy_confirm = bool(signal == "BUY")
+        cond_near_now = bool(signal == "NEAR")
+        cond_buy_price_ok = bool(price_now >= float(pivot_window) * (1.0 + cfg.intraday.confirm_headroom_pct / 100.0))
+        cond_buy_vol_ok = bool((not np.isnan(vol_pace)) and vol_pace >= cfg.intraday.vol_pace_min)
+        cond_near_pace_gate = bool((not np.isnan(vol_pace)) and vol_pace >= cfg.intraday.near_vol_pace_min)
+        cond_ma_ok = bool(price_now > float(last["MA150"]) * (1.0 + cfg.intraday.dist_above_ma_min))
+        cond_weekly_stage_ok = True
+        cond_rs_ok = True
+        cond_pivot_ok = bool(not pd.isna(pivot_window) and float(pivot_window) > 0)
+        cond_pace_full_gate = cond_buy_vol_ok
+
         rows.append(
             dict(
                 Ticker=ticker,
@@ -589,6 +631,27 @@ def evaluate_intraday_signals(
                 MA30=float(last["MA30"]) if not pd.isna(last["MA30"]) else np.nan,
                 MA150=float(last["MA150"]),
                 ATR14=float(last["ATR14"]) if not pd.isna(last["ATR14"]) else np.nan,
+                # Lowercase compatibility columns consumed by tools/signal_engine.py
+                ticker=ticker,
+                signal=signal,
+                reason=reason,
+                price=price_now,
+                pivot=pivot_window,
+                ma30=float(last["MA150"]),
+                pace_full_vs50dma=vol_pace,
+                dist_bps=headroom_pct * 100.0,
+                elapsed_min=cfg.intraday.min_elapsed_minutes,
+                pace_intrabar=cfg.intraday.sell_intrabar_vol_pace_min,
+                cond_weekly_stage_ok=cond_weekly_stage_ok,
+                cond_rs_ok=cond_rs_ok,
+                cond_ma_ok=cond_ma_ok,
+                cond_pivot_ok=cond_pivot_ok,
+                cond_buy_vol_ok=cond_buy_vol_ok,
+                cond_pace_full_gate=cond_pace_full_gate,
+                cond_near_pace_gate=cond_near_pace_gate,
+                cond_buy_price_ok=cond_buy_price_ok,
+                cond_near_now=cond_near_now,
+                buy_confirm=buy_confirm,
             )
         )
 
