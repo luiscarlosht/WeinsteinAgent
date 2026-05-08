@@ -873,6 +873,7 @@ def backtest(
     ma150_cache: Dict[str, pd.Series] = {}      # MA150 proxy (for shorts + market context)
     atr_series_cache: Dict[str, pd.Series] = {}
     vol_mult_cache: Dict[str, pd.Series] = {}
+    adx_cache: Dict[str, pd.Series] = {}
 
     for t in universe_tickers:
         close = get_panel(daily_df, "Close", t)
@@ -887,6 +888,10 @@ def backtest(
         ma_cache[t] = close.rolling(30, min_periods=30).mean()
         ma150_cache[t] = close.rolling(150, min_periods=150).mean()
         atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
+        try:
+            adx_cache[t] = compute_adx_series(pd.DataFrame({"High": high, "Low": low, "Close": close}), n=14)
+        except Exception:
+            adx_cache[t] = pd.Series(index=close.index, dtype="float64")
 
         v50 = vol.rolling(50, min_periods=50).mean()
         vol_mult_cache[t] = vol / v50
@@ -1108,7 +1113,40 @@ def backtest(
                 ma_f = float(ma_val)
                 atr_f = float(atr_val)
 
-                if price_f <= ma_f:
+                # Shared LONG CORE gate: SIM and PROD use the same breakout/volume/ADX logic.
+                cs = close_cache.get(t, pd.Series(dtype="float64"))
+                prior = cs.loc[:dt] if not cs.empty else pd.Series(dtype="float64")
+                pivot_lb = int(long_logic_cfg.get("pivot_lookback_days", long_logic_cfg.get("pivot_lookback", 60)))
+                if len(prior) < (pivot_lb + 1):
+                    continue
+                pivot = float(prior.iloc[:-1].tail(pivot_lb).max())
+
+                vm = vol_mult_cache.get(t, pd.Series(dtype="float64"))
+                vol_mult = float(vm.loc[dt]) if dt in vm.index and pd.notna(vm.loc[dt]) else np.nan
+
+                adx_s = adx_cache.get(t, pd.Series(dtype="float64"))
+                adx_val = float(adx_s.loc[dt]) if dt in adx_s.index and pd.notna(adx_s.loc[dt]) else np.nan
+
+                rs_above = _get_snapshot_rs_above_ma(row)
+                if rs_above is None:
+                    rs_above = bool(long_logic_cfg.get("default_rs_above_ma", True))
+
+                core_params = LongEntryParams(
+                    min_break_pct=float(long_logic_cfg.get("break_pct", long_logic_cfg.get("min_break_pct", 0.004))),
+                    dist_above_ma_min=float(long_logic_cfg.get("dist_above_ma_min", 0.0)),
+                    vol_min=float(long_logic_cfg.get("vol_min", long_logic_cfg.get("vol_pace_min", 1.3))),
+                    adx_min=float(long_logic_cfg.get("adx_min_long", long_logic_cfg.get("adx_min", ADX_MIN))),
+                )
+                core_entry = check_long_entry(
+                    price=price_f,
+                    ma_val=ma_f,
+                    pivot=pivot,
+                    rs_above_ma=bool(rs_above),
+                    vol_mult=vol_mult,
+                    adx_val=adx_val,
+                    params=core_params,
+                )
+                if not core_entry.can_enter:
                     continue
 
                 stop = long_stop_level(price_f, atr_f, ma_f)
