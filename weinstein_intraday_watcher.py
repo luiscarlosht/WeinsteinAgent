@@ -662,6 +662,202 @@ def evaluate_intraday_signals(
 
 
 # ---------------------------------------------------------------------------
+# HTML / Email-style report rendering
+# ---------------------------------------------------------------------------
+
+def _fmt_num(value, digits: int = 2, suffix: str = "") -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+        return f"{float(value):,.{digits}f}{suffix}"
+    except Exception:
+        return "—"
+
+
+def _stage_label(row: pd.Series) -> str:
+    for col in ("Stage", "stage", "WeeklyStage", "weekly_stage"):
+        if col in row and not pd.isna(row.get(col)):
+            try:
+                return f"Stage {int(float(row.get(col)))}"
+            except Exception:
+                return str(row.get(col))
+    return "Stage 2 (Uptrend)"
+
+
+def _rank_near(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["_abs_headroom"] = pd.to_numeric(out.get("HeadroomPct"), errors="coerce").abs()
+    out["_vol"] = pd.to_numeric(out.get("VolPace"), errors="coerce").fillna(0)
+    out["_adx"] = pd.to_numeric(out.get("ADX14"), errors="coerce").fillna(0)
+    return out.sort_values(["_abs_headroom", "_vol", "_adx"], ascending=[True, False, False])
+
+
+def _rank_buy(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["_vol"] = pd.to_numeric(out.get("VolPace"), errors="coerce").fillna(0)
+    out["_adx"] = pd.to_numeric(out.get("ADX14"), errors="coerce").fillna(0)
+    out["_headroom"] = pd.to_numeric(out.get("HeadroomPct"), errors="coerce").fillna(0)
+    return out.sort_values(["_vol", "_adx", "_headroom"], ascending=[False, False, False])
+
+
+def _rank_sell(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["_adx"] = pd.to_numeric(out.get("ADX14"), errors="coerce").fillna(0)
+    return out.sort_values(["_adx"], ascending=[False])
+
+
+def _signal_li(row: pd.Series, idx: int, kind: str) -> str:
+    ticker = str(row.get("Ticker", row.get("ticker", ""))).upper()
+    price = _fmt_num(row.get("PriceNow", row.get("price")), 2)
+    pivot = _fmt_num(row.get("Pivot", row.get("pivot")), 2)
+    headroom = _fmt_num(row.get("HeadroomPct"), 2, "%")
+    vol = _fmt_num(row.get("VolPace", row.get("pace_full_vs50dma")), 2, "x")
+    adx = _fmt_num(row.get("ADX14"), 1)
+    stage = _stage_label(row)
+    reason = str(row.get("Reason", row.get("reason", ""))).strip()
+
+    if kind == "SELL":
+        ma150 = _fmt_num(row.get("MA150", row.get("ma30")), 2)
+        detail = f"SMA150 {ma150}, ADX {adx}, {stage}"
+    else:
+        detail = f"pivot {pivot}, distance {headroom}, vol {vol}, ADX {adx}, {stage}"
+
+    reason_html = f"<br><span style=\"color:#666;font-size:12px;\">{reason}</span>" if reason else ""
+    return f"<li><b>{idx}.</b> <b>{ticker}</b> @ {price} ({detail}){reason_html}</li>"
+
+
+def _ordered_section(title: str, df: pd.DataFrame, kind: str, empty_text: str, limit: int = 25) -> str:
+    if kind == "BUY":
+        df = _rank_buy(df)
+    elif kind == "SELL":
+        df = _rank_sell(df)
+    else:
+        df = _rank_near(df)
+
+    html = [f"<h4>{title}</h4>"]
+    if df.empty:
+        html.append(f"<p>{empty_text}</p>")
+    else:
+        html.append("<ol>")
+        for i, (_, row) in enumerate(df.head(limit).iterrows(), start=1):
+            html.append(_signal_li(row, i, kind))
+        html.append("</ol>")
+        if len(df) > limit:
+            html.append(f"<p style=\"font-size:12px;color:#777;\">Showing top {limit} of {len(df)} candidates.</p>")
+    return "\n".join(html)
+
+
+def build_intraday_report_html(
+    diag: pd.DataFrame,
+    cfg: FullConfig,
+    ts_display: str,
+    breadth_pct: float,
+    breadth_long_ok: bool,
+    long_ok: bool,
+) -> str:
+    """Build the polished intraday HTML/email-style report."""
+    if diag is None:
+        diag = pd.DataFrame()
+
+    sig = diag["Signal"].astype(str).str.upper() if not diag.empty and "Signal" in diag else pd.Series(dtype=str)
+    buys = diag.loc[sig.eq("BUY")].copy() if not diag.empty else pd.DataFrame()
+    nears = diag.loc[sig.isin(["NEAR", "NEAR_BUY", "NEAR-TRIGGER"])].copy() if not diag.empty else pd.DataFrame()
+    sells = diag.loc[sig.isin(["SELL", "SELLTRIG", "SELL-TRIGGER"])].copy() if not diag.empty else pd.DataFrame()
+
+    skip_stage = int(sig.eq("SKIP-STAGE").sum()) if not sig.empty else 0
+    skip_adx = int(sig.eq("SKIP-ADX").sum()) if not sig.empty else 0
+    none_count = int(sig.eq("NONE").sum()) if not sig.empty else 0
+    skip_data = int(sig.isin(["SKIP-DATA", "SKIP-MA", "SKIP-INTRADAY"]).sum()) if not sig.empty else 0
+
+    market_regime = "BULL" if long_ok else "LONG DISABLED"
+    short_allowed = bool(cfg.regime.use_short and not long_ok)
+    env_ok = bool(long_ok and breadth_long_ok)
+
+    rules = f"""
+    <h3>Weinstein Intraday Watch — {ts_display}</h3>
+    <p><i>
+      <b>BUY:</b> Weekly Stage 2 breakout confirmed above pivot and SMA150 (~30-week MA proxy),
+      with price confirmation, RS support, volume pace ≥ {cfg.intraday.vol_pace_min:.2f}×,
+      and ADX14 ≥ {cfg.intraday.adx_min_long:.1f} when available.<br><br>
+      <b>NEAR-TRIGGER:</b> Structurally valid Stage 2 setup approaching pivot breakout,
+      or initial pivot cross lacking full BUY confirmation. This is the early watchlist layer before confirmed BUY signals.<br><br>
+      <b>SELL-TRIGGER:</b> Confirmed breakdown below SMA150 by {cfg.intraday.crack_ma_pct:.1f}% with persistence and downside confirmation.
+    </i></p>
+    <p style="font-size:13px;color:#555;">
+      <b>Market Regime (Chapter 8 filter):</b> {market_regime} — LONG allowed={bool(long_ok)}, SHORT allowed={short_allowed}.<br>
+      <b>Breadth Health:</b> {breadth_pct:.1f}% of breadth universe above MA{cfg.intraday.breadth_ma_window}
+      (breadth filter enabled={cfg.intraday.breadth_enabled}, LONG breadth_ok={bool(breadth_long_ok)}).<br>
+      <b>Effective LONG gate:</b> env_long_ok = market_long_ok AND breadth_long_ok → {env_ok}.
+    </p>
+    """
+
+    style = """
+    <style>
+      body { font-family: Arial, Helvetica, sans-serif; color:#222; }
+      h3 { margin-bottom: 8px; }
+      h4 { margin-top: 18px; margin-bottom: 8px; }
+      li { margin: 6px 0; line-height: 1.35; }
+      .summary { border-collapse: collapse; margin-top: 8px; }
+      .summary th, .summary td { border: 1px solid #ddd; padding: 6px 10px; font-size: 13px; }
+      .summary th { background: #f6f6f6; }
+      .note { color:#666; font-size:12px; }
+      hr { border:0; border-top:1px solid #ddd; margin:18px 0; }
+    </style>
+    """
+
+    sections = [
+        "<html><body>",
+        style,
+        rules,
+        "<hr>",
+        _ordered_section("Buy Triggers (ranked)", buys, "BUY", "No confirmed BUY breakouts at this scan."),
+        "<hr>",
+        _ordered_section("Near-Triggers (ranked)", nears, "NEAR", "No NEAR-TRIGGER setups at this scan."),
+        "<hr>",
+        _ordered_section("Sell Triggers (ranked)", sells, "SELL", "No SELL-TRIGGER signals."),
+        "<hr>",
+        "<h4>Scanner Diagnostics</h4>",
+        "<table class=\"summary\"><thead><tr><th>Metric</th><th>Count</th></tr></thead><tbody>",
+        f"<tr><td>Confirmed BUY</td><td>{len(buys)}</td></tr>",
+        f"<tr><td>NEAR-TRIGGER</td><td>{len(nears)}</td></tr>",
+        f"<tr><td>SELL-TRIGGER</td><td>{len(sells)}</td></tr>",
+        f"<tr><td>NONE / structurally valid but no trigger</td><td>{none_count}</td></tr>",
+        f"<tr><td>SKIP-STAGE</td><td>{skip_stage}</td></tr>",
+        f"<tr><td>SKIP-ADX</td><td>{skip_adx}</td></tr>",
+        f"<tr><td>SKIP-DATA / SKIP-MA / SKIP-INTRADAY</td><td>{skip_data}</td></tr>",
+        "</tbody></table>",
+        "<ul>",
+        "<li>BUY remains strict: confirmed breakout plus participation confirmation.</li>",
+        "<li>NEAR-TRIGGER is the early watchlist layer: structurally valid setups that may become actionable if volume expands.</li>",
+        "<li>Low volume pace environments may produce elevated NEAR activity with limited BUY confirmation.</li>",
+        "<li>Signals are filtered through the Chapter 8 market/regime model and optional breadth health gate.</li>",
+        "</ul>",
+        "<hr>",
+        "<h4>Diagnostics Table</h4>",
+    ]
+
+    if diag.empty:
+        sections.append("<p>No diagnostics rows generated.</p>")
+    else:
+        preferred_cols = ["Ticker", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "CloseDaily", "MA150", "ATR14"]
+        cols = [c for c in preferred_cols if c in diag.columns]
+        table_df = diag[cols].copy() if cols else diag.copy()
+        sections.append(table_df.to_html(index=False, escape=False))
+
+    sections.extend([
+        "<p class=\"note\">Generated by Weinstein Hybrid Intraday Engine.</p>",
+        "</body></html>",
+    ])
+    return "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -759,16 +955,21 @@ def main() -> None:
     diag.to_csv(out_csv, index=False)
     log(f"Wrote diagnostics CSV → {out_csv}")
 
-    # Simple HTML summary
+    # Polished HTML/email-style report
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts_display = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     html_path = os.path.join(cfg.app.output_dir, f"intraday_watch_{ts}.html")
     try:
-        html = diag.to_html(index=False)
-        with open(html_path, "w") as f:
-            f.write("<html><body>\n")
-            f.write("<h2>Weinstein Intraday Watch — Diagnostics</h2>\n")
+        html = build_intraday_report_html(
+            diag=diag,
+            cfg=cfg,
+            ts_display=ts_display,
+            breadth_pct=breadth_pct,
+            breadth_long_ok=breadth_long_ok,
+            long_ok=long_ok,
+        )
+        with open(html_path, "w", encoding="utf-8") as f:
             f.write(html)
-            f.write("\n</body></html>")
         log(f"Saved HTML → {html_path}")
     except Exception as e:
         print(f"⚠️ Failed to write HTML summary: {e}")
