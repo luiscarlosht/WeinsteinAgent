@@ -103,6 +103,8 @@ from weinstein_long_core import (
 from weinstein_short_core import (
     check_short_entry,
     ShortEntryParams,
+    short_stop_level as core_short_stop_level,
+    should_exit_short as core_should_exit_short,
 )
 
 from weinstein_filters import stock_ma30_slope_ok_from_snapshot
@@ -1011,7 +1013,7 @@ def backtest(
                     pos.stop = float(max(pos.stop, new_stop))
                 pos.atr = atr_f
             else:
-                new_stop = short_stop_level(
+                new_stop = core_short_stop_level(
                     px_f, atr_f, ma_f,
                     stop_hard_pct=sh_stop_hard,
                     trail_atr=sh_trail_atr,
@@ -1076,7 +1078,7 @@ def backtest(
 
                 ma_f = float(ma_exit) if pd.notna(ma_exit) else np.nan
 
-                if should_exit_short(px_f, float(pos.stop), ma_f):
+                if core_should_exit_short(px_f, float(pos.stop), ma_f, ma_guard=sh_ma_guard):
                     cover_price = px_f
                     cover_cost = float(pos.qty) * cover_price
                     entry_proceeds = float(pos.qty) * float(pos.entry_price)
@@ -1325,7 +1327,7 @@ def backtest(
                         short_diag["no_bars"] += 1
                     continue
 
-                stop = short_stop_level(
+                stop = core_short_stop_level(
                     price_f, atr_f, ma_f,
                     stop_hard_pct=sh_stop_hard,
                     trail_atr=sh_trail_atr,
