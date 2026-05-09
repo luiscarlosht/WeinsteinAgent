@@ -27,6 +27,8 @@ import glob
 import os
 import re
 import html
+import io
+import base64
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -35,6 +37,10 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import yaml
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from weinstein_long_core import LongEntryParams, evaluate_long_signal
 
@@ -1226,6 +1232,149 @@ def _ordered_section(title: str, df: pd.DataFrame, kind: str, empty_text: str, l
     return "\n".join(html)
 
 
+
+
+def _safe_float(value) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _chart_candidate_rows(buys: pd.DataFrame, nears: pd.DataFrame, sells: pd.DataFrame, max_charts: int = 15) -> List[Tuple[str, pd.Series]]:
+    """
+    Old-style chart selection:
+      - BUY first
+      - NEAR second
+      - SELL third
+    Only chart actionable sections, not the entire portfolio/diagnostics universe.
+    """
+    candidates: List[Tuple[str, pd.Series]] = []
+    for label, df in [("BUY", _rank_buy(buys)), ("NEAR", _rank_near(nears)), ("SELL", _rank_sell(sells))]:
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            candidates.append((label, row))
+            if len(candidates) >= max_charts:
+                return candidates
+    return candidates
+
+
+def _get_daily_for_ticker(daily: Optional[pd.DataFrame], ticker: str) -> pd.DataFrame:
+    if daily is None or daily.empty or not ticker:
+        return pd.DataFrame()
+    try:
+        if isinstance(daily.index, pd.MultiIndex) and "Ticker" in daily.index.names:
+            return daily.xs(ticker, level="Ticker").sort_index().copy()
+        if isinstance(daily.columns, pd.MultiIndex):
+            if ticker in daily.columns.get_level_values(0):
+                return daily[ticker].sort_index().copy()
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _build_chart_base64(daily: Optional[pd.DataFrame], ticker: str, pivot: Optional[float] = None) -> Optional[str]:
+    """
+    Generate a compact old-style embedded PNG chart:
+      - Close
+      - MA30
+      - MA150
+      - Pivot line when available
+    The chart is returned as base64 so the HTML can be opened directly or emailed.
+    """
+    try:
+        d = _get_daily_for_ticker(daily, ticker)
+        if d.empty or "Close" not in d.columns:
+            return None
+
+        d = d.tail(180).copy()
+        close = pd.to_numeric(d["Close"], errors="coerce").dropna()
+        if close.empty:
+            return None
+
+        ma30 = close.rolling(30).mean()
+        ma150 = close.rolling(150).mean()
+
+        fig, ax = plt.subplots(figsize=(7.4, 3.6))
+        ax.plot(close.index, close.values, linewidth=1.6, label="Close")
+        ax.plot(ma30.index, ma30.values, linewidth=1.1, label="MA30")
+        ax.plot(ma150.index, ma150.values, linewidth=1.2, label="MA150")
+
+        pivot_val = _safe_float(pivot)
+        if pivot_val and pivot_val > 0:
+            ax.axhline(pivot_val, linestyle="--", linewidth=1.1, label=f"Pivot {pivot_val:.2f}")
+
+        ax.set_title(f"{ticker} — Price + MA30 + MA150 + Pivot", fontsize=10)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best", fontsize=8)
+        ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+        ax.tick_params(axis="y", labelsize=8)
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=120)
+        plt.close(fig)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"⚠️ chart generation failed for {ticker}: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
+def build_action_charts_section(
+    buys: pd.DataFrame,
+    nears: pd.DataFrame,
+    sells: pd.DataFrame,
+    daily: Optional[pd.DataFrame],
+    max_charts: int = 15,
+) -> str:
+    parts = ["<hr>", "<h4>Charts (BUY / NEAR / SELL)</h4>"]
+    candidates = _chart_candidate_rows(buys, nears, sells, max_charts=max_charts)
+    if not candidates:
+        parts.append("<p>No BUY / NEAR / SELL charts to display at this scan.</p>")
+        return "\n".join(parts)
+
+    section_colors = {
+        "BUY": "#137333",
+        "NEAR": "#8a5a00",
+        "SELL": "#a50e0e",
+    }
+
+    for label, row in candidates:
+        ticker = str(row.get("Ticker", row.get("ticker", ""))).strip().upper()
+        if not ticker:
+            continue
+        pivot = row.get("Pivot", row.get("pivot"))
+        img_b64 = _build_chart_base64(daily=daily, ticker=ticker, pivot=pivot)
+        if not img_b64:
+            continue
+        price = _fmt_num(row.get("PriceNow", row.get("price")), 2)
+        pivot_txt = _fmt_num(pivot, 2)
+        headroom = _fmt_num(row.get("HeadroomPct"), 2, "%")
+        vol = _fmt_num(row.get("VolPace", row.get("pace_full_vs50dma")), 2, "×")
+        stage = html.escape(_stage_label(row))
+        color = section_colors.get(label, "#333")
+        parts.append(f"""
+        <div style="display:block;margin:12px 0 18px 0;padding:12px;border:1px solid #ddd;border-radius:8px;background:#fff;">
+          <div style="font-size:15px;font-weight:bold;margin-bottom:6px;color:{color};">
+            {html.escape(label)}: {html.escape(ticker)} @ {price}
+          </div>
+          <div style="font-size:12px;color:#555;margin-bottom:8px;">
+            Pivot {pivot_txt} | Distance {headroom} | Vol {vol} | {stage}
+          </div>
+          <img src="data:image/png;base64,{img_b64}" style="max-width:100%;height:auto;border-radius:6px;border:1px solid #eee;" />
+        </div>
+        """)
+    if len(candidates) >= max_charts:
+        parts.append(f"<p class=\"note\">Chart section limited to top {max_charts} actionable tickers.</p>")
+    return "\n".join(parts)
+
 def build_intraday_report_html(
     diag: pd.DataFrame,
     cfg: FullConfig,
@@ -1235,6 +1384,7 @@ def build_intraday_report_html(
     long_ok: bool,
     holdings: Optional[pd.DataFrame] = None,
     holdings_source: str = "",
+    daily: Optional[pd.DataFrame] = None,
 ) -> str:
     """Build the polished intraday HTML/email-style report."""
     if diag is None:
@@ -1306,6 +1456,7 @@ def build_intraday_report_html(
         _ordered_section("Near-Triggers (ranked)", nears, "NEAR", "No NEAR-TRIGGER setups at this scan."),
         "<hr>",
         _ordered_section("Sell Triggers (ranked)", sells, "SELL", "No SELL-TRIGGER signals."),
+        build_action_charts_section(buys, nears, sells, daily=daily, max_charts=15),
         build_portfolio_review_section(diag, holdings, holdings_source),
         "<hr>",
         "<h4>Scanner Diagnostics</h4>",
@@ -1472,6 +1623,7 @@ def main() -> None:
             long_ok=long_ok,
             holdings=holdings_df,
             holdings_source=holdings_source,
+            daily=daily,
         )
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html)
