@@ -137,7 +137,7 @@ def build_short_regime_from_spy_stage(
 # Price/zone primitives (shared with watcher + sim)
 # -------------------------------------------------------------------
 
-def _short_price_break(px: float, ma: float, pivot_low: float) -> bool:
+def _short_price_break(px: float, ma: float, pivot_low: float, *, break_pct: float = SHORT_BREAK_PCT) -> bool:
     """
     True if price has broken below short zone (~pivot low/MA).
 
@@ -147,13 +147,13 @@ def _short_price_break(px: float, ma: float, pivot_low: float) -> bool:
     """
     conds = []
     if pd.notna(pivot_low):
-        conds.append(px <= pivot_low * (1.0 - SHORT_BREAK_PCT))
+        conds.append(px <= pivot_low * (1.0 - break_pct))
     if pd.notna(ma):
-        conds.append(px <= ma * (1.0 - SHORT_BREAK_PCT))
+        conds.append(px <= ma * (1.0 - break_pct))
     return any(conds) if conds else False
 
 
-def _short_near_zone(px: float, ma: float, pivot_low: float) -> bool:
+def _short_near_zone(px: float, ma: float, pivot_low: float, *, near_above_pivot_pct: float = NEAR_ABOVE_PIVOT_PCT, break_pct: float = SHORT_BREAK_PCT) -> bool:
     """
     Near-breakdown zone: under MA but not yet breaking pivot/MA too hard.
 
@@ -172,17 +172,17 @@ def _short_near_zone(px: float, ma: float, pivot_low: float) -> bool:
     if pd.notna(pivot_low):
         if px <= pivot_low:
             return False
-        if px <= pivot_low * (1.0 + NEAR_ABOVE_PIVOT_PCT):
+        if px <= pivot_low * (1.0 + near_above_pivot_pct):
             return True
 
     if pd.notna(ma):
-        if (px <= ma) and (px >= ma * (1.0 - SHORT_BREAK_PCT)):
+        if (px <= ma) and (px >= ma * (1.0 - break_pct)):
             return True
 
     return False
 
 
-def _short_ready_to_close(px: float, ma: float) -> bool:
+def _short_ready_to_close(px: float, ma: float, *, ready_above_ma_pct: float = READY_ABOVE_MA_PCT) -> bool:
     """
     READY-TO-CLOSE short:
       - price has reclaimed MA by READY_ABOVE_MA_PCT (e.g. 0.5+% above MA),
@@ -193,7 +193,7 @@ def _short_ready_to_close(px: float, ma: float) -> bool:
     """
     if pd.isna(px) or pd.isna(ma):
         return False
-    return px >= ma * (1.0 + READY_ABOVE_MA_PCT)
+    return px >= ma * (1.0 + ready_above_ma_pct)
 
 
 def _short_entry_stop_targets(
@@ -201,6 +201,12 @@ def _short_entry_stop_targets(
     ma: float,
     pivot_low: float,
     atr: float,
+    *,
+    stop_hard_pct: float = SHORT_HARD_STOP_PCT,
+    trail_atr_mult: float = SHORT_TRAIL_ATR_MULT,
+    ma_guard_pct: float = SHORT_MA_GUARD_PCT,
+    target1_pct: float = SHORT_TARGET1_PCT,
+    target2_pct: float = SHORT_TARGET2_PCT,
 ) -> tuple[float, float, float, float]:
     """
     For shorts (generic; caller decides what MA means):
@@ -220,15 +226,15 @@ def _short_entry_stop_targets(
 
     entry = float(px)
 
-    hard = entry * (1.0 + SHORT_HARD_STOP_PCT)
-    atr_stop = (entry + SHORT_TRAIL_ATR_MULT * atr) if pd.notna(atr) else np.nan
-    ma_guard = (ma * (1.0 + SHORT_MA_GUARD_PCT)) if pd.notna(ma) else np.nan
+    hard = entry * (1.0 + stop_hard_pct)
+    atr_stop = (entry + trail_atr_mult * atr) if pd.notna(atr) else np.nan
+    ma_guard = (ma * (1.0 + ma_guard_pct)) if pd.notna(ma) else np.nan
 
     cand = [c for c in (hard, atr_stop, ma_guard) if pd.notna(c)]
     stop = max(cand) if cand else hard
 
-    t1 = entry * (1.0 - SHORT_TARGET1_PCT)
-    t2 = entry * (1.0 - SHORT_TARGET2_PCT)
+    t1 = entry * (1.0 - target1_pct)
+    t2 = entry * (1.0 - target2_pct)
     return entry, stop, t1, t2
 
 
@@ -371,7 +377,15 @@ def check_short_entry(
 # Shared short-side stop / exit helpers (used by SIM + optionally PROD)
 # -------------------------------------------------------------------
 
-def short_stop_level(entry: float, atr: float, ma_val: float) -> float:
+def short_stop_level(
+    entry: float,
+    atr: float,
+    ma_val: float,
+    *,
+    stop_hard_pct: float = SHORT_HARD_STOP_PCT,
+    trail_atr: float = SHORT_TRAIL_ATR_MULT,
+    ma_guard: float = SHORT_MA_GUARD_PCT,
+) -> float:
     """
     Compute an initial stop for a short position.
 
@@ -388,15 +402,21 @@ def short_stop_level(entry: float, atr: float, ma_val: float) -> float:
     if _is_nan(entry):
         return np.nan
 
-    hard = entry * (1.0 + SHORT_HARD_STOP_PCT)
-    atr_stop = entry + SHORT_TRAIL_ATR_MULT * atr if not _is_nan(atr) else np.nan
-    ma_guard = ma_val * (1.0 + SHORT_MA_GUARD_PCT) if not _is_nan(ma_val) else np.nan
+    hard = entry * (1.0 + stop_hard_pct)
+    atr_stop = entry + trail_atr_mult * atr if not _is_nan(atr) else np.nan
+    ma_guard = ma_val * (1.0 + ma_guard) if not _is_nan(ma_val) else np.nan
 
     cands = [c for c in (hard, atr_stop, ma_guard) if not _is_nan(c)]
     return min(cands) if cands else hard
 
 
-def should_exit_short(price: float, stop: float, ma_val: float) -> bool:
+def should_exit_short(
+    price: float,
+    stop: float,
+    ma_val: float,
+    *,
+    ma_guard: float = SHORT_MA_GUARD_PCT,
+) -> bool:
     """
     Exit condition for a short:
 
@@ -415,7 +435,7 @@ def should_exit_short(price: float, stop: float, ma_val: float) -> bool:
         return True
 
     # 2) Extra guard: reclaimed MA by ~3%
-    if not _is_nan(ma_val) and price >= ma_val * (1.0 + SHORT_MA_GUARD_PCT):
+    if not _is_nan(ma_val) and price >= ma_val * (1.0 + ma_guard):
         return True
 
     return False
@@ -437,6 +457,16 @@ def eval_short_bar(
     *,
     intraday_interval: str = INTRADAY_INTERVAL,
     test_ease: bool = False,
+    break_pct: float = SHORT_BREAK_PCT,
+    near_above_pivot_pct: float = NEAR_ABOVE_PIVOT_PCT,
+    vol_pace_min: float = VOL_PACE_MIN,
+    near_vol_pace_min: float = NEAR_VOL_PACE_MIN,
+    intrabar_confirm_min_elapsed: int = INTRABAR_CONFIRM_MIN_ELAPSED,
+    intrabar_volpace_min: float = INTRABAR_VOLPACE_MIN,
+    near_hits_window: int = SHORT_NEAR_HITS_WINDOW,
+    near_hits_min: int = SHORT_NEAR_HITS_MIN,
+    cooldown_scans: int = SHORT_COOLDOWN_SCANS,
+    ready_above_ma_pct: float = READY_ABOVE_MA_PCT,
 ) -> tuple[Dict[str, Any], Dict[str, bool]]:
     """
     Evaluate *one bar* of short-side logic using the same rules
@@ -494,16 +524,16 @@ def eval_short_bar(
         intrabar_confirm_min = 0
         intrabar_volpace_min = 0.0
     else:
-        short_near_hits_min = SHORT_NEAR_HITS_MIN
-        intrabar_confirm_min = INTRABAR_CONFIRM_MIN_ELAPSED
-        intrabar_volpace_min = INTRABAR_VOLPACE_MIN
+        short_near_hits_min = near_hits_min
+        intrabar_confirm_min = intrabar_confirm_min_elapsed
+        intrabar_volpace_min = intrabar_volpace_min
 
     # ----- price / confirmation logic -----
     if ma_ok and pivot_ok and price is not None and not pd.isna(price):
-        short_near_now = _short_near_zone(price, ma, pivot_low)
+        short_near_now = _short_near_zone(price, ma, pivot_low, near_above_pivot_pct=near_above_pivot_pct, break_pct=break_pct)
 
         if intraday_interval == "60m":
-            short_price_ok = _short_price_break(price, ma, pivot_low)
+            short_price_ok = _short_price_break(price, ma, pivot_low, break_pct=break_pct)
             short_vol_ok = (pd.isna(pace_intra) or pace_intra >= intrabar_volpace_min)
             short_confirm = bool(
                 short_price_ok
@@ -513,24 +543,24 @@ def eval_short_bar(
         else:
             if closes_tail:
                 short_price_ok = all(
-                    _short_price_break(c, ma, pivot_low) for c in closes_tail
+                    _short_price_break(c, ma, pivot_low, break_pct=break_pct) for c in closes_tail
                 )
                 short_confirm = short_price_ok
                 # For non-60m modes you can optionally layer in your own
                 # last-bar volume confirmation in the watcher if desired.
 
     if ma_ok and price is not None and not pd.isna(price):
-        ready_close_now = _short_ready_to_close(price, ma)
+        ready_close_now = _short_ready_to_close(price, ma, ready_above_ma_pct=ready_above_ma_pct)
 
     # Gates
-    pace_full_gate = pd.isna(pace_full) or pace_full >= VOL_PACE_MIN
-    near_pace_gate = pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN
+    pace_full_gate = pd.isna(pace_full) or pace_full >= vol_pace_min
+    near_pace_gate = pd.isna(pace_full) or pace_full >= near_vol_pace_min
 
     # ----- stateful promotion (same logic as watcher) -----
     hits = list(state.get("short_hits", []))
     hits.append(1 if short_near_now else 0)
-    if len(hits) > SHORT_NEAR_HITS_WINDOW:
-        hits = hits[-SHORT_NEAR_HITS_WINDOW:]
+    if len(hits) > near_hits_window:
+        hits = hits[-near_hits_window:]
     hit_count = sum(hits)
 
     cooldown = int(state.get("short_cooldown", 0))
@@ -550,7 +580,7 @@ def eval_short_bar(
         and pace_full_gate
     ):
         sstate = "TRIGGERED"
-        cooldown = SHORT_COOLDOWN_SCANS
+        cooldown = cooldown_scans
     elif cooldown > 0 and not short_near_now:
         sstate = "COOLDOWN"
     elif cooldown == 0 and not short_near_now and not short_confirm:
