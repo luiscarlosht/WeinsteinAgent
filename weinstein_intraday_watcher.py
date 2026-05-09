@@ -837,6 +837,89 @@ def load_portfolio_holdings(cfg_raw: Dict, output_dir: str = "./output") -> Tupl
     return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"]), "no holdings source found"
 
 
+
+# ---------------------------------------------------------------------------
+# HTML color helpers
+# ---------------------------------------------------------------------------
+
+def _badge_class_for_action(value: object) -> str:
+    v = str(value or '').lower()
+    if 'sell' in v or 'reduce' in v or 'risk' in v:
+        return 'badge-red'
+    if 'review manually' in v or 'monitor' in v:
+        return 'badge-gray'
+    if 'needs volume' in v or 'watch closely' in v or 'near' in v:
+        return 'badge-yellow'
+    if 'add' in v or 'buy' in v or 'hold' in v:
+        return 'badge-green'
+    return 'badge-gray'
+
+def _badge_class_for_signal(value: object) -> str:
+    v = str(value or '').upper()
+    if v in ('BUY', 'BUY_TRIGGER', 'BUY-TRIGGER'):
+        return 'badge-green'
+    if v in ('NEAR', 'NEAR_BUY', 'NEAR-TRIGGER'):
+        return 'badge-yellow'
+    if v in ('SELL', 'SELLTRIG', 'SELL-TRIGGER'):
+        return 'badge-red'
+    if v.startswith('SKIP') or v == 'NOT-SCANNED':
+        return 'badge-gray'
+    return 'badge-blue'
+
+def _badge_class_for_structure(value: object) -> str:
+    v = str(value or '').lower()
+    if 'stage 2' in v:
+        return 'badge-green'
+    if 'stage 4' in v or 'below' in v or 'not stage' in v:
+        return 'badge-red'
+    if 'stage 1' in v or 'stage 3' in v:
+        return 'badge-yellow'
+    return 'badge-gray'
+
+def _badge(text: object, cls: str) -> str:
+    val = '' if text is None else str(text)
+    return f'<span class="badge {cls}">{html.escape(val)}</span>'
+
+def _fmt_table_num(value: object, digits: int = 2, suffix: str = '') -> str:
+    try:
+        if value is None or pd.isna(value):
+            return '—'
+        return f'{float(value):,.{digits}f}{suffix}'
+    except Exception:
+        return '—'
+
+def _colorize_portfolio_table(show: pd.DataFrame) -> pd.DataFrame:
+    df = show.copy()
+    if 'Recommendation' in df.columns:
+        df['Recommendation'] = df['Recommendation'].map(lambda x: _badge(x, _badge_class_for_action(x)))
+    if 'Signal' in df.columns:
+        df['Signal'] = df['Signal'].map(lambda x: _badge(x, _badge_class_for_signal(x)))
+    if 'Structure' in df.columns:
+        df['Structure'] = df['Structure'].map(lambda x: _badge(x, _badge_class_for_structure(x)))
+    for col, digits, suffix in [
+        ('PriceNow', 2, ''), ('Pivot', 2, ''), ('Pivot Distance %', 2, '%'),
+        ('Vol Pace', 2, '×'), ('ADX14', 1, ''), ('MA150', 2, ''),
+        ('Quantity', 2, ''), ('Value', 2, ''), ('Gain %', 2, '%')
+    ]:
+        if col in df.columns:
+            df[col] = df[col].map(lambda x, d=digits, s=suffix: _fmt_table_num(x, d, s))
+    return df
+
+def _colorize_diag_table(show: pd.DataFrame) -> pd.DataFrame:
+    df = show.copy()
+    if 'Signal' in df.columns:
+        df['Signal'] = df['Signal'].map(lambda x: _badge(x, _badge_class_for_signal(x)))
+    if 'Structure' in df.columns:
+        df['Structure'] = df['Structure'].map(lambda x: _badge(x, _badge_class_for_structure(x)))
+    for col, digits, suffix in [
+        ('PriceNow', 2, ''), ('Pivot', 2, ''), ('HeadroomPct', 2, '%'),
+        ('VolPace', 2, '×'), ('ADX14', 1, ''), ('CloseDaily', 2, ''),
+        ('MA150', 2, ''), ('ATR14', 2, '')
+    ]:
+        if col in df.columns:
+            df[col] = df[col].map(lambda x, d=digits, s=suffix: _fmt_table_num(x, d, s))
+    return df
+
 def _portfolio_action(row: pd.Series) -> Tuple[str, str]:
     signal = str(row.get("Signal", "")).upper()
     structure = str(row.get("Structure", ""))
@@ -889,12 +972,14 @@ def build_portfolio_review_section(diag: pd.DataFrame, holdings: Optional[pd.Dat
     html_parts.append(f"<p class=\"note\">Source: {html.escape(str(holdings_source))}. Reviewed {len(merged)} owned tickers against the current intraday scanner state.</p>")
     html_parts.append("<table class=\"summary\"><thead><tr><th>Portfolio Action</th><th>Count</th></tr></thead><tbody>")
     for action, count in sorted(counts.items(), key=lambda kv: priority.get(kv[0], 9)):
-        html_parts.append(f"<tr><td>{html.escape(str(action))}</td><td>{int(count)}</td></tr>")
+        cls = _badge_class_for_action(action)
+        html_parts.append(f"<tr><td>{_badge(action, cls)}</td><td>{int(count)}</td></tr>")
     html_parts.append("</tbody></table>")
     display_cols = ["Ticker", "PortfolioAction", "PortfolioNote", "Structure", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "MA150", "Quantity", "Value", "GainPct"]
     show = merged[[c for c in display_cols if c in merged.columns]].head(limit).copy()
     show = show.rename(columns={"PortfolioAction": "Recommendation", "PortfolioNote": "Portfolio Note", "HeadroomPct": "Pivot Distance %", "VolPace": "Vol Pace", "GainPct": "Gain %"})
-    html_parts.append(show.to_html(index=False, escape=False))
+    show = _colorize_portfolio_table(show)
+    html_parts.append(show.to_html(index=False, escape=False, classes="portfolio-table"))
     if len(merged) > limit:
         html_parts.append(f"<p class=\"note\">Showing top {limit} of {len(merged)} owned tickers by action priority/value.</p>")
     html_parts.append("<p class=\"note\">Portfolio recommendations are rule-based scanner labels for review, not automatic orders.</p>")
@@ -1051,9 +1136,16 @@ def build_intraday_report_html(
       h3 { margin-bottom: 8px; }
       h4 { margin-top: 18px; margin-bottom: 8px; }
       li { margin: 6px 0; line-height: 1.35; }
-      .summary { border-collapse: collapse; margin-top: 8px; }
-      .summary th, .summary td { border: 1px solid #ddd; padding: 6px 10px; font-size: 13px; }
-      .summary th { background: #f6f6f6; }
+      .summary, .portfolio-table, .dataframe { border-collapse: collapse; margin-top: 8px; width: 100%; }
+      .summary th, .summary td, .portfolio-table th, .portfolio-table td, .dataframe th, .dataframe td { border: 1px solid #ddd; padding: 6px 10px; font-size: 13px; }
+      .summary th, .portfolio-table th, .dataframe th { background: #f6f6f6; }
+      .portfolio-table tr:nth-child(even), .dataframe tr:nth-child(even) { background: #fafafa; }
+      .badge { display:inline-block; padding:3px 8px; border-radius:12px; font-size:12px; font-weight:700; white-space:nowrap; }
+      .badge-green { background:#e6f4ea; color:#137333; border:1px solid #b7dfc2; }
+      .badge-yellow { background:#fff7d6; color:#8a5a00; border:1px solid #f2d675; }
+      .badge-red { background:#fce8e6; color:#a50e0e; border:1px solid #f5b5ae; }
+      .badge-blue { background:#e8f0fe; color:#174ea6; border:1px solid #b8cdf8; }
+      .badge-gray { background:#f1f3f4; color:#3c4043; border:1px solid #d9dce0; }
       .note { color:#666; font-size:12px; }
       hr { border:0; border-top:1px solid #ddd; margin:18px 0; }
     </style>
@@ -1099,7 +1191,8 @@ def build_intraday_report_html(
         preferred_cols = ["Ticker", "Structure", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "CloseDaily", "MA150", "ATR14"]
         cols = [c for c in preferred_cols if c in diag.columns]
         table_df = diag[cols].copy() if cols else diag.copy()
-        sections.append(table_df.to_html(index=False, escape=False))
+        table_df = _colorize_diag_table(table_df)
+        sections.append(table_df.to_html(index=False, escape=False, classes="diagnostics-table"))
 
     sections.extend([
         "<p class=\"note\">Generated by Weinstein Hybrid Intraday Engine.</p>",
