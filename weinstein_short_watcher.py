@@ -67,6 +67,7 @@ from weinstein_short_core import (
     _short_near_zone,
     _short_ready_to_close,
     _short_entry_stop_targets,
+    eval_short_bar,
     ShortRegimeContext,
     build_short_regime_from_spy_stage,
 )
@@ -921,61 +922,7 @@ def run(
         cond["pivot_ok"] = pd.notna(pivot_low)
 
         # Short near / trigger / ready-close
-        short_near_now = False
-        short_price_ok = False
-        short_vol_ok = True
-        short_confirm = False
-        ready_close_now = False
-
-        if cond["ma_ok"] and cond["pivot_ok"]:
-            short_near_now = _short_near_zone(px, ma30, pivot_low)
-
-            if INTRADAY_INTERVAL == "60m":
-                short_price_ok = _short_price_break(px, ma30, pivot_low)
-                short_vol_ok = (
-                    pd.isna(pace_intra) or pace_intra >= _INTRABAR_VOLPACE_MIN
-                )
-                short_confirm = bool(
-                    short_price_ok
-                    and (
-                        elapsed is not None
-                        and elapsed >= _INTRABAR_CONFIRM_MIN_ELAPSED
-                    )
-                    and short_vol_ok
-                )
-            else:
-                closes_n2 = get_last_n_intraday_closes(intraday, t, n=2)
-                if closes_n2:
-                    short_price_ok = all(
-                        _short_price_break(c, ma30, pivot_low) for c in closes_n2
-                    )
-                    short_confirm = short_price_ok
-                    if len(closes_n2) >= 2:
-                        vols2 = get_last_n_intraday_volumes(intraday, t, n=2)
-                        vavg = get_intraday_avg_volume(
-                            intraday, t, window=INTRADAY_AVG_VOL_WINDOW
-                        )
-                        if len(vols2) >= 2 and pd.notna(vavg) and vavg > 0:
-                            short_vol_ok = (
-                                vols2[-1] >= INTRADAY_LASTBAR_MULT * vavg
-                            )
-                        else:
-                            short_vol_ok = False
-
-        # READY-to-close: reclaimed MA150 by ~0.5+%
-        if cond["ma_ok"]:
-            ready_close_now = _short_ready_to_close(px, ma30)
-
-        cond["short_near_now"] = bool(short_near_now)
-        cond["short_price_ok"] = bool(short_price_ok)
-        cond["short_vol_ok"] = bool(short_vol_ok)
-        cond["short_confirm"] = bool(short_confirm)
-        cond["pace_full_gate"] = pd.isna(pace_full) or pace_full >= VOL_PACE_MIN
-        cond["near_pace_gate"] = pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN
-        cond["ready_close_now"] = bool(ready_close_now)
-        cond["spy_regime_allow_shorts"] = bool(short_regime.allow_shorts)
-
-        # Stateful promotion (short_state)
+        # Delegated to SHORT CORE so PROD watcher and SIM share the same stateful trigger rules.
         st = short_state.get(
             t,
             {
@@ -985,35 +932,49 @@ def run(
             },
         )
 
-        # Short NEAR hits
-        st["short_hits"], short_hit_count = _update_hits(
-            st.get("short_hits", []),
-            short_near_now,
-            SHORT_NEAR_HITS_WINDOW,
+        closes_tail = get_last_n_intraday_closes(intraday, t, n=2)
+
+        st, flags = eval_short_bar(
+            price=px,
+            ma=ma30,
+            pivot_low=pivot_low,
+            pace_full=pace_full,
+            pace_intra=pace_intra,
+            elapsed_min=elapsed,
+            closes_tail=closes_tail,
+            state=st,
+            intraday_interval=INTRADAY_INTERVAL,
+            test_ease=bool(test_ease or (os.getenv("INTRADAY_TEST", "0") == "1")),
+            break_pct=SHORT_BREAK_PCT,
+            near_above_pivot_pct=NEAR_ABOVE_PIVOT_PCT,
+            vol_pace_min=VOL_PACE_MIN,
+            near_vol_pace_min=NEAR_VOL_PACE_MIN,
+            intrabar_confirm_min_elapsed=INTRABAR_CONFIRM_MIN_ELAPSED,
+            intrabar_volpace_min=INTRABAR_VOLPACE_MIN,
+            near_hits_window=SHORT_NEAR_HITS_WINDOW,
+            near_hits_min=SHORT_NEAR_HITS_MIN,
+            cooldown_scans=SHORT_COOLDOWN_SCANS,
+            ready_above_ma_pct=READY_ABOVE_MA_PCT,
         )
-        if st.get("short_cooldown", 0) > 0:
-            st["short_cooldown"] = int(st["short_cooldown"]) - 1
 
-        sstate = st.get("short_state", "IDLE")
-        if sstate == "IDLE" and short_near_now:
-            sstate = "NEAR"
-        elif sstate in ("IDLE", "NEAR") and short_hit_count >= _SHORT_NEAR_HITS_MIN:
-            sstate = "ARMED"
-        elif (
-            sstate == "ARMED"
-            and short_confirm
-            and short_vol_ok
-            and cond["pace_full_gate"]
-        ):
-            sstate = "TRIGGERED"
-            st["short_cooldown"] = SHORT_COOLDOWN_SCANS
-        elif st["short_cooldown"] > 0 and not short_near_now:
-            sstate = "COOLDOWN"
-        elif st["short_cooldown"] == 0 and not short_near_now and not short_confirm:
-            sstate = "IDLE"
-
-        st["short_state"] = sstate
         short_state[t] = st
+
+        short_near_now = bool(flags.get("short_near_now", False))
+        short_price_ok = bool(flags.get("short_price_ok", False))
+        short_vol_ok = bool(flags.get("short_vol_ok", False))
+        short_confirm = bool(flags.get("short_confirm", False))
+        ready_close_now = bool(flags.get("ready_close_now", False))
+        short_trigger_now = bool(flags.get("short_trigger_now", False))
+
+        cond["short_near_now"] = short_near_now
+        cond["short_price_ok"] = short_price_ok
+        cond["short_vol_ok"] = short_vol_ok
+        cond["short_confirm"] = short_confirm
+        cond["pace_full_gate"] = pd.isna(pace_full) or pace_full >= VOL_PACE_MIN
+        cond["near_pace_gate"] = pd.isna(pace_full) or pace_full >= NEAR_VOL_PACE_MIN
+        cond["ready_close_now"] = ready_close_now
+        cond["short_trigger_now"] = short_trigger_now
+        cond["spy_regime_allow_shorts"] = bool(short_regime.allow_shorts)
 
         # Weinstein Option 4 gate for new shorts (SPY must be Stage 4)
         allow_new_shorts = short_regime.allow_shorts
@@ -1021,7 +982,7 @@ def run(
         # Emit short lists
         if (
             allow_new_shorts
-            and st["short_state"] == "TRIGGERED"
+            and short_trigger_now
             and cond["pace_full_gate"]
         ):
             trig_shorts.append(
