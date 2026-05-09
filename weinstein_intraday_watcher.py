@@ -851,27 +851,133 @@ def _read_gsheet_tab(cfg_raw: Dict, tab_name: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def _holding_source_quality(df: pd.DataFrame) -> int:
+    """Higher score = better portfolio metadata coverage."""
+    if df is None or df.empty:
+        return 0
+    score = len(df) * 2
+    for col in ["Quantity", "Value", "GainPct"]:
+        if col in df.columns:
+            score += int(df[col].notna().sum()) * 10
+    return score
+
+
+def _merge_holding_sources(sources: List[Tuple[pd.DataFrame, str]]) -> Tuple[pd.DataFrame, str]:
+    """
+    Merge portfolio metadata from multiple tabs/files.
+
+    Why:
+    - Open_Positions often has Ticker/OpenQty/EntryPrice, but Value/Gain% may be blank
+      or formula-based (#NAME?) outside Google Sheets.
+    - Holdings or Open_Positions_Snapshot usually has Fidelity broker metadata:
+      Current Value and Total Gain/Loss Percent.
+    """
+    clean_sources = [(df.copy(), src) for df, src in sources if df is not None and not df.empty]
+    if not clean_sources:
+        return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"]), "no holdings source found"
+
+    base, base_src = clean_sources[0]
+    base = base.copy()
+    used_sources = [base_src]
+
+    for enrich, src in clean_sources[1:]:
+        if enrich is None or enrich.empty:
+            continue
+        enrich = enrich.copy()
+        used_this_source = False
+
+        for col in ["Ticker", "Quantity", "Value", "GainPct", "Account"]:
+            if col not in base.columns:
+                base[col] = np.nan if col not in ("Ticker", "Account") else ""
+            if col not in enrich.columns:
+                enrich[col] = np.nan if col not in ("Ticker", "Account") else ""
+
+        enrich_idx = enrich.drop_duplicates("Ticker").set_index("Ticker")
+
+        for idx, row in base.iterrows():
+            ticker = row.get("Ticker", "")
+            if not ticker or ticker not in enrich_idx.index:
+                continue
+            erow = enrich_idx.loc[ticker]
+
+            for col in ["Quantity", "Value", "GainPct"]:
+                current = base.at[idx, col]
+                replacement = erow.get(col, np.nan)
+                if (pd.isna(current) or str(current).strip() in ("", "nan", "None", "—")) and not pd.isna(replacement):
+                    base.at[idx, col] = replacement
+                    used_this_source = True
+
+            current_acct = str(base.at[idx, "Account"]) if "Account" in base.columns else ""
+            replacement_acct = erow.get("Account", "")
+            if (not current_acct or current_acct == "nan") and replacement_acct and str(replacement_acct) != "nan":
+                base.at[idx, "Account"] = replacement_acct
+                used_this_source = True
+
+        if used_this_source:
+            used_sources.append(src)
+
+    base = base[~base["Ticker"].isin(INVALID_HOLDING_SYMBOLS)].copy()
+    base = base[base["Ticker"].astype(str).str.match(r"^[A-Z0-9.\-]{1,12}$", na=False)].copy()
+    if base.empty:
+        return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"]), "no holdings source found"
+
+    grouped = base.groupby("Ticker", as_index=False).agg(
+        Quantity=("Quantity", lambda s: s.sum(min_count=1)),
+        Value=("Value", lambda s: s.sum(min_count=1)),
+        GainPct=("GainPct", "mean"),
+        Account=("Account", lambda s: ", ".join(sorted({x for x in s.astype(str) if x and x != "nan"}))[:80]),
+    )
+    grouped = grouped.sort_values("Value", ascending=False, na_position="last")
+    return grouped, " + enriched from ".join(used_sources)
+
+
 def load_portfolio_holdings(cfg_raw: Dict, output_dir: str = "./output") -> Tuple[pd.DataFrame, str]:
     sheets_cfg = cfg_raw.get("sheets", {}) or {}
     open_tab = sheets_cfg.get("open_positions_tab", "Open_Positions")
-    for tab in [open_tab, "Holdings", "Portfolio", "Positions"]:
+
+    # Keep Open_Positions first for membership, then enrich from broker/snapshot tabs
+    # that usually contain Current Value and Total Gain/Loss Percent.
+    tab_candidates = []
+    for tab in [open_tab, "Open_Positions_Snapshot", "Holdings", "OpenLots_Detail", "Portfolio", "Positions"]:
+        if tab and tab not in tab_candidates:
+            tab_candidates.append(tab)
+
+    gsheet_sources: List[Tuple[pd.DataFrame, str]] = []
+    for tab in tab_candidates:
         raw = _read_gsheet_tab(cfg_raw, tab)
         norm = _normalize_holdings_df(raw) if raw is not None else pd.DataFrame()
-        if not norm.empty:
-            return norm, f"Google Sheet tab '{tab}'"
-    patterns = ["Portfolio_Positions*.csv", "*Portfolio*Positions*.csv", "holdings*.csv", "Holdings*.csv", os.path.join(output_dir, "Portfolio_Positions*.csv"), os.path.join(output_dir, "holdings*.csv")]
+        if norm is not None and not norm.empty:
+            gsheet_sources.append((norm, f"Google Sheet tab '{tab}'"))
+
+    if gsheet_sources:
+        merged, source = _merge_holding_sources(gsheet_sources)
+        if not merged.empty:
+            return merged, source
+
+    patterns = [
+        "Portfolio_Positions*.csv", "*Portfolio*Positions*.csv", "holdings*.csv", "Holdings*.csv",
+        os.path.join(output_dir, "Portfolio_Positions*.csv"), os.path.join(output_dir, "holdings*.csv")
+    ]
     candidates = []
     for pat in patterns:
         candidates.extend(glob.glob(pat))
     candidates = sorted(set(candidates), key=os.path.getmtime, reverse=True)
+
+    csv_sources: List[Tuple[pd.DataFrame, str]] = []
     for path in candidates:
         try:
             raw = pd.read_csv(path, engine="python")
             norm = _normalize_holdings_df(raw)
-            if not norm.empty:
-                return norm, f"local CSV '{path}'"
+            if norm is not None and not norm.empty:
+                csv_sources.append((norm, f"local CSV '{path}'"))
         except Exception:
             continue
+
+    if csv_sources:
+        merged, source = _merge_holding_sources(csv_sources)
+        if not merged.empty:
+            return merged, source
+
     return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"]), "no holdings source found"
 
 
