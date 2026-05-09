@@ -866,69 +866,55 @@ def _merge_holding_sources(sources: List[Tuple[pd.DataFrame, str]]) -> Tuple[pd.
     """
     Merge portfolio metadata from multiple tabs/files.
 
-    Why:
-    - Open_Positions often has Ticker/OpenQty/EntryPrice, but Value/Gain% may be blank
-      or formula-based (#NAME?) outside Google Sheets.
-    - Holdings or Open_Positions_Snapshot usually has Fidelity broker metadata:
-      Current Value and Total Gain/Loss Percent.
+    This intentionally uses a UNION of tickers across all available sources.
+    Earlier versions used Open_Positions as the membership source and only enriched
+    those tickers. That missed tickers that existed only in the broker Holdings /
+    snapshot export, such as positions from a second account.
     """
     clean_sources = [(df.copy(), src) for df, src in sources if df is not None and not df.empty]
     if not clean_sources:
         return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"]), "no holdings source found"
 
-    base, base_src = clean_sources[0]
-    base = base.copy()
-    used_sources = [base_src]
-
-    for enrich, src in clean_sources[1:]:
-        if enrich is None or enrich.empty:
-            continue
-        enrich = enrich.copy()
-        used_this_source = False
-
+    normalized_sources = []
+    used_sources = []
+    for df, src in clean_sources:
+        df = df.copy()
         for col in ["Ticker", "Quantity", "Value", "GainPct", "Account"]:
-            if col not in base.columns:
-                base[col] = np.nan if col not in ("Ticker", "Account") else ""
-            if col not in enrich.columns:
-                enrich[col] = np.nan if col not in ("Ticker", "Account") else ""
-
-        enrich_idx = enrich.drop_duplicates("Ticker").set_index("Ticker")
-
-        for idx, row in base.iterrows():
-            ticker = row.get("Ticker", "")
-            if not ticker or ticker not in enrich_idx.index:
-                continue
-            erow = enrich_idx.loc[ticker]
-
-            for col in ["Quantity", "Value", "GainPct"]:
-                current = base.at[idx, col]
-                replacement = erow.get(col, np.nan)
-                if (pd.isna(current) or str(current).strip() in ("", "nan", "None", "—")) and not pd.isna(replacement):
-                    base.at[idx, col] = replacement
-                    used_this_source = True
-
-            current_acct = str(base.at[idx, "Account"]) if "Account" in base.columns else ""
-            replacement_acct = erow.get("Account", "")
-            if (not current_acct or current_acct == "nan") and replacement_acct and str(replacement_acct) != "nan":
-                base.at[idx, "Account"] = replacement_acct
-                used_this_source = True
-
-        if used_this_source:
+            if col not in df.columns:
+                df[col] = np.nan if col not in ("Ticker", "Account") else ""
+        df = df[~df["Ticker"].isin(INVALID_HOLDING_SYMBOLS)].copy()
+        df = df[df["Ticker"].astype(str).str.match(r"^[A-Z0-9.\-]{1,12}$", na=False)].copy()
+        if not df.empty:
+            normalized_sources.append(df[["Ticker", "Quantity", "Value", "GainPct", "Account"]])
             used_sources.append(src)
 
-    base = base[~base["Ticker"].isin(INVALID_HOLDING_SYMBOLS)].copy()
-    base = base[base["Ticker"].astype(str).str.match(r"^[A-Z0-9.\-]{1,12}$", na=False)].copy()
-    if base.empty:
+    if not normalized_sources:
         return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"]), "no holdings source found"
 
-    grouped = base.groupby("Ticker", as_index=False).agg(
+    all_rows = pd.concat(normalized_sources, ignore_index=True)
+
+    def _first_nonblank(series):
+        for x in series:
+            if x is None:
+                continue
+            try:
+                if pd.isna(x):
+                    continue
+            except Exception:
+                pass
+            if str(x).strip() in ("", "nan", "None", "—"):
+                continue
+            return x
+        return np.nan
+
+    grouped = all_rows.groupby("Ticker", as_index=False).agg(
         Quantity=("Quantity", lambda s: s.sum(min_count=1)),
         Value=("Value", lambda s: s.sum(min_count=1)),
-        GainPct=("GainPct", "mean"),
+        GainPct=("GainPct", _first_nonblank),
         Account=("Account", lambda s: ", ".join(sorted({x for x in s.astype(str) if x and x != "nan"}))[:80]),
     )
     grouped = grouped.sort_values("Value", ascending=False, na_position="last")
-    return grouped, " + enriched from ".join(used_sources)
+    return grouped, " + merged with ".join(used_sources)
 
 
 def load_portfolio_holdings(cfg_raw: Dict, output_dir: str = "./output") -> Tuple[pd.DataFrame, str]:
@@ -1032,6 +1018,16 @@ def _fmt_table_num(value: object, digits: int = 2, suffix: str = '') -> str:
     except Exception:
         return '—'
 
+def _fmt_colored_num(value: object, digits: int = 2, suffix: str = '') -> str:
+    try:
+        if value is None or pd.isna(value):
+            return '—'
+        v = float(value)
+        cls = 'num-pos' if v > 0 else 'num-neg' if v < 0 else 'num-flat'
+        return f'<span class="{cls}">{v:,.{digits}f}{suffix}</span>'
+    except Exception:
+        return '—'
+
 def _colorize_portfolio_table(show: pd.DataFrame) -> pd.DataFrame:
     df = show.copy()
     if 'Recommendation' in df.columns:
@@ -1043,10 +1039,12 @@ def _colorize_portfolio_table(show: pd.DataFrame) -> pd.DataFrame:
     for col, digits, suffix in [
         ('PriceNow', 2, ''), ('Pivot', 2, ''), ('Pivot Distance %', 2, '%'),
         ('Vol Pace', 2, '×'), ('ADX14', 1, ''), ('MA150', 2, ''),
-        ('Quantity', 2, ''), ('Value', 2, ''), ('Gain %', 2, '%')
+        ('Quantity', 2, ''), ('Value', 2, '')
     ]:
         if col in df.columns:
             df[col] = df[col].map(lambda x, d=digits, s=suffix: _fmt_table_num(x, d, s))
+    if 'Gain %' in df.columns:
+        df['Gain %'] = df['Gain %'].map(lambda x: _fmt_colored_num(x, 2, '%'))
     return df
 
 def _colorize_diag_table(show: pd.DataFrame) -> pd.DataFrame:
@@ -1290,6 +1288,9 @@ def build_intraday_report_html(
       .badge-red { background:#fce8e6; color:#a50e0e; border:1px solid #f5b5ae; }
       .badge-blue { background:#e8f0fe; color:#174ea6; border:1px solid #b8cdf8; }
       .badge-gray { background:#f1f3f4; color:#3c4043; border:1px solid #d9dce0; }
+      .num-pos { color:#137333; font-weight:700; }
+      .num-neg { color:#a50e0e; font-weight:700; }
+      .num-flat { color:#3c4043; }
       .note { color:#666; font-size:12px; }
       hr { border:0; border-top:1px solid #ddd; margin:18px 0; }
     </style>
