@@ -1004,10 +1004,15 @@ def _badge_class_for_signal(value: object) -> str:
 
 def _badge_class_for_structure(value: object) -> str:
     v = str(value or '').lower()
+    # IMPORTANT: check weak/non-recommended labels before checking "stage 2".
+    # Otherwise "Not Stage 2 / below MA150" accidentally matches "stage 2"
+    # and gets colored green.
+    if 'not stage' in v or 'below ma150' in v or 'below/weak' in v or 'downtrend' in v:
+        return 'badge-red'
+    if 'stage 4' in v:
+        return 'badge-red'
     if 'stage 2' in v:
         return 'badge-green'
-    if 'stage 4' in v or 'below' in v or 'not stage' in v:
-        return 'badge-red'
     if 'stage 1' in v or 'stage 3' in v:
         return 'badge-yellow'
     return 'badge-gray'
@@ -1067,6 +1072,57 @@ def _colorize_diag_table(show: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].map(lambda x, d=digits, s=suffix: _fmt_table_num(x, d, s))
     return df
+
+
+def _sort_diag_for_report(diag: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sort the Diagnostics Table so the best/actionable rows appear first.
+
+    Priority order:
+      1) BUY confirmations
+      2) NEAR triggers
+      3) Stage 2 / valid structure with no trigger yet
+         - closest to pivot first
+         - then better volume pace
+         - then stronger ADX
+      4) data/ADX skips
+      5) not Stage 2 / below MA150 and other weak structures
+    """
+    if diag is None or diag.empty:
+        return pd.DataFrame() if diag is None else diag
+
+    df = diag.copy()
+
+    signal = df.get('Signal', pd.Series('', index=df.index)).astype(str).str.upper()
+    structure = df.get('Structure', pd.Series('', index=df.index)).astype(str).str.lower()
+
+    priority = pd.Series(50, index=df.index, dtype=float)
+    priority.loc[signal.eq('BUY')] = 0
+    priority.loc[signal.isin(['NEAR', 'NEAR_BUY', 'NEAR-TRIGGER'])] = 1
+    priority.loc[signal.eq('NONE') & structure.str.contains('stage 2', na=False)] = 2
+    priority.loc[signal.eq('NONE')] = 3
+    priority.loc[signal.eq('SKIP-ADX')] = 4
+    priority.loc[signal.isin(['SKIP-DATA', 'SKIP-MA', 'SKIP-INTRADAY', 'SKIP-PIVOT'])] = 5
+    priority.loc[signal.eq('SKIP-STAGE')] = 9
+    priority.loc[structure.str.contains('not stage|below ma150|downtrend', na=False)] = 9
+
+    headroom = pd.to_numeric(df.get('HeadroomPct'), errors='coerce')
+    volpace = pd.to_numeric(df.get('VolPace'), errors='coerce')
+    adx = pd.to_numeric(df.get('ADX14'), errors='coerce')
+    price = pd.to_numeric(df.get('PriceNow'), errors='coerce')
+
+    df['_report_priority'] = priority
+    df['_abs_headroom'] = headroom.abs().fillna(9999)
+    df['_volpace_sort'] = volpace.fillna(-1)
+    df['_adx_sort'] = adx.fillna(-1)
+    df['_price_sort'] = price.fillna(-1)
+
+    df = df.sort_values(
+        ['_report_priority', '_abs_headroom', '_volpace_sort', '_adx_sort', '_price_sort'],
+        ascending=[True, True, False, False, False],
+    )
+
+    return df.drop(columns=['_report_priority', '_abs_headroom', '_volpace_sort', '_adx_sort', '_price_sort'], errors='ignore')
 
 def _portfolio_action(row: pd.Series) -> Tuple[str, str]:
     signal = str(row.get("Signal", "")).upper()
@@ -1486,7 +1542,9 @@ def build_intraday_report_html(
     else:
         preferred_cols = ["Ticker", "Structure", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "CloseDaily", "MA150", "ATR14"]
         cols = [c for c in preferred_cols if c in diag.columns]
-        table_df = diag[cols].copy() if cols else diag.copy()
+        # Sort before colorizing so the raw numeric values can still be ranked.
+        diag_sorted = _sort_diag_for_report(diag)
+        table_df = diag_sorted[cols].copy() if cols else diag_sorted.copy()
         table_df = _colorize_diag_table(table_df)
         sections.append(table_df.to_html(index=False, escape=False, classes="diagnostics-table"))
 
