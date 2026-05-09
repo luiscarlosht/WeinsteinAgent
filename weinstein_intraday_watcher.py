@@ -500,6 +500,15 @@ def evaluate_intraday_signals(
         # ADX is evaluated by shared CORE below so PROD and SIM use one gate.
 
         # Stage-like filter: price above MA150 and MA150 rising
+        # Compute pivot early so SKIP-STAGE portfolio rows can still show price/pivot context.
+        pivot_window = d["Close"].tail(cfg.intraday.pivot_lookback_days).max()
+        close_daily = float(last["Close"]) if not pd.isna(last["Close"]) else np.nan
+        ma150_val = float(last["MA150"]) if not pd.isna(last["MA150"]) else np.nan
+        atr14_val = float(last["ATR14"]) if not pd.isna(last["ATR14"]) else np.nan
+        vol_ma50_val = float(last["VolMA50"]) if not pd.isna(last["VolMA50"]) else np.nan
+        vol_pace_daily = (float(last["Volume"]) / vol_ma50_val) if vol_ma50_val and not np.isnan(vol_ma50_val) else np.nan
+        headroom_daily = ((close_daily / float(pivot_window)) - 1.0) * 100.0 if (not pd.isna(pivot_window) and pivot_window > 0 and not np.isnan(close_daily)) else np.nan
+
         if pd.isna(last["MA150"]):
             rows.append(
                 dict(
@@ -508,6 +517,15 @@ def evaluate_intraday_signals(
                     Stage=stage_num,
                     Signal="SKIP-MA",
                     Reason="MA150 not available",
+                    PriceNow=close_daily,
+                    Pivot=pivot_window,
+                    HeadroomPct=headroom_daily,
+                    VolPace=vol_pace_daily,
+                    ADX14=adx14,
+                    CloseDaily=close_daily,
+                    MA30=float(last["MA30"]) if not pd.isna(last["MA30"]) else np.nan,
+                    MA150=ma150_val,
+                    ATR14=atr14_val,
                 )
             )
             continue
@@ -523,12 +541,20 @@ def evaluate_intraday_signals(
                         f"Close not sufficiently above MA150 +{cfg.intraday.stage_above_ma_pct * 100:.2f}% "
                         f"({last['Close']:.2f} vs {last['MA150']:.2f})"
                     ),
+                    PriceNow=close_daily,
+                    Pivot=pivot_window,
+                    HeadroomPct=headroom_daily,
+                    VolPace=vol_pace_daily,
+                    ADX14=adx14,
+                    CloseDaily=close_daily,
+                    MA30=float(last["MA30"]) if not pd.isna(last["MA30"]) else np.nan,
+                    MA150=ma150_val,
+                    ATR14=atr14_val,
                 )
             )
             continue
 
-        # Pivot = 50d high close (using last ~60 days as a robust window)
-        pivot_window = d["Close"].tail(cfg.intraday.pivot_lookback_days).max()
+        # Pivot = recent high close over configured lookback.
         if pd.isna(pivot_window):
             rows.append(
                 dict(
@@ -756,9 +782,20 @@ def _normalize_holdings_df(raw: pd.DataFrame) -> pd.DataFrame:
     sym_col = _first_present_col(df, ["Ticker", "Symbol", "symbol", "ticker"])
     if not sym_col:
         return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"])
-    qty_col = _first_present_col(df, ["Quantity", "Qty", "Shares", "quantity"])
-    val_col = _first_present_col(df, ["Current Value", "Value", "Market Value", "current_value", "value"])
-    gain_col = _first_present_col(df, ["Total Gain/Loss Percent", "GainPct", "Gain %", "Unrealized %", "UnrealizedPct"])
+    # Support common Fidelity/Google-Sheet/export header variants.
+    qty_col = _first_present_col(df, [
+        "Quantity", "Qty", "Shares", "Share Quantity", "Current Quantity", "Total Quantity",
+        "Quantity Held", "Shares Held", "quantity", "qty"
+    ])
+    val_col = _first_present_col(df, [
+        "Current Value", "Value", "Market Value", "MarketValue", "CurrentValue",
+        "Position Value", "PositionValue", "Total Value", "Account Value", "value", "current_value"
+    ])
+    gain_col = _first_present_col(df, [
+        "Total Gain/Loss Percent", "Total Gain/Loss %", "% Total Gain/Loss", "GainPct",
+        "Gain %", "Gain/Loss %", "Percent Gain/Loss", "Unrealized %", "UnrealizedPct",
+        "Unrealized Gain/Loss %", "Unrealized Gain/Loss Percent", "Return %"
+    ])
     acct_col = _first_present_col(df, ["Account Name", "Account", "Account Number", "account"])
     out = pd.DataFrame()
     out["Ticker"] = df[sym_col].map(_clean_symbol)
@@ -770,9 +807,10 @@ def _normalize_holdings_df(raw: pd.DataFrame) -> pd.DataFrame:
     out = out[out["Ticker"].str.match(r"^[A-Z0-9.\-]{1,12}$", na=False)].copy()
     if out.empty:
         return out
+    # Use min_count=1 so blank quantity/value columns remain blank instead of becoming 0.00.
     grouped = out.groupby("Ticker", as_index=False).agg(
-        Quantity=("Quantity", "sum"),
-        Value=("Value", "sum"),
+        Quantity=("Quantity", lambda s: s.sum(min_count=1)),
+        Value=("Value", lambda s: s.sum(min_count=1)),
         GainPct=("GainPct", "mean"),
         Account=("Account", lambda s: ", ".join(sorted({x for x in s.astype(str) if x and x != "nan"}))[:80]),
     )
