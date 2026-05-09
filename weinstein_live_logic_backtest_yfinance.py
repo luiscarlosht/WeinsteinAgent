@@ -1563,22 +1563,118 @@ def main():
     )
 
     final_eq = float(result["final_equity"])
-    pnl = final_eq - float(args.capital)
-    pnl_pct = (pnl / float(args.capital) * 100.0) if float(args.capital) != 0 else 0.0
+    equity_pnl = final_eq - float(args.capital)
+    equity_pnl_pct = (equity_pnl / float(args.capital) * 100.0) if float(args.capital) != 0 else 0.0
     trades = result.get("trades", []) or []
     equity_curve = result.get("equity_curve", []) or []
 
+    # =========================
+    # REALIZED / UNREALIZED BREAKDOWN
+    # =========================
+    # The equity curve is mark-to-market: cash + value of open positions.
+    # Closed-trade reports/monthly PnL are realized-only.  Without this
+    # split, a run can look confusing: Final Equity can be strongly positive
+    # while monthly closed-trade PnL is negative if most profit is still open.
+
+    realized_pnl = float(sum(float(t.pnl) for t in trades)) if trades else 0.0
+
+    open_positions = result.get("positions", {}) or {}
+    cash_now = float(result.get("cash", 0.0))
+
+    unrealized_pnl = 0.0
+    open_market_value = 0.0
+    open_long_count = 0
+    open_short_count = 0
+    open_long_value = 0.0
+    open_short_value = 0.0
+
+    if equity_curve:
+        last_dt = pd.to_datetime(equity_curve[-1][0])
+    else:
+        last_dt = pd.Timestamp(args.end)
+
+    for _, pos in open_positions.items():
+        try:
+            px = _safe_close(daily_df, last_dt, pos.ticker)
+            if pd.isna(px):
+                continue
+
+            px = float(px)
+            qty = float(pos.qty)
+            entry = float(pos.entry_price)
+
+            if pos.side == "long":
+                market_value = qty * px
+                cost_basis = qty * entry
+                open_market_value += market_value
+                open_long_value += market_value
+                unrealized_pnl += market_value - cost_basis
+                open_long_count += 1
+            else:
+                # For shorts, market_value is the current cover liability.
+                # Unrealized profit is entry proceeds minus current cover cost.
+                market_value = qty * px
+                entry_value = qty * entry
+                open_market_value += market_value
+                open_short_value += market_value
+                unrealized_pnl += entry_value - market_value
+                open_short_count += 1
+        except Exception:
+            pass
+
+    total_mark_to_market_pnl = realized_pnl + unrealized_pnl
+    total_mark_to_market_pct = (
+        total_mark_to_market_pnl / float(args.capital) * 100.0
+        if float(args.capital) != 0 else 0.0
+    )
+
     log(
         f"Backtest complete. Final equity: ${final_eq:,.2f} "
-        f"(P/L ${pnl:,.2f}, {pnl_pct:,.2f}%) — Trades: {len(trades)}",
+        f"(Equity P/L ${equity_pnl:,.2f}, {equity_pnl_pct:,.2f}%)",
         level="ok",
     )
+
+    log(
+        f"Realized P/L:        ${realized_pnl:,.2f} from {len(trades)} closed trades",
+        level="info",
+    )
+
+    log(
+        f"Unrealized P/L:      ${unrealized_pnl:,.2f} from {len(open_positions)} open positions",
+        level="info",
+    )
+
+    log(
+        f"Total MTM P/L:       ${total_mark_to_market_pnl:,.2f} "
+        f"({total_mark_to_market_pct:,.2f}%)",
+        level="info",
+    )
+
+    log(
+        f"Cash:                ${cash_now:,.2f}",
+        level="info",
+    )
+
+    log(
+        f"Open Positions:      {len(open_positions)} "
+        f"(L={open_long_count}, S={open_short_count}) | "
+        f"Market Value/Liability: ${open_market_value:,.2f}",
+        level="info",
+    )
+
+    if open_positions:
+        log(
+            f"Open Long Value:    ${open_long_value:,.2f} | "
+            f"Open Short Liability: ${open_short_value:,.2f}",
+            level="info",
+        )
 
     tag = _now_tag()
     _write_reports(tag=tag, trades=trades, equity_curve=equity_curve)
 
     log(
-        f"Done. Open positions={len(result['positions'])}, trades={len(trades)}, "
+        f"Done. Open positions={len(open_positions)}, closed_trades={len(trades)}, "
+        f"realized=${realized_pnl:,.2f}, unrealized=${unrealized_pnl:,.2f}, "
         f"final_equity=${final_eq:,.2f}",
         level="ok",
     )
