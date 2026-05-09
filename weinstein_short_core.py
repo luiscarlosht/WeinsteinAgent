@@ -29,6 +29,10 @@ NEW:
 
 - short_stop_level / should_exit_short shared between PROD/SIM so that
   risk logic (hard stop / ATR / MA guard) is defined in a single place.
+
+FIX:
+- short_stop_level() now correctly uses the trail_atr parameter instead of
+  the undefined trail_atr_mult variable.
 """
 
 from __future__ import annotations
@@ -102,18 +106,6 @@ def build_short_regime_from_spy_stage(
 ) -> ShortRegimeContext:
     """
     Option 4 (pure Weinstein): shorts only when SPY is Stage 4 on the weekly chart.
-
-    Parameters
-    ----------
-    spy_stage : str or None
-        Value from weekly 'stage' column for SPY, e.g. "Stage 4 (Downtrend)".
-        If None/NaN, we conservatively *disable* new shorts.
-    as_of : str or None
-        Optional as-of label (date) for debug logging.
-
-    Returns
-    -------
-    ShortRegimeContext
     """
     if spy_stage is None or (isinstance(spy_stage, float) and pd.isna(spy_stage)):
         return ShortRegimeContext(
@@ -153,7 +145,14 @@ def _short_price_break(px: float, ma: float, pivot_low: float, *, break_pct: flo
     return any(conds) if conds else False
 
 
-def _short_near_zone(px: float, ma: float, pivot_low: float, *, near_above_pivot_pct: float = NEAR_ABOVE_PIVOT_PCT, break_pct: float = SHORT_BREAK_PCT) -> bool:
+def _short_near_zone(
+    px: float,
+    ma: float,
+    pivot_low: float,
+    *,
+    near_above_pivot_pct: float = NEAR_ABOVE_PIVOT_PCT,
+    break_pct: float = SHORT_BREAK_PCT,
+) -> bool:
     """
     Near-breakdown zone: under MA but not yet breaking pivot/MA too hard.
 
@@ -246,18 +245,6 @@ def _short_entry_stop_targets(
 class ShortEntryParams:
     """
     Tunable thresholds for the short entry decision (DAILY approximation).
-
-    These are generic enough that both:
-      - intraday logic (which might call this on end-of-day),
-      - daily SIM logic (daily bars)
-
-    can share them.
-
-    Attributes:
-        min_break_pct:
-            Required % breakdown under pivot low (e.g. 0.004 = 0.4%).
-        vol_min:
-            Minimum volume multiple vs 50dma (e.g. 1.3).
     """
     min_break_pct: float = SHORT_BREAK_PCT
     vol_min: float = VOL_PACE_MIN
@@ -267,13 +254,6 @@ class ShortEntryParams:
 class ShortEntryResult:
     """
     Outcome of the short entry check for DAILY bars.
-
-    Attributes:
-        can_enter:
-            True when all gates (RS, MA, pivot, vol) pass.
-        reason:
-            Short diagnostic string explaining the first reason for rejection
-            (or "ok" if can_enter=True).
     """
     can_enter: bool
     reason: str
@@ -300,30 +280,6 @@ def check_short_entry(
 ) -> ShortEntryResult:
     """
     Shared Weinstein Stage 4 SHORT entry filter for DAILY bars.
-
-    This is the short-side mirror of weinstein_long_core.check_long_entry,
-    tuned to match your current live-logic backtest's `should_enter_short`
-    behavior.
-
-    Inputs:
-        price:
-            Current price (close / last).
-        ma_val:
-            MA(30) (or your equivalent trend MA).
-        pivot_low:
-            Lowest close in lookback window (e.g. 50d).
-        rs_above_ma:
-            True if RS line is above its MA (strong RS).
-            For shorts we require *weak* RS, i.e. rs_above_ma must be False.
-        vol_mult:
-            Volume multiple vs 50dma (e.g. 1.3 means 30% above).
-        params:
-            ShortEntryParams object with thresholds.
-        min_break_pct / vol_min:
-            Optional explicit overrides. If provided, they win over params.
-
-    Returns:
-        ShortEntryResult(can_enter, reason)
     """
     if params is None:
         params = ShortEntryParams()
@@ -398,16 +354,19 @@ def short_stop_level(
         entry + SHORT_TRAIL_ATR_MULT * ATR,
         ma_val * (1 + SHORT_MA_GUARD_PCT)
     )
+
+    For shorts, the tightest valid stop above the current/entry price wins.
     """
     if _is_nan(entry):
         return np.nan
 
     hard = entry * (1.0 + stop_hard_pct)
-    atr_stop = entry + trail_atr_mult * atr if not _is_nan(atr) else np.nan
-    ma_guard = ma_val * (1.0 + ma_guard) if not _is_nan(ma_val) else np.nan
+    atr_stop = entry + trail_atr * atr if not _is_nan(atr) else np.nan
+    ma_guard_stop = ma_val * (1.0 + ma_guard) if not _is_nan(ma_val) else np.nan
 
-    cands = [c for c in (hard, atr_stop, ma_guard) if not _is_nan(c)]
-    return min(cands) if cands else hard
+    cands = [c for c in (hard, atr_stop, ma_guard_stop) if not _is_nan(c)]
+    cands = [c for c in cands if np.isfinite(c) and c > entry]
+    return float(min(cands)) if cands else float(hard)
 
 
 def should_exit_short(
@@ -471,40 +430,6 @@ def eval_short_bar(
     """
     Evaluate *one bar* of short-side logic using the same rules
     as the intraday watcher.
-
-    Parameters
-    ----------
-    price : float
-        Last trade for this bar.
-    ma : float
-        Weekly MA proxy (SMA150 on daily in PROD).
-    pivot_low : float
-        ~10-week pivot low from weekly report.
-    pace_full : float or NaN
-        Projected full-day volume / 50dma.
-    pace_intra : float or NaN
-        Intrabar volume pace vs avg (for 60m).
-    elapsed_min : int or None
-        Minutes elapsed in current bar (60m mode).
-    closes_tail : sequence[float] or None
-        Last N closes used for non-60m confirmation (e.g. 2 bars).
-    state : dict or None
-        Stateful dict with at least:
-          { "short_state": str, "short_hits": list[int], "short_cooldown": int }
-
-    Returns
-    -------
-    new_state : dict
-        Updated state dict (same keys as input).
-    flags : dict
-        {
-          "short_near_now": bool,
-          "short_trigger_now": bool,  # one-shot event on this bar
-          "ready_close_now": bool,
-          "short_price_ok": bool,
-          "short_vol_ok": bool,
-          "short_confirm": bool,
-        }
     """
     if state is None:
         state = {"short_state": "IDLE", "short_hits": [], "short_cooldown": 0}
