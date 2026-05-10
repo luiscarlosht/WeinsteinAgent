@@ -904,6 +904,62 @@ def _regime_permissions(
         "CURRENT",
     )
 
+
+
+def _regime_exposure_multipliers(
+    regime_label: str,
+    *,
+    regime_mode: str = "current",
+    exposure_mode: str = "off",
+    bull_long_mult: float = 1.0,
+    neutral_long_mult: float = 0.50,
+    bear_short_mult: float = 0.60,
+    neutral_short_mult: float = 0.0,
+) -> Tuple[float, float]:
+    """
+    Return (long_size_multiplier, short_size_multiplier).
+
+    This is a SIM/research-only exposure scaling layer. It does NOT change
+    entry rules. It only scales position sizing after regime permissions decide
+    whether new longs/shorts are allowed.
+
+    exposure_mode:
+      off    -> all allowed trades use normal size (1.0)
+      scaled -> for --regime-mode prod:
+                  BULL    => full long size, no short size
+                  BEAR    => no long size, configured short size
+                  NEUTRAL => configured reduced long/short sizes
+
+    The default scaled values are intentionally conservative:
+      BULL long 100%, NEUTRAL long 50%, BEAR short 60%.
+    """
+    em = str(exposure_mode or "off").strip().lower()
+    rm = str(regime_mode or "current").strip().lower()
+    label = str(regime_label or "UNKNOWN").strip().upper()
+
+    if em in ("off", "none", "false", "0") or rm != "prod":
+        return 1.0, 1.0
+
+    if em != "scaled":
+        return 1.0, 1.0
+
+    def clean(x: float) -> float:
+        try:
+            v = float(x)
+        except Exception:
+            v = 0.0
+        if not np.isfinite(v):
+            return 0.0
+        return max(0.0, min(1.0, v))
+
+    if label == "BULL":
+        return clean(bull_long_mult), 0.0
+    if label == "BEAR":
+        return 0.0, clean(bear_short_mult)
+
+    # NEUTRAL / UNKNOWN / transition states
+    return clean(neutral_long_mult), clean(neutral_short_mult)
+
 def _parse_boolish(v) -> Optional[bool]:
     if v is None:
         return None
@@ -1009,6 +1065,11 @@ def backtest(
     max_pos_frac: float = 0.25,
     regime_mode: str = "current",
     neutral_policy: str = "long",
+    exposure_mode: str = "off",
+    bull_long_mult: float = 1.0,
+    neutral_long_mult: float = 0.50,
+    bear_short_mult: float = 0.60,
+    neutral_short_mult: float = 0.0,
 ):
     industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
 
@@ -1236,6 +1297,21 @@ def backtest(
             neutral_policy=neutral_policy,
         )
 
+        long_size_mult, short_size_mult = _regime_exposure_multipliers(
+            regime_label,
+            regime_mode=regime_mode,
+            exposure_mode=exposure_mode,
+            bull_long_mult=bull_long_mult,
+            neutral_long_mult=neutral_long_mult,
+            bear_short_mult=bear_short_mult,
+            neutral_short_mult=neutral_short_mult,
+        )
+
+        if long_size_mult <= 0:
+            allow_new_longs = False
+        if short_size_mult <= 0:
+            allow_new_shorts = False
+
         gross_expo = _gross_exposure(daily_df, dt, positions)
         buying_power = max(0.0, float(max_leverage) * eq_now - gross_expo)
 
@@ -1327,12 +1403,12 @@ def backtest(
                 if per_share_risk <= 0:
                     continue
 
-                risk_amt = float(eq_now) * float(risk_per_trade)
+                risk_amt = float(eq_now) * float(risk_per_trade) * float(long_size_mult)
                 qty_risk = int(math.floor(risk_amt / per_share_risk))
                 if qty_risk <= 0:
                     continue
 
-                max_pos_value = float(max_pos_frac) * float(eq_now)
+                max_pos_value = float(max_pos_frac) * float(eq_now) * float(long_size_mult)
                 qty_cap_pos = int(math.floor(max_pos_value / price_f)) if price_f > 0 else 0
                 qty_cap_bp = int(math.floor(buying_power / price_f)) if price_f > 0 else 0
 
@@ -1466,13 +1542,13 @@ def backtest(
                     short_diag["px_not_below_ma"] += 1
                     continue
 
-                risk_amt = float(eq_now) * float(risk_per_trade)
+                risk_amt = float(eq_now) * float(risk_per_trade) * float(short_size_mult)
                 qty_risk = int(math.floor(risk_amt / per_share_risk))
                 if qty_risk <= 0:
                     short_diag["sized_zero"] += 1
                     continue
 
-                max_pos_value = float(max_pos_frac) * float(eq_now)
+                max_pos_value = float(max_pos_frac) * float(eq_now) * float(short_size_mult)
                 qty_cap_pos = int(math.floor(max_pos_value / price_f)) if price_f > 0 else 0
                 qty_cap_bp = int(math.floor(buying_power / price_f)) if price_f > 0 else 0
 
@@ -1582,6 +1658,17 @@ def main():
         choices=["long", "none", "both", "current"],
         help="For --regime-mode prod: how to handle NEUTRAL/UNKNOWN market regimes.",
     )
+    ap.add_argument(
+        "--exposure-mode",
+        type=str,
+        default="off",
+        choices=["off", "scaled"],
+        help="SIM research exposure scaling. scaled only applies with --regime-mode prod.",
+    )
+    ap.add_argument("--bull-long-mult", type=float, default=1.0, help="Scaled exposure: long size multiplier in BULL regime.")
+    ap.add_argument("--neutral-long-mult", type=float, default=0.50, help="Scaled exposure: long size multiplier in NEUTRAL/UNKNOWN regime.")
+    ap.add_argument("--bear-short-mult", type=float, default=0.60, help="Scaled exposure: short size multiplier in BEAR regime.")
+    ap.add_argument("--neutral-short-mult", type=float, default=0.0, help="Scaled exposure: short size multiplier in NEUTRAL/UNKNOWN regime.")
 
     ap.add_argument("--max-leverage", type=float, default=1.0)
     ap.add_argument("--max-pos-frac", type=float, default=0.25)
@@ -1610,6 +1697,12 @@ def main():
     )
     log(
         f"Regime mode: {args.regime_mode} | neutral_policy={args.neutral_policy}",
+        level="info",
+    )
+    log(
+        f"Exposure mode: {args.exposure_mode} | bull_long={args.bull_long_mult:.2f} "
+        f"neutral_long={args.neutral_long_mult:.2f} bear_short={args.bear_short_mult:.2f} "
+        f"neutral_short={args.neutral_short_mult:.2f}",
         level="info",
     )
     log(
@@ -1712,6 +1805,11 @@ def main():
         max_pos_frac=float(args.max_pos_frac),
         regime_mode=args.regime_mode,
         neutral_policy=args.neutral_policy,
+        exposure_mode=args.exposure_mode,
+        bull_long_mult=float(args.bull_long_mult),
+        neutral_long_mult=float(args.neutral_long_mult),
+        bear_short_mult=float(args.bear_short_mult),
+        neutral_short_mult=float(args.neutral_short_mult),
     )
 
     final_eq = float(result["final_equity"])
