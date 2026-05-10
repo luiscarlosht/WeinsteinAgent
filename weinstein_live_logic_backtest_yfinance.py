@@ -787,6 +787,123 @@ def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: 
     return bool(below_ma and slope_falling)  # "both"
 
 
+
+
+def _spy_regime_label(
+    daily_df: pd.DataFrame,
+    dt: pd.Timestamp,
+    market_cfg: Mapping,
+) -> str:
+    """
+    Weinstein-style broad market regime using SPY 30-week proxy (150 trading days).
+
+    BULL:
+      - SPY is above its 150d MA
+      - MA150 slope over 5 sessions is rising/flat enough
+
+    BEAR:
+      - SPY is below its 150d MA
+      - MA150 slope over 5 sessions is falling/flat enough
+
+    NEUTRAL:
+      - mixed/transition state or not enough data
+
+    This is intentionally simple and deterministic so SIM and PROD-style
+    research can use the same high-level interpretation.
+    """
+    if ("Close", "SPY") not in daily_df.columns:
+        return "UNKNOWN"
+
+    spy = daily_df[("Close", "SPY")].dropna()
+    if dt not in spy.index:
+        return "UNKNOWN"
+
+    ma150 = spy.rolling(150, min_periods=150).mean()
+    if dt not in ma150.index or pd.isna(ma150.loc[dt]):
+        return "UNKNOWN"
+
+    prev = ma150.shift(5)
+    if dt not in prev.index or pd.isna(prev.loc[dt]):
+        return "UNKNOWN"
+
+    price = float(spy.loc[dt])
+    ma = float(ma150.loc[dt])
+    slope = float(ma150.loc[dt] - prev.loc[dt])
+
+    long_slope_min = float(market_cfg.get("ma30_slope_min", 0.0))
+    short_slope_max = float(market_cfg.get("ma30_slope_min_short", 0.0))
+
+    above_ma = price >= ma
+    below_ma = price < ma
+    rising = slope >= long_slope_min
+    falling = slope <= short_slope_max
+
+    if above_ma and rising:
+        return "BULL"
+    if below_ma and falling:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def _regime_permissions(
+    daily_df: pd.DataFrame,
+    dt: pd.Timestamp,
+    market_cfg: Mapping,
+    *,
+    regime_mode: str = "current",
+    neutral_policy: str = "long",
+) -> Tuple[bool, bool, str]:
+    """
+    Return (allow_new_longs, allow_new_shorts, regime_label).
+
+    regime_mode:
+      off     -> ignore broad market gates; mode/max positions decide only
+      current -> existing config gates (_market_allows_longs/_market_allows_shorts)
+      prod    -> true Weinstein-style switch:
+                   BULL    => longs only
+                   BEAR    => shorts only
+                   NEUTRAL => configurable with neutral_policy
+
+    neutral_policy for prod:
+      long    => longs only in neutral/transitional markets
+      none    => no new entries in neutral
+      both    => allow both in neutral
+      current => fall back to existing config gates in neutral
+    """
+    rm = str(regime_mode or "current").strip().lower()
+    neutral = str(neutral_policy or "long").strip().lower()
+
+    if rm == "off":
+        return True, True, "OFF"
+
+    if rm == "prod":
+        label = _spy_regime_label(daily_df, dt, market_cfg)
+        if label == "BULL":
+            return True, False, label
+        if label == "BEAR":
+            return False, True, label
+
+        # NEUTRAL / UNKNOWN handling
+        if neutral == "none":
+            return False, False, label
+        if neutral == "both":
+            return True, True, label
+        if neutral == "current":
+            return (
+                _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True,
+                _market_allows_shorts(daily_df, dt, market_cfg) if market_cfg else True,
+                label,
+            )
+        # default: neutral behaves conservatively long-only
+        return True, False, label
+
+    # current: preserve existing behavior
+    return (
+        _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True,
+        _market_allows_shorts(daily_df, dt, market_cfg) if market_cfg else True,
+        "CURRENT",
+    )
+
 def _parse_boolish(v) -> Optional[bool]:
     if v is None:
         return None
@@ -890,6 +1007,8 @@ def backtest(
     industry_cfg: Mapping,
     max_leverage: float = 1.0,
     max_pos_frac: float = 0.25,
+    regime_mode: str = "current",
+    neutral_policy: str = "long",
 ):
     industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
 
@@ -1109,8 +1228,13 @@ def backtest(
         # ENTRIES
         eq_now = _equity(daily_df, dt, cash, positions)
 
-        allow_new_longs = _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True
-        allow_new_shorts = _market_allows_shorts(daily_df, dt, market_cfg) if market_cfg else True
+        allow_new_longs, allow_new_shorts, regime_label = _regime_permissions(
+            daily_df,
+            dt,
+            market_cfg,
+            regime_mode=regime_mode,
+            neutral_policy=neutral_policy,
+        )
 
         gross_expo = _gross_exposure(daily_df, dt, positions)
         buying_power = max(0.0, float(max_leverage) * eq_now - gross_expo)
@@ -1440,6 +1564,24 @@ def main():
     ap.add_argument("--snapshot-mode", type=str, choices=["static", "historical", "auto"], default="auto")
     ap.add_argument("--config", type=str, default="./config.yaml")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument(
+        "--regime-mode",
+        type=str,
+        default="current",
+        choices=["off", "current", "prod"],
+        help=(
+            "Broad market regime behavior: off=ignore market gates, "
+            "current=existing config gates, prod=true Weinstein switch "
+            "(BULL longs-only, BEAR shorts-only)."
+        ),
+    )
+    ap.add_argument(
+        "--neutral-policy",
+        type=str,
+        default="long",
+        choices=["long", "none", "both", "current"],
+        help="For --regime-mode prod: how to handle NEUTRAL/UNKNOWN market regimes.",
+    )
 
     ap.add_argument("--max-leverage", type=float, default=1.0)
     ap.add_argument("--max-pos-frac", type=float, default=0.25)
@@ -1464,6 +1606,10 @@ def main():
     log(
         f"Mode={args.mode} | market: rise_ma30={market_cfg.get('require_rising_ma30', False)} "
         f"fall_ma30={market_cfg.get('require_falling_ma30', False)}",
+        level="info",
+    )
+    log(
+        f"Regime mode: {args.regime_mode} | neutral_policy={args.neutral_policy}",
         level="info",
     )
     log(
@@ -1532,7 +1678,11 @@ def main():
     if not all_tickers:
         raise SystemExit("No tickers found in weekly universe.")
 
-    if bool(market_cfg.get("require_rising_ma30", False)) or bool(market_cfg.get("require_falling_ma30", False)):
+    if (
+        bool(market_cfg.get("require_rising_ma30", False))
+        or bool(market_cfg.get("require_falling_ma30", False))
+        or str(args.regime_mode).strip().lower() == "prod"
+    ):
         all_tickers.add("SPY")
     if market_cfg.get("vix_max", None) is not None:
         all_tickers.add("^VIX")
@@ -1560,6 +1710,8 @@ def main():
         industry_cfg=industry_cfg,
         max_leverage=float(args.max_leverage),
         max_pos_frac=float(args.max_pos_frac),
+        regime_mode=args.regime_mode,
+        neutral_policy=args.neutral_policy,
     )
 
     final_eq = float(result["final_equity"])
