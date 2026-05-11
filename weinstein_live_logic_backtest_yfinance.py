@@ -985,6 +985,204 @@ def _get_snapshot_rs_above_ma(row: pd.Series) -> Optional[bool]:
 
 
 # =========================
+# SIGNAL QUALITY HELPERS (SIM / RESEARCH ONLY)
+# =========================
+
+def _clamp_score(v: float) -> float:
+    try:
+        return float(max(0.0, min(100.0, v)))
+    except Exception:
+        return 0.0
+
+
+def _row_float(row: pd.Series, names: Tuple[str, ...], default: Optional[float] = None) -> Optional[float]:
+    for name in names:
+        if name in row.index:
+            try:
+                v = float(row.get(name))
+                if np.isfinite(v):
+                    return v
+            except Exception:
+                pass
+    return default
+
+
+def _long_signal_quality_score(
+    row: pd.Series,
+    *,
+    price: float,
+    ma_val: float,
+    pivot: float,
+    vol_mult: float,
+    adx_val: float,
+    atr_val: float,
+    rs_above_ma: bool,
+) -> float:
+    """
+    SIM/research-only quality score for LONG entries.
+
+    Purpose:
+      - Do NOT replace Weinstein/core entry logic.
+      - Only rank/filter setups AFTER the normal long core has already passed.
+      - Prefer clean Stage 2 breakouts that are strong but not overextended.
+
+    Score is intentionally simple and transparent so we can evaluate it safely.
+    """
+    score = 50.0
+
+    # Stage confirmation
+    if _is_stage2(row):
+        score += 8.0
+
+    # Relative strength confirmation
+    score += 10.0 if bool(rs_above_ma) else -15.0
+
+    # Volume expansion quality
+    if np.isfinite(vol_mult):
+        if vol_mult >= 2.0:
+            score += 14.0
+        elif vol_mult >= 1.5:
+            score += 10.0
+        elif vol_mult >= 1.3:
+            score += 6.0
+        else:
+            score -= 8.0
+
+    # Trend strength quality
+    if np.isfinite(adx_val):
+        if adx_val >= 30:
+            score += 12.0
+        elif adx_val >= 25:
+            score += 9.0
+        elif adx_val >= 20:
+            score += 5.0
+        elif adx_val < 16:
+            score -= 8.0
+
+    # Distance above MA: enough strength, but avoid very extended names
+    if price > 0 and ma_val > 0:
+        dist_ma = (price / ma_val) - 1.0
+        if 0.005 <= dist_ma <= 0.12:
+            score += 10.0
+        elif 0.12 < dist_ma <= 0.20:
+            score += 2.0
+        elif dist_ma > 0.20:
+            score -= 12.0
+        elif dist_ma < 0:
+            score -= 15.0
+
+    # Breakout extension vs pivot: prefer fresh/controlled breakouts
+    if price > 0 and pivot > 0:
+        ext = (price / pivot) - 1.0
+        if 0.0 <= ext <= 0.06:
+            score += 10.0
+        elif 0.06 < ext <= 0.12:
+            score += 3.0
+        elif ext > 0.12:
+            score -= 10.0
+
+    # Volatility quality: avoid extremely noisy setups
+    if price > 0 and np.isfinite(atr_val) and atr_val > 0:
+        atr_pct = atr_val / price
+        if atr_pct <= 0.05:
+            score += 8.0
+        elif atr_pct <= 0.08:
+            score += 4.0
+        elif atr_pct > 0.14:
+            score -= 10.0
+
+    # Optional snapshot slope quality if present
+    slope = _row_float(row, ("ma30_slope_per_wk", "ma_slope_per_wk", "ma30_slope"), None)
+    if slope is not None:
+        if slope > 0:
+            score += 5.0
+        elif slope < 0:
+            score -= 8.0
+
+    return _clamp_score(score)
+
+
+def _short_signal_quality_score(
+    row: pd.Series,
+    *,
+    price: float,
+    ma_val: float,
+    pivot_low: float,
+    vol_mult: float,
+    atr_val: float,
+    rs_above_ma: bool,
+) -> float:
+    """
+    SIM/research-only quality score for SHORT entries.
+
+    Purpose:
+      - Do NOT replace short core logic.
+      - Only filter/rank shorts AFTER the normal short core has already passed.
+      - Prefer weak Stage 4 breakdowns that are not extremely extended already.
+    """
+    score = 50.0
+
+    if _is_stage4(row):
+        score += 10.0
+
+    # For shorts, strong RS is bad. Weak RS is good.
+    score += 12.0 if not bool(rs_above_ma) else -18.0
+
+    # Volume expansion on breakdown
+    if np.isfinite(vol_mult):
+        if vol_mult >= 2.0:
+            score += 14.0
+        elif vol_mult >= 1.5:
+            score += 10.0
+        elif vol_mult >= 1.1:
+            score += 5.0
+        else:
+            score -= 8.0
+
+    # Price below MA, but avoid chasing extremely extended downside moves
+    if price > 0 and ma_val > 0:
+        below = (ma_val / price) - 1.0
+        if 0.005 <= below <= 0.15:
+            score += 10.0
+        elif 0.15 < below <= 0.30:
+            score += 2.0
+        elif below > 0.30:
+            score -= 12.0
+        elif below < 0:
+            score -= 15.0
+
+    # Breakdown depth vs pivot low: prefer controlled fresh breakdowns
+    if price > 0 and pivot_low > 0:
+        breakdown = (pivot_low / price) - 1.0
+        if 0.0 <= breakdown <= 0.08:
+            score += 10.0
+        elif 0.08 < breakdown <= 0.15:
+            score += 2.0
+        elif breakdown > 0.15:
+            score -= 10.0
+
+    # Volatility quality
+    if price > 0 and np.isfinite(atr_val) and atr_val > 0:
+        atr_pct = atr_val / price
+        if atr_pct <= 0.06:
+            score += 7.0
+        elif atr_pct <= 0.10:
+            score += 3.0
+        elif atr_pct > 0.16:
+            score -= 10.0
+
+    # Optional snapshot slope quality if present: falling is good for shorts
+    slope = _row_float(row, ("ma30_slope_per_wk", "ma_slope_per_wk", "ma30_slope"), None)
+    if slope is not None:
+        if slope < 0:
+            score += 6.0
+        elif slope > 0:
+            score -= 8.0
+
+    return _clamp_score(score)
+
+
+# =========================
 # SHORT HELPERS
 # =========================
 
@@ -1070,6 +1268,9 @@ def backtest(
     neutral_long_mult: float = 0.50,
     bear_short_mult: float = 0.60,
     neutral_short_mult: float = 0.0,
+    signal_quality_mode: str = "off",
+    min_long_quality: float = 65.0,
+    min_short_quality: float = 65.0,
 ):
     industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
 
@@ -1156,6 +1357,7 @@ def backtest(
         "rs_too_strong": 0,
         "sized_zero": 0,
         "entered": 0,
+        "quality_fail": 0,
     }
 
     for dt in all_dates:
@@ -1395,6 +1597,20 @@ def backtest(
                 if not core_entry.can_enter:
                     continue
 
+                if str(signal_quality_mode or "off").strip().lower() == "score":
+                    q_score = _long_signal_quality_score(
+                        row,
+                        price=price_f,
+                        ma_val=ma_f,
+                        pivot=pivot,
+                        vol_mult=vol_mult,
+                        adx_val=adx_val,
+                        atr_val=atr_f,
+                        rs_above_ma=bool(rs_above),
+                    )
+                    if q_score < float(min_long_quality):
+                        continue
+
                 stop = long_stop_level(price_f, atr_f, ma_f)
                 if np.isnan(stop) or stop >= price_f:
                     continue
@@ -1526,6 +1742,20 @@ def backtest(
                     else:
                         short_diag["no_bars"] += 1
                     continue
+
+                if str(signal_quality_mode or "off").strip().lower() == "score":
+                    q_score = _short_signal_quality_score(
+                        row,
+                        price=price_f,
+                        ma_val=ma_f,
+                        pivot_low=pivot_low,
+                        vol_mult=vol_mult,
+                        atr_val=atr_f,
+                        rs_above_ma=bool(rs_above_ma),
+                    )
+                    if q_score < float(min_short_quality):
+                        short_diag["quality_fail"] += 1
+                        continue
 
                 stop = core_short_stop_level(
                     price_f, atr_f, ma_f,
@@ -1669,6 +1899,15 @@ def main():
     ap.add_argument("--neutral-long-mult", type=float, default=0.50, help="Scaled exposure: long size multiplier in NEUTRAL/UNKNOWN regime.")
     ap.add_argument("--bear-short-mult", type=float, default=0.60, help="Scaled exposure: short size multiplier in BEAR regime.")
     ap.add_argument("--neutral-short-mult", type=float, default=0.0, help="Scaled exposure: short size multiplier in NEUTRAL/UNKNOWN regime.")
+    ap.add_argument(
+        "--signal-quality-mode",
+        type=str,
+        default="off",
+        choices=["off", "score"],
+        help="SIM research signal-quality filter. score=filter entries below min quality thresholds.",
+    )
+    ap.add_argument("--min-long-quality", type=float, default=65.0, help="Minimum long quality score when --signal-quality-mode=score.")
+    ap.add_argument("--min-short-quality", type=float, default=65.0, help="Minimum short quality score when --signal-quality-mode=score.")
 
     ap.add_argument("--max-leverage", type=float, default=1.0)
     ap.add_argument("--max-pos-frac", type=float, default=0.25)
@@ -1703,6 +1942,11 @@ def main():
         f"Exposure mode: {args.exposure_mode} | bull_long={args.bull_long_mult:.2f} "
         f"neutral_long={args.neutral_long_mult:.2f} bear_short={args.bear_short_mult:.2f} "
         f"neutral_short={args.neutral_short_mult:.2f}",
+        level="info",
+    )
+    log(
+        f"Signal quality mode: {args.signal_quality_mode} | "
+        f"min_long={args.min_long_quality:.1f} min_short={args.min_short_quality:.1f}",
         level="info",
     )
     log(
@@ -1810,6 +2054,9 @@ def main():
         neutral_long_mult=float(args.neutral_long_mult),
         bear_short_mult=float(args.bear_short_mult),
         neutral_short_mult=float(args.neutral_short_mult),
+        signal_quality_mode=args.signal_quality_mode,
+        min_long_quality=float(args.min_long_quality),
+        min_short_quality=float(args.min_short_quality),
     )
 
     final_eq = float(result["final_equity"])
