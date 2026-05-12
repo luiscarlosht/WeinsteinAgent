@@ -1182,6 +1182,94 @@ def _short_signal_quality_score(
     return _clamp_score(score)
 
 
+def _long_signal_quality_strict_ok(
+    row: pd.Series,
+    *,
+    price: float,
+    ma_val: float,
+    pivot: float,
+    vol_mult: float,
+    adx_val: float,
+    atr_val: float,
+    rs_above_ma: bool,
+) -> bool:
+    """
+    SIM/research-only STRICT quality gate for LONG entries.
+
+    This intentionally filters more aggressively than score mode.
+    It is not used by PROD. It is meant to answer:
+      "Do fewer, cleaner Weinstein breakouts improve risk-adjusted results?"
+    """
+    if not bool(rs_above_ma):
+        return False
+
+    if not (np.isfinite(vol_mult) and vol_mult >= 1.50):
+        return False
+
+    # ADX may be NaN early in history. If present, require at least a real trend.
+    if np.isfinite(adx_val) and adx_val < 20.0:
+        return False
+
+    if price <= 0 or ma_val <= 0 or pivot <= 0:
+        return False
+
+    dist_ma = (price / ma_val) - 1.0
+    if not (0.005 <= dist_ma <= 0.15):
+        return False
+
+    ext = (price / pivot) - 1.0
+    if not (0.0 <= ext <= 0.08):
+        return False
+
+    if np.isfinite(atr_val) and atr_val > 0:
+        atr_pct = atr_val / price
+        if atr_pct > 0.10:
+            return False
+
+    return True
+
+
+def _short_signal_quality_strict_ok(
+    row: pd.Series,
+    *,
+    price: float,
+    ma_val: float,
+    pivot_low: float,
+    vol_mult: float,
+    atr_val: float,
+    rs_above_ma: bool,
+) -> bool:
+    """
+    SIM/research-only STRICT quality gate for SHORT entries.
+
+    The goal is to avoid noisy/choppy shorts and keep only clean Stage 4
+    breakdowns with weak relative strength and sufficient volume.
+    """
+    if bool(rs_above_ma):
+        return False
+
+    if not (np.isfinite(vol_mult) and vol_mult >= 1.30):
+        return False
+
+    if price <= 0 or ma_val <= 0 or pivot_low <= 0:
+        return False
+
+    below = (ma_val / price) - 1.0
+    if not (0.005 <= below <= 0.20):
+        return False
+
+    breakdown = (pivot_low / price) - 1.0
+    if not (0.0 <= breakdown <= 0.10):
+        return False
+
+    if np.isfinite(atr_val) and atr_val > 0:
+        atr_pct = atr_val / price
+        if atr_pct > 0.12:
+            return False
+
+    return True
+
+
 # =========================
 # SHORT HELPERS
 # =========================
@@ -1597,7 +1685,8 @@ def backtest(
                 if not core_entry.can_enter:
                     continue
 
-                if str(signal_quality_mode or "off").strip().lower() == "score":
+                quality_mode = str(signal_quality_mode or "off").strip().lower()
+                if quality_mode in ("score", "strict"):
                     q_score = _long_signal_quality_score(
                         row,
                         price=price_f,
@@ -1609,6 +1698,17 @@ def backtest(
                         rs_above_ma=bool(rs_above),
                     )
                     if q_score < float(min_long_quality):
+                        continue
+                    if quality_mode == "strict" and not _long_signal_quality_strict_ok(
+                        row,
+                        price=price_f,
+                        ma_val=ma_f,
+                        pivot=pivot,
+                        vol_mult=vol_mult,
+                        adx_val=adx_val,
+                        atr_val=atr_f,
+                        rs_above_ma=bool(rs_above),
+                    ):
                         continue
 
                 stop = long_stop_level(price_f, atr_f, ma_f)
@@ -1743,7 +1843,8 @@ def backtest(
                         short_diag["no_bars"] += 1
                     continue
 
-                if str(signal_quality_mode or "off").strip().lower() == "score":
+                quality_mode = str(signal_quality_mode or "off").strip().lower()
+                if quality_mode in ("score", "strict"):
                     q_score = _short_signal_quality_score(
                         row,
                         price=price_f,
@@ -1754,6 +1855,17 @@ def backtest(
                         rs_above_ma=bool(rs_above_ma),
                     )
                     if q_score < float(min_short_quality):
+                        short_diag["quality_fail"] += 1
+                        continue
+                    if quality_mode == "strict" and not _short_signal_quality_strict_ok(
+                        row,
+                        price=price_f,
+                        ma_val=ma_f,
+                        pivot_low=pivot_low,
+                        vol_mult=vol_mult,
+                        atr_val=atr_f,
+                        rs_above_ma=bool(rs_above_ma),
+                    ):
                         short_diag["quality_fail"] += 1
                         continue
 
@@ -1903,8 +2015,8 @@ def main():
         "--signal-quality-mode",
         type=str,
         default="off",
-        choices=["off", "score"],
-        help="SIM research signal-quality filter. score=filter entries below min quality thresholds.",
+        choices=["off", "score", "strict"],
+        help="SIM research signal-quality filter. score=threshold only; strict=threshold plus hard quality gates.",
     )
     ap.add_argument("--min-long-quality", type=float, default=65.0, help="Minimum long quality score when --signal-quality-mode=score.")
     ap.add_argument("--min-short-quality", type=float, default=65.0, help="Minimum short quality score when --signal-quality-mode=score.")
