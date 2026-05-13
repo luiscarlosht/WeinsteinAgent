@@ -1325,6 +1325,46 @@ class Trade:
     pnl_pct: float
 
 
+
+
+def _quality_score_multiplier(
+    score: float,
+    *,
+    reject_below: float = 60.0,
+    floor_mult: float = 0.40,
+    mid_mult: float = 0.65,
+    good_mult: float = 0.85,
+    elite_mult: float = 1.00,
+) -> float:
+    """
+    SIM/research-only adaptive quality sizing.
+
+    Unlike strict filtering, adaptive quality does not throw away every
+    non-elite setup. It scales risk and position value by quality score:
+      < reject_below => reject
+      60-69          => floor_mult
+      70-79          => mid_mult
+      80-89          => good_mult
+      90+            => elite_mult
+
+    This is intentionally kept out of PROD unless explicitly promoted later.
+    """
+    try:
+        q = float(score)
+    except Exception:
+        return 0.0
+    if not np.isfinite(q):
+        return 0.0
+    if q < float(reject_below):
+        return 0.0
+    if q >= 90.0:
+        return float(elite_mult)
+    if q >= 80.0:
+        return float(good_mult)
+    if q >= 70.0:
+        return float(mid_mult)
+    return float(floor_mult)
+
 # =========================
 # BACKTEST ENGINE
 # =========================
@@ -1359,6 +1399,11 @@ def backtest(
     signal_quality_mode: str = "off",
     min_long_quality: float = 65.0,
     min_short_quality: float = 65.0,
+    adaptive_reject_below: float = 60.0,
+    adaptive_floor_mult: float = 0.40,
+    adaptive_mid_mult: float = 0.65,
+    adaptive_good_mult: float = 0.85,
+    adaptive_elite_mult: float = 1.00,
 ):
     industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
 
@@ -1686,7 +1731,8 @@ def backtest(
                     continue
 
                 quality_mode = str(signal_quality_mode or "off").strip().lower()
-                if quality_mode in ("score", "strict"):
+                quality_size_mult = 1.0
+                if quality_mode in ("score", "strict", "adaptive"):
                     q_score = _long_signal_quality_score(
                         row,
                         price=price_f,
@@ -1697,19 +1743,31 @@ def backtest(
                         atr_val=atr_f,
                         rs_above_ma=bool(rs_above),
                     )
-                    if q_score < float(min_long_quality):
-                        continue
-                    if quality_mode == "strict" and not _long_signal_quality_strict_ok(
-                        row,
-                        price=price_f,
-                        ma_val=ma_f,
-                        pivot=pivot,
-                        vol_mult=vol_mult,
-                        adx_val=adx_val,
-                        atr_val=atr_f,
-                        rs_above_ma=bool(rs_above),
-                    ):
-                        continue
+                    if quality_mode == "adaptive":
+                        quality_size_mult = _quality_score_multiplier(
+                            q_score,
+                            reject_below=adaptive_reject_below,
+                            floor_mult=adaptive_floor_mult,
+                            mid_mult=adaptive_mid_mult,
+                            good_mult=adaptive_good_mult,
+                            elite_mult=adaptive_elite_mult,
+                        )
+                        if quality_size_mult <= 0:
+                            continue
+                    else:
+                        if q_score < float(min_long_quality):
+                            continue
+                        if quality_mode == "strict" and not _long_signal_quality_strict_ok(
+                            row,
+                            price=price_f,
+                            ma_val=ma_f,
+                            pivot=pivot,
+                            vol_mult=vol_mult,
+                            adx_val=adx_val,
+                            atr_val=atr_f,
+                            rs_above_ma=bool(rs_above),
+                        ):
+                            continue
 
                 stop = long_stop_level(price_f, atr_f, ma_f)
                 if np.isnan(stop) or stop >= price_f:
@@ -1719,12 +1777,12 @@ def backtest(
                 if per_share_risk <= 0:
                     continue
 
-                risk_amt = float(eq_now) * float(risk_per_trade) * float(long_size_mult)
+                risk_amt = float(eq_now) * float(risk_per_trade) * float(long_size_mult) * float(quality_size_mult)
                 qty_risk = int(math.floor(risk_amt / per_share_risk))
                 if qty_risk <= 0:
                     continue
 
-                max_pos_value = float(max_pos_frac) * float(eq_now) * float(long_size_mult)
+                max_pos_value = float(max_pos_frac) * float(eq_now) * float(long_size_mult) * float(quality_size_mult)
                 qty_cap_pos = int(math.floor(max_pos_value / price_f)) if price_f > 0 else 0
                 qty_cap_bp = int(math.floor(buying_power / price_f)) if price_f > 0 else 0
 
@@ -1844,7 +1902,8 @@ def backtest(
                     continue
 
                 quality_mode = str(signal_quality_mode or "off").strip().lower()
-                if quality_mode in ("score", "strict"):
+                quality_size_mult = 1.0
+                if quality_mode in ("score", "strict", "adaptive"):
                     q_score = _short_signal_quality_score(
                         row,
                         price=price_f,
@@ -1854,20 +1913,33 @@ def backtest(
                         atr_val=atr_f,
                         rs_above_ma=bool(rs_above_ma),
                     )
-                    if q_score < float(min_short_quality):
-                        short_diag["quality_fail"] += 1
-                        continue
-                    if quality_mode == "strict" and not _short_signal_quality_strict_ok(
-                        row,
-                        price=price_f,
-                        ma_val=ma_f,
-                        pivot_low=pivot_low,
-                        vol_mult=vol_mult,
-                        atr_val=atr_f,
-                        rs_above_ma=bool(rs_above_ma),
-                    ):
-                        short_diag["quality_fail"] += 1
-                        continue
+                    if quality_mode == "adaptive":
+                        quality_size_mult = _quality_score_multiplier(
+                            q_score,
+                            reject_below=adaptive_reject_below,
+                            floor_mult=adaptive_floor_mult,
+                            mid_mult=adaptive_mid_mult,
+                            good_mult=adaptive_good_mult,
+                            elite_mult=adaptive_elite_mult,
+                        )
+                        if quality_size_mult <= 0:
+                            short_diag["quality_fail"] += 1
+                            continue
+                    else:
+                        if q_score < float(min_short_quality):
+                            short_diag["quality_fail"] += 1
+                            continue
+                        if quality_mode == "strict" and not _short_signal_quality_strict_ok(
+                            row,
+                            price=price_f,
+                            ma_val=ma_f,
+                            pivot_low=pivot_low,
+                            vol_mult=vol_mult,
+                            atr_val=atr_f,
+                            rs_above_ma=bool(rs_above_ma),
+                        ):
+                            short_diag["quality_fail"] += 1
+                            continue
 
                 stop = core_short_stop_level(
                     price_f, atr_f, ma_f,
@@ -1884,13 +1956,13 @@ def backtest(
                     short_diag["px_not_below_ma"] += 1
                     continue
 
-                risk_amt = float(eq_now) * float(risk_per_trade) * float(short_size_mult)
+                risk_amt = float(eq_now) * float(risk_per_trade) * float(short_size_mult) * float(quality_size_mult)
                 qty_risk = int(math.floor(risk_amt / per_share_risk))
                 if qty_risk <= 0:
                     short_diag["sized_zero"] += 1
                     continue
 
-                max_pos_value = float(max_pos_frac) * float(eq_now) * float(short_size_mult)
+                max_pos_value = float(max_pos_frac) * float(eq_now) * float(short_size_mult) * float(quality_size_mult)
                 qty_cap_pos = int(math.floor(max_pos_value / price_f)) if price_f > 0 else 0
                 qty_cap_bp = int(math.floor(buying_power / price_f)) if price_f > 0 else 0
 
@@ -2015,11 +2087,16 @@ def main():
         "--signal-quality-mode",
         type=str,
         default="off",
-        choices=["off", "score", "strict"],
-        help="SIM research signal-quality filter. score=threshold only; strict=threshold plus hard quality gates.",
+        choices=["off", "score", "strict", "adaptive"],
+        help="SIM research signal-quality filter. score=threshold; strict=threshold plus hard gates; adaptive=scales size by score.",
     )
     ap.add_argument("--min-long-quality", type=float, default=65.0, help="Minimum long quality score when --signal-quality-mode=score.")
     ap.add_argument("--min-short-quality", type=float, default=65.0, help="Minimum short quality score when --signal-quality-mode=score.")
+    ap.add_argument("--adaptive-reject-below", type=float, default=60.0, help="Adaptive quality: reject trades below this score.")
+    ap.add_argument("--adaptive-floor-mult", type=float, default=0.40, help="Adaptive quality: size multiplier for 60-69 quality.")
+    ap.add_argument("--adaptive-mid-mult", type=float, default=0.65, help="Adaptive quality: size multiplier for 70-79 quality.")
+    ap.add_argument("--adaptive-good-mult", type=float, default=0.85, help="Adaptive quality: size multiplier for 80-89 quality.")
+    ap.add_argument("--adaptive-elite-mult", type=float, default=1.00, help="Adaptive quality: size multiplier for 90+ quality.")
 
     ap.add_argument("--max-leverage", type=float, default=1.0)
     ap.add_argument("--max-pos-frac", type=float, default=0.25)
@@ -2169,6 +2246,11 @@ def main():
         signal_quality_mode=args.signal_quality_mode,
         min_long_quality=float(args.min_long_quality),
         min_short_quality=float(args.min_short_quality),
+        adaptive_reject_below=float(args.adaptive_reject_below),
+        adaptive_floor_mult=float(args.adaptive_floor_mult),
+        adaptive_mid_mult=float(args.adaptive_mid_mult),
+        adaptive_good_mult=float(args.adaptive_good_mult),
+        adaptive_elite_mult=float(args.adaptive_elite_mult),
     )
 
     final_eq = float(result["final_equity"])
