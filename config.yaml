@@ -139,9 +139,21 @@ intraday:
     min_long: 0.50        # ignored when enabled=false; kept for future tests
 
   regime:
-    use_long: true        # gate LONG intraday signals by regime
-    use_short: true       # gate SHORT intraday signals by regime
-                          # → market_regime decides which side is active
+    use_long: true        # legacy gate for LONG intraday signals
+    use_short: true       # legacy gate for SHORT intraday signals
+
+  # PROD implementation of researched Test D: Regime + Exposure Scaling.
+  # This is opt-in. Set enabled=true only after you are ready to shadow/live-test.
+  regime_exposure:
+    enabled: false          # SAFE DEFAULT: do not change PROD behavior until intentionally enabled
+    benchmark: "SPY"
+    regime_mode: "prod"     # BULL=longs, BEAR=shorts, NEUTRAL follows neutral_policy
+    exposure_mode: "scaled"
+    neutral_policy: "long"
+    bull_long_mult: 1.00
+    neutral_long_mult: 0.50
+    bear_short_mult: 0.60
+    neutral_short_mult: 0.00
 
 # ---- Crypto weekly block, fed by your Signals tab ----
 crypto:
@@ -222,7 +234,20 @@ backtest:
 
   regime:
     use_long: true             # LONGs gated by Chapter 8 regime
-    use_short: true            # ✅ Option A: keep structural shorts OFF for now
+    use_short: true            # shorts enabled for research modes
+
+  # SIM implementation of researched Test D. The backtester CLI can still override
+  # these values, but this records the candidate PROD architecture in config.
+  regime_exposure:
+    enabled: true
+    benchmark: "SPY"
+    regime_mode: "prod"
+    exposure_mode: "scaled"
+    neutral_policy: "long"
+    bull_long_mult: 1.00
+    neutral_long_mult: 0.50
+    bear_short_mult: 0.60
+    neutral_short_mult: 0.00
 
   # Coppock curve filters (on benchmark, e.g., SPY)
   coppock:
