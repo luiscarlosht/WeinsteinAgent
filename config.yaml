@@ -145,7 +145,7 @@ intraday:
   # PROD implementation of researched Test D: Regime + Exposure Scaling.
   # This is opt-in. Set enabled=true only after you are ready to shadow/live-test.
   regime_exposure:
-    enabled: false          # SAFE DEFAULT: do not change PROD behavior until intentionally enabled
+    enabled: true          # SAFE DEFAULT: do not change PROD behavior until intentionally enabled
     benchmark: "SPY"
     regime_mode: "prod"     # BULL=longs, BEAR=shorts, NEUTRAL follows neutral_policy
     exposure_mode: "scaled"
