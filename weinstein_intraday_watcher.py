@@ -43,6 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from weinstein_long_core import LongEntryParams, evaluate_long_signal
+from weinstein_regime_exposure_core import decide_regime_exposure, read_d_config
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,16 @@ class UniverseConfig:
 class RegimeConfig:
     use_long: bool
     use_short: bool
+    d_enabled: bool = False
+    benchmark: str = "SPY"
+    regime_mode: str = "prod"
+    exposure_mode: str = "scaled"
+    neutral_policy: str = "long"
+    bull_long_mult: float = 1.0
+    neutral_long_mult: float = 0.50
+    bear_short_mult: float = 0.60
+    neutral_short_mult: float = 0.0
+
 
 
 @dataclass
@@ -205,9 +216,20 @@ def build_full_config(cfg: Dict) -> FullConfig:
         breadth_ma_window=breadth_ma,
         breadth_min_long=breadth_min_long,
     )
+    # Shared D regime/exposure config. Intraday can override; otherwise defaults are safe/off.
+    d_intraday = read_d_config(cfg, section="intraday")
     r_cfg = RegimeConfig(
         use_long=regime_use_long,
         use_short=regime_use_short,
+        d_enabled=bool(d_intraday.get("enabled", False)),
+        benchmark=str(d_intraday.get("benchmark", app.get("benchmark", "SPY"))),
+        regime_mode=str(d_intraday.get("regime_mode", "prod")),
+        exposure_mode=str(d_intraday.get("exposure_mode", "scaled")),
+        neutral_policy=str(d_intraday.get("neutral_policy", "long")),
+        bull_long_mult=float(d_intraday.get("bull_long_mult", 1.0)),
+        neutral_long_mult=float(d_intraday.get("neutral_long_mult", 0.50)),
+        bear_short_mult=float(d_intraday.get("bear_short_mult", 0.60)),
+        neutral_short_mult=float(d_intraday.get("neutral_short_mult", 0.0)),
     )
     return FullConfig(
         app=app_cfg,
@@ -373,7 +395,7 @@ def compute_breadth(weekly_df: pd.DataFrame, ma_window: int = 50) -> float:
 # Intraday scanning
 # ---------------------------------------------------------------------------
 
-def fetch_price_data(tickers: List[str], daily_history_period: str = "18mo") -> Tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_price_data(tickers: List[str], daily_history_period: str = "18mo", benchmark: str = "SPY") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Download:
         - daily OHLCV (configurable history period) for pivots / MAs
@@ -385,7 +407,8 @@ def fetch_price_data(tickers: List[str], daily_history_period: str = "18mo") -> 
     if not tickers:
         return pd.DataFrame(), pd.DataFrame()
 
-    tickers_str = " ".join(sorted(set(tickers)))
+    download_tickers = sorted(set(list(tickers) + ([benchmark] if benchmark else [])))
+    tickers_str = " ".join(download_tickers)
 
     # Daily
     daily = yf.download(
@@ -423,7 +446,7 @@ def fetch_price_data(tickers: List[str], daily_history_period: str = "18mo") -> 
         else:
             # Single ticker
             out = df_raw.copy()
-            out["Ticker"] = tickers[0]
+            out["Ticker"] = download_tickers[0]
         out.reset_index(inplace=True)
         date_col = "Date" if "Date" in out.columns else "Datetime"
         out = out.rename(columns={date_col: "Date"})
@@ -441,6 +464,7 @@ def evaluate_intraday_signals(
     daily: pd.DataFrame,
     intraday: pd.DataFrame,
     cfg: FullConfig,
+    regime_decision=None,
 ) -> pd.DataFrame:
     """
     For each ticker:
@@ -454,6 +478,10 @@ def evaluate_intraday_signals(
     Returns diagnostics DataFrame with one row per ticker.
     """
     rows = []
+    regime_label = getattr(regime_decision, "regime_label", "LEGACY") if regime_decision is not None else "LEGACY"
+    allow_new_longs = bool(getattr(regime_decision, "allow_new_longs", True)) if regime_decision is not None else True
+    long_exposure_mult = float(getattr(regime_decision, "long_size_mult", 1.0)) if regime_decision is not None else 1.0
+    short_exposure_mult = float(getattr(regime_decision, "short_size_mult", 1.0)) if regime_decision is not None else 1.0
 
     if focus_df.empty:
         return pd.DataFrame()
@@ -641,6 +669,15 @@ def evaluate_intraday_signals(
         signal = core_result.signal
         reason = core_result.reason
 
+        # Shared D CORE regime gate for PROD. If D is enabled and the current
+        # regime does not allow new longs, do not emit BUY/NEAR alerts.
+        if cfg.regime.d_enabled and not allow_new_longs:
+            signal = "SKIP-REGIME"
+            reason = (
+                f"D regime/exposure CORE blocks new longs: regime={regime_label}, "
+                f"long_mult={long_exposure_mult:.2f}, short_mult={short_exposure_mult:.2f}"
+            )
+
         # ------------------------------------------------------------------
         # HYBRID NEAR layer
         # ------------------------------------------------------------------
@@ -655,7 +692,7 @@ def evaluate_intraday_signals(
         near_zone_pct = cfg.intraday.near_below_pivot_pct / 100.0
         soft_near_price_ok = price_now >= float(pivot_window) * (1.0 - near_zone_pct)
         soft_near_vol_ok = (not np.isnan(vol_pace)) and vol_pace >= cfg.intraday.near_vol_pace_min
-        soft_near_now = bool(signal != "BUY" and soft_near_price_ok and soft_near_vol_ok)
+        soft_near_now = bool(signal not in ("BUY", "SKIP-REGIME") and soft_near_price_ok and soft_near_vol_ok)
 
         if soft_near_now:
             signal = "NEAR"
@@ -690,6 +727,10 @@ def evaluate_intraday_signals(
                 Stage=stage_num,
                 Signal=signal,
                 Reason=reason,
+                RegimeLabel=regime_label,
+                LongExposureMult=long_exposure_mult,
+                ShortExposureMult=short_exposure_mult,
+                SuggestedLongSizePct=long_exposure_mult * 100.0,
                 PriceNow=price_now,
                 Pivot=pivot_window,
                 HeadroomPct=headroom_pct,
@@ -1610,7 +1651,7 @@ def main() -> None:
     tickers = focus_df["Ticker"].tolist()
 
     log_step("Downloading intraday + daily bars...")
-    daily, intraday = fetch_price_data(tickers, cfg.intraday.daily_history_period)
+    daily, intraday = fetch_price_data(tickers, cfg.intraday.daily_history_period, benchmark=cfg.regime.benchmark)
     log("Price data downloaded.")
 
     # Breadth proxy (optional)
@@ -1626,11 +1667,39 @@ def main() -> None:
     else:
         log("Breadth filter disabled for intraday.")
 
-    # Regime gate for longs (if desired you can call your market_regime module here)
+    # Shared D Regime + Exposure CORE gate. This is the PROD side of the same
+    # architecture tested in SIM as Test D. It is opt-in via intraday.regime_exposure.enabled.
+    regime_decision = None
     long_ok = True
     if not cfg.regime.use_long:
         long_ok = False
         log("Regime filter: long side disabled by config.intraday.regime.use_long=False")
+
+    if cfg.regime.d_enabled:
+        try:
+            as_of = pd.Timestamp(daily.index.get_level_values(0).max()) if isinstance(daily.index, pd.MultiIndex) and not daily.empty else None
+            regime_decision = decide_regime_exposure(
+                daily,
+                as_of,
+                {},
+                benchmark=cfg.regime.benchmark,
+                regime_mode=cfg.regime.regime_mode,
+                exposure_mode=cfg.regime.exposure_mode,
+                neutral_policy=cfg.regime.neutral_policy,
+                bull_long_mult=cfg.regime.bull_long_mult,
+                neutral_long_mult=cfg.regime.neutral_long_mult,
+                bear_short_mult=cfg.regime.bear_short_mult,
+                neutral_short_mult=cfg.regime.neutral_short_mult,
+            )
+            long_ok = bool(long_ok and regime_decision.allow_new_longs and regime_decision.long_size_mult > 0)
+            log(
+                f"D Regime/Exposure CORE: regime={regime_decision.regime_label} "
+                f"allow_long={regime_decision.allow_new_longs} allow_short={regime_decision.allow_new_shorts} "
+                f"long_mult={regime_decision.long_size_mult:.2f} short_mult={regime_decision.short_size_mult:.2f}"
+            )
+        except Exception as e:
+            log(f"D Regime/Exposure CORE failed; falling back to legacy long gate: {e}")
+            regime_decision = None
 
     if not (breadth_long_ok and long_ok):
         log("Regime/Breadth gate blocking new long intraday signals — scan will still compute diagnostics.")
@@ -1638,7 +1707,7 @@ def main() -> None:
         log("Regime/Breadth gate OK for long signals.")
 
     log_step("Evaluating candidates...")
-    diag = evaluate_intraday_signals(focus_df, daily, intraday, cfg)
+    diag = evaluate_intraday_signals(focus_df, daily, intraday, cfg, regime_decision=regime_decision)
 
     if diag.empty:
         log("No diagnostics rows generated.")
