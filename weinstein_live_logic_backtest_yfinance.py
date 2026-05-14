@@ -109,6 +109,7 @@ from weinstein_short_core import (
 
 from weinstein_filters import stock_ma30_slope_ok_from_snapshot
 
+from weinstein_regime_exposure_core import decide_regime_exposure, spy_regime_label as core_spy_regime_label
 from market_regime import (
     MarketRegimeConfig,              # (placeholder; not used yet)
     build_historical_regime_table,   # (placeholder; not used yet)
@@ -959,6 +960,76 @@ def _regime_exposure_multipliers(
 
     # NEUTRAL / UNKNOWN / transition states
     return clean(neutral_long_mult), clean(neutral_short_mult)
+
+
+# ---------------------------------------------------------------------------
+# Shared CORE D regime/exposure wrappers
+# ---------------------------------------------------------------------------
+# Keep the legacy helpers for --regime-mode current; use the shared module for
+# --regime-mode prod so SIM and PROD evaluate D from one source of truth.
+_legacy_regime_permissions = _regime_permissions
+_legacy_regime_exposure_multipliers = _regime_exposure_multipliers
+
+
+def _regime_permissions(
+    daily_df: pd.DataFrame,
+    dt: pd.Timestamp,
+    market_cfg: Mapping,
+    *,
+    regime_mode: str = "current",
+    neutral_policy: str = "long",
+) -> Tuple[bool, bool, str]:
+    rm = str(regime_mode or "current").strip().lower()
+    if rm == "prod":
+        d = decide_regime_exposure(
+            daily_df,
+            dt,
+            market_cfg or {},
+            benchmark="SPY",
+            regime_mode="prod",
+            exposure_mode="scaled",  # permissions are based on D labels; size mode handled below
+            neutral_policy=neutral_policy,
+        )
+        return d.allow_new_longs, d.allow_new_shorts, d.regime_label
+    return _legacy_regime_permissions(
+        daily_df,
+        dt,
+        market_cfg,
+        regime_mode=regime_mode,
+        neutral_policy=neutral_policy,
+    )
+
+
+def _regime_exposure_multipliers(
+    regime_label: str,
+    *,
+    regime_mode: str = "current",
+    exposure_mode: str = "off",
+    bull_long_mult: float = 1.0,
+    neutral_long_mult: float = 0.50,
+    bear_short_mult: float = 0.60,
+    neutral_short_mult: float = 0.0,
+) -> Tuple[float, float]:
+    if str(regime_mode or "current").strip().lower() == "prod":
+        # Reuse the shared multiplier logic by passing a tiny synthetic decision path.
+        from weinstein_regime_exposure_core import exposure_multipliers_from_label
+        return exposure_multipliers_from_label(
+            regime_label,
+            exposure_mode=exposure_mode,
+            bull_long_mult=bull_long_mult,
+            neutral_long_mult=neutral_long_mult,
+            bear_short_mult=bear_short_mult,
+            neutral_short_mult=neutral_short_mult,
+        )
+    return _legacy_regime_exposure_multipliers(
+        regime_label,
+        regime_mode=regime_mode,
+        exposure_mode=exposure_mode,
+        bull_long_mult=bull_long_mult,
+        neutral_long_mult=neutral_long_mult,
+        bear_short_mult=bear_short_mult,
+        neutral_short_mult=neutral_short_mult,
+    )
 
 def _parse_boolish(v) -> Optional[bool]:
     if v is None:
