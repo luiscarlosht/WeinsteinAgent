@@ -2172,6 +2172,16 @@ def main():
     ap.add_argument("--max-leverage", type=float, default=1.0)
     ap.add_argument("--max-pos-frac", type=float, default=0.25)
 
+    # Refactor Phase 1: PROD-like signal replay mode.
+    # This uses the shared replay core and bypasses portfolio accounting, cash,
+    # sizing, P/L, and open-position carry.  It answers: "what would PROD
+    # have recommended?" rather than "what did a simulated portfolio earn?"
+    ap.add_argument("--signal-replay-only", action="store_true", help="Output PROD-like BUY/NEAR/SELL replay events without portfolio simulation.")
+    ap.add_argument("--include-near", action="store_true", help="Include NEAR watchlist events in --signal-replay-only output.")
+    ap.add_argument("--include-raw-sell", action="store_true", help="Include raw MA150 SELL risk events in --signal-replay-only output.")
+    ap.add_argument("--near-zone-pct", type=float, default=0.01, help="NEAR zone below pivot for signal replay, e.g. 0.01 = within 1%.")
+    ap.add_argument("--sell-crack-pct", type=float, default=0.005, help="SELL crack below MA150 for signal replay, e.g. 0.005 = 0.5%.")
+
     args = ap.parse_args()
     VERBOSE = not args.quiet
 
@@ -2287,6 +2297,54 @@ def main():
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
     regime_table = None
+
+    if args.signal_replay_only:
+        from weinstein_signal_replay_core import replay_signals, replay_summary
+        tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        events_df = replay_signals(
+            daily_df=daily_df,
+            start=args.start,
+            end=args.end,
+            mode=args.mode,
+            universe_tickers=sorted(all_tickers),
+            weekly_df=weekly_df,
+            weekly_snapshots=weekly_snapshots,
+            long_logic_cfg=bt_long_cfg,
+            short_logic_cfg=bt_short_cfg,
+            market_cfg=market_cfg,
+            industry_cfg=industry_cfg,
+            regime_mode=args.regime_mode,
+            neutral_policy=args.neutral_policy,
+            exposure_mode=args.exposure_mode,
+            bull_long_mult=float(args.bull_long_mult),
+            neutral_long_mult=float(args.neutral_long_mult),
+            bear_short_mult=float(args.bear_short_mult),
+            neutral_short_mult=float(args.neutral_short_mult),
+            signal_quality_mode=args.signal_quality_mode,
+            min_long_quality=float(args.min_long_quality),
+            min_short_quality=float(args.min_short_quality),
+            adaptive_reject_below=float(args.adaptive_reject_below),
+            adaptive_floor_mult=float(args.adaptive_floor_mult),
+            adaptive_mid_mult=float(args.adaptive_mid_mult),
+            adaptive_good_mult=float(args.adaptive_good_mult),
+            adaptive_elite_mult=float(args.adaptive_elite_mult),
+            include_near=bool(args.include_near),
+            include_raw_sell=bool(args.include_raw_sell),
+            near_zone_pct=float(args.near_zone_pct),
+            sell_crack_pct=float(args.sell_crack_pct),
+        )
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        out_path = os.path.join(OUTPUT_DIR, f"prod_signal_replay_{tag}.csv")
+        sum_path = os.path.join(OUTPUT_DIR, f"prod_signal_replay_summary_{tag}.csv")
+        events_df.to_csv(out_path, index=False)
+        replay_summary(events_df).to_csv(sum_path, index=False)
+        log(f"Signal replay complete. Events={len(events_df)}", level="ok")
+        log(f"Wrote signal replay CSV → {out_path}", level="ok")
+        log(f"Wrote signal replay summary → {sum_path}", level="ok")
+        if not events_df.empty:
+            counts = events_df["signal"].value_counts().to_dict()
+            log(f"Signal counts: {counts}", level="info")
+        return
 
     result = backtest(
         daily_df=daily_df,
