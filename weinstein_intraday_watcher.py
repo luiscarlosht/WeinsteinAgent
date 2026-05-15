@@ -515,6 +515,7 @@ def evaluate_intraday_signals(
     intraday: pd.DataFrame,
     cfg: FullConfig,
     regime_decision=None,
+    owned_tickers=None,
 ) -> pd.DataFrame:
     """
     For each ticker:
@@ -528,6 +529,7 @@ def evaluate_intraday_signals(
     Returns diagnostics DataFrame with one row per ticker.
     """
     rows = []
+    owned_set = {str(t).upper().strip() for t in (owned_tickers or []) if str(t).strip()}
     regime_label = getattr(regime_decision, "regime_label", "LEGACY") if regime_decision is not None else "LEGACY"
     allow_new_longs = bool(getattr(regime_decision, "allow_new_longs", True)) if regime_decision is not None else True
     long_exposure_mult = float(getattr(regime_decision, "long_size_mult", 1.0)) if regime_decision is not None else 1.0
@@ -1843,7 +1845,15 @@ def main() -> None:
         log("Regime/Breadth gate OK for long signals.")
 
     log_step("Evaluating candidates...")
-    diag = evaluate_intraday_signals(focus_df, daily, intraday, cfg, regime_decision=regime_decision)
+    owned_tickers = holdings_df["Ticker"].dropna().astype(str).str.upper().str.strip().tolist() if holdings_df is not None and not holdings_df.empty and "Ticker" in holdings_df.columns else []
+    diag = evaluate_intraday_signals(
+        focus_df,
+        daily,
+        intraday,
+        cfg,
+        regime_decision=regime_decision,
+        owned_tickers=owned_tickers,
+    )
 
     if diag.empty:
         log("No diagnostics rows generated.")
