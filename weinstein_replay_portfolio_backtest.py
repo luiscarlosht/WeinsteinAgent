@@ -1,2273 +1,158 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weinstein Live Logic Backtest (daily approximation of intraday watchers)
+weinstein_replay_portfolio_backtest.py
 
-This version (LONG FIXES + MORE WEINSTEIN-ALIGNED + SHORT CORE + METRICS):
-- ✅ Proper cash accounting: subtract entry cost, add exit proceeds
-- ✅ Equity = cash + market value of open positions (mark-to-market)
-- ✅ Risk sizing uses EQUITY
-- ✅ Caps:
-    - max_leverage (default 1.0)
-    - max_pos_frac per position (default 0.25)
-- ✅ Restores monthly progress logging
-- ✅ Final summary + outputs:
-    - trades CSV
-    - equity curve PNG
-    - monthly breakdown CSV
-    - performance summary CSV (CAGR / MaxDD / Vol / Sharpe-ish)
-- ✅ Keeps Industry filters (single source of truth)
-- ✅ Adds Stage 2 gate (from snapshot row) for LONG entries
-- ✅ Adds SHORTS (Weinstein-style, conservative):
-    - Stage 4 gate (from snapshot)
-    - Market gate for shorts (optional)
-    - Industry confirmation
-    - Cash + liability accounting for shorts
-    - Stop + trailing stop skeleton for shorts (ATR/MA guard)
+Phase 2 refactor: portfolio research wrapper that consumes the PROD-like
+signal replay stream instead of independently deciding entries.
 
-- ✅ Market gate (Weinstein Chapter 8-ish):
-    - SPY 30-week proxy (150d) MA slope >= ma30_slope_min for longs if require_rising_ma30=True
-    - SPY 30-week proxy slope <= ma30_slope_min_short for shorts if require_falling_ma30=True
-    - Optional short_gate_mode: "either"|"both"|"below_ma"|"slope"
-    - Optional VIX filter (longs suppressed when ^VIX > vix_max)
+Architecture:
+  daily data + weekly snapshots
+      -> weinstein_signal_replay_core.replay_signals(...)
+      -> this wrapper applies portfolio accounting/sizing/exits
 
-IMPORTANT FIX (Dec 2025):
-- ✅ Shorts were not triggering because Stage4 names were being rejected by a “long slope ok” check.
-  This file keeps:
-    - short_slope_ok_from_snapshot(...) (optional, configurable)
-    - per-month short gating diagnostics (so you can see where candidates die)
+Purpose:
+  Keep the strategy decision layer closer to PROD.  The wrapper only decides
+  whether available cash/slots allow acting on a replayed signal.
 
-NEW (Dec 2025):
-- ✅ Optional "failed rally" short entry gate:
-    - require_failed_rally: True/False
-    - failed_rally_lookback: e.g. 10 days
-    - failed_rally_pct: e.g. 0.02 (2% below recent lookback high)
-
-NEW (Dec 2025 - your request):
-- ✅ Wire SHORT entry to use:
-    - pivot low breakdown (daily proxy, last N closes)
-    - vol_mult vs 50d avg volume (uses config backtest.short.vol_min)
-    - weak RS gate (snapshot rs_above_ma must be False when present)
-
-FIX (Jan 2026):
-- ✅ yfinance output can be MultiIndex or single-level columns depending on ticker count.
-  This file normalizes to MultiIndex columns (field, ticker) reliably.
-- ✅ failed_rally debug prints the actual ticker symbol (not a ('Close', 'TICKER') tuple)
-
-FIX (Jan 2026 - CRITICAL):
-- ✅ Short pivot_low was mistakenly computed INCLUDING today's close, making breakdown impossible.
-  Now pivot_low is computed from PRIOR closes only (exclude current day).
-
-ADDED (Jan 2026 - your request from today):
-- ✅ SHORT exits use MA150 proxy (Weinstein-aligned) instead of MA30:
-    - We still use stop first
-    - If MA150 isn't available yet, we fall back to MA30
+Notes:
+  - BUY/SHORT entries come from replay events.
+  - Long exits can use replay SELL events (MA150 crack) for held tickers.
+  - NEAR events are retained in the replay CSV but not traded by default.
+  - This is intentionally separate from the legacy backtester while we validate
+    parity before replacing the old research path.
 """
+from __future__ import annotations
 
 import argparse
-import os
 import math
-import re
-from dataclasses import dataclass
-from datetime import datetime, timedelta, date
-from typing import Dict, Optional, List, Tuple, Mapping
+import os
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-import yaml
-
-# =========================
-# SHARED IMPORTS
-# =========================
-
-from weinstein_indicators import (
-    compute_adx_series,               # (not yet fully used here; kept for future)
-    ADX_WINDOW,                       # (kept)
-    ADX_MIN,                          # (kept)
-    compute_breadth_series_above_ma,  # (not used here yet; kept for future)
+from weinstein_live_logic_backtest_yfinance import (
+    OUTPUT_DIR,
+    WEEKLY_SNAPSHOT_DIR,
+    build_sim_long_config,
+    compute_atr_series_from_ohlc,
+    download_daily_bars,
+    get_panel,
+    load_weekly_report,
+    load_weekly_snapshots,
+    load_yaml_config,
+    log,
+    pick_snapshot_for_date,
 )
+from weinstein_signal_replay_core import replay_signals, replay_summary
+from weinstein_long_core import long_stop_level, should_exit_long
+from weinstein_short_core import short_stop_level as core_short_stop_level, should_exit_short as core_should_exit_short
 
-from weinstein_long_core import (
-    LongEntryParams,     # (kept for future wiring)
-    check_long_entry,    # (kept for future wiring)
-    long_stop_level,
-    should_exit_long,
-)
-
-from weinstein_short_core import (
-    check_short_entry,
-    ShortEntryParams,
-    short_stop_level as core_short_stop_level,
-    should_exit_short as core_should_exit_short,
-)
-
-from weinstein_filters import stock_ma30_slope_ok_from_snapshot
-
-from weinstein_regime_exposure_core import decide_regime_exposure, spy_regime_label as core_spy_regime_label
-from market_regime import (
-    MarketRegimeConfig,              # (placeholder; not used yet)
-    build_historical_regime_table,   # (placeholder; not used yet)
-)
-
-# ✅ INDUSTRY FILTERS (PROD + SIM)
-from industry_filters import (
-    IndustryFilterConfig,
-    enrich_with_industry_and_stats,
-    industry_ok_from_row,
-)
-
-# =========================
-# LOGGING
-# =========================
-
-VERBOSE = True
-
-
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
-
-
-def log(msg: str, *, level: str = "info"):
-    if not VERBOSE and level == "debug":
-        return
-    prefix = {
-        "info": "•",
-        "ok": "✅",
-        "step": "▶️",
-        "warn": "⚠️",
-        "err": "❌",
-        "debug": "··",
-    }.get(level, "•")
-    print(f"{prefix} [{_ts()}] {msg}", flush=True)
-
-
-# =========================
-# CONFIG
-# =========================
-
-def load_yaml_config(path: str = "./config.yaml") -> dict:
-    try:
-        with open(path, "r") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        log(f"Failed to load {path} — using defaults.", level="warn")
-        return {}
-
-
-def build_sim_long_config(cfg: Mapping) -> dict:
-    """
-    Build the LONG config used by SIM.
-
-    Priority:
-      1) backtest.long base values
-      2) intraday.long overrides for shared PROD/SIM knobs
-      3) intraday top-level adx_min_long fallback
-
-    This allows you to tune common strategy knobs from config.yaml and have
-    PROD + SIM react consistently.
-    """
-    bt_cfg = cfg.get("backtest", {}) or {}
-    intraday_cfg = cfg.get("intraday", {}) or {}
-
-    out = dict(bt_cfg.get("long", {}) or {})
-
-    intraday_long = intraday_cfg.get("long", {}) or {}
-
-    same_name_keys = [
-        "stage_above_ma_pct",
-        "dist_above_ma_min",
-        "pivot_lookback_days",
-        "pivot_lookback",
-        "adx_min_long",
-        "adx_min",
-        "default_rs_above_ma",
-    ]
-    for key in same_name_keys:
-        if key in intraday_long:
-            out[key] = intraday_long[key]
-
-    if "confirm_headroom_pct" in intraday_long:
-        out["break_pct"] = float(intraday_long["confirm_headroom_pct"]) / 100.0
-
-    if "vol_pace_min" in intraday_long:
-        out["vol_min"] = intraday_long["vol_pace_min"]
-
-    if "adx_min_long" in intraday_cfg and "adx_min_long" not in out:
-        out["adx_min_long"] = intraday_cfg["adx_min_long"]
-
-    return out
-
-
-# =========================
-# WEEKLY / SNAPSHOT HELPERS
-# =========================
-
-WEEKLY_OUTPUT_DIR = "./output"
-WEEKLY_FILE_PREFIX = "weinstein_weekly_equities_"
-WEEKLY_SNAPSHOT_DIR = "./data/weekly_snapshots"
-
-_SNAPSHOT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
-
-
-def newest_weekly_csv() -> str:
-    files = [
-        f for f in os.listdir(WEEKLY_OUTPUT_DIR)
-        if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
-    ]
-    if not files:
-        raise FileNotFoundError("No weekly CSV found.")
-    files.sort(reverse=True)
-    return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
-
-
-def load_weekly_report() -> pd.DataFrame:
-    path = newest_weekly_csv()
-    log(f"Using weekly CSV: {path}", level="info")
-    return pd.read_csv(path).rename(columns=str.lower)
-
-
-def _parse_snapshot_date_from_name(fname: str) -> Optional[date]:
-    m = _SNAPSHOT_NAME_RE.search(fname)
-    if not m:
-        return None
-    token = m.group(1)
-    try:
-        return (
-            datetime.strptime(token, "%Y%m%d").date()
-            if len(token) == 8
-            else datetime.strptime(token, "%Y-%m-%d").date()
-        )
-    except Exception:
-        return None
-
-
-def load_weekly_snapshots(snapshot_dir: str) -> List[Tuple[date, pd.DataFrame]]:
-    if not os.path.isdir(snapshot_dir):
-        return []
-
-    out: List[Tuple[date, pd.DataFrame]] = []
-    for fname in os.listdir(snapshot_dir):
-        if not (fname.startswith(WEEKLY_FILE_PREFIX) and fname.endswith(".csv")):
-            continue
-        d = _parse_snapshot_date_from_name(fname)
-        if not d:
-            continue
-        df = pd.read_csv(os.path.join(snapshot_dir, fname)).rename(columns=str.lower)
-        out.append((d, df))
-
-    out.sort(key=lambda x: x[0])
-    if out:
-        log(f"Loaded {len(out)} weekly snapshots ({out[0][0]} → {out[-1][0]}).", level="info")
-    return out
-
-
-def pick_snapshot_for_date(
-    snapshots: List[Tuple[date, pd.DataFrame]],
-    as_of_ts: pd.Timestamp,
-) -> Optional[Tuple[date, pd.DataFrame]]:
-    chosen = None
-    for d, df in snapshots:
-        if d <= as_of_ts.date():
-            chosen = (d, df)
-        else:
-            break
-    return chosen
-
-
-# =========================
-# DAILY DATA HELPERS
-# =========================
-
-def _normalize_yf_columns_to_multiindex(df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
-    """
-    Normalize yfinance output to MultiIndex columns (field, ticker).
-    yfinance sometimes returns:
-      - MultiIndex when multiple tickers
-      - Single-level columns when one ticker
-    """
-    if df is None or df.empty:
-        return df
-
-    if isinstance(df.columns, pd.MultiIndex):
-        return df
-
-    t = tickers[0] if tickers and isinstance(tickers[0], str) and tickers[0].strip() else "SINGLE"
-    df.columns = pd.MultiIndex.from_product([list(df.columns), [t]])
-    return df
-
-
-def download_daily_bars(tickers: List[str], start: str, end: str) -> pd.DataFrame:
-    """
-    Download daily OHLCV using yfinance.
-    Adds padding before start so rolling indicators have enough history.
-    """
-    start_dt = datetime.fromisoformat(start)
-    pad_start = (start_dt - timedelta(days=365)).strftime("%Y-%m-%d")
-
-    tickers = sorted(set([t for t in tickers if isinstance(t, str) and t.strip()]))
-    log(f"Downloading daily bars for {len(tickers)} tickers ({pad_start} → {end})...", level="step")
-
-    df = yf.download(
-        tickers=tickers,
-        start=pad_start,
-        end=end,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-    )
-    if df is None or df.empty:
-        raise RuntimeError("No daily data returned from yfinance.")
-
-    df = _normalize_yf_columns_to_multiindex(df, tickers)
-
-    log("Daily download complete.", level="ok")
-    return df
-
-
-def get_panel(daily_df: pd.DataFrame, field: str, ticker: str) -> pd.Series:
-    try:
-        s = daily_df[(field, ticker)].dropna()
-        if isinstance(s.name, tuple):
-            s = s.rename(ticker)
-        return s
-    except Exception:
-        return pd.Series(dtype="float64")
-
-
-def compute_atr_series_from_ohlc(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    n: int = 14
-) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1
-    ).max(axis=1)
-    atr = tr.rolling(n, min_periods=n).mean()
-    return atr
-
-
-# =========================
-# REPORTING / OUTPUT
-# =========================
-
-OUTPUT_DIR = "./output"
-
-
-def _now_tag() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def _ensure_outdir(path: str = OUTPUT_DIR):
-    os.makedirs(path, exist_ok=True)
-
-
-def _safe_close(daily_df: pd.DataFrame, dt: pd.Timestamp, ticker: str) -> float:
-    try:
-        if ("Close", ticker) in daily_df.columns and dt in daily_df.index:
-            v = daily_df.loc[dt, ("Close", ticker)]
-            if pd.notna(v):
-                return float(v)
-    except Exception:
-        pass
-    return np.nan
-
-
-def _positions_market_value(
-    daily_df: pd.DataFrame,
-    dt: pd.Timestamp,
-    positions: Dict[str, "Position"],
-) -> float:
-    mv = 0.0
-    for _, p in positions.items():
-        px = _safe_close(daily_df, dt, p.ticker)
-        if pd.notna(px):
-            if p.side == "short":
-                mv -= float(p.qty) * float(px)
-            else:
-                mv += float(p.qty) * float(px)
-    return float(mv)
-
-
-def _gross_exposure(
-    daily_df: pd.DataFrame,
-    dt: pd.Timestamp,
-    positions: Dict[str, "Position"],
-) -> float:
-    ex = 0.0
-    for _, p in positions.items():
-        px = _safe_close(daily_df, dt, p.ticker)
-        if pd.notna(px):
-            ex += abs(float(p.qty) * float(px))
-    return float(ex)
-
-
-def _equity(daily_df: pd.DataFrame, dt: pd.Timestamp, cash: float, positions: Dict[str, "Position"]) -> float:
-    return float(cash) + _positions_market_value(daily_df, dt, positions)
-
-
-def _trades_to_df(trades: List["Trade"]) -> pd.DataFrame:
-    if not trades:
-        return pd.DataFrame(
-            columns=[
-                "ticker", "side", "entry_date", "exit_date",
-                "entry_price", "exit_price", "qty", "pnl", "pnl_pct",
-            ]
-        )
-    rows = []
-    for t in trades:
-        rows.append({
-            "ticker": t.ticker,
-            "side": t.side,
-            "entry_date": pd.to_datetime(t.entry_date),
-            "exit_date": pd.to_datetime(t.exit_date),
-            "entry_price": float(t.entry_price),
-            "exit_price": float(t.exit_price),
-            "qty": int(t.qty),
-            "pnl": float(t.pnl),
-            "pnl_pct": float(t.pnl_pct),
-        })
-    df = pd.DataFrame(rows).sort_values(["exit_date", "ticker"]).reset_index(drop=True)
-    return df
-
-
-def _equity_to_df(equity_curve: List[Tuple[pd.Timestamp, float]]) -> pd.DataFrame:
-    if not equity_curve:
-        return pd.DataFrame(columns=["date", "equity"])
-    df = pd.DataFrame(equity_curve, columns=["date", "equity"])
-    df["date"] = pd.to_datetime(df["date"])
-    df["equity"] = pd.to_numeric(df["equity"], errors="coerce")
-    return df
-
-
-def _monthly_breakdown(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.DataFrame:
-    if trades_df.empty:
-        return pd.DataFrame(columns=["month", "pnl", "trades", "win_rate", "equity_end"])
-
-    tdf = trades_df.copy()
-    tdf["month"] = tdf["exit_date"].dt.to_period("M").astype(str)
-    g = tdf.groupby("month", dropna=False)
-
-    out = pd.DataFrame({
-        "pnl": g["pnl"].sum(),
-        "trades": g.size(),
-        "win_rate": (g["pnl"].apply(lambda s: float((s > 0).mean())) * 100.0),
-    }).reset_index()
-
-    equity_end_map = {}
-    if not equity_df.empty:
-        edf = equity_df.copy()
-        edf["month"] = edf["date"].dt.to_period("M").astype(str)
-        equity_end = edf.sort_values("date").groupby("month", as_index=False).tail(1)
-        equity_end_map = dict(zip(equity_end["month"], equity_end["equity"]))
-
-    out["equity_end"] = out["month"].map(equity_end_map)
-    return out.sort_values("month").reset_index(drop=True)
-
-
-def _performance_summary(equity_df: pd.DataFrame) -> pd.DataFrame:
-    if equity_df is None or equity_df.empty:
-        return pd.DataFrame([{
-            "start_equity": np.nan,
-            "end_equity": np.nan,
-            "years": np.nan,
-            "cagr": np.nan,
-            "max_drawdown": np.nan,
-            "ann_vol": np.nan,
-            "sharpe0": np.nan,
-        }])
-
-    df = equity_df.sort_values("date").dropna()
-    if df.empty:
-        return pd.DataFrame([{
-            "start_equity": np.nan,
-            "end_equity": np.nan,
-            "years": np.nan,
-            "cagr": np.nan,
-            "max_drawdown": np.nan,
-            "ann_vol": np.nan,
-            "sharpe0": np.nan,
-        }])
-
-    start_eq = float(df["equity"].iloc[0])
-    end_eq = float(df["equity"].iloc[-1])
-
-    start_dt = pd.to_datetime(df["date"].iloc[0]).to_pydatetime()
-    end_dt = pd.to_datetime(df["date"].iloc[-1]).to_pydatetime()
-    days = max(1, (end_dt - start_dt).days)
-    years = days / 365.25
-
-    cagr = np.nan
-    if start_eq > 0 and years > 0:
-        cagr = (end_eq / start_eq) ** (1.0 / years) - 1.0
-
-    eq = df["equity"].astype(float)
-    peak = eq.cummax()
-    dd = (eq / peak) - 1.0
-    max_dd = float(dd.min()) if len(dd) else np.nan
-
-    rets = eq.pct_change().dropna()
-    ann_vol = float(rets.std(ddof=0) * math.sqrt(252)) if len(rets) > 2 else np.nan
-    sharpe0 = np.nan
-    if len(rets) > 2 and rets.std(ddof=0) > 1e-12:
-        sharpe0 = float((rets.mean() / rets.std(ddof=0)) * math.sqrt(252))
-
-    return pd.DataFrame([{
-        "start_equity": start_eq,
-        "end_equity": end_eq,
-        "years": years,
-        "cagr": cagr,
-        "max_drawdown": max_dd,
-        "ann_vol": ann_vol,
-        "sharpe0": sharpe0,
-    }])
-
-
-def _write_reports(*, tag: str, trades: List["Trade"], equity_curve: List[Tuple[pd.Timestamp, float]]):
-    _ensure_outdir(OUTPUT_DIR)
-
-    trades_df = _trades_to_df(trades)
-    equity_df = _equity_to_df(equity_curve)
-    monthly_df = _monthly_breakdown(trades_df, equity_df)
-    perf_df = _performance_summary(equity_df)
-
-    trades_path = os.path.join(OUTPUT_DIR, f"live_logic_bt_trades_{tag}.csv")
-    equity_png = os.path.join(OUTPUT_DIR, f"live_logic_bt_equity_{tag}.png")
-    monthly_path = os.path.join(OUTPUT_DIR, f"live_logic_bt_monthly_{tag}.csv")
-    perf_path = os.path.join(OUTPUT_DIR, f"live_logic_bt_perf_{tag}.csv")
-
-    trades_df.to_csv(trades_path, index=False)
-    monthly_df.to_csv(monthly_path, index=False)
-    perf_df.to_csv(perf_path, index=False)
-
-    if not equity_df.empty:
-        plt.figure()
-        plt.plot(equity_df["date"], equity_df["equity"])
-        plt.title("Equity Curve")
-        plt.xlabel("Date")
-        plt.ylabel("Equity")
-        plt.tight_layout()
-        plt.savefig(equity_png, dpi=140)
-        plt.close()
-
-    log(f"Wrote trade log → {trades_path}", level="ok")
-    if not equity_df.empty:
-        log(f"Wrote equity curve PNG → {equity_png}", level="ok")
-    log(f"Wrote monthly P/L breakdown → {monthly_path}", level="ok")
-    log(f"Wrote performance summary → {perf_path}", level="ok")
-
-    if not monthly_df.empty:
-        log("Monthly P/L summary:", level="info")
-        for _, r in monthly_df.iterrows():
-            m = r["month"]
-            pnl = float(r["pnl"])
-            tr = int(r["trades"])
-            wr = float(r["win_rate"])
-            eqe = r.get("equity_end", np.nan)
-            eq_s = f"${float(eqe):,.2f}" if pd.notna(eqe) else "$nan"
-            log(f"  {m}: PnL=${pnl:,.2f} | Trades={tr} | WinRate={wr:5.1f}% | Equity={eq_s}", level="info")
-
-    try:
-        p = perf_df.iloc[0].to_dict()
-        cagr = p.get("cagr", np.nan)
-        mdd = p.get("max_drawdown", np.nan)
-        vol = p.get("ann_vol", np.nan)
-        sh = p.get("sharpe0", np.nan)
-        log(
-            f"Perf: CAGR={cagr*100:,.2f}% | MaxDD={mdd*100:,.2f}% | AnnVol={vol*100:,.2f}% | Sharpe0={sh:,.2f}",
-            level="info",
-        )
-    except Exception:
-        pass
-
-
-# =========================
-# WEINSTEIN HELPERS
-# =========================
-
-def _stage_num(row: pd.Series) -> Optional[int]:
-    v = row.get("stage", None)
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return None
-    try:
-        fv = float(v)
-        if np.isnan(fv):
-            return None
-        iv = int(round(fv))
-        if iv in (1, 2, 3, 4):
-            return iv
-    except Exception:
-        pass
-    s = str(v).strip().lower()
-    if s in ("1", "1.0", "stage1", "stage 1"):
-        return 1
-    if s in ("2", "2.0", "stage2", "stage 2"):
-        return 2
-    if s in ("3", "3.0", "stage3", "stage 3"):
-        return 3
-    if s in ("4", "4.0", "stage4", "stage 4"):
-        return 4
-    if "stage" in s:
-        for k in ("1", "2", "3", "4"):
-            if k in s:
-                return int(k)
-    return None
-
-
-def _is_stage2(row: pd.Series) -> bool:
-    return _stage_num(row) == 2
-
-
-def _is_stage4(row: pd.Series) -> bool:
-    return _stage_num(row) == 4
-
-
-def short_slope_ok_from_snapshot(row: pd.Series, short_cfg: Mapping) -> bool:
-    """
-    Proper short slope gate (optional).
-
-    Config (under backtest.short):
-      require_ma30_falling: bool (default False)
-      ma30_slope_max: float (default 0.0)  # must be <= this (e.g. 0.0 or -0.05)
-    """
-    require = bool(short_cfg.get("require_ma30_falling", False))
-    if not require:
-        return True
-
-    ma30_slope_max = float(short_cfg.get("ma30_slope_max", 0.0))
-
-    for col in ("ma30_slope_per_wk", "ma_slope_per_wk", "ma30_slope"):
-        if col in row.index:
-            v = row.get(col)
-            try:
-                fv = float(v)
-                if np.isfinite(fv):
-                    return fv <= ma30_slope_max
-            except Exception:
-                pass
-
-    return False
-
-
-def short_failed_rally_ok(
-    close_series: pd.Series,
-    dt: pd.Timestamp,
-    short_cfg: Mapping,
-    *,
-    ticker: Optional[str] = None,
-) -> bool:
-    """
-    Optional short entry gate: "failed rally" (rollover) filter.
-
-    If enabled (backtest.short.require_failed_rally=True):
-      require close <= rolling_max(close, lookback) * (1 - failed_rally_pct)
-    """
-    if not bool(short_cfg.get("require_failed_rally", False)):
-        return True
-
-    lookback = int(short_cfg.get("failed_rally_lookback", 10))
-    pct = float(short_cfg.get("failed_rally_pct", 0.02))
-
-    if lookback < 2 or pct <= 0:
-        return False
-    if close_series is None or close_series.empty:
-        return False
-    if dt not in close_series.index:
-        return False
-
-    roll_hi = close_series.rolling(lookback, min_periods=lookback).max()
-    if dt not in roll_hi.index or pd.isna(roll_hi.loc[dt]):
-        return False
-
-    px = float(close_series.loc[dt])
-    hi = float(roll_hi.loc[dt])
-    if not np.isfinite(px) or not np.isfinite(hi) or hi <= 0:
-        return False
-
-    ok = px <= hi * (1.0 - pct)
-    if not ok:
-        t = ticker or (str(close_series.name) if close_series.name is not None else "TICKER")
-        log(f"[failed_rally] {t} on {dt.date()} rejected", level="debug")
-    return ok
-
-
-def _market_allows_longs(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
-    require_rising = bool(market_cfg.get("require_rising_ma30", False))
-    ma30_slope_min = float(market_cfg.get("ma30_slope_min", 0.0))
-
-    vix_max = market_cfg.get("vix_max", None)
-    try:
-        vix_max = float(vix_max) if vix_max is not None else None
-    except Exception:
-        vix_max = None
-
-    if vix_max is not None:
-        if ("Close", "^VIX") not in daily_df.columns or dt not in daily_df.index:
-            return False
-        vix = daily_df.loc[dt, ("Close", "^VIX")]
-        if pd.isna(vix):
-            return False
-        if float(vix) > float(vix_max):
-            return False
-
-    if require_rising:
-        if ("Close", "SPY") not in daily_df.columns:
-            return False
-        spy = daily_df[("Close", "SPY")].dropna()
-        if dt not in spy.index:
-            return False
-
-        ma150 = spy.rolling(150, min_periods=150).mean()
-        if dt not in ma150.index or pd.isna(ma150.loc[dt]):
-            return False
-
-        prev = ma150.shift(5)
-        if dt not in prev.index or pd.isna(prev.loc[dt]):
-            return False
-
-        slope = float(ma150.loc[dt] - prev.loc[dt])
-        if slope < float(ma30_slope_min):
-            return False
-
-    return True
-
-
-def _market_allows_shorts(daily_df: pd.DataFrame, dt: pd.Timestamp, market_cfg: Mapping) -> bool:
-    """
-    Optional short market gate. Supports:
-      short_gate_mode: "either"|"both"|"below_ma"|"slope"
-    Uses:
-      require_falling_ma30: bool
-      ma30_slope_min_short: float (0.0 default; falling if slope <= threshold)
-    """
-    require_falling = bool(market_cfg.get("require_falling_ma30", False))
-    if not require_falling:
-        return True
-
-    gate_mode = str(market_cfg.get("short_gate_mode", "both")).strip().lower()
-    if gate_mode not in ("either", "both", "below_ma", "slope"):
-        gate_mode = "both"
-
-    ma30_slope_min_short = float(market_cfg.get("ma30_slope_min_short", 0.0))
-
-    if ("Close", "SPY") not in daily_df.columns:
-        return False
-
-    spy = daily_df[("Close", "SPY")].dropna()
-    if dt not in spy.index:
-        return False
-
-    ma150 = spy.rolling(150, min_periods=150).mean()
-    if dt not in ma150.index or pd.isna(ma150.loc[dt]):
-        return False
-
-    below_ma = float(spy.loc[dt]) < float(ma150.loc[dt])
-
-    prev = ma150.shift(5)
-    if dt not in prev.index or pd.isna(prev.loc[dt]):
-        return False
-
-    slope = float(ma150.loc[dt] - prev.loc[dt])
-    slope_falling = slope <= float(ma30_slope_min_short)
-
-    if gate_mode == "below_ma":
-        return bool(below_ma)
-    if gate_mode == "slope":
-        return bool(slope_falling)
-    if gate_mode == "either":
-        return bool(below_ma or slope_falling)
-    return bool(below_ma and slope_falling)  # "both"
-
-
-
-
-def _spy_regime_label(
-    daily_df: pd.DataFrame,
-    dt: pd.Timestamp,
-    market_cfg: Mapping,
-) -> str:
-    """
-    Weinstein-style broad market regime using SPY 30-week proxy (150 trading days).
-
-    BULL:
-      - SPY is above its 150d MA
-      - MA150 slope over 5 sessions is rising/flat enough
-
-    BEAR:
-      - SPY is below its 150d MA
-      - MA150 slope over 5 sessions is falling/flat enough
-
-    NEUTRAL:
-      - mixed/transition state or not enough data
-
-    This is intentionally simple and deterministic so SIM and PROD-style
-    research can use the same high-level interpretation.
-    """
-    if ("Close", "SPY") not in daily_df.columns:
-        return "UNKNOWN"
-
-    spy = daily_df[("Close", "SPY")].dropna()
-    if dt not in spy.index:
-        return "UNKNOWN"
-
-    ma150 = spy.rolling(150, min_periods=150).mean()
-    if dt not in ma150.index or pd.isna(ma150.loc[dt]):
-        return "UNKNOWN"
-
-    prev = ma150.shift(5)
-    if dt not in prev.index or pd.isna(prev.loc[dt]):
-        return "UNKNOWN"
-
-    price = float(spy.loc[dt])
-    ma = float(ma150.loc[dt])
-    slope = float(ma150.loc[dt] - prev.loc[dt])
-
-    long_slope_min = float(market_cfg.get("ma30_slope_min", 0.0))
-    short_slope_max = float(market_cfg.get("ma30_slope_min_short", 0.0))
-
-    above_ma = price >= ma
-    below_ma = price < ma
-    rising = slope >= long_slope_min
-    falling = slope <= short_slope_max
-
-    if above_ma and rising:
-        return "BULL"
-    if below_ma and falling:
-        return "BEAR"
-    return "NEUTRAL"
-
-
-def _regime_permissions(
-    daily_df: pd.DataFrame,
-    dt: pd.Timestamp,
-    market_cfg: Mapping,
-    *,
-    regime_mode: str = "current",
-    neutral_policy: str = "long",
-) -> Tuple[bool, bool, str]:
-    """
-    Return (allow_new_longs, allow_new_shorts, regime_label).
-
-    regime_mode:
-      off     -> ignore broad market gates; mode/max positions decide only
-      current -> existing config gates (_market_allows_longs/_market_allows_shorts)
-      prod    -> true Weinstein-style switch:
-                   BULL    => longs only
-                   BEAR    => shorts only
-                   NEUTRAL => configurable with neutral_policy
-
-    neutral_policy for prod:
-      long    => longs only in neutral/transitional markets
-      none    => no new entries in neutral
-      both    => allow both in neutral
-      current => fall back to existing config gates in neutral
-    """
-    rm = str(regime_mode or "current").strip().lower()
-    neutral = str(neutral_policy or "long").strip().lower()
-
-    if rm == "off":
-        return True, True, "OFF"
-
-    if rm == "prod":
-        label = _spy_regime_label(daily_df, dt, market_cfg)
-        if label == "BULL":
-            return True, False, label
-        if label == "BEAR":
-            return False, True, label
-
-        # NEUTRAL / UNKNOWN handling
-        if neutral == "none":
-            return False, False, label
-        if neutral == "both":
-            return True, True, label
-        if neutral == "current":
-            return (
-                _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True,
-                _market_allows_shorts(daily_df, dt, market_cfg) if market_cfg else True,
-                label,
-            )
-        # default: neutral behaves conservatively long-only
-        return True, False, label
-
-    # current: preserve existing behavior
-    return (
-        _market_allows_longs(daily_df, dt, market_cfg) if market_cfg else True,
-        _market_allows_shorts(daily_df, dt, market_cfg) if market_cfg else True,
-        "CURRENT",
-    )
-
-
-
-def _regime_exposure_multipliers(
-    regime_label: str,
-    *,
-    regime_mode: str = "current",
-    exposure_mode: str = "off",
-    bull_long_mult: float = 1.0,
-    neutral_long_mult: float = 0.50,
-    bear_short_mult: float = 0.60,
-    neutral_short_mult: float = 0.0,
-) -> Tuple[float, float]:
-    """
-    Return (long_size_multiplier, short_size_multiplier).
-
-    This is a SIM/research-only exposure scaling layer. It does NOT change
-    entry rules. It only scales position sizing after regime permissions decide
-    whether new longs/shorts are allowed.
-
-    exposure_mode:
-      off    -> all allowed trades use normal size (1.0)
-      scaled -> for --regime-mode prod:
-                  BULL    => full long size, no short size
-                  BEAR    => no long size, configured short size
-                  NEUTRAL => configured reduced long/short sizes
-
-    The default scaled values are intentionally conservative:
-      BULL long 100%, NEUTRAL long 50%, BEAR short 60%.
-    """
-    em = str(exposure_mode or "off").strip().lower()
-    rm = str(regime_mode or "current").strip().lower()
-    label = str(regime_label or "UNKNOWN").strip().upper()
-
-    if em in ("off", "none", "false", "0") or rm != "prod":
-        return 1.0, 1.0
-
-    if em != "scaled":
-        return 1.0, 1.0
-
-    def clean(x: float) -> float:
-        try:
-            v = float(x)
-        except Exception:
-            v = 0.0
-        if not np.isfinite(v):
-            return 0.0
-        return max(0.0, min(1.0, v))
-
-    if label == "BULL":
-        return clean(bull_long_mult), 0.0
-    if label == "BEAR":
-        return 0.0, clean(bear_short_mult)
-
-    # NEUTRAL / UNKNOWN / transition states
-    return clean(neutral_long_mult), clean(neutral_short_mult)
-
-
-# ---------------------------------------------------------------------------
-# Shared CORE D regime/exposure wrappers
-# ---------------------------------------------------------------------------
-# Keep the legacy helpers for --regime-mode current; use the shared module for
-# --regime-mode prod so SIM and PROD evaluate D from one source of truth.
-_legacy_regime_permissions = _regime_permissions
-_legacy_regime_exposure_multipliers = _regime_exposure_multipliers
-
-
-def _regime_permissions(
-    daily_df: pd.DataFrame,
-    dt: pd.Timestamp,
-    market_cfg: Mapping,
-    *,
-    regime_mode: str = "current",
-    neutral_policy: str = "long",
-) -> Tuple[bool, bool, str]:
-    rm = str(regime_mode or "current").strip().lower()
-    if rm == "prod":
-        d = decide_regime_exposure(
-            daily_df,
-            dt,
-            market_cfg or {},
-            benchmark="SPY",
-            regime_mode="prod",
-            exposure_mode="scaled",  # permissions are based on D labels; size mode handled below
-            neutral_policy=neutral_policy,
-        )
-        return d.allow_new_longs, d.allow_new_shorts, d.regime_label
-    return _legacy_regime_permissions(
-        daily_df,
-        dt,
-        market_cfg,
-        regime_mode=regime_mode,
-        neutral_policy=neutral_policy,
-    )
-
-
-def _regime_exposure_multipliers(
-    regime_label: str,
-    *,
-    regime_mode: str = "current",
-    exposure_mode: str = "off",
-    bull_long_mult: float = 1.0,
-    neutral_long_mult: float = 0.50,
-    bear_short_mult: float = 0.60,
-    neutral_short_mult: float = 0.0,
-) -> Tuple[float, float]:
-    if str(regime_mode or "current").strip().lower() == "prod":
-        # Reuse the shared multiplier logic by passing a tiny synthetic decision path.
-        from weinstein_regime_exposure_core import exposure_multipliers_from_label
-        return exposure_multipliers_from_label(
-            regime_label,
-            exposure_mode=exposure_mode,
-            bull_long_mult=bull_long_mult,
-            neutral_long_mult=neutral_long_mult,
-            bear_short_mult=bear_short_mult,
-            neutral_short_mult=neutral_short_mult,
-        )
-    return _legacy_regime_exposure_multipliers(
-        regime_label,
-        regime_mode=regime_mode,
-        exposure_mode=exposure_mode,
-        bull_long_mult=bull_long_mult,
-        neutral_long_mult=neutral_long_mult,
-        bear_short_mult=bear_short_mult,
-        neutral_short_mult=neutral_short_mult,
-    )
-
-def _parse_boolish(v) -> Optional[bool]:
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)) and np.isfinite(v):
-        return bool(int(v))
-    s = str(v).strip().lower()
-    if s in ("true", "1", "yes", "y", "t"):
-        return True
-    if s in ("false", "0", "no", "n", "f"):
-        return False
-    return None
-
-
-def _get_snapshot_rs_above_ma(row: pd.Series) -> Optional[bool]:
-    for col in ("rs_above_ma", "rs_above_ma30", "rs_above"):
-        if col in row.index:
-            b = _parse_boolish(row.get(col))
-            if b is not None:
-                return b
-    return None
-
-
-# =========================
-# SIGNAL QUALITY HELPERS (SIM / RESEARCH ONLY)
-# =========================
-
-def _clamp_score(v: float) -> float:
-    try:
-        return float(max(0.0, min(100.0, v)))
-    except Exception:
-        return 0.0
-
-
-def _row_float(row: pd.Series, names: Tuple[str, ...], default: Optional[float] = None) -> Optional[float]:
-    for name in names:
-        if name in row.index:
-            try:
-                v = float(row.get(name))
-                if np.isfinite(v):
-                    return v
-            except Exception:
-                pass
-    return default
-
-
-def _long_signal_quality_score(
-    row: pd.Series,
-    *,
-    price: float,
-    ma_val: float,
-    pivot: float,
-    vol_mult: float,
-    adx_val: float,
-    atr_val: float,
-    rs_above_ma: bool,
-) -> float:
-    """
-    SIM/research-only quality score for LONG entries.
-
-    Purpose:
-      - Do NOT replace Weinstein/core entry logic.
-      - Only rank/filter setups AFTER the normal long core has already passed.
-      - Prefer clean Stage 2 breakouts that are strong but not overextended.
-
-    Score is intentionally simple and transparent so we can evaluate it safely.
-    """
-    score = 50.0
-
-    # Stage confirmation
-    if _is_stage2(row):
-        score += 8.0
-
-    # Relative strength confirmation
-    score += 10.0 if bool(rs_above_ma) else -15.0
-
-    # Volume expansion quality
-    if np.isfinite(vol_mult):
-        if vol_mult >= 2.0:
-            score += 14.0
-        elif vol_mult >= 1.5:
-            score += 10.0
-        elif vol_mult >= 1.3:
-            score += 6.0
-        else:
-            score -= 8.0
-
-    # Trend strength quality
-    if np.isfinite(adx_val):
-        if adx_val >= 30:
-            score += 12.0
-        elif adx_val >= 25:
-            score += 9.0
-        elif adx_val >= 20:
-            score += 5.0
-        elif adx_val < 16:
-            score -= 8.0
-
-    # Distance above MA: enough strength, but avoid very extended names
-    if price > 0 and ma_val > 0:
-        dist_ma = (price / ma_val) - 1.0
-        if 0.005 <= dist_ma <= 0.12:
-            score += 10.0
-        elif 0.12 < dist_ma <= 0.20:
-            score += 2.0
-        elif dist_ma > 0.20:
-            score -= 12.0
-        elif dist_ma < 0:
-            score -= 15.0
-
-    # Breakout extension vs pivot: prefer fresh/controlled breakouts
-    if price > 0 and pivot > 0:
-        ext = (price / pivot) - 1.0
-        if 0.0 <= ext <= 0.06:
-            score += 10.0
-        elif 0.06 < ext <= 0.12:
-            score += 3.0
-        elif ext > 0.12:
-            score -= 10.0
-
-    # Volatility quality: avoid extremely noisy setups
-    if price > 0 and np.isfinite(atr_val) and atr_val > 0:
-        atr_pct = atr_val / price
-        if atr_pct <= 0.05:
-            score += 8.0
-        elif atr_pct <= 0.08:
-            score += 4.0
-        elif atr_pct > 0.14:
-            score -= 10.0
-
-    # Optional snapshot slope quality if present
-    slope = _row_float(row, ("ma30_slope_per_wk", "ma_slope_per_wk", "ma30_slope"), None)
-    if slope is not None:
-        if slope > 0:
-            score += 5.0
-        elif slope < 0:
-            score -= 8.0
-
-    return _clamp_score(score)
-
-
-def _short_signal_quality_score(
-    row: pd.Series,
-    *,
-    price: float,
-    ma_val: float,
-    pivot_low: float,
-    vol_mult: float,
-    atr_val: float,
-    rs_above_ma: bool,
-) -> float:
-    """
-    SIM/research-only quality score for SHORT entries.
-
-    Purpose:
-      - Do NOT replace short core logic.
-      - Only filter/rank shorts AFTER the normal short core has already passed.
-      - Prefer weak Stage 4 breakdowns that are not extremely extended already.
-    """
-    score = 50.0
-
-    if _is_stage4(row):
-        score += 10.0
-
-    # For shorts, strong RS is bad. Weak RS is good.
-    score += 12.0 if not bool(rs_above_ma) else -18.0
-
-    # Volume expansion on breakdown
-    if np.isfinite(vol_mult):
-        if vol_mult >= 2.0:
-            score += 14.0
-        elif vol_mult >= 1.5:
-            score += 10.0
-        elif vol_mult >= 1.1:
-            score += 5.0
-        else:
-            score -= 8.0
-
-    # Price below MA, but avoid chasing extremely extended downside moves
-    if price > 0 and ma_val > 0:
-        below = (ma_val / price) - 1.0
-        if 0.005 <= below <= 0.15:
-            score += 10.0
-        elif 0.15 < below <= 0.30:
-            score += 2.0
-        elif below > 0.30:
-            score -= 12.0
-        elif below < 0:
-            score -= 15.0
-
-    # Breakdown depth vs pivot low: prefer controlled fresh breakdowns
-    if price > 0 and pivot_low > 0:
-        breakdown = (pivot_low / price) - 1.0
-        if 0.0 <= breakdown <= 0.08:
-            score += 10.0
-        elif 0.08 < breakdown <= 0.15:
-            score += 2.0
-        elif breakdown > 0.15:
-            score -= 10.0
-
-    # Volatility quality
-    if price > 0 and np.isfinite(atr_val) and atr_val > 0:
-        atr_pct = atr_val / price
-        if atr_pct <= 0.06:
-            score += 7.0
-        elif atr_pct <= 0.10:
-            score += 3.0
-        elif atr_pct > 0.16:
-            score -= 10.0
-
-    # Optional snapshot slope quality if present: falling is good for shorts
-    slope = _row_float(row, ("ma30_slope_per_wk", "ma_slope_per_wk", "ma30_slope"), None)
-    if slope is not None:
-        if slope < 0:
-            score += 6.0
-        elif slope > 0:
-            score -= 8.0
-
-    return _clamp_score(score)
-
-
-def _long_signal_quality_strict_ok(
-    row: pd.Series,
-    *,
-    price: float,
-    ma_val: float,
-    pivot: float,
-    vol_mult: float,
-    adx_val: float,
-    atr_val: float,
-    rs_above_ma: bool,
-) -> bool:
-    """
-    SIM/research-only STRICT quality gate for LONG entries.
-
-    This intentionally filters more aggressively than score mode.
-    It is not used by PROD. It is meant to answer:
-      "Do fewer, cleaner Weinstein breakouts improve risk-adjusted results?"
-    """
-    if not bool(rs_above_ma):
-        return False
-
-    if not (np.isfinite(vol_mult) and vol_mult >= 1.50):
-        return False
-
-    # ADX may be NaN early in history. If present, require at least a real trend.
-    if np.isfinite(adx_val) and adx_val < 20.0:
-        return False
-
-    if price <= 0 or ma_val <= 0 or pivot <= 0:
-        return False
-
-    dist_ma = (price / ma_val) - 1.0
-    if not (0.005 <= dist_ma <= 0.15):
-        return False
-
-    ext = (price / pivot) - 1.0
-    if not (0.0 <= ext <= 0.08):
-        return False
-
-    if np.isfinite(atr_val) and atr_val > 0:
-        atr_pct = atr_val / price
-        if atr_pct > 0.10:
-            return False
-
-    return True
-
-
-def _short_signal_quality_strict_ok(
-    row: pd.Series,
-    *,
-    price: float,
-    ma_val: float,
-    pivot_low: float,
-    vol_mult: float,
-    atr_val: float,
-    rs_above_ma: bool,
-) -> bool:
-    """
-    SIM/research-only STRICT quality gate for SHORT entries.
-
-    The goal is to avoid noisy/choppy shorts and keep only clean Stage 4
-    breakdowns with weak relative strength and sufficient volume.
-    """
-    if bool(rs_above_ma):
-        return False
-
-    if not (np.isfinite(vol_mult) and vol_mult >= 1.30):
-        return False
-
-    if price <= 0 or ma_val <= 0 or pivot_low <= 0:
-        return False
-
-    below = (ma_val / price) - 1.0
-    if not (0.005 <= below <= 0.20):
-        return False
-
-    breakdown = (pivot_low / price) - 1.0
-    if not (0.0 <= breakdown <= 0.10):
-        return False
-
-    if np.isfinite(atr_val) and atr_val > 0:
-        atr_pct = atr_val / price
-        if atr_pct > 0.12:
-            return False
-
-    return True
-
-
-# =========================
-# SHORT HELPERS
-# =========================
-
-def short_stop_level(price: float, atr: float, ma: float, *, stop_hard_pct: float, trail_atr: float, ma_guard: float) -> float:
-    cands = []
-    if price > 0 and stop_hard_pct > 0:
-        cands.append(price * (1.0 + stop_hard_pct))
-    if ma > 0 and ma_guard >= 0:
-        cands.append(ma * (1.0 + ma_guard))
-    if atr > 0 and trail_atr > 0:
-        cands.append(price + atr * trail_atr)
-
-    cands = [x for x in cands if np.isfinite(x) and x > price]
-    if not cands:
-        return np.nan
-    return float(min(cands))
-
-
-def should_exit_short(price: float, stop: float, ma: float) -> bool:
-    if np.isfinite(stop) and price >= stop:
-        return True
-    if np.isfinite(ma) and price >= ma:
-        return True
-    return False
-
-
-# =========================
-# BACKTEST DATA STRUCTURES
-# =========================
 
 @dataclass
 class Position:
     ticker: str
-    side: str            # "long" | "short"
-    qty: int
-    entry_price: float
-    stop: float
-    atr: float
+    side: str
     opened: pd.Timestamp
+    entry_price: float
+    qty: int
+    stop: float
+    atr: float = np.nan
+    entry_reason: str = ""
 
 
 @dataclass
 class Trade:
     ticker: str
     side: str
-    entry_date: pd.Timestamp
-    exit_date: pd.Timestamp
+    entry_date: str
+    exit_date: str
     entry_price: float
     exit_price: float
     qty: int
     pnl: float
     pnl_pct: float
+    entry_reason: str = ""
+    exit_reason: str = ""
 
 
+def _now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def _quality_score_multiplier(
-    score: float,
-    *,
-    reject_below: float = 60.0,
-    floor_mult: float = 0.40,
-    mid_mult: float = 0.65,
-    good_mult: float = 0.85,
-    elite_mult: float = 1.00,
-) -> float:
-    """
-    SIM/research-only adaptive quality sizing.
-
-    Unlike strict filtering, adaptive quality does not throw away every
-    non-elite setup. It scales risk and position value by quality score:
-      < reject_below => reject
-      60-69          => floor_mult
-      70-79          => mid_mult
-      80-89          => good_mult
-      90+            => elite_mult
-
-    This is intentionally kept out of PROD unless explicitly promoted later.
-    """
+def _safe_float(v, default=np.nan) -> float:
     try:
-        q = float(score)
+        f = float(v)
+        return f if np.isfinite(f) else default
     except Exception:
-        return 0.0
-    if not np.isfinite(q):
-        return 0.0
-    if q < float(reject_below):
-        return 0.0
-    if q >= 90.0:
-        return float(elite_mult)
-    if q >= 80.0:
-        return float(good_mult)
-    if q >= 70.0:
-        return float(mid_mult)
-    return float(floor_mult)
+        return default
 
-# =========================
-# BACKTEST ENGINE
-# =========================
 
-def backtest(
-    *,
-    daily_df: pd.DataFrame,
-    start: str,
-    end: str,
-    capital: float,
-    risk_per_trade: float,
-    max_long: int,
-    max_short: int,
-    mode: str,
-    universe_tickers: List[str],
-    weekly_df: Optional[pd.DataFrame],
-    weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]],
-    regime_table: Optional[pd.DataFrame],
-    long_logic_cfg: Mapping,
-    short_logic_cfg: Mapping,
-    market_cfg: Mapping,
-    industry_cfg: Mapping,
-    max_leverage: float = 1.0,
-    max_pos_frac: float = 0.25,
-    regime_mode: str = "current",
-    neutral_policy: str = "long",
-    exposure_mode: str = "off",
-    bull_long_mult: float = 1.0,
-    neutral_long_mult: float = 0.50,
-    bear_short_mult: float = 0.60,
-    neutral_short_mult: float = 0.0,
-    signal_quality_mode: str = "off",
-    min_long_quality: float = 65.0,
-    min_short_quality: float = 65.0,
-    adaptive_reject_below: float = 60.0,
-    adaptive_floor_mult: float = 0.40,
-    adaptive_mid_mult: float = 0.65,
-    adaptive_good_mult: float = 0.85,
-    adaptive_elite_mult: float = 1.00,
-):
-    industry_filter_cfg = IndustryFilterConfig(**(industry_cfg or {}))
+def _close_at(daily_df: pd.DataFrame, dt: pd.Timestamp, ticker: str) -> float:
+    try:
+        v = daily_df.loc[dt, ("Close", ticker)]
+        return _safe_float(v)
+    except Exception:
+        return np.nan
 
-    if weekly_df is not None and not weekly_df.empty:
-        weekly_df = enrich_with_industry_and_stats(weekly_df, cfg=industry_filter_cfg)
 
-    if weekly_snapshots:
-        weekly_snapshots = [
-            (d, enrich_with_industry_and_stats(df, cfg=industry_filter_cfg))
-            for d, df in weekly_snapshots
-        ]
+def _equity(daily_df: pd.DataFrame, dt: pd.Timestamp, cash: float, positions: Dict[str, Position]) -> float:
+    eq = float(cash)
+    for p in positions.values():
+        px = _close_at(daily_df, dt, p.ticker)
+        if not np.isfinite(px):
+            px = p.entry_price
+        if p.side == "long":
+            eq += float(p.qty) * px
+        else:
+            # short equity contribution: entry proceeds minus mark-to-cover liability
+            eq += float(p.qty) * (2.0 * p.entry_price - px)
+    return float(eq)
 
-    start_dt = pd.Timestamp(start)
-    end_dt = pd.Timestamp(end)
 
-    cash = float(capital)
-    positions: Dict[str, Position] = {}
-    trades: List[Trade] = []
+def _gross_exposure(daily_df: pd.DataFrame, dt: pd.Timestamp, positions: Dict[str, Position]) -> float:
+    gross = 0.0
+    for p in positions.values():
+        px = _close_at(daily_df, dt, p.ticker)
+        if not np.isfinite(px):
+            px = p.entry_price
+        gross += abs(float(p.qty) * px)
+    return float(gross)
 
-    equity_curve: List[Tuple[pd.Timestamp, float]] = []
-    last_progress_month: Optional[str] = None
 
-    # caches
-    close_cache: Dict[str, pd.Series] = {}
-    vol_cache: Dict[str, pd.Series] = {}
-    ma_cache: Dict[str, pd.Series] = {}         # MA30 (for longs)
-    ma150_cache: Dict[str, pd.Series] = {}      # MA150 proxy (for shorts + market context)
-    atr_series_cache: Dict[str, pd.Series] = {}
-    vol_mult_cache: Dict[str, pd.Series] = {}
-    adx_cache: Dict[str, pd.Series] = {}
-
-    for t in universe_tickers:
+def _build_indicator_caches(daily_df: pd.DataFrame, tickers: List[str]):
+    close_cache, ma30_cache, ma150_cache, atr_cache = {}, {}, {}, {}
+    for t in sorted(set(tickers)):
         close = get_panel(daily_df, "Close", t)
         high = get_panel(daily_df, "High", t)
         low = get_panel(daily_df, "Low", t)
-        vol = get_panel(daily_df, "Volume", t)
-        if close.empty or high.empty or low.empty or vol.empty:
+        if close.empty or high.empty or low.empty:
             continue
-
         close_cache[t] = close
-        vol_cache[t] = vol
-        ma_cache[t] = close.rolling(30, min_periods=30).mean()
+        ma30_cache[t] = close.rolling(30, min_periods=30).mean()
         ma150_cache[t] = close.rolling(150, min_periods=150).mean()
-        atr_series_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
-        try:
-            adx_cache[t] = compute_adx_series(pd.DataFrame({"High": high, "Low": low, "Close": close}), n=14)
-        except Exception:
-            adx_cache[t] = pd.Series(index=close.index, dtype="float64")
+        atr_cache[t] = compute_atr_series_from_ohlc(high, low, close, n=14)
+    return close_cache, ma30_cache, ma150_cache, atr_cache
 
-        v50 = vol.rolling(50, min_periods=50).mean()
-        vol_mult_cache[t] = vol / v50
 
-    _ = LongEntryParams(
-        min_break_pct=float(long_logic_cfg.get("break_pct", 0.004)),
-        dist_above_ma_min=0.0,
-        vol_min=float(long_logic_cfg.get("vol_min", 1.3)),
-        adx_min=float(long_logic_cfg.get("adx_min", ADX_MIN)),
-    )
+def _load_universe(snapshot_mode: str):
+    weekly_df = None
+    weekly_snapshots = None
+    all_tickers = set()
 
-    sh_stop_hard = float(short_logic_cfg.get("stop_hard", short_logic_cfg.get("stop_hard_pct", 0.20)))
-    sh_trail_atr = float(short_logic_cfg.get("trail_atr", 2.0))
-    sh_ma_guard = float(short_logic_cfg.get("ma_guard", 0.03))
-
-    # Short entry gates (wired)
-    sh_break_pct = float(short_logic_cfg.get("break_pct", 0.006))
-    sh_vol_min = float(short_logic_cfg.get("vol_min", 1.10))
-    sh_pivot_lb = int(short_logic_cfg.get("pivot_lookback_days", short_logic_cfg.get("pivot_lookback", 50)))
-    if sh_pivot_lb < 10:
-        sh_pivot_lb = 50
-
-    all_dates = list(pd.to_datetime(daily_df.index))
-
-    # Diagnostics for why shorts don’t fire (month-to-date)
-    short_diag = {
-        "stage4": 0,
-        "short_slope_fail": 0,
-        "failed_rally_fail": 0,
-        "industry_fail": 0,
-        "no_bars": 0,
-        "pivot_window_too_small": 0,
-        "px_not_below_ma": 0,
-        "no_breakdown": 0,
-        "vol_too_low": 0,
-        "rs_too_strong": 0,
-        "sized_zero": 0,
-        "entered": 0,
-        "quality_fail": 0,
-    }
-
-    for dt in all_dates:
-        if dt < start_dt or dt > end_dt:
-            continue
-
-        snap = pick_snapshot_for_date(weekly_snapshots, dt) if weekly_snapshots else None
-        universe = snap[1] if snap else (weekly_snapshots[0][1] if weekly_snapshots else weekly_df)
-        if universe is None or universe.empty:
-            continue
-
-        # TRAIL STOPS
-        for key, pos in list(positions.items()):
-            t = pos.ticker
-            if ("Close", t) not in daily_df.columns:
-                continue
-            if t not in ma_cache or t not in atr_series_cache:
-                continue
-            if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
-                continue
-
-            px = daily_df.loc[dt, ("Close", t)]
-            ma = ma_cache[t].loc[dt]  # MA30 used for stop mechanics (consistent w/ prior logic)
-            atr = atr_series_cache[t].loc[dt]
-            if pd.isna(px) or pd.isna(ma) or pd.isna(atr):
-                continue
-
-            px_f = float(px)
-            ma_f = float(ma)
-            atr_f = float(atr)
-
-            if pos.side == "long":
-                new_stop = long_stop_level(px_f, atr_f, ma_f)
-                if np.isfinite(new_stop):
-                    pos.stop = float(max(pos.stop, new_stop))
-                pos.atr = atr_f
-            else:
-                new_stop = core_short_stop_level(
-                    px_f, atr_f, ma_f,
-                    stop_hard_pct=sh_stop_hard,
-                    trail_atr=sh_trail_atr,
-                    ma_guard=sh_ma_guard,
-                )
-                if np.isfinite(new_stop):
-                    pos.stop = float(min(pos.stop, new_stop))
-                pos.atr = atr_f
-
-            positions[key] = pos
-
-        # EXITS
-        to_close: List[str] = []
-        for key, pos in positions.items():
-            t = pos.ticker
-            if (("Close", t) not in daily_df.columns) or (t not in ma_cache):
-                continue
-            if dt not in ma_cache[t].index:
-                continue
-
-            price = daily_df.loc[dt, ("Close", t)]
-            if pd.isna(price):
-                continue
-
-            px_f = float(price)
-
-            if pos.side == "long":
-                ma_val = ma_cache[t].loc[dt]
-                ma_f = float(ma_val) if pd.notna(ma_val) else np.nan
-
-                if should_exit_long(px_f, float(pos.stop), ma_f):
-                    exit_price = px_f
-                    proceeds = float(pos.qty) * exit_price
-                    entry_cost = float(pos.qty) * float(pos.entry_price)
-
-                    pnl = proceeds - entry_cost
-                    pnl_pct = pnl / entry_cost if entry_cost > 0 else 0.0
-
-                    cash += proceeds
-
-                    trades.append(
-                        Trade(
-                            ticker=t,
-                            side="long",
-                            entry_date=pos.opened,
-                            exit_date=dt,
-                            entry_price=pos.entry_price,
-                            exit_price=exit_price,
-                            qty=pos.qty,
-                            pnl=pnl,
-                            pnl_pct=pnl_pct,
-                        )
-                    )
-                    to_close.append(key)
-            else:
-                # ✅ SHORT exits: use MA150 if available, else fallback to MA30
-                ma_exit = np.nan
-                if t in ma150_cache and dt in ma150_cache[t].index:
-                    ma_exit = ma150_cache[t].loc[dt]
-                if pd.isna(ma_exit):
-                    ma_exit = ma_cache[t].loc[dt]
-
-                ma_f = float(ma_exit) if pd.notna(ma_exit) else np.nan
-
-                if core_should_exit_short(px_f, float(pos.stop), ma_f, ma_guard=sh_ma_guard):
-                    cover_price = px_f
-                    cover_cost = float(pos.qty) * cover_price
-                    entry_proceeds = float(pos.qty) * float(pos.entry_price)
-
-                    pnl = entry_proceeds - cover_cost
-                    pnl_pct = pnl / entry_proceeds if entry_proceeds > 1e-12 else 0.0
-
-                    cash -= cover_cost
-
-                    trades.append(
-                        Trade(
-                            ticker=t,
-                            side="short",
-                            entry_date=pos.opened,
-                            exit_date=dt,
-                            entry_price=pos.entry_price,
-                            exit_price=cover_price,
-                            qty=pos.qty,
-                            pnl=pnl,
-                            pnl_pct=pnl_pct,
-                        )
-                    )
-                    to_close.append(key)
-
-        for key in to_close:
-            del positions[key]
-
-        # ENTRIES
-        eq_now = _equity(daily_df, dt, cash, positions)
-
-        allow_new_longs, allow_new_shorts, regime_label = _regime_permissions(
-            daily_df,
-            dt,
-            market_cfg,
-            regime_mode=regime_mode,
-            neutral_policy=neutral_policy,
-        )
-
-        long_size_mult, short_size_mult = _regime_exposure_multipliers(
-            regime_label,
-            regime_mode=regime_mode,
-            exposure_mode=exposure_mode,
-            bull_long_mult=bull_long_mult,
-            neutral_long_mult=neutral_long_mult,
-            bear_short_mult=bear_short_mult,
-            neutral_short_mult=neutral_short_mult,
-        )
-
-        if long_size_mult <= 0:
-            allow_new_longs = False
-        if short_size_mult <= 0:
-            allow_new_shorts = False
-
-        gross_expo = _gross_exposure(daily_df, dt, positions)
-        buying_power = max(0.0, float(max_leverage) * eq_now - gross_expo)
-
-        do_longs = mode in ("long", "both", "auto")
-        do_shorts = mode in ("short", "both", "auto")
-
-        n_long_now = sum(1 for p in positions.values() if p.side == "long")
-        n_short_now = sum(1 for p in positions.values() if p.side == "short")
-
-        # LONG ENTRIES
-        if do_longs and allow_new_longs and n_long_now < max_long and buying_power > 0:
-            for _, row in universe.iterrows():
-                if n_long_now >= max_long:
-                    break
-                t = str(row.get("ticker", "")).upper().strip()
-                if not t:
-                    continue
-                pos_key = f"{t}_long"
-                if pos_key in positions:
-                    continue
-
-                if not _is_stage2(row):
-                    continue
-
-                if not stock_ma30_slope_ok_from_snapshot(row, long_logic_cfg):
-                    continue
-
-                if not industry_ok_from_row(row, cfg=industry_filter_cfg):
-                    continue
-
-                if ("Close", t) not in daily_df.columns:
-                    continue
-                if t not in ma_cache or t not in atr_series_cache:
-                    continue
-                if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index:
-                    continue
-
-                price = daily_df.loc[dt, ("Close", t)]
-                ma_val = ma_cache[t].loc[dt]
-                atr_val = atr_series_cache[t].loc[dt]
-                if pd.isna(price) or pd.isna(ma_val) or pd.isna(atr_val):
-                    continue
-
-                price_f = float(price)
-                ma_f = float(ma_val)
-                atr_f = float(atr_val)
-
-                # Shared LONG CORE gate: SIM and PROD use the same breakout/volume/ADX logic.
-                cs = close_cache.get(t, pd.Series(dtype="float64"))
-                prior = cs.loc[:dt] if not cs.empty else pd.Series(dtype="float64")
-                pivot_lb = int(long_logic_cfg.get("pivot_lookback_days", long_logic_cfg.get("pivot_lookback", 60)))
-                if len(prior) < (pivot_lb + 1):
-                    continue
-                pivot = float(prior.iloc[:-1].tail(pivot_lb).max())
-
-                vm = vol_mult_cache.get(t, pd.Series(dtype="float64"))
-                vol_mult = float(vm.loc[dt]) if dt in vm.index and pd.notna(vm.loc[dt]) else np.nan
-
-                adx_s = adx_cache.get(t, pd.Series(dtype="float64"))
-                adx_val = float(adx_s.loc[dt]) if dt in adx_s.index and pd.notna(adx_s.loc[dt]) else np.nan
-
-                rs_above = _get_snapshot_rs_above_ma(row)
-                if rs_above is None:
-                    rs_above = bool(long_logic_cfg.get("default_rs_above_ma", True))
-
-                core_params = LongEntryParams(
-                    min_break_pct=float(long_logic_cfg.get("break_pct", long_logic_cfg.get("min_break_pct", 0.004))),
-                    dist_above_ma_min=float(long_logic_cfg.get("dist_above_ma_min", 0.0)),
-                    vol_min=float(long_logic_cfg.get("vol_min", long_logic_cfg.get("vol_pace_min", 1.3))),
-                    adx_min=float(long_logic_cfg.get("adx_min_long", long_logic_cfg.get("adx_min", ADX_MIN))),
-                )
-                core_entry = check_long_entry(
-                    price=price_f,
-                    ma_val=ma_f,
-                    pivot=pivot,
-                    rs_above_ma=bool(rs_above),
-                    vol_mult=vol_mult,
-                    adx_val=adx_val,
-                    params=core_params,
-                )
-                if not core_entry.can_enter:
-                    continue
-
-                quality_mode = str(signal_quality_mode or "off").strip().lower()
-                quality_size_mult = 1.0
-                if quality_mode in ("score", "strict", "adaptive"):
-                    q_score = _long_signal_quality_score(
-                        row,
-                        price=price_f,
-                        ma_val=ma_f,
-                        pivot=pivot,
-                        vol_mult=vol_mult,
-                        adx_val=adx_val,
-                        atr_val=atr_f,
-                        rs_above_ma=bool(rs_above),
-                    )
-                    if quality_mode == "adaptive":
-                        quality_size_mult = _quality_score_multiplier(
-                            q_score,
-                            reject_below=adaptive_reject_below,
-                            floor_mult=adaptive_floor_mult,
-                            mid_mult=adaptive_mid_mult,
-                            good_mult=adaptive_good_mult,
-                            elite_mult=adaptive_elite_mult,
-                        )
-                        if quality_size_mult <= 0:
-                            continue
-                    else:
-                        if q_score < float(min_long_quality):
-                            continue
-                        if quality_mode == "strict" and not _long_signal_quality_strict_ok(
-                            row,
-                            price=price_f,
-                            ma_val=ma_f,
-                            pivot=pivot,
-                            vol_mult=vol_mult,
-                            adx_val=adx_val,
-                            atr_val=atr_f,
-                            rs_above_ma=bool(rs_above),
-                        ):
-                            continue
-
-                stop = long_stop_level(price_f, atr_f, ma_f)
-                if np.isnan(stop) or stop >= price_f:
-                    continue
-
-                per_share_risk = price_f - float(stop)
-                if per_share_risk <= 0:
-                    continue
-
-                risk_amt = float(eq_now) * float(risk_per_trade) * float(long_size_mult) * float(quality_size_mult)
-                qty_risk = int(math.floor(risk_amt / per_share_risk))
-                if qty_risk <= 0:
-                    continue
-
-                max_pos_value = float(max_pos_frac) * float(eq_now) * float(long_size_mult) * float(quality_size_mult)
-                qty_cap_pos = int(math.floor(max_pos_value / price_f)) if price_f > 0 else 0
-                qty_cap_bp = int(math.floor(buying_power / price_f)) if price_f > 0 else 0
-
-                qty = max(0, min(qty_risk, qty_cap_pos, qty_cap_bp))
-                if qty <= 0:
-                    continue
-
-                cost = float(qty) * price_f
-                if cost <= 0 or cost > buying_power + 1e-9:
-                    continue
-
-                cash -= cost
-                buying_power -= cost
-
-                positions[pos_key] = Position(
-                    ticker=t,
-                    side="long",
-                    qty=qty,
-                    entry_price=price_f,
-                    stop=float(stop),
-                    atr=atr_f,
-                    opened=pd.Timestamp(dt),
-                )
-                n_long_now += 1
-
-        # SHORT ENTRIES (pivot + vol_min + weak RS + optional failed rally)
-        if do_shorts and allow_new_shorts and n_short_now < max_short and buying_power > 0:
-            for _, row in universe.iterrows():
-                if n_short_now >= max_short:
-                    break
-                t = str(row.get("ticker", "")).upper().strip()
-                if not t:
-                    continue
-                pos_key = f"{t}_short"
-                if pos_key in positions:
-                    continue
-
-                if not _is_stage4(row):
-                    continue
-                short_diag["stage4"] += 1
-
-                if not short_slope_ok_from_snapshot(row, short_logic_cfg):
-                    short_diag["short_slope_fail"] += 1
-                    continue
-
-                if not industry_ok_from_row(row, cfg=industry_filter_cfg):
-                    short_diag["industry_fail"] += 1
-                    continue
-
-                if ("Close", t) not in daily_df.columns:
-                    short_diag["no_bars"] += 1
-                    continue
-                if t not in ma_cache or t not in atr_series_cache or t not in close_cache or t not in vol_cache or t not in vol_mult_cache:
-                    short_diag["no_bars"] += 1
-                    continue
-                if dt not in ma_cache[t].index or dt not in atr_series_cache[t].index or dt not in close_cache[t].index:
-                    short_diag["no_bars"] += 1
-                    continue
-
-                if not short_failed_rally_ok(close_cache[t], dt, short_logic_cfg, ticker=t):
-                    short_diag["failed_rally_fail"] += 1
-                    continue
-
-                price = daily_df.loc[dt, ("Close", t)]
-                ma_val = ma_cache[t].loc[dt]
-                atr_val = atr_series_cache[t].loc[dt]
-                if pd.isna(price) or pd.isna(ma_val) or pd.isna(atr_val):
-                    short_diag["no_bars"] += 1
-                    continue
-
-                price_f = float(price)
-                ma_f = float(ma_val)
-                atr_f = float(atr_val)
-
-                # ✅ FIX: pivot_low must be from PRIOR closes only (exclude today)
-                cs = close_cache[t]
-                prior = cs.loc[:dt]
-                if len(prior) < (sh_pivot_lb + 1):
-                    short_diag["pivot_window_too_small"] += 1
-                    continue
-                prior_tail = prior.iloc[:-1].tail(sh_pivot_lb)  # exclude current day
-                if len(prior_tail) < sh_pivot_lb:
-                    short_diag["pivot_window_too_small"] += 1
-                    continue
-                pivot_low = float(prior_tail.min())
-
-                vm = vol_mult_cache[t]
-                if dt not in vm.index or pd.isna(vm.loc[dt]):
-                    short_diag["no_bars"] += 1
-                    continue
-                vol_mult = float(vm.loc[dt])
-
-                rs_above_ma = _get_snapshot_rs_above_ma(row)
-                if rs_above_ma is None:
-                    rs_above_ma = False
-
-                res = check_short_entry(
-                    price=price_f,
-                    ma_val=ma_f,
-                    pivot_low=pivot_low,
-                    rs_above_ma=bool(rs_above_ma),
-                    vol_mult=vol_mult,
-                    params=ShortEntryParams(min_break_pct=sh_break_pct, vol_min=sh_vol_min),
-                )
-
-                if not res.can_enter:
-                    if res.reason == "price_not_below_ma":
-                        short_diag["px_not_below_ma"] += 1
-                    elif res.reason == "no_breakdown_vs_pivot":
-                        short_diag["no_breakdown"] += 1
-                    elif res.reason == "volume_too_low":
-                        short_diag["vol_too_low"] += 1
-                    elif res.reason == "rs_too_strong_for_short":
-                        short_diag["rs_too_strong"] += 1
-                    else:
-                        short_diag["no_bars"] += 1
-                    continue
-
-                quality_mode = str(signal_quality_mode or "off").strip().lower()
-                quality_size_mult = 1.0
-                if quality_mode in ("score", "strict", "adaptive"):
-                    q_score = _short_signal_quality_score(
-                        row,
-                        price=price_f,
-                        ma_val=ma_f,
-                        pivot_low=pivot_low,
-                        vol_mult=vol_mult,
-                        atr_val=atr_f,
-                        rs_above_ma=bool(rs_above_ma),
-                    )
-                    if quality_mode == "adaptive":
-                        quality_size_mult = _quality_score_multiplier(
-                            q_score,
-                            reject_below=adaptive_reject_below,
-                            floor_mult=adaptive_floor_mult,
-                            mid_mult=adaptive_mid_mult,
-                            good_mult=adaptive_good_mult,
-                            elite_mult=adaptive_elite_mult,
-                        )
-                        if quality_size_mult <= 0:
-                            short_diag["quality_fail"] += 1
-                            continue
-                    else:
-                        if q_score < float(min_short_quality):
-                            short_diag["quality_fail"] += 1
-                            continue
-                        if quality_mode == "strict" and not _short_signal_quality_strict_ok(
-                            row,
-                            price=price_f,
-                            ma_val=ma_f,
-                            pivot_low=pivot_low,
-                            vol_mult=vol_mult,
-                            atr_val=atr_f,
-                            rs_above_ma=bool(rs_above_ma),
-                        ):
-                            short_diag["quality_fail"] += 1
-                            continue
-
-                stop = core_short_stop_level(
-                    price_f, atr_f, ma_f,
-                    stop_hard_pct=sh_stop_hard,
-                    trail_atr=sh_trail_atr,
-                    ma_guard=sh_ma_guard,
-                )
-                if np.isnan(stop) or stop <= price_f:
-                    short_diag["px_not_below_ma"] += 1
-                    continue
-
-                per_share_risk = float(stop) - price_f
-                if per_share_risk <= 0:
-                    short_diag["px_not_below_ma"] += 1
-                    continue
-
-                risk_amt = float(eq_now) * float(risk_per_trade) * float(short_size_mult) * float(quality_size_mult)
-                qty_risk = int(math.floor(risk_amt / per_share_risk))
-                if qty_risk <= 0:
-                    short_diag["sized_zero"] += 1
-                    continue
-
-                max_pos_value = float(max_pos_frac) * float(eq_now) * float(short_size_mult) * float(quality_size_mult)
-                qty_cap_pos = int(math.floor(max_pos_value / price_f)) if price_f > 0 else 0
-                qty_cap_bp = int(math.floor(buying_power / price_f)) if price_f > 0 else 0
-
-                qty = max(0, min(qty_risk, qty_cap_pos, qty_cap_bp))
-                if qty <= 0:
-                    short_diag["sized_zero"] += 1
-                    continue
-
-                proceeds = float(qty) * price_f
-                if proceeds <= 0 or proceeds > buying_power + 1e-9:
-                    short_diag["sized_zero"] += 1
-                    continue
-
-                cash += proceeds
-                buying_power -= proceeds
-
-                positions[pos_key] = Position(
-                    ticker=t,
-                    side="short",
-                    qty=qty,
-                    entry_price=price_f,
-                    stop=float(stop),
-                    atr=atr_f,
-                    opened=pd.Timestamp(dt),
-                )
-                n_short_now += 1
-                short_diag["entered"] += 1
-
-        eq = _equity(daily_df, dt, cash, positions)
-        equity_curve.append((dt, eq))
-
-        month_key = dt.strftime("%Y-%m")
-        if last_progress_month is None:
-            last_progress_month = month_key
-        if month_key != last_progress_month:
-            last_progress_month = month_key
-            log(
-                f"Progress: {dt.date()} — equity ${eq:,.2f}, positions: {len(positions)} "
-                f"(L={n_long_now}, S={n_short_now}), trades so far: {len(trades)}",
-                level="debug",
-            )
-
-            if mode in ("short", "both", "auto"):
-                log(
-                    "Short diag (month-to-date): "
-                    f"stage4={short_diag['stage4']} "
-                    f"slope_fail={short_diag['short_slope_fail']} "
-                    f"failed_rally_fail={short_diag['failed_rally_fail']} "
-                    f"industry_fail={short_diag['industry_fail']} "
-                    f"no_bars={short_diag['no_bars']} "
-                    f"pivot_small={short_diag['pivot_window_too_small']} "
-                    f"px_not_below_ma={short_diag['px_not_below_ma']} "
-                    f"no_breakdown={short_diag['no_breakdown']} "
-                    f"vol_low={short_diag['vol_too_low']} "
-                    f"rs_strong={short_diag['rs_too_strong']} "
-                    f"sized0={short_diag['sized_zero']} "
-                    f"entered={short_diag['entered']}",
-                    level="debug",
-                )
-                for k in list(short_diag.keys()):
-                    short_diag[k] = 0
-
-    final_eq = float(equity_curve[-1][1]) if equity_curve else _equity(daily_df, end_dt, cash, positions)
-
-    return {
-        "positions": positions,
-        "trades": trades,
-        "final_equity": final_eq,
-        "equity_curve": equity_curve,
-        "cash": cash,
-    }
-
-
-# =========================
-# CLI
-# =========================
-
-def main():
-    global VERBOSE
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--start", type=str, required=True, help="YYYY-MM-DD")
-    ap.add_argument("--end", type=str, required=True, help="YYYY-MM-DD")
-    ap.add_argument("--mode", type=str, default="auto", choices=["long", "short", "both", "auto", "none"])
-    ap.add_argument("--capital", type=float, default=10000.0)
-    ap.add_argument("--risk-per-trade", type=float, default=0.01)
-    ap.add_argument("--max-long", type=int, default=10)
-    ap.add_argument("--max-short", type=int, default=6)
-    ap.add_argument("--snapshot-mode", type=str, choices=["static", "historical", "auto"], default="auto")
-    ap.add_argument("--config", type=str, default="./config.yaml")
-    ap.add_argument("--quiet", action="store_true")
-    ap.add_argument(
-        "--regime-mode",
-        type=str,
-        default="current",
-        choices=["off", "current", "prod"],
-        help=(
-            "Broad market regime behavior: off=ignore market gates, "
-            "current=existing config gates, prod=true Weinstein switch "
-            "(BULL longs-only, BEAR shorts-only)."
-        ),
-    )
-    ap.add_argument(
-        "--neutral-policy",
-        type=str,
-        default="long",
-        choices=["long", "none", "both", "current"],
-        help="For --regime-mode prod: how to handle NEUTRAL/UNKNOWN market regimes.",
-    )
-    ap.add_argument(
-        "--exposure-mode",
-        type=str,
-        default="off",
-        choices=["off", "scaled"],
-        help="SIM research exposure scaling. scaled only applies with --regime-mode prod.",
-    )
-    ap.add_argument("--bull-long-mult", type=float, default=1.0, help="Scaled exposure: long size multiplier in BULL regime.")
-    ap.add_argument("--neutral-long-mult", type=float, default=0.50, help="Scaled exposure: long size multiplier in NEUTRAL/UNKNOWN regime.")
-    ap.add_argument("--bear-short-mult", type=float, default=0.60, help="Scaled exposure: short size multiplier in BEAR regime.")
-    ap.add_argument("--neutral-short-mult", type=float, default=0.0, help="Scaled exposure: short size multiplier in NEUTRAL/UNKNOWN regime.")
-    ap.add_argument(
-        "--signal-quality-mode",
-        type=str,
-        default="off",
-        choices=["off", "score", "strict", "adaptive"],
-        help="SIM research signal-quality filter. score=threshold; strict=threshold plus hard gates; adaptive=scales size by score.",
-    )
-    ap.add_argument("--min-long-quality", type=float, default=65.0, help="Minimum long quality score when --signal-quality-mode=score.")
-    ap.add_argument("--min-short-quality", type=float, default=65.0, help="Minimum short quality score when --signal-quality-mode=score.")
-    ap.add_argument("--adaptive-reject-below", type=float, default=60.0, help="Adaptive quality: reject trades below this score.")
-    ap.add_argument("--adaptive-floor-mult", type=float, default=0.40, help="Adaptive quality: size multiplier for 60-69 quality.")
-    ap.add_argument("--adaptive-mid-mult", type=float, default=0.65, help="Adaptive quality: size multiplier for 70-79 quality.")
-    ap.add_argument("--adaptive-good-mult", type=float, default=0.85, help="Adaptive quality: size multiplier for 80-89 quality.")
-    ap.add_argument("--adaptive-elite-mult", type=float, default=1.00, help="Adaptive quality: size multiplier for 90+ quality.")
-
-    ap.add_argument("--max-leverage", type=float, default=1.0)
-    ap.add_argument("--max-pos-frac", type=float, default=0.25)
-
-    # Refactor Phase 1: PROD-like signal replay mode.
-    # This uses the shared replay core and bypasses portfolio accounting, cash,
-    # sizing, P/L, and open-position carry.  It answers: "what would PROD
-    # have recommended?" rather than "what did a simulated portfolio earn?"
-    ap.add_argument("--signal-replay-only", action="store_true", help="Output PROD-like BUY/NEAR/SELL replay events without portfolio simulation.")
-    ap.add_argument("--include-near", action="store_true", help="Include NEAR watchlist events in --signal-replay-only output.")
-    ap.add_argument("--include-raw-sell", action="store_true", help="Include raw MA150 SELL risk events in --signal-replay-only output.")
-    ap.add_argument("--near-zone-pct", type=float, default=0.01, help="NEAR zone below pivot for signal replay, e.g. 0.01 = within 1%.")
-    ap.add_argument("--sell-crack-pct", type=float, default=0.005, help="SELL crack below MA150 for signal replay, e.g. 0.005 = 0.5%.")
-
-    args = ap.parse_args()
-    VERBOSE = not args.quiet
-
-    cfg = load_yaml_config(args.config)
-    bt_cfg = cfg.get("backtest", {}) or {}
-
-    bt_long_cfg = build_sim_long_config(cfg)
-    bt_short_cfg = bt_cfg.get("short", {}) or {}
-    market_cfg = bt_cfg.get("market", {}) or {}
-    industry_cfg = bt_cfg.get("industry", {}) or {}
-    regime_cfg = bt_cfg.get("regime", {}) or {}
-
-    log(
-        f"Industry filters enabled={industry_cfg.get('enabled', False)} "
-        f"min_stage2_frac={industry_cfg.get('min_stage2_frac', 'n/a')}",
-        level="info",
-    )
-    log(
-        f"Mode={args.mode} | market: rise_ma30={market_cfg.get('require_rising_ma30', False)} "
-        f"fall_ma30={market_cfg.get('require_falling_ma30', False)}",
-        level="info",
-    )
-    log(
-        f"Regime mode: {args.regime_mode} | neutral_policy={args.neutral_policy}",
-        level="info",
-    )
-    log(
-        f"Exposure mode: {args.exposure_mode} | bull_long={args.bull_long_mult:.2f} "
-        f"neutral_long={args.neutral_long_mult:.2f} bear_short={args.bear_short_mult:.2f} "
-        f"neutral_short={args.neutral_short_mult:.2f}",
-        level="info",
-    )
-    log(
-        f"Signal quality mode: {args.signal_quality_mode} | "
-        f"min_long={args.min_long_quality:.1f} min_short={args.min_short_quality:.1f}",
-        level="info",
-    )
-    log(
-        "Long cfg: "
-        f"break_pct={bt_long_cfg.get('break_pct', 'n/a')} "
-        f"vol_min={bt_long_cfg.get('vol_min', 'n/a')} "
-        f"adx_min_long={bt_long_cfg.get('adx_min_long', bt_long_cfg.get('adx_min', 'n/a'))} "
-        f"dist_above_ma_min={bt_long_cfg.get('dist_above_ma_min', 'n/a')} "
-        f"pivot_lb={bt_long_cfg.get('pivot_lookback_days', bt_long_cfg.get('pivot_lookback', 'n/a'))}",
-        level="info",
-    )
-    log(
-        f"Backtest regime toggles: use_long={regime_cfg.get('use_long', True)} "
-        f"use_short={regime_cfg.get('use_short', True)}",
-        level="info",
-    )
-
-    if args.mode in ("short", "both", "auto"):
-        log(
-            f"Short cfg: require_failed_rally={bt_short_cfg.get('require_failed_rally', False)} "
-            f"lookback={bt_short_cfg.get('failed_rally_lookback', 'n/a')} "
-            f"pct={bt_short_cfg.get('failed_rally_pct', 'n/a')}",
-            level="info",
-        )
-        log(
-            f"Short entry gates: break_pct={bt_short_cfg.get('break_pct', 'n/a')} "
-            f"vol_min={bt_short_cfg.get('vol_min', 'n/a')} "
-            f"pivot_lb={bt_short_cfg.get('pivot_lookback_days', bt_short_cfg.get('pivot_lookback', 50))}",
-            level="info",
-        )
-        log(
-            f"Short market gate: short_gate_mode={market_cfg.get('short_gate_mode', 'both')}",
-            level="info",
-        )
-
-    weekly_df: Optional[pd.DataFrame] = None
-    weekly_snapshots: Optional[List[Tuple[date, pd.DataFrame]]] = None
-    all_tickers: set[str] = set()
-
-    if args.snapshot_mode == "historical":
+    if snapshot_mode == "historical":
         weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
         if not weekly_snapshots:
             raise SystemExit("snapshot_mode=historical but no snapshots found.")
         for _, df in weekly_snapshots:
             if "ticker" in df.columns:
                 all_tickers.update(df["ticker"].astype(str).str.upper())
-
-    elif args.snapshot_mode == "auto":
-        tmp = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
-        if tmp:
-            weekly_snapshots = tmp
+    elif snapshot_mode == "auto":
+        weekly_snapshots = load_weekly_snapshots(WEEKLY_SNAPSHOT_DIR)
+        if weekly_snapshots:
             for _, df in weekly_snapshots:
                 if "ticker" in df.columns:
                     all_tickers.update(df["ticker"].astype(str).str.upper())
@@ -2276,258 +161,294 @@ def main():
             weekly_df = load_weekly_report()
             all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
             log(f"[auto] No snapshots; using latest weekly (tickers={len(all_tickers)}).", level="info")
-
     else:
         weekly_df = load_weekly_report()
         all_tickers.update(weekly_df["ticker"].astype(str).str.upper())
         log(f"snapshot_mode=static: tickers={len(all_tickers)}.", level="info")
 
+    all_tickers = {t for t in all_tickers if t and t not in {"NAN", "NONE"}}
     if not all_tickers:
         raise SystemExit("No tickers found in weekly universe.")
+    return weekly_df, weekly_snapshots, all_tickers
 
-    if (
-        bool(market_cfg.get("require_rising_ma30", False))
-        or bool(market_cfg.get("require_falling_ma30", False))
-        or str(args.regime_mode).strip().lower() == "prod"
-    ):
-        all_tickers.add("SPY")
+
+def run_replay_portfolio(args) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    cfg = load_yaml_config(args.config)
+    bt_cfg = cfg.get("backtest", {}) or {}
+    bt_long_cfg = build_sim_long_config(cfg)
+    bt_short_cfg = bt_cfg.get("short", {}) or {}
+    market_cfg = bt_cfg.get("market", {}) or {}
+    industry_cfg = bt_cfg.get("industry", {}) or {}
+
+    weekly_df, weekly_snapshots, all_tickers = _load_universe(args.snapshot_mode)
+    # Regime support tickers
+    all_tickers.add("SPY")
     if market_cfg.get("vix_max", None) is not None:
         all_tickers.add("^VIX")
 
-    # Phase 3: holdings-aware replay SELL scope.  Add owned tickers before
-    # download so PROD-like replay can evaluate SELL risk for names outside the
-    # weekly BUY universe, matching the live intraday watcher behavior.
-    replay_sell_scope = str(getattr(args, "sell_scope", "none") or "none").strip().lower()
-    if bool(getattr(args, "include_raw_sell", False)) and replay_sell_scope == "none":
-        replay_sell_scope = "universe"
-    replay_holdings_tickers = []
-    replay_holdings_source = "not requested"
-    if bool(getattr(args, "signal_replay_only", False)) and replay_sell_scope == "holdings":
-        try:
-            from weinstein_intraday_watcher import load_portfolio_holdings
-            holdings_df, replay_holdings_source = load_portfolio_holdings(cfg, OUTPUT_DIR)
-            if holdings_df is not None and not holdings_df.empty and "Ticker" in holdings_df.columns:
-                replay_holdings_tickers = sorted({
-                    str(x).upper().strip()
-                    for x in holdings_df["Ticker"].dropna().tolist()
-                    if str(x).strip()
-                })
-                all_tickers.update(replay_holdings_tickers)
-                log(
-                    f"Signal replay SELL scope=holdings: loaded {len(replay_holdings_tickers)} owned tickers from {replay_holdings_source}.",
-                    level="info",
-                )
-            else:
-                log(f"Signal replay SELL scope=holdings: no holdings loaded ({replay_holdings_source}).", level="warn")
-        except Exception as e:
-            log(f"Signal replay SELL scope=holdings: failed to load holdings: {e}", level="warn")
-
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
-    regime_table = None
-
-    if args.signal_replay_only:
-        from weinstein_signal_replay_core import replay_signals, replay_summary
-        tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        events_df = replay_signals(
-            daily_df=daily_df,
-            start=args.start,
-            end=args.end,
-            mode=args.mode,
-            universe_tickers=sorted(all_tickers),
-            weekly_df=weekly_df,
-            weekly_snapshots=weekly_snapshots,
-            long_logic_cfg=bt_long_cfg,
-            short_logic_cfg=bt_short_cfg,
-            market_cfg=market_cfg,
-            industry_cfg=industry_cfg,
-            regime_mode=args.regime_mode,
-            neutral_policy=args.neutral_policy,
-            exposure_mode=args.exposure_mode,
-            bull_long_mult=float(args.bull_long_mult),
-            neutral_long_mult=float(args.neutral_long_mult),
-            bear_short_mult=float(args.bear_short_mult),
-            neutral_short_mult=float(args.neutral_short_mult),
-            signal_quality_mode=args.signal_quality_mode,
-            min_long_quality=float(args.min_long_quality),
-            min_short_quality=float(args.min_short_quality),
-            adaptive_reject_below=float(args.adaptive_reject_below),
-            adaptive_floor_mult=float(args.adaptive_floor_mult),
-            adaptive_mid_mult=float(args.adaptive_mid_mult),
-            adaptive_good_mult=float(args.adaptive_good_mult),
-            adaptive_elite_mult=float(args.adaptive_elite_mult),
-            include_near=bool(args.include_near),
-            include_raw_sell=(replay_sell_scope != "none"),
-            sell_scope=replay_sell_scope,
-            sell_tickers=replay_holdings_tickers,
-            near_zone_pct=float(args.near_zone_pct),
-            sell_crack_pct=float(args.sell_crack_pct),
-        )
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        out_path = os.path.join(OUTPUT_DIR, f"prod_signal_replay_{tag}.csv")
-        sum_path = os.path.join(OUTPUT_DIR, f"prod_signal_replay_summary_{tag}.csv")
-        events_df.to_csv(out_path, index=False)
-        replay_summary(events_df).to_csv(sum_path, index=False)
-        log(f"Signal replay complete. Events={len(events_df)}", level="ok")
-        log(f"Wrote signal replay CSV → {out_path}", level="ok")
-        log(f"Wrote signal replay summary → {sum_path}", level="ok")
-        if not events_df.empty:
-            counts = events_df["signal"].value_counts().to_dict()
-            log(f"Signal counts: {counts}", level="info")
-        return
-
-    result = backtest(
+    # IMPORTANT: include raw SELL risk events in the signal stream, but the
+    # portfolio wrapper only acts on SELL for tickers it actually holds.
+    events = replay_signals(
         daily_df=daily_df,
         start=args.start,
         end=args.end,
-        capital=args.capital,
-        risk_per_trade=args.risk_per_trade,
-        max_long=args.max_long,
-        max_short=args.max_short,
         mode=args.mode,
         universe_tickers=sorted(all_tickers),
         weekly_df=weekly_df,
         weekly_snapshots=weekly_snapshots,
-        regime_table=regime_table,
         long_logic_cfg=bt_long_cfg,
         short_logic_cfg=bt_short_cfg,
         market_cfg=market_cfg,
         industry_cfg=industry_cfg,
-        max_leverage=float(args.max_leverage),
-        max_pos_frac=float(args.max_pos_frac),
         regime_mode=args.regime_mode,
         neutral_policy=args.neutral_policy,
         exposure_mode=args.exposure_mode,
-        bull_long_mult=float(args.bull_long_mult),
-        neutral_long_mult=float(args.neutral_long_mult),
-        bear_short_mult=float(args.bear_short_mult),
-        neutral_short_mult=float(args.neutral_short_mult),
+        bull_long_mult=args.bull_long_mult,
+        neutral_long_mult=args.neutral_long_mult,
+        bear_short_mult=args.bear_short_mult,
+        neutral_short_mult=args.neutral_short_mult,
         signal_quality_mode=args.signal_quality_mode,
-        min_long_quality=float(args.min_long_quality),
-        min_short_quality=float(args.min_short_quality),
-        adaptive_reject_below=float(args.adaptive_reject_below),
-        adaptive_floor_mult=float(args.adaptive_floor_mult),
-        adaptive_mid_mult=float(args.adaptive_mid_mult),
-        adaptive_good_mult=float(args.adaptive_good_mult),
-        adaptive_elite_mult=float(args.adaptive_elite_mult),
+        min_long_quality=args.min_long_quality,
+        min_short_quality=args.min_short_quality,
+        adaptive_reject_below=args.adaptive_reject_below,
+        adaptive_floor_mult=args.adaptive_floor_mult,
+        adaptive_mid_mult=args.adaptive_mid_mult,
+        adaptive_good_mult=args.adaptive_good_mult,
+        adaptive_elite_mult=args.adaptive_elite_mult,
+        include_near=args.include_near,
+        include_raw_sell=True,
+        near_zone_pct=args.near_zone_pct,
+        sell_crack_pct=args.sell_crack_pct,
     )
+    if events.empty:
+        return events, pd.DataFrame(), pd.DataFrame()
 
-    final_eq = float(result["final_equity"])
-    equity_pnl = final_eq - float(args.capital)
-    equity_pnl_pct = (equity_pnl / float(args.capital) * 100.0) if float(args.capital) != 0 else 0.0
-    trades = result.get("trades", []) or []
-    equity_curve = result.get("equity_curve", []) or []
+    events["date"] = pd.to_datetime(events["date"])
+    events = events.sort_values(["date", "signal", "ticker"]).reset_index(drop=True)
 
-    # =========================
-    # REALIZED / UNREALIZED BREAKDOWN
-    # =========================
-    # The equity curve is mark-to-market: cash + value of open positions.
-    # Closed-trade reports/monthly PnL are realized-only.  Without this
-    # split, a run can look confusing: Final Equity can be strongly positive
-    # while monthly closed-trade PnL is negative if most profit is still open.
+    tickers = sorted(set(events["ticker"].astype(str).str.upper()))
+    _, ma30_cache, ma150_cache, atr_cache = _build_indicator_caches(daily_df, tickers)
 
-    realized_pnl = float(sum(float(t.pnl) for t in trades)) if trades else 0.0
+    cash = float(args.capital)
+    positions: Dict[str, Position] = {}
+    trades: List[Trade] = []
+    equity_rows: List[dict] = []
+    dates = [d for d in pd.to_datetime(daily_df.index) if pd.Timestamp(args.start) <= d <= pd.Timestamp(args.end)]
+    events_by_date = {d: x for d, x in events.groupby("date")}
 
-    open_positions = result.get("positions", {}) or {}
-    cash_now = float(result.get("cash", 0.0))
-
-    unrealized_pnl = 0.0
-    open_market_value = 0.0
-    open_long_count = 0
-    open_short_count = 0
-    open_long_value = 0.0
-    open_short_value = 0.0
-
-    if equity_curve:
-        last_dt = pd.to_datetime(equity_curve[-1][0])
-    else:
-        last_dt = pd.Timestamp(args.end)
-
-    for _, pos in open_positions.items():
-        try:
-            px = _safe_close(daily_df, last_dt, pos.ticker)
-            if pd.isna(px):
+    for dt in dates:
+        # 1) Core stop exits first, for held names only. This preserves the
+        # old risk guard while entry decisions come from replay events.
+        for key, pos in list(positions.items()):
+            px = _close_at(daily_df, dt, pos.ticker)
+            if not np.isfinite(px):
                 continue
-
-            px = float(px)
-            qty = float(pos.qty)
-            entry = float(pos.entry_price)
-
+            ma_series = ma30_cache.get(pos.ticker)
+            ma150_series = ma150_cache.get(pos.ticker)
+            atr_series = atr_cache.get(pos.ticker)
+            ma30 = _safe_float(ma_series.get(dt, np.nan)) if ma_series is not None else np.nan
+            ma150 = _safe_float(ma150_series.get(dt, np.nan)) if ma150_series is not None else np.nan
+            atr = _safe_float(atr_series.get(dt, np.nan)) if atr_series is not None else np.nan
             if pos.side == "long":
-                market_value = qty * px
-                cost_basis = qty * entry
-                open_market_value += market_value
-                open_long_value += market_value
-                unrealized_pnl += market_value - cost_basis
-                open_long_count += 1
+                if np.isfinite(atr) and np.isfinite(ma30):
+                    new_stop = long_stop_level(px, atr, ma30)
+                    if np.isfinite(new_stop):
+                        pos.stop = max(float(pos.stop), float(new_stop))
+                if should_exit_long(px, float(pos.stop), ma30):
+                    pnl = float(pos.qty) * (px - pos.entry_price)
+                    cash += float(pos.qty) * px
+                    trades.append(Trade(pos.ticker, pos.side, pos.opened.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d"), pos.entry_price, px, pos.qty, pnl, pnl/(pos.qty*pos.entry_price), pos.entry_reason, "core_stop_or_ma_exit"))
+                    del positions[key]
             else:
-                # For shorts, market_value is the current cover liability.
-                # Unrealized profit is entry proceeds minus current cover cost.
-                market_value = qty * px
-                entry_value = qty * entry
-                open_market_value += market_value
-                open_short_value += market_value
-                unrealized_pnl += entry_value - market_value
-                open_short_count += 1
-        except Exception:
-            pass
+                ma_exit = ma150 if np.isfinite(ma150) else ma30
+                if np.isfinite(atr) and np.isfinite(ma30):
+                    new_stop = core_short_stop_level(px, atr, ma30)
+                    if np.isfinite(new_stop):
+                        pos.stop = min(float(pos.stop), float(new_stop))
+                if core_should_exit_short(px, float(pos.stop), ma_exit):
+                    pnl = float(pos.qty) * (pos.entry_price - px)
+                    cash -= float(pos.qty) * px
+                    trades.append(Trade(pos.ticker, pos.side, pos.opened.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d"), pos.entry_price, px, pos.qty, pnl, pnl/(pos.qty*pos.entry_price), pos.entry_reason, "core_short_exit"))
+                    del positions[key]
 
-    total_mark_to_market_pnl = realized_pnl + unrealized_pnl
-    total_mark_to_market_pct = (
-        total_mark_to_market_pnl / float(args.capital) * 100.0
-        if float(args.capital) != 0 else 0.0
-    )
+        day_events = events_by_date.get(dt)
+        if day_events is not None and not day_events.empty:
+            # 2) Replay SELL exits: only if currently held.
+            for _, ev in day_events[day_events["signal"].eq("SELL")].iterrows():
+                t = str(ev["ticker"]).upper()
+                key = f"{t}_long"
+                if key not in positions:
+                    continue
+                pos = positions[key]
+                px = _safe_float(ev.get("price"), _close_at(daily_df, dt, t))
+                if not np.isfinite(px):
+                    continue
+                pnl = float(pos.qty) * (px - pos.entry_price)
+                cash += float(pos.qty) * px
+                trades.append(Trade(t, "long", pos.opened.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d"), pos.entry_price, px, pos.qty, pnl, pnl/(pos.qty*pos.entry_price), pos.entry_reason, "replay_sell_event"))
+                del positions[key]
 
-    log(
-        f"Backtest complete. Final equity: ${final_eq:,.2f} "
-        f"(Equity P/L ${equity_pnl:,.2f}, {equity_pnl_pct:,.2f}%)",
-        level="ok",
-    )
+            # 3) Entries from replay BUY/SHORT events only.
+            eq_now = _equity(daily_df, dt, cash, positions)
+            gross = _gross_exposure(daily_df, dt, positions)
+            buying_power = max(0.0, float(args.max_leverage) * eq_now - gross)
 
-    log(
-        f"Realized P/L:        ${realized_pnl:,.2f} from {len(trades)} closed trades",
-        level="info",
-    )
+            n_long = sum(1 for p in positions.values() if p.side == "long")
+            n_short = sum(1 for p in positions.values() if p.side == "short")
 
-    log(
-        f"Unrealized P/L:      ${unrealized_pnl:,.2f} from {len(open_positions)} open positions",
-        level="info",
-    )
+            for _, ev in day_events.iterrows():
+                sig = str(ev.get("signal", "")).upper()
+                if sig not in {"BUY", "SHORT"}:
+                    continue
+                t = str(ev["ticker"]).upper()
+                side = "long" if sig == "BUY" else "short"
+                if side == "long" and n_long >= int(args.max_long):
+                    continue
+                if side == "short" and n_short >= int(args.max_short):
+                    continue
+                key = f"{t}_{side}"
+                if key in positions:
+                    continue
+                px = _safe_float(ev.get("price"), _close_at(daily_df, dt, t))
+                atr = _safe_float(ev.get("atr14"), np.nan)
+                ma30 = _safe_float(ev.get("ma30"), np.nan)
+                if not np.isfinite(px) or px <= 0:
+                    continue
+                if not np.isfinite(atr) or not np.isfinite(ma30):
+                    continue
 
-    log(
-        f"Total MTM P/L:       ${total_mark_to_market_pnl:,.2f} "
-        f"({total_mark_to_market_pct:,.2f}%)",
-        level="info",
-    )
+                # Risk sizing. Uses replay multipliers from the signal itself.
+                if side == "long":
+                    stop = long_stop_level(px, atr, ma30)
+                    if not np.isfinite(stop) or stop >= px:
+                        continue
+                    per_share_risk = px - stop
+                    size_mult = _safe_float(ev.get("long_size_mult"), 1.0) * _safe_float(ev.get("quality_mult"), 1.0)
+                else:
+                    stop = core_short_stop_level(px, atr, ma30)
+                    if not np.isfinite(stop) or stop <= px:
+                        continue
+                    per_share_risk = stop - px
+                    size_mult = _safe_float(ev.get("short_size_mult"), 1.0) * _safe_float(ev.get("quality_mult"), 1.0)
+                if per_share_risk <= 0 or size_mult <= 0:
+                    continue
+                risk_amt = eq_now * float(args.risk_per_trade) * size_mult
+                qty_risk = int(math.floor(risk_amt / per_share_risk))
+                qty_cash = int(math.floor(min(cash if side == "long" else buying_power, buying_power) / px))
+                qty = max(0, min(qty_risk, qty_cash))
+                if qty <= 0:
+                    continue
+                if side == "long":
+                    cost = qty * px
+                    if cost > cash:
+                        continue
+                    cash -= cost
+                    n_long += 1
+                else:
+                    cash += qty * px
+                    n_short += 1
+                positions[key] = Position(t, side, dt, px, qty, float(stop), atr=float(atr), entry_reason=str(ev.get("reason", "")))
+                buying_power = max(0.0, float(args.max_leverage) * _equity(daily_df, dt, cash, positions) - _gross_exposure(daily_df, dt, positions))
 
-    log(
-        f"Cash:                ${cash_now:,.2f}",
-        level="info",
-    )
+        equity_rows.append({
+            "date": dt.strftime("%Y-%m-%d"),
+            "equity": _equity(daily_df, dt, cash, positions),
+            "cash": cash,
+            "positions": len(positions),
+            "long_positions": sum(1 for p in positions.values() if p.side == "long"),
+            "short_positions": sum(1 for p in positions.values() if p.side == "short"),
+        })
 
-    log(
-        f"Open Positions:      {len(open_positions)} "
-        f"(L={open_long_count}, S={open_short_count}) | "
-        f"Market Value/Liability: ${open_market_value:,.2f}",
-        level="info",
-    )
+    # Open positions are emitted as trade rows with blank exit_date and MTM pnl.
+    last_dt = dates[-1] if dates else pd.Timestamp(args.end)
+    for pos in positions.values():
+        px = _close_at(daily_df, last_dt, pos.ticker)
+        if not np.isfinite(px):
+            px = pos.entry_price
+        if pos.side == "long":
+            pnl = pos.qty * (px - pos.entry_price)
+        else:
+            pnl = pos.qty * (pos.entry_price - px)
+        denom = pos.qty * pos.entry_price
+        trades.append(Trade(pos.ticker, pos.side, pos.opened.strftime("%Y-%m-%d"), "", pos.entry_price, px, pos.qty, pnl, pnl/denom if denom else 0.0, pos.entry_reason, "OPEN"))
 
-    if open_positions:
-        log(
-            f"Open Long Value:    ${open_long_value:,.2f} | "
-            f"Open Short Liability: ${open_short_value:,.2f}",
-            level="info",
-        )
+    return events, pd.DataFrame([asdict(t) for t in trades]), pd.DataFrame(equity_rows)
 
+
+def main():
+    ap = argparse.ArgumentParser(description="Replay-first portfolio research wrapper.")
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--mode", choices=["long", "short", "both", "auto"], default="both")
+    ap.add_argument("--capital", type=float, default=10000.0)
+    ap.add_argument("--risk-per-trade", type=float, default=0.01)
+    ap.add_argument("--max-long", type=int, default=10)
+    ap.add_argument("--max-short", type=int, default=10)
+    ap.add_argument("--max-leverage", type=float, default=1.0)
+    ap.add_argument("--snapshot-mode", choices=["static", "historical", "auto"], default="auto")
+    ap.add_argument("--config", default="./config.yaml")
+    ap.add_argument("--regime-mode", choices=["off", "current", "prod"], default="prod")
+    ap.add_argument("--neutral-policy", choices=["long", "none", "both", "current"], default="long")
+    ap.add_argument("--exposure-mode", choices=["off", "scaled"], default="scaled")
+    ap.add_argument("--bull-long-mult", type=float, default=1.0)
+    ap.add_argument("--neutral-long-mult", type=float, default=0.50)
+    ap.add_argument("--bear-short-mult", type=float, default=0.60)
+    ap.add_argument("--neutral-short-mult", type=float, default=0.0)
+    ap.add_argument("--signal-quality-mode", choices=["off", "score", "strict", "adaptive"], default="off")
+    ap.add_argument("--min-long-quality", type=float, default=65.0)
+    ap.add_argument("--min-short-quality", type=float, default=65.0)
+    ap.add_argument("--adaptive-reject-below", type=float, default=60.0)
+    ap.add_argument("--adaptive-floor-mult", type=float, default=0.40)
+    ap.add_argument("--adaptive-mid-mult", type=float, default=0.65)
+    ap.add_argument("--adaptive-good-mult", type=float, default=0.85)
+    ap.add_argument("--adaptive-elite-mult", type=float, default=1.00)
+    ap.add_argument("--include-near", action="store_true", help="Keep NEAR events in replay CSV, but do not trade them by default.")
+    ap.add_argument("--near-zone-pct", type=float, default=0.01)
+    ap.add_argument("--sell-crack-pct", type=float, default=0.005)
+    args = ap.parse_args()
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     tag = _now_tag()
-    _write_reports(tag=tag, trades=trades, equity_curve=equity_curve)
+    events, trades, equity = run_replay_portfolio(args)
 
-    log(
-        f"Done. Open positions={len(open_positions)}, closed_trades={len(trades)}, "
-        f"realized=${realized_pnl:,.2f}, unrealized=${unrealized_pnl:,.2f}, "
-        f"final_equity=${final_eq:,.2f}",
-        level="ok",
-    )
+    events_path = os.path.join(OUTPUT_DIR, f"replay_core_events_{tag}.csv")
+    trades_path = os.path.join(OUTPUT_DIR, f"replay_portfolio_trades_{tag}.csv")
+    equity_path = os.path.join(OUTPUT_DIR, f"replay_portfolio_equity_{tag}.csv")
+    summary_path = os.path.join(OUTPUT_DIR, f"replay_portfolio_summary_{tag}.csv")
+
+    events.to_csv(events_path, index=False)
+    trades.to_csv(trades_path, index=False)
+    equity.to_csv(equity_path, index=False)
+
+    final_equity = float(equity["equity"].iloc[-1]) if not equity.empty else float(args.capital)
+    closed = trades[trades["exit_date"].astype(str).ne("")] if not trades.empty else pd.DataFrame()
+    open_rows = trades[trades["exit_date"].astype(str).eq("")] if not trades.empty else pd.DataFrame()
+    summary = pd.DataFrame([{
+        "start": args.start,
+        "end": args.end,
+        "mode": args.mode,
+        "capital": args.capital,
+        "final_equity": final_equity,
+        "total_pnl": final_equity - float(args.capital),
+        "return_pct": (final_equity / float(args.capital) - 1.0) if args.capital else np.nan,
+        "events": len(events),
+        "buy_events": int((events["signal"] == "BUY").sum()) if not events.empty else 0,
+        "near_events": int((events["signal"] == "NEAR").sum()) if not events.empty else 0,
+        "sell_events_raw": int((events["signal"] == "SELL").sum()) if not events.empty else 0,
+        "closed_trades": len(closed),
+        "open_positions": len(open_rows),
+        "realized_pnl": float(closed["pnl"].sum()) if not closed.empty else 0.0,
+        "open_mtm_pnl": float(open_rows["pnl"].sum()) if not open_rows.empty else 0.0,
+    }])
+    summary.to_csv(summary_path, index=False)
+
+    log(f"Replay-first portfolio complete. Final equity=${final_equity:,.2f} ({(final_equity/args.capital-1.0)*100:.2f}%)", level="ok")
+    log(f"Wrote replay events → {events_path}", level="ok")
+    log(f"Wrote replay portfolio trades → {trades_path}", level="ok")
+    log(f"Wrote replay portfolio equity → {equity_path}", level="ok")
+    log(f"Wrote replay portfolio summary → {summary_path}", level="ok")
 
 
 if __name__ == "__main__":
