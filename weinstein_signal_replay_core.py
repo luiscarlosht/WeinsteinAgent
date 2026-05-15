@@ -105,6 +105,8 @@ def replay_signals(
     adaptive_elite_mult: float = 1.00,
     include_near: bool = True,
     include_raw_sell: bool = True,
+    sell_scope: str = "raw",
+    sell_tickers: Optional[List[str]] = None,
     near_zone_pct: float = 0.01,
     sell_crack_pct: float = 0.005,
 ) -> pd.DataFrame:
@@ -164,6 +166,12 @@ def replay_signals(
     events: List[ReplaySignal] = []
     all_dates = list(pd.to_datetime(daily_df.index))
     quality_mode = str(signal_quality_mode or "off").strip().lower()
+    sell_scope_norm = str(sell_scope or ("raw" if include_raw_sell else "none")).strip().lower()
+    if not include_raw_sell:
+        sell_scope_norm = "none"
+    if sell_scope_norm not in {"none", "raw", "universe", "holdings"}:
+        sell_scope_norm = "raw"
+    sell_ticker_set = {str(x).upper().strip() for x in (sell_tickers or []) if str(x).strip()}
     do_longs = mode in ("long", "both", "auto")
     do_shorts = mode in ("short", "both", "auto")
 
@@ -193,6 +201,46 @@ def replay_signals(
         if short_mult <= 0:
             allow_short = False
 
+        universe_ticker_set = {
+            str(r.get("ticker", r.get("Ticker", ""))).upper().strip()
+            for _, r in universe.iterrows()
+        }
+        universe_ticker_set = {x for x in universe_ticker_set if x}
+
+        # SELL replay is deliberately separated from BUY/NEAR universe evaluation.
+        # PROD parity normally wants BUY/NEAR from the discovery universe but SELL
+        # only for owned holdings.  Raw/universe SELL remains available for research.
+        if sell_scope_norm != "none":
+            if sell_scope_norm == "holdings":
+                sell_candidates = sell_ticker_set
+            else:
+                sell_candidates = universe_ticker_set if sell_scope_norm == "universe" else set(close_cache.keys())
+            for st in sorted(sell_candidates):
+                if not st or st not in close_cache or dt not in close_cache[st].index:
+                    continue
+                s_price = close_cache[st].loc[dt]
+                if pd.isna(s_price):
+                    continue
+                s_price_f = float(s_price)
+                s_ma30 = ma30_cache.get(st, pd.Series(dtype="float64")).get(dt, np.nan)
+                s_ma150 = ma150_cache.get(st, pd.Series(dtype="float64")).get(dt, np.nan)
+                s_atr = atr_cache.get(st, pd.Series(dtype="float64")).get(dt, np.nan)
+                s_vol = vol_mult_cache.get(st, pd.Series(dtype="float64")).get(dt, np.nan)
+                s_adx = adx_cache.get(st, pd.Series(dtype="float64")).get(dt, np.nan)
+                s_ma30_f = float(s_ma30) if pd.notna(s_ma30) else np.nan
+                s_ma150_f = float(s_ma150) if pd.notna(s_ma150) else np.nan
+                if np.isfinite(s_ma150_f) and s_price_f <= s_ma150_f * (1.0 - float(sell_crack_pct)):
+                    events.append(ReplaySignal(
+                        date=dt, ticker=st, side="long", signal="SELL", reason="sell_below_ma150_crack",
+                        price=s_price_f, pivot=np.nan, ma30=s_ma30_f, ma150=s_ma150_f,
+                        atr14=float(s_atr) if pd.notna(s_atr) else np.nan,
+                        vol_mult=float(s_vol) if pd.notna(s_vol) else np.nan,
+                        adx14=float(s_adx) if pd.notna(s_adx) else np.nan,
+                        regime=regime_label, allow_long=allow_long, allow_short=allow_short,
+                        long_size_mult=long_mult, short_size_mult=short_mult, stage="risk",
+                        source=f"{sell_scope_norm}_sell_replay",
+                    ))
+
         for _, row in universe.iterrows():
             t = str(row.get("ticker", row.get("Ticker", ""))).upper().strip()
             if not t or t not in close_cache:
@@ -215,17 +263,6 @@ def replay_signals(
             atr_f = float(atr) if pd.notna(atr) else np.nan
             vol_f = float(vol_mult) if pd.notna(vol_mult) else np.nan
             adx_f = float(adx_val) if pd.notna(adx_val) else np.nan
-
-            # Raw SELL replay: what the PROD risk layer would flag if this name were held.
-            # This is not portfolio-aware unless caller limits universe to holdings; it is a risk-pattern replay.
-            if include_raw_sell and np.isfinite(ma150_f) and price_f <= ma150_f * (1.0 - float(sell_crack_pct)):
-                events.append(ReplaySignal(
-                    date=dt, ticker=t, side="long", signal="SELL", reason="raw_sell_below_ma150_crack",
-                    price=price_f, pivot=np.nan, ma30=ma30_f, ma150=ma150_f, atr14=atr_f,
-                    vol_mult=vol_f, adx14=adx_f, regime=regime_label,
-                    allow_long=allow_long, allow_short=allow_short, long_size_mult=long_mult,
-                    short_size_mult=short_mult, stage="risk", source="raw_sell_replay",
-                ))
 
             # Long BUY / NEAR replay
             if do_longs and allow_long:
