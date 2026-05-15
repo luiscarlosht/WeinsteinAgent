@@ -2294,6 +2294,34 @@ def main():
     if market_cfg.get("vix_max", None) is not None:
         all_tickers.add("^VIX")
 
+    # Phase 3: holdings-aware replay SELL scope.  Add owned tickers before
+    # download so PROD-like replay can evaluate SELL risk for names outside the
+    # weekly BUY universe, matching the live intraday watcher behavior.
+    replay_sell_scope = str(getattr(args, "sell_scope", "none") or "none").strip().lower()
+    if bool(getattr(args, "include_raw_sell", False)) and replay_sell_scope == "none":
+        replay_sell_scope = "universe"
+    replay_holdings_tickers = []
+    replay_holdings_source = "not requested"
+    if bool(getattr(args, "signal_replay_only", False)) and replay_sell_scope == "holdings":
+        try:
+            from weinstein_intraday_watcher import load_portfolio_holdings
+            holdings_df, replay_holdings_source = load_portfolio_holdings(cfg, OUTPUT_DIR)
+            if holdings_df is not None and not holdings_df.empty and "Ticker" in holdings_df.columns:
+                replay_holdings_tickers = sorted({
+                    str(x).upper().strip()
+                    for x in holdings_df["Ticker"].dropna().tolist()
+                    if str(x).strip()
+                })
+                all_tickers.update(replay_holdings_tickers)
+                log(
+                    f"Signal replay SELL scope=holdings: loaded {len(replay_holdings_tickers)} owned tickers from {replay_holdings_source}.",
+                    level="info",
+                )
+            else:
+                log(f"Signal replay SELL scope=holdings: no holdings loaded ({replay_holdings_source}).", level="warn")
+        except Exception as e:
+            log(f"Signal replay SELL scope=holdings: failed to load holdings: {e}", level="warn")
+
     daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
 
     regime_table = None
@@ -2329,7 +2357,9 @@ def main():
             adaptive_good_mult=float(args.adaptive_good_mult),
             adaptive_elite_mult=float(args.adaptive_elite_mult),
             include_near=bool(args.include_near),
-            include_raw_sell=bool(args.include_raw_sell),
+            include_raw_sell=(replay_sell_scope != "none"),
+            sell_scope=replay_sell_scope,
+            sell_tickers=replay_holdings_tickers,
             near_zone_pct=float(args.near_zone_pct),
             sell_crack_pct=float(args.sell_crack_pct),
         )
