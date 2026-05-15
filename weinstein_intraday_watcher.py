@@ -42,7 +42,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from weinstein_long_core import LongEntryParams, evaluate_long_signal
+from weinstein_long_core import LongEntryParams, evaluate_long_signal, should_exit_long
 from weinstein_regime_exposure_core import decide_regime_exposure, read_d_config
 
 
@@ -349,6 +349,56 @@ def load_focus_universe(weekly_csv: str, u_cfg: UniverseConfig) -> pd.DataFrame:
     return df
 
 
+
+def augment_universe_with_holdings(focus_df: pd.DataFrame, holdings_df: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Ensure every current portfolio holding is evaluated by the intraday watcher.
+
+    The normal weekly universe is optimized for BUY discovery, so it can exclude:
+      - low-liquidity holdings
+      - recent/small-cap holdings
+      - tickers that fail Stage 1/2 or min-volume filters
+
+    That is fine for BUY scans, but dangerous for SELL/risk monitoring.
+    For owned positions, we must still fetch daily/intraday data and evaluate
+    MA150/exit risk even if the symbol is not in the buy universe.
+    """
+    if focus_df is None:
+        focus_df = pd.DataFrame(columns=["Ticker"])
+    out = focus_df.copy()
+    if "Ticker" not in out.columns:
+        out["Ticker"] = []
+    out["Ticker"] = out["Ticker"].map(_clean_symbol)
+    out = out[out["Ticker"].astype(str).str.len() > 0].copy()
+    out["PortfolioOwned"] = False
+
+    added: List[str] = []
+    if holdings_df is not None and not holdings_df.empty and "Ticker" in holdings_df.columns:
+        owned = (
+            holdings_df["Ticker"]
+            .map(_clean_symbol)
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
+        owned = sorted({x for x in owned if x and x not in INVALID_HOLDING_SYMBOLS})
+        existing = set(out["Ticker"].astype(str))
+        missing = [x for x in owned if x not in existing]
+
+        if missing:
+            add_df = pd.DataFrame({"Ticker": missing})
+            # Stage is unknown because these did not come from the weekly buy universe.
+            # The evaluation loop will compute current MA150/Stage-like risk from price data.
+            add_df["Stage"] = np.nan
+            add_df["PortfolioOwned"] = True
+            out = pd.concat([out, add_df], ignore_index=True, sort=False)
+            added = missing
+
+        out.loc[out["Ticker"].isin(owned), "PortfolioOwned"] = True
+
+    out = out.drop_duplicates(subset=["Ticker"], keep="first").reset_index(drop=True)
+    return out, added
+
 # ---------------------------------------------------------------------------
 # Indicator helpers
 # ---------------------------------------------------------------------------
@@ -542,6 +592,71 @@ def evaluate_intraday_signals(
         vol_ma50_val = float(last["VolMA50"]) if not pd.isna(last["VolMA50"]) else np.nan
         vol_pace_daily = (float(last["Volume"]) / vol_ma50_val) if vol_ma50_val and not np.isnan(vol_ma50_val) else np.nan
         headroom_daily = ((close_daily / float(pivot_window)) - 1.0) * 100.0 if (not pd.isna(pivot_window) and pivot_window > 0 and not np.isnan(close_daily)) else np.nan
+
+        is_owned = str(ticker).upper() in owned_set
+
+        # Portfolio SELL/risk monitoring must run even when an owned ticker is
+        # not part of the normal BUY universe.  This mirrors the SIM CORE exit
+        # guard: long positions are at risk when price breaks below the MA150
+        # guard zone.  The intraday config crack_ma_pct is a stricter PROD alert
+        # threshold for "SELL / reduce review".
+        if is_owned and not pd.isna(last["MA150"]) and not np.isnan(close_daily):
+            sell_break_pct = float(cfg.intraday.crack_ma_pct) / 100.0
+            core_exit = should_exit_long(close_daily, np.nan, ma150_val)
+            hard_sell = bool(close_daily <= ma150_val * (1.0 - sell_break_pct))
+            if hard_sell or core_exit:
+                signal = "SELL" if hard_sell else "SELL-WATCH"
+                reason = (
+                    f"Owned position exit risk: close={close_daily:.2f}, "
+                    f"MA150={ma150_val:.2f}, crack_ma={cfg.intraday.crack_ma_pct:.2f}%, "
+                    f"core_exit={core_exit}"
+                )
+                rows.append(
+                    dict(
+                        Ticker=ticker,
+                        Structure="Below/weak vs MA150",
+                        Stage=stage_num,
+                        Signal=signal,
+                        Reason=reason,
+                        RegimeLabel=regime_label,
+                        LongExposureMult=long_exposure_mult,
+                        ShortExposureMult=short_exposure_mult,
+                        SuggestedLongSizePct=0.0,
+                        PriceNow=close_daily,
+                        Pivot=pivot_window,
+                        HeadroomPct=headroom_daily,
+                        VolPace=vol_pace_daily,
+                        ADX14=adx14,
+                        CloseDaily=close_daily,
+                        MA30=float(last["MA30"]) if not pd.isna(last["MA30"]) else np.nan,
+                        MA150=ma150_val,
+                        ATR14=atr14_val,
+                        ticker=ticker,
+                        structure="Below/weak vs MA150",
+                        stage=stage_num,
+                        signal=signal,
+                        reason=reason,
+                        price=close_daily,
+                        pivot=pivot_window,
+                        ma30=ma150_val,
+                        pace_full_vs50dma=vol_pace_daily,
+                        dist_bps=headroom_daily * 100.0 if not np.isnan(headroom_daily) else np.nan,
+                        elapsed_min=cfg.intraday.min_elapsed_minutes,
+                        pace_intrabar=cfg.intraday.sell_intrabar_vol_pace_min,
+                        cond_weekly_stage_ok=False,
+                        cond_rs_ok=False,
+                        cond_ma_ok=False,
+                        cond_pivot_ok=bool(not pd.isna(pivot_window) and float(pivot_window) > 0),
+                        cond_buy_vol_ok=False,
+                        cond_pace_full_gate=False,
+                        cond_near_pace_gate=False,
+                        cond_buy_price_ok=False,
+                        cond_near_now=False,
+                        buy_confirm=False,
+                        portfolio_owned=True,
+                    )
+                )
+                continue
 
         if pd.isna(last["MA150"]):
             rows.append(
@@ -1037,7 +1152,7 @@ def _badge_class_for_signal(value: object) -> str:
         return 'badge-green'
     if v in ('NEAR', 'NEAR_BUY', 'NEAR-TRIGGER'):
         return 'badge-yellow'
-    if v in ('SELL', 'SELLTRIG', 'SELL-TRIGGER'):
+    if v in ('SELL', 'SELLTRIG', 'SELL-TRIGGER', 'SELL-WATCH'):
         return 'badge-red'
     if v.startswith('SKIP') or v == 'NOT-SCANNED':
         return 'badge-gray'
@@ -1173,7 +1288,7 @@ def _portfolio_action(row: pd.Series) -> Tuple[str, str]:
     ma150 = _parse_money_like(row.get("MA150"))
     headroom = _parse_money_like(row.get("HeadroomPct"))
     vol = _parse_money_like(row.get("VolPace"))
-    if signal in ("SELL", "SELLTRIG", "SELL-TRIGGER"):
+    if signal in ("SELL", "SELLTRIG", "SELL-TRIGGER", "SELL-WATCH"):
         return "SELL / reduce review", "Confirmed sell trigger from scanner."
     if signal.startswith("SKIP-DATA") or signal in ("NOT-SCANNED", "SKIP-INTRADAY", "SKIP-MA"):
         return "Review manually", "Owned ticker was not fully evaluated by the intraday scanner."
@@ -1643,8 +1758,29 @@ def main() -> None:
 
     log(f"Focus universe: {len(focus_df)} symbols (Stage 1/2, price/volume filtered).")
 
+    # Load holdings BEFORE data download so portfolio positions are always
+    # scanned for SELL/risk, even if they are outside the BUY discovery universe.
+    try:
+        holdings_df, holdings_source = load_portfolio_holdings(cfg_raw, cfg.app.output_dir)
+        if holdings_df.empty:
+            log(f"Portfolio holdings pre-scan: no holdings loaded ({holdings_source}).")
+        else:
+            log(f"Portfolio holdings pre-scan: loaded {len(holdings_df)} owned tickers from {holdings_source}.")
+    except Exception as e:
+        holdings_df, holdings_source = pd.DataFrame(), f"holdings load error: {e}"
+        log(f"Portfolio holdings pre-scan skipped: {e}")
+
+    focus_df, added_holdings = augment_universe_with_holdings(focus_df, holdings_df)
+    if added_holdings:
+        log(
+            "Portfolio SELL coverage: added "
+            f"{len(added_holdings)} owned tickers outside weekly BUY universe: "
+            + ", ".join(added_holdings[:20])
+            + ("..." if len(added_holdings) > 20 else "")
+        )
+
     if focus_df.empty:
-        print("⚠️ Focus universe is empty. Nothing to do.")
+        print("⚠️ Focus universe is empty and no holdings were found. Nothing to do.")
         print("✅ Intraday tick complete.")
         return
 
@@ -1724,17 +1860,12 @@ def main() -> None:
 
     # Polished HTML/email-style report
     # Keep filenames/logs in the VM local timezone, but show report time in Dallas/Central time.
-    # Load owned portfolio positions for the portfolio review section.
-    # This is best-effort: report generation continues even if holdings are unavailable.
-    try:
-        holdings_df, holdings_source = load_portfolio_holdings(cfg_raw, cfg.app.output_dir)
-        if holdings_df.empty:
-            log(f"Portfolio holdings review: no holdings loaded ({holdings_source}).")
-        else:
-            log(f"Portfolio holdings review: loaded {len(holdings_df)} owned tickers from {holdings_source}.")
-    except Exception as e:
-        holdings_df, holdings_source = pd.DataFrame(), f"holdings load error: {e}"
-        log(f"Portfolio holdings review skipped: {e}")
+    # Holdings were already loaded before data download so owned tickers could
+    # be included in SELL/risk evaluation.
+    if holdings_df is None or holdings_df.empty:
+        log(f"Portfolio holdings review: no holdings loaded ({holdings_source}).")
+    else:
+        log(f"Portfolio holdings review: loaded {len(holdings_df)} owned tickers from {holdings_source}.")
 
     now_ct = dt.datetime.now(ZoneInfo("America/Chicago"))
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
