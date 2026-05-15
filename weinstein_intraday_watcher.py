@@ -45,6 +45,11 @@ import matplotlib.pyplot as plt
 from weinstein_long_core import LongEntryParams, evaluate_long_signal, should_exit_long
 from weinstein_regime_exposure_core import decide_regime_exposure, read_d_config
 
+try:
+    from weinstein_mailer import send_email
+except Exception:
+    send_email = None
+
 
 # ---------------------------------------------------------------------------
 # Small helpers for logging
@@ -1881,6 +1886,7 @@ def main() -> None:
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     ts_display = now_ct.strftime("%Y-%m-%d %H:%M CT")
     html_path = os.path.join(cfg.app.output_dir, f"intraday_watch_{ts}.html")
+    html = ""
     try:
         html = build_intraday_report_html(
             diag=diag,
@@ -1899,14 +1905,70 @@ def main() -> None:
     except Exception as e:
         print(f"⚠️ Failed to write HTML summary: {e}")
 
-    # Simple trigger summary
-    buys = diag.loc[diag["Signal"] == "BUY"] if not diag.empty else pd.DataFrame()
-    nears = diag.loc[diag["Signal"] == "NEAR"] if not diag.empty else pd.DataFrame()
+    # Simple trigger summary + optional email notification
+    if not diag.empty and "Signal" in diag.columns:
+        sig_upper = diag["Signal"].astype(str).str.upper()
+        buys = diag.loc[sig_upper.eq("BUY")].copy()
+        nears = diag.loc[sig_upper.isin(["NEAR", "NEAR_BUY", "NEAR-TRIGGER"])].copy()
+        sells = diag.loc[sig_upper.isin(["SELL", "SELLTRIG", "SELL-TRIGGER"])].copy()
+        skip_adx_count = int(sig_upper.eq("SKIP-ADX").sum())
+    else:
+        buys = pd.DataFrame()
+        nears = pd.DataFrame()
+        sells = pd.DataFrame()
+        skip_adx_count = 0
 
     log(
         f"Scan done. Raw counts → BUY:{len(buys)} NEAR:{len(nears)} "
-        f"SKIP-ADX:{int((diag['Signal'] == 'SKIP-ADX').sum()) if not diag.empty else 0}"
+        f"SELL:{len(sells)} SKIP-ADX:{skip_adx_count}"
     )
+
+    # Email the polished HTML report when the visible recommendation sections contain
+    # at least one BUY, NEAR, or SELL. This is intentionally tied to the same
+    # data used by the HTML sections, not the debounced signal_engine state, so
+    # portfolio SELL recommendations are not missed when a holding is outside
+    # the weekly BUY universe.
+    recommendations_present = (len(buys) > 0) or (len(nears) > 0) or (len(sells) > 0)
+    if recommendations_present:
+        if send_email is None:
+            log("Email helper unavailable — cannot send recommendation email.")
+        else:
+            counts = f"{len(buys)} BUY / {len(nears)} NEAR / {len(sells)} SELL"
+            subject = f"Intraday Watch — {counts}"
+
+            def _lines(df: pd.DataFrame, label: str) -> str:
+                if df.empty:
+                    return f"No {label} recommendations."
+                rows = []
+                for _, r in df.head(25).iterrows():
+                    t = str(r.get("Ticker", r.get("ticker", ""))).upper()
+                    px = r.get("PriceNow", r.get("price", ""))
+                    reason = r.get("Reason", r.get("reason", ""))
+                    rows.append(f"- {t} @ {px}: {reason}")
+                return "\n".join(rows)
+
+            text_body = (
+                f"Weinstein Intraday Watch — {ts_display}\n"
+                f"Recommendations: {counts}\n\n"
+                f"BUY:\n{_lines(buys, 'BUY')}\n\n"
+                f"NEAR:\n{_lines(nears, 'NEAR')}\n\n"
+                f"SELL:\n{_lines(sells, 'SELL')}\n\n"
+                f"HTML report saved on VM: {html_path}\n"
+            )
+            try:
+                log(f"Sending recommendation email → {counts}")
+                send_email(
+                    subject=subject,
+                    html_body=html,
+                    text_body=text_body,
+                    cfg_path=args.config,
+                    subject_tag="INTRADAY",
+                )
+                log("Recommendation email sent.")
+            except Exception as e:
+                log(f"Recommendation email failed: {e}")
+    else:
+        log("No BUY/NEAR/SELL recommendations present — skipping email send.")
 
     print("✅ Intraday tick complete.")
 
