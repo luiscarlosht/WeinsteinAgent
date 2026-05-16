@@ -2328,7 +2328,7 @@ def main():
     regime_table = None
 
     if args.signal_replay_only:
-        from weinstein_signal_replay_core import replay_signals, replay_summary
+        from weinstein_signal_replay_core import replay_signals, replay_summary, replay_explainability_summary
         tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         events_df = replay_signals(
             daily_df=daily_df,
@@ -2367,11 +2367,14 @@ def main():
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, f"prod_signal_replay_{tag}.csv")
         sum_path = os.path.join(OUTPUT_DIR, f"prod_signal_replay_summary_{tag}.csv")
+        explain_path = os.path.join(OUTPUT_DIR, f"prod_signal_replay_explainability_{tag}.csv")
         events_df.to_csv(out_path, index=False)
         replay_summary(events_df).to_csv(sum_path, index=False)
+        replay_explainability_summary(events_df).to_csv(explain_path, index=False)
         log(f"Signal replay complete. Events={len(events_df)}", level="ok")
         log(f"Wrote signal replay CSV → {out_path}", level="ok")
         log(f"Wrote signal replay summary → {sum_path}", level="ok")
+        log(f"Wrote signal replay explainability → {explain_path}", level="ok")
         if not events_df.empty:
             counts = events_df["signal"].value_counts().to_dict()
             log(f"Signal counts: {counts}", level="info")
