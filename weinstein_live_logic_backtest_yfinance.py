@@ -2179,6 +2179,7 @@ def main():
     ap.add_argument("--signal-replay-only", action="store_true", help="Output PROD-like BUY/NEAR/SELL replay events without portfolio simulation.")
     ap.add_argument("--include-near", action="store_true", help="Include NEAR watchlist events in --signal-replay-only output.")
     ap.add_argument("--include-raw-sell", action="store_true", help="Include raw MA150 SELL risk events in --signal-replay-only output.")
+    ap.add_argument("--sell-scope", choices=["none", "universe", "raw", "holdings"], default="none", help="SELL scope for --signal-replay-only: none=no replay SELLs, universe/raw=all scanned tickers, holdings=owned tickers only.")
     ap.add_argument("--near-zone-pct", type=float, default=0.01, help="NEAR zone below pivot for signal replay, e.g. 0.01 = within 1%.")
     ap.add_argument("--sell-crack-pct", type=float, default=0.005, help="SELL crack below MA150 for signal replay, e.g. 0.005 = 0.5%.")
 
