@@ -50,6 +50,121 @@ from weinstein_live_logic_backtest_yfinance import (
 )
 
 
+def _safe_float(x, default=np.nan) -> float:
+    try:
+        if pd.isna(x):
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _pct_from_level(price: float, level: float) -> float:
+    """Return percent distance from level: + means price above level."""
+    try:
+        price_f = float(price)
+        level_f = float(level)
+        if not np.isfinite(price_f) or not np.isfinite(level_f) or level_f == 0:
+            return np.nan
+        return (price_f / level_f - 1.0) * 100.0
+    except Exception:
+        return np.nan
+
+
+def _yesno(v) -> str:
+    return "yes" if bool(v) else "no"
+
+
+def _fmt_num(x, digits=2) -> str:
+    try:
+        xf = float(x)
+        if not np.isfinite(xf):
+            return "n/a"
+        return f"{xf:.{digits}f}"
+    except Exception:
+        return "n/a"
+
+
+def _fmt_pct(x, digits=2) -> str:
+    try:
+        xf = float(x)
+        if not np.isfinite(xf):
+            return "n/a"
+        return f"{xf:.{digits}f}%"
+    except Exception:
+        return "n/a"
+
+
+def _explain_long_event(*, signal: str, price: float, pivot: float, ma30: float, ma150: float,
+                        vol_mult: float, vol_min: float, adx_val: float, adx_min: float,
+                        rs_above: bool, regime: str, long_mult: float, quality_score: float,
+                        quality_mult: float, quality_mode: str, reason: str) -> str:
+    pivot_dist = _pct_from_level(price, pivot)
+    ma30_dist = _pct_from_level(price, ma30)
+    ma150_dist = _pct_from_level(price, ma150)
+    pieces = [
+        f"{signal}: {reason}",
+        f"regime={regime}",
+        f"long_mult={_fmt_num(long_mult, 2)}",
+        f"price={_fmt_num(price)}",
+        f"pivot={_fmt_num(pivot)}",
+        f"pivot_dist={_fmt_pct(pivot_dist)}",
+        f"MA30_dist={_fmt_pct(ma30_dist)}",
+        f"MA150_dist={_fmt_pct(ma150_dist)}",
+        f"vol={_fmt_num(vol_mult, 2)}x vs min {_fmt_num(vol_min, 2)}x",
+        f"ADX={_fmt_num(adx_val, 1)} vs min {_fmt_num(adx_min, 1)}",
+        f"RS_above_MA={_yesno(rs_above)}",
+    ]
+    if str(quality_mode or "off").lower() != "off":
+        pieces.append(f"quality={_fmt_num(quality_score, 1)}")
+        pieces.append(f"quality_mult={_fmt_num(quality_mult, 2)}")
+    return " | ".join(pieces)
+
+
+def _explain_sell_event(*, price: float, ma150: float, ma30: float, sell_crack_pct: float,
+                        vol_mult: float, adx_val: float, regime: str, source: str) -> str:
+    ma150_dist = _pct_from_level(price, ma150)
+    ma30_dist = _pct_from_level(price, ma30)
+    crack_level = ma150 * (1.0 - sell_crack_pct) if np.isfinite(ma150) else np.nan
+    return " | ".join([
+        "SELL: sell_below_ma150_crack",
+        f"source={source}",
+        f"regime={regime}",
+        f"price={_fmt_num(price)}",
+        f"MA150={_fmt_num(ma150)}",
+        f"crack_level={_fmt_num(crack_level)}",
+        f"MA150_dist={_fmt_pct(ma150_dist)}",
+        f"MA30_dist={_fmt_pct(ma30_dist)}",
+        f"vol={_fmt_num(vol_mult, 2)}x",
+        f"ADX={_fmt_num(adx_val, 1)}",
+    ])
+
+
+def _explain_short_event(*, price: float, pivot_low: float, ma30: float, ma150: float,
+                         vol_mult: float, vol_min: float, rs_above: bool, regime: str,
+                         short_mult: float, quality_score: float, quality_mult: float,
+                         quality_mode: str, reason: str) -> str:
+    pivot_dist = _pct_from_level(price, pivot_low)
+    ma30_dist = _pct_from_level(price, ma30)
+    ma150_dist = _pct_from_level(price, ma150)
+    pieces = [
+        f"SHORT: {reason}",
+        f"regime={regime}",
+        f"short_mult={_fmt_num(short_mult, 2)}",
+        f"price={_fmt_num(price)}",
+        f"pivot_low={_fmt_num(pivot_low)}",
+        f"pivot_dist={_fmt_pct(pivot_dist)}",
+        f"MA30_dist={_fmt_pct(ma30_dist)}",
+        f"MA150_dist={_fmt_pct(ma150_dist)}",
+        f"vol={_fmt_num(vol_mult, 2)}x vs min {_fmt_num(vol_min, 2)}x",
+        f"RS_above_MA={_yesno(rs_above)}",
+    ]
+    if str(quality_mode or "off").lower() != "off":
+        pieces.append(f"quality={_fmt_num(quality_score, 1)}")
+        pieces.append(f"quality_mult={_fmt_num(quality_mult, 2)}")
+    return " | ".join(pieces)
+
+
 @dataclass(frozen=True)
 class ReplaySignal:
     date: pd.Timestamp
@@ -73,6 +188,14 @@ class ReplaySignal:
     quality_mult: float = 1.0
     stage: str = ""
     source: str = "replay"
+    explanation: str = ""
+    pivot_distance_pct: float = np.nan
+    ma30_distance_pct: float = np.nan
+    ma150_distance_pct: float = np.nan
+    vol_min_required: float = np.nan
+    adx_min_required: float = np.nan
+    rs_above_ma: Optional[bool] = None
+    explain_version: str = "v1"
 
 
 def replay_signals(
@@ -230,15 +353,25 @@ def replay_signals(
                 s_ma30_f = float(s_ma30) if pd.notna(s_ma30) else np.nan
                 s_ma150_f = float(s_ma150) if pd.notna(s_ma150) else np.nan
                 if np.isfinite(s_ma150_f) and s_price_f <= s_ma150_f * (1.0 - float(sell_crack_pct)):
+                    sell_source = f"{sell_scope_norm}_sell_replay"
+                    s_vol_f = float(s_vol) if pd.notna(s_vol) else np.nan
+                    s_adx_f = float(s_adx) if pd.notna(s_adx) else np.nan
                     events.append(ReplaySignal(
                         date=dt, ticker=st, side="long", signal="SELL", reason="sell_below_ma150_crack",
                         price=s_price_f, pivot=np.nan, ma30=s_ma30_f, ma150=s_ma150_f,
                         atr14=float(s_atr) if pd.notna(s_atr) else np.nan,
-                        vol_mult=float(s_vol) if pd.notna(s_vol) else np.nan,
-                        adx14=float(s_adx) if pd.notna(s_adx) else np.nan,
+                        vol_mult=s_vol_f,
+                        adx14=s_adx_f,
                         regime=regime_label, allow_long=allow_long, allow_short=allow_short,
                         long_size_mult=long_mult, short_size_mult=short_mult, stage="risk",
-                        source=f"{sell_scope_norm}_sell_replay",
+                        source=sell_source,
+                        explanation=_explain_sell_event(
+                            price=s_price_f, ma150=s_ma150_f, ma30=s_ma30_f,
+                            sell_crack_pct=float(sell_crack_pct), vol_mult=s_vol_f,
+                            adx_val=s_adx_f, regime=regime_label, source=sell_source,
+                        ),
+                        ma30_distance_pct=_pct_from_level(s_price_f, s_ma30_f),
+                        ma150_distance_pct=_pct_from_level(s_price_f, s_ma150_f),
                     ))
 
         for _, row in universe.iterrows():
@@ -317,6 +450,20 @@ def replay_signals(
                                 allow_long=allow_long, allow_short=allow_short, long_size_mult=long_mult,
                                 short_size_mult=short_mult, quality_score=q_score, quality_mult=q_mult,
                                 stage="Stage 2", source="core_long",
+                                explanation=_explain_long_event(
+                                    signal="BUY", price=price_f, pivot=pivot, ma30=ma30_f, ma150=ma150_f,
+                                    vol_mult=vol_f, vol_min=long_core_params.vol_min,
+                                    adx_val=adx_f, adx_min=long_core_params.adx_min,
+                                    rs_above=bool(rs_above), regime=regime_label, long_mult=long_mult,
+                                    quality_score=q_score, quality_mult=q_mult, quality_mode=quality_mode,
+                                    reason=core_entry.reason,
+                                ),
+                                pivot_distance_pct=_pct_from_level(price_f, pivot),
+                                ma30_distance_pct=_pct_from_level(price_f, ma30_f),
+                                ma150_distance_pct=_pct_from_level(price_f, ma150_f),
+                                vol_min_required=long_core_params.vol_min,
+                                adx_min_required=long_core_params.adx_min,
+                                rs_above_ma=bool(rs_above),
                             ))
                         elif include_near:
                             # PROD-like early watchlist: structurally valid Stage 2 near pivot but not a full BUY.
@@ -329,6 +476,20 @@ def replay_signals(
                                     allow_long=allow_long, allow_short=allow_short, long_size_mult=long_mult,
                                     short_size_mult=short_mult, quality_score=q_score, quality_mult=q_mult,
                                     stage="Stage 2", source="core_long_near",
+                                    explanation=_explain_long_event(
+                                        signal="NEAR", price=price_f, pivot=pivot, ma30=ma30_f, ma150=ma150_f,
+                                        vol_mult=vol_f, vol_min=long_core_params.vol_min,
+                                        adx_val=adx_f, adx_min=long_core_params.adx_min,
+                                        rs_above=bool(rs_above), regime=regime_label, long_mult=long_mult,
+                                        quality_score=q_score, quality_mult=q_mult, quality_mode=quality_mode,
+                                        reason=core_entry.reason,
+                                    ),
+                                    pivot_distance_pct=_pct_from_level(price_f, pivot),
+                                    ma30_distance_pct=_pct_from_level(price_f, ma30_f),
+                                    ma150_distance_pct=_pct_from_level(price_f, ma150_f),
+                                    vol_min_required=long_core_params.vol_min,
+                                    adx_min_required=long_core_params.adx_min,
+                                    rs_above_ma=bool(rs_above),
                                 ))
 
             # Short BUY equivalent in replay: SHORT signal when PROD/research short CORE would enter.
@@ -386,6 +547,17 @@ def replay_signals(
                         allow_long=allow_long, allow_short=allow_short, long_size_mult=long_mult,
                         short_size_mult=short_mult, quality_score=q_score, quality_mult=q_mult,
                         stage="Stage 4", source="core_short",
+                        explanation=_explain_short_event(
+                            price=price_f, pivot_low=pivot_low, ma30=ma30_f, ma150=ma150_f,
+                            vol_mult=vol_f, vol_min=sh_vol_min, rs_above=bool(rs_above),
+                            regime=regime_label, short_mult=short_mult, quality_score=q_score,
+                            quality_mult=q_mult, quality_mode=quality_mode, reason=short_res.reason,
+                        ),
+                        pivot_distance_pct=_pct_from_level(price_f, pivot_low),
+                        ma30_distance_pct=_pct_from_level(price_f, ma30_f),
+                        ma150_distance_pct=_pct_from_level(price_f, ma150_f),
+                        vol_min_required=sh_vol_min,
+                        rs_above_ma=bool(rs_above),
                     ))
 
     return replay_events_to_df(events)
@@ -416,6 +588,14 @@ def replay_events_to_df(events: List[ReplaySignal]) -> pd.DataFrame:
             "quality_mult": e.quality_mult,
             "stage": e.stage,
             "source": e.source,
+            "explanation": e.explanation,
+            "pivot_distance_pct": e.pivot_distance_pct,
+            "ma30_distance_pct": e.ma30_distance_pct,
+            "ma150_distance_pct": e.ma150_distance_pct,
+            "vol_min_required": e.vol_min_required,
+            "adx_min_required": e.adx_min_required,
+            "rs_above_ma": e.rs_above_ma,
+            "explain_version": e.explain_version,
         })
     return pd.DataFrame(rows)
 
@@ -432,4 +612,25 @@ def replay_summary(df: pd.DataFrame) -> pd.DataFrame:
         .agg(count=("ticker", "size"), unique_tickers=("ticker", "nunique"))
         .reset_index()
         .sort_values(["year", "month", "signal"])
+    )
+
+
+
+def replay_explainability_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Compact summary of why replay events fired, for 10-year audit reports."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["signal", "reason", "source", "count", "unique_tickers"])
+    x = df.copy()
+    return (
+        x.groupby(["signal", "reason", "source"], dropna=False)
+        .agg(
+            count=("ticker", "size"),
+            unique_tickers=("ticker", "nunique"),
+            avg_pivot_distance_pct=("pivot_distance_pct", "mean"),
+            avg_ma150_distance_pct=("ma150_distance_pct", "mean"),
+            avg_vol_mult=("vol_mult", "mean"),
+            avg_adx14=("adx14", "mean"),
+        )
+        .reset_index()
+        .sort_values(["signal", "count"], ascending=[True, False])
     )
