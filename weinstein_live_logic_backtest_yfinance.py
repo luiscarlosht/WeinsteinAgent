@@ -82,6 +82,8 @@ import matplotlib.pyplot as plt
 
 import yaml
 
+from weinstein_daily_cache import load_or_download_daily_bars
+
 # =========================
 # SHARED IMPORTS
 # =========================
@@ -2323,7 +2325,7 @@ def main():
         except Exception as e:
             log(f"Signal replay SELL scope=holdings: failed to load holdings: {e}", level="warn")
 
-    daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
+    daily_df = load_or_download_daily_bars(sorted(all_tickers), args.start, args.end, downloader=download_daily_bars, log_func=log)
 
     regime_table = None
 

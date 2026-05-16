@@ -48,6 +48,7 @@ from weinstein_live_logic_backtest_yfinance import (
     pick_snapshot_for_date,
 )
 from weinstein_signal_replay_core import replay_signals, replay_summary
+from weinstein_daily_cache import load_or_download_daily_bars
 from weinstein_long_core import long_stop_level, should_exit_long
 from weinstein_short_core import short_stop_level as core_short_stop_level, should_exit_short as core_should_exit_short
 
@@ -186,7 +187,7 @@ def run_replay_portfolio(args) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
     if market_cfg.get("vix_max", None) is not None:
         all_tickers.add("^VIX")
 
-    daily_df = download_daily_bars(sorted(all_tickers), args.start, args.end)
+    daily_df = load_or_download_daily_bars(sorted(all_tickers), args.start, args.end, downloader=download_daily_bars, log_func=log)
 
     # IMPORTANT: include raw SELL risk events in the signal stream, but the
     # portfolio wrapper only acts on SELL for tickers it actually holds.
