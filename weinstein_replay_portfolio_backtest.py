@@ -101,6 +101,16 @@ def _close_at(daily_df: pd.DataFrame, dt: pd.Timestamp, ticker: str) -> float:
 
 
 def _equity(daily_df: pd.DataFrame, dt: pd.Timestamp, cash: float, positions: Dict[str, Position]) -> float:
+    """Return mark-to-market account equity.
+
+    Accounting convention used by this wrapper:
+      * Long entry subtracts cost from cash; equity adds current long market value.
+      * Short entry adds sale proceeds to cash; equity subtracts current cover liability.
+
+    The previous implementation added ``qty * (2 * entry - current_price)`` for
+    shorts while cash already included the short-sale proceeds. That double-counted
+    short proceeds and created impossible returns such as +1000% or below -100%.
+    """
     eq = float(cash)
     for p in positions.values():
         px = _close_at(daily_df, dt, p.ticker)
@@ -109,8 +119,8 @@ def _equity(daily_df: pd.DataFrame, dt: pd.Timestamp, cash: float, positions: Di
         if p.side == "long":
             eq += float(p.qty) * px
         else:
-            # short equity contribution: entry proceeds minus mark-to-cover liability
-            eq += float(p.qty) * (2.0 * p.entry_price - px)
+            # Cash already includes short-sale proceeds; subtract current liability.
+            eq -= float(p.qty) * px
     return float(eq)
 
 
@@ -122,6 +132,14 @@ def _gross_exposure(daily_df: pd.DataFrame, dt: pd.Timestamp, positions: Dict[st
             px = p.entry_price
         gross += abs(float(p.qty) * px)
     return float(gross)
+
+
+def _net_liquidation_guard(equity: float, initial_capital: float, min_equity_frac: float) -> bool:
+    """True when the account still has enough equity to open new risk."""
+    if not np.isfinite(equity):
+        return False
+    floor = max(0.0, float(initial_capital) * float(min_equity_frac))
+    return equity > floor
 
 
 def _build_indicator_caches(daily_df: pd.DataFrame, tickers: List[str]):
@@ -229,7 +247,12 @@ def run_replay_portfolio(args) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
     events["date"] = pd.to_datetime(events["date"])
     events = events.sort_values(["date", "signal", "ticker"]).reset_index(drop=True)
 
-    tickers = sorted(set(events["ticker"].astype(str).str.upper()))
+    # Portfolio accounting only trades BUY/SHORT/SELL.  NEAR can still be saved
+    # for diagnostics when requested, but keeping it out of the daily trading loop
+    # improves runtime and lowers memory pressure.
+    trade_events = events[events["signal"].astype(str).str.upper().isin(["BUY", "SHORT", "SELL"])].copy()
+
+    tickers = sorted(set(trade_events["ticker"].astype(str).str.upper()))
     _, ma30_cache, ma150_cache, atr_cache = _build_indicator_caches(daily_df, tickers)
 
     cash = float(args.capital)
@@ -237,7 +260,7 @@ def run_replay_portfolio(args) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
     trades: List[Trade] = []
     equity_rows: List[dict] = []
     dates = [d for d in pd.to_datetime(daily_df.index) if pd.Timestamp(args.start) <= d <= pd.Timestamp(args.end)]
-    events_by_date = {d: x for d, x in events.groupby("date")}
+    events_by_date = {d: x for d, x in trade_events.groupby("date")}
 
     for dt in dates:
         # 1) Core stop exits first, for held names only. This preserves the
@@ -293,6 +316,18 @@ def run_replay_portfolio(args) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
 
             # 3) Entries from replay BUY/SHORT events only.
             eq_now = _equity(daily_df, dt, cash, positions)
+            if not _net_liquidation_guard(eq_now, float(args.capital), float(args.min_equity_frac)):
+                # Continue exits/mark-to-market, but do not add new risk once the
+                # account has breached the equity guardrail.
+                equity_rows.append({
+                    "date": dt.strftime("%Y-%m-%d"),
+                    "equity": eq_now,
+                    "cash": cash,
+                    "positions": len(positions),
+                    "long_positions": sum(1 for p in positions.values() if p.side == "long"),
+                    "short_positions": sum(1 for p in positions.values() if p.side == "short"),
+                })
+                continue
             gross = _gross_exposure(daily_df, dt, positions)
             buying_power = max(0.0, float(args.max_leverage) * eq_now - gross)
 
@@ -337,8 +372,10 @@ def run_replay_portfolio(args) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
                     continue
                 risk_amt = eq_now * float(args.risk_per_trade) * size_mult
                 qty_risk = int(math.floor(risk_amt / per_share_risk))
+                max_position_value = max(0.0, eq_now * float(args.max_pos_frac))
+                qty_pos_cap = int(math.floor(max_position_value / px)) if px > 0 else 0
                 qty_cash = int(math.floor(min(cash if side == "long" else buying_power, buying_power) / px))
-                qty = max(0, min(qty_risk, qty_cash))
+                qty = max(0, min(qty_risk, qty_cash, qty_pos_cap))
                 if qty <= 0:
                     continue
                 if side == "long":
@@ -388,6 +425,9 @@ def main():
     ap.add_argument("--max-long", type=int, default=10)
     ap.add_argument("--max-short", type=int, default=10)
     ap.add_argument("--max-leverage", type=float, default=1.0)
+    ap.add_argument("--max-pos-frac", type=float, default=0.20, help="Maximum gross value per new position as fraction of current equity.")
+    ap.add_argument("--min-equity-frac", type=float, default=0.25, help="Stop opening new positions once equity falls below this fraction of starting capital.")
+    ap.add_argument("--save-events", action="store_true", help="Persist full replay events CSV. Off by default to save disk and speed packaging.")
     ap.add_argument("--snapshot-mode", choices=["static", "historical", "auto"], default="auto")
     ap.add_argument("--config", default="./config.yaml")
     ap.add_argument("--regime-mode", choices=["off", "current", "prod"], default="prod")
@@ -419,7 +459,8 @@ def main():
     equity_path = os.path.join(OUTPUT_DIR, f"replay_portfolio_equity_{tag}.csv")
     summary_path = os.path.join(OUTPUT_DIR, f"replay_portfolio_summary_{tag}.csv")
 
-    events.to_csv(events_path, index=False)
+    if args.save_events:
+        events.to_csv(events_path, index=False)
     trades.to_csv(trades_path, index=False)
     equity.to_csv(equity_path, index=False)
 
@@ -442,11 +483,17 @@ def main():
         "open_positions": len(open_rows),
         "realized_pnl": float(closed["pnl"].sum()) if not closed.empty else 0.0,
         "open_mtm_pnl": float(open_rows["pnl"].sum()) if not open_rows.empty else 0.0,
+        "max_pos_frac": args.max_pos_frac,
+        "min_equity_frac": args.min_equity_frac,
+        "save_events": bool(args.save_events),
     }])
     summary.to_csv(summary_path, index=False)
 
     log(f"Replay-first portfolio complete. Final equity=${final_equity:,.2f} ({(final_equity/args.capital-1.0)*100:.2f}%)", level="ok")
-    log(f"Wrote replay events → {events_path}", level="ok")
+    if args.save_events:
+        log(f"Wrote replay events → {events_path}", level="ok")
+    else:
+        log("Skipped replay events CSV (--save-events not set)", level="info")
     log(f"Wrote replay portfolio trades → {trades_path}", level="ok")
     log(f"Wrote replay portfolio equity → {equity_path}", level="ok")
     log(f"Wrote replay portfolio summary → {summary_path}", level="ok")
