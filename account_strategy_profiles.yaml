@@ -1,19 +1,21 @@
-# Account-to-strategy profile map for live/shadow comparison.
-# Main account runs META F. Smaller control account runs D.
+# Account-to-strategy profile map for live PROD + daily SIM parity.
+# Updated rollout:
+# - Small Fidelity account runs META F live/control validation.
+# - Large Fidelity account stays on D as the stable production baseline.
 accounts:
   - account_number: "X48354910"
-    label: "Fidelity Main - META F"
-    profile: "F"
+    label: "Fidelity Main - D Baseline"
+    profile: "D"
     target_capital: 14000
-    role: "primary_live"
-    notes: "Main account. Adaptive META F recommendations."
+    role: "primary_live_baseline"
+    notes: "Large account. Stable PROD D baseline: regime + exposure scaled."
 
   - account_number: "Z30958579"
-    label: "Fidelity Control - D"
-    profile: "D"
+    label: "Fidelity Small - META F"
+    profile: "F"
     target_capital: 1000
-    role: "control_shadow"
-    notes: "Small account. Static PROD D baseline/control."
+    role: "small_live_meta_validation"
+    notes: "Small account. Controlled live validation of adaptive META F."
 
 profiles:
   D:
