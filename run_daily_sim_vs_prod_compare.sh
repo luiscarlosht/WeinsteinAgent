@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -16,9 +15,15 @@ PROD_DEBUG="${PROD_DEBUG:-$PROJECT_DIR/output/intraday_debug.csv}"
 SEND_EMAIL="${SEND_EMAIL:-1}"
 UPLOAD_SHEETS="${UPLOAD_SHEETS:-0}"
 
-# If no positions CSV provided, try latest Fidelity positions file in repo/output/home.
+# Auto-detect latest Fidelity positions export if not provided.
 if [[ -z "$POSITIONS_CSV" ]]; then
-  POSITIONS_CSV="$(ls -t "$PROJECT_DIR"/Portfolio_Positions*.csv "$PROJECT_DIR"/output/Portfolio_Positions*.csv "$HOME"/Portfolio_Positions*.csv 2>/dev/null | head -1 || true)"
+  POSITIONS_CSV="$(
+    ls -t \
+      "$PROJECT_DIR"/Portfolio_Positions*.csv \
+      "$PROJECT_DIR"/output/Portfolio_Positions*.csv \
+      "$HOME"/Portfolio_Positions*.csv \
+      2>/dev/null | head -1 || true
+  )"
 fi
 
 echo "Daily SIM vs PROD parity"
@@ -32,7 +37,12 @@ SIM_D_EVENTS="$RUN_DIR/sim_D_replay_events.csv"
 SIM_F_EVENTS="$RUN_DIR/sim_F_base_events.csv"
 SIM_F_META="$RUN_DIR/sim_F_meta_equity.csv"
 
+###############################################################################
+# SIM D
+###############################################################################
+
 echo "Generating SIM D replay events..."
+
 python3 weinstein_replay_portfolio_backtest_fast.py \
   --start "$START_DATE" \
   --end "$END_DATE" \
@@ -49,7 +59,12 @@ python3 weinstein_replay_portfolio_backtest_fast.py \
   --replay-events-out "$SIM_D_EVENTS" \
   --save-events
 
+###############################################################################
+# SIM F BASE
+###############################################################################
+
 echo "Generating broad replay events for SIM F..."
+
 python3 weinstein_replay_portfolio_backtest_fast_meta.py \
   --start "$START_DATE" \
   --end "$END_DATE" \
@@ -65,7 +80,12 @@ python3 weinstein_replay_portfolio_backtest_fast_meta.py \
   --replay-events-out "$SIM_F_EVENTS" \
   --save-events
 
+###############################################################################
+# SIM F META PORTFOLIO
+###############################################################################
+
 echo "Running SIM F meta portfolio for daily decision log..."
+
 python3 weinstein_replay_portfolio_backtest_fast_meta.py \
   --start "$START_DATE" \
   --end "$END_DATE" \
@@ -83,6 +103,10 @@ python3 weinstein_replay_portfolio_backtest_fast_meta.py \
     tail -80 "$RUN_DIR/sim_F_meta_run.log"
     exit 1
   }
+
+###############################################################################
+# BUILD COMPARISON REPORT
+###############################################################################
 
 ARGS=(
   --prod-debug "$PROD_DEBUG"
@@ -106,10 +130,12 @@ if [[ "$UPLOAD_SHEETS" == "1" ]]; then
 fi
 
 echo "Building comparison report..."
+
 python3 weinstein_daily_sim_prod_compare.py "${ARGS[@]}"
 
 echo
 echo "DONE daily parity run"
 echo "Output folder: $RUN_DIR"
+
 ls -lh "$RUN_DIR"
 ```
