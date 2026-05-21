@@ -1,3 +1,4 @@
+```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -76,7 +77,7 @@ python3 weinstein_replay_portfolio_backtest_fast_meta.py \
   --min-equity-frac 0.25 \
   --replay-events-in "$SIM_F_EVENTS" \
   --meta-strategy F \
-  --meta-log "$SIM_F_META" \
+  --meta-log \
   > "$RUN_DIR/sim_F_meta_run.log" 2>&1 || {
     echo "SIM F meta run failed. Last 80 lines:"
     tail -80 "$RUN_DIR/sim_F_meta_run.log"
@@ -111,3 +112,4 @@ echo
 echo "DONE daily parity run"
 echo "Output folder: $RUN_DIR"
 ls -lh "$RUN_DIR"
+```
