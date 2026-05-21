@@ -1,0 +1,40 @@
+# Account-to-strategy profile map for live/shadow comparison.
+# Main account runs META F. Smaller control account runs D.
+accounts:
+  - account_number: "X48354910"
+    label: "Fidelity Main - META F"
+    profile: "F"
+    target_capital: 14000
+    role: "primary_live"
+    notes: "Main account. Adaptive META F recommendations."
+
+  - account_number: "Z30958579"
+    label: "Fidelity Control - D"
+    profile: "D"
+    target_capital: 1000
+    role: "control_shadow"
+    notes: "Small account. Static PROD D baseline/control."
+
+profiles:
+  D:
+    description: "PROD regime + exposure scaled"
+    mode: "both"
+    regime_mode: "prod"
+    exposure_mode: "scaled"
+    signal_quality_mode: "off"
+
+  F:
+    description: "META adaptive selector; dynamically switches A/B/D/E above CORE"
+    mode: "both"
+    regime_mode: "off"
+    exposure_mode: "off"
+    meta_strategy: "F"
+
+google_sheets:
+  enabled: false
+  sheet_url: "https://docs.google.com/spreadsheets/d/17eYLngeM_SbasWRVSy748J-RltTRli1_4od6mlZnpW4/edit"
+  service_account_json: "/home/luiscarlosht/WeinsteinAgent/creds/gcp_service_account.json"
+  tabs:
+    comparison: "Daily_SIM_vs_PROD"
+    account_recs: "Daily_Account_Recommendations"
+    meta_decisions: "Daily_META_F_Decisions"
