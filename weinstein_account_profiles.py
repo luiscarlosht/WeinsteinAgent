@@ -7,6 +7,7 @@ Purpose:
 - Read account_strategy_profiles.yaml
 - Read Fidelity positions exports robustly
 - Map account numbers to strategy profiles.
+- Exclude Fidelity pseudo rows like PENDING ACTIVITY from operational positions.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ def read_fidelity_positions(csv_path: str) -> pd.DataFrame:
 
     Handles:
     - UTF-8 BOM
-    - footer disclaimer rows
+    - footer/disclaimer rows
     - cash rows
     - trailing commas
     - occasional malformed footer text
@@ -112,6 +113,23 @@ def normalize_positions(df: pd.DataFrame) -> pd.DataFrame:
     out["Account Number"] = out["Account Number"].astype(str).str.strip()
     out["Symbol"] = out["Symbol"].astype(str).str.upper().str.strip()
 
+    # Exclude Fidelity operational pseudo rows. These are not holdings and
+    # should not appear in the live routing report.
+    pseudo_mask = out["Symbol"].str.contains(
+        r"^PENDING ACTIVITY$|^PENDING$|^ACTIVITY$",
+        case=False,
+        regex=True,
+        na=False,
+    )
+    if "Description" in out.columns:
+        pseudo_mask = pseudo_mask | out["Description"].astype(str).str.contains(
+            r"pending activity",
+            case=False,
+            regex=True,
+            na=False,
+        )
+    out = out[~pseudo_mask].copy()
+
     for c in ["Quantity", "Last Price", "Current Value", "Cost Basis Total", "Average Cost Basis"]:
         if c in out.columns:
             out[c + "_Num"] = out[c].apply(money_to_float)
@@ -119,6 +137,8 @@ def normalize_positions(df: pd.DataFrame) -> pd.DataFrame:
     if "Percent Of Account" in out.columns:
         out["Percent_Of_Account_Num"] = out["Percent Of Account"].apply(money_to_float)
 
+    # Keep real Fidelity cash/money market rows, but mark them as cash so they
+    # are excluded from owned equity matching while still visible for cash context.
     out["IsCash"] = out["Symbol"].astype(str).str.contains(
         r"FCASH|SPAXX|CASH|\*\*|MONEY MARKET",
         case=False,
@@ -170,5 +190,17 @@ if __name__ == "__main__":
     if pos.empty:
         print("No positions loaded. Check file header/format.")
     else:
-        cols = [c for c in ["Account Number", "AccountLabel", "Profile", "Symbol", "Quantity", "Current Value", "IsCash"] if c in pos.columns]
+        cols = [
+            c
+            for c in [
+                "Account Number",
+                "AccountLabel",
+                "Profile",
+                "Symbol",
+                "Quantity",
+                "Current Value",
+                "IsCash",
+            ]
+            if c in pos.columns
+        ]
         print(pos[cols].to_string(index=False))
