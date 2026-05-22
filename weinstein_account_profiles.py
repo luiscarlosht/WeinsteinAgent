@@ -157,7 +157,18 @@ if __name__ == "__main__":
     ap.add_argument("--profiles", default="account_strategy_profiles.yaml")
     args = ap.parse_args()
 
+    raw = read_fidelity_positions(args.positions_csv)
+    print("Raw columns:", list(raw.columns))
+    print("Raw rows:", len(raw))
+
     cfg = load_profiles(args.profiles)
-    pos = attach_profiles(normalize_positions(read_fidelity_positions(args.positions_csv)), cfg)
-    print(pos[["Account Number", "AccountLabel", "Profile", "Symbol", "Quantity", "Current Value", "IsCash"]].to_string(index=False))
-    print(f"\nRows loaded: {len(pos)}")
+    pos = attach_profiles(normalize_positions(raw), cfg)
+
+    print("Normalized columns:", list(pos.columns))
+    print("Rows loaded:", len(pos))
+
+    if pos.empty:
+        print("No positions loaded. Check file header/format.")
+    else:
+        cols = [c for c in ["Account Number", "AccountLabel", "Profile", "Symbol", "Quantity", "Current Value", "IsCash"] if c in pos.columns]
+        print(pos[cols].to_string(index=False))
