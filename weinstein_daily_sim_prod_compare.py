@@ -161,6 +161,13 @@ def compare_signals(prod: pd.DataFrame, sim_d: pd.DataFrame, sim_f: pd.DataFrame
 
 
 def account_recommendations(sim_d: pd.DataFrame, sim_f: pd.DataFrame, positions: pd.DataFrame, profile_cfg: dict) -> pd.DataFrame:
+    """Build account-level recommendations.
+
+    Operational filtering:
+    - BUY/NEAR are shown as candidates for the account profile.
+    - SELL is shown only when the account owns the ticker.
+    - SHORT is shown as a candidate, but can be ignored if the account does not trade shorts.
+    """
     accounts = profile_cfg.get("accounts", []) or []
     rows = []
     owned = positions[~positions.get("IsCash", False)].copy() if not positions.empty else pd.DataFrame()
@@ -176,19 +183,26 @@ def account_recommendations(sim_d: pd.DataFrame, sim_f: pd.DataFrame, positions:
 
         for _, ev in events.iterrows():
             sig = _norm_signal(ev.get("Signal"))
-            t = str(ev.get("Ticker", "")).upper()
+            t = str(ev.get("Ticker", "")).upper().strip()
             if not t or sig not in {"BUY", "NEAR", "SELL", "SHORT"}:
                 continue
 
-            # SELL/SHORT review is more urgent if the account owns the ticker.
-            owned_row = acct_owned[acct_owned["Symbol"].astype(str).str.upper().eq(t)].head(1) if not acct_owned.empty else pd.DataFrame()
             is_owned = t in owned_tickers
+
+            # Reduce noise: do not show hundreds of "SELL not owned" rows.
             if sig == "SELL" and not is_owned:
-                action = "SELL signal - not owned in this account"
-            elif sig == "SELL":
+                continue
+
+            owned_row = acct_owned[acct_owned["Symbol"].astype(str).str.upper().eq(t)].head(1) if not acct_owned.empty else pd.DataFrame()
+
+            if sig == "SELL":
                 action = "SELL / reduce review"
+            elif sig == "BUY" and is_owned:
+                action = "BUY / add-to-position candidate"
             elif sig == "BUY":
                 action = "BUY candidate"
+            elif sig == "NEAR" and is_owned:
+                action = "NEAR watch - already owned"
             elif sig == "NEAR":
                 action = "NEAR watch"
             elif sig == "SHORT":
@@ -217,17 +231,17 @@ def account_recommendations(sim_d: pd.DataFrame, sim_f: pd.DataFrame, positions:
             "RunUTC", "AccountNumber", "AccountLabel", "Profile", "Ticker", "Signal",
             "RecommendedAction", "Owned", "OwnedQty", "CurrentValue", "SignalPrice", "Reason"
         ])
+
     priority = {"SELL": 0, "BUY": 1, "NEAR": 2, "SHORT": 3}
     out["_p"] = out["Signal"].map(priority).fillna(9)
     return out.sort_values(["AccountNumber", "_p", "Ticker"]).drop(columns=["_p"])
-
 
 def read_meta_decisions(path: str) -> pd.DataFrame:
     df = _read_csv(path)
     if df.empty:
         return pd.DataFrame()
     # Keep compact useful columns if present.
-    keep = [c for c in ["date", "meta_profile", "meta_reason", "equity", "cash", "positions"] if c in df.columns]
+    keep = [c for c in ["date", "meta_profile", "meta_reason", "equity", "cash", "positions", "long_positions", "short_positions"] if c in df.columns]
     return df[keep].copy() if keep else df
 
 
@@ -314,7 +328,10 @@ def main():
 
     if args.positions_csv and os.path.exists(args.positions_csv):
         pos = attach_profiles(normalize_positions(read_fidelity_positions(args.positions_csv)), profile_cfg)
+        print(f"Positions loaded from {args.positions_csv}: {len(pos)}")
     else:
+        if args.positions_csv:
+            print(f"WARNING: positions CSV not found: {args.positions_csv}")
         pos = pd.DataFrame()
 
     comparison = compare_signals(prod, sim_d, sim_f)

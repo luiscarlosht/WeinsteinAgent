@@ -23,8 +23,13 @@ PROD_DEBUG="${PROD_DEBUG:-$PROJECT_DIR/output/intraday_debug.csv}"
 SEND_EMAIL="${SEND_EMAIL:-1}"
 UPLOAD_SHEETS="${UPLOAD_SHEETS:-0}"
 
-# Auto-detect latest Fidelity positions export if not provided.
-if [[ -z "$POSITIONS_CSV" ]]; then
+# Auto-detect latest Fidelity positions export if not provided or if provided path is missing.
+if [[ -z "$POSITIONS_CSV" || ! -f "$POSITIONS_CSV" ]]; then
+  if [[ -n "$POSITIONS_CSV" && ! -f "$POSITIONS_CSV" ]]; then
+    echo "WARNING: Provided POSITIONS_CSV does not exist: $POSITIONS_CSV"
+    echo "Attempting auto-detect instead..."
+  fi
+
   POSITIONS_CSV="$(
     ls -t \
       "$PROJECT_DIR"/Portfolio_Positions*.csv \
@@ -94,6 +99,9 @@ python3 weinstein_replay_portfolio_backtest_fast_meta.py \
 
 echo "Running SIM F meta portfolio for daily decision log..."
 
+META_MARKER="$RUN_DIR/.meta_start_marker"
+touch "$META_MARKER"
+
 python3 weinstein_replay_portfolio_backtest_fast_meta.py \
   --start "$START_DATE" \
   --end "$END_DATE" \
@@ -112,6 +120,22 @@ python3 weinstein_replay_portfolio_backtest_fast_meta.py \
     exit 1
   }
 
+# The META engine currently writes meta_profile/meta_reason into its normal
+# replay_portfolio_equity_*.csv output. Copy the newest equity file generated
+# by this run into the daily parity folder so the report can read it reliably.
+LATEST_META_EQUITY="$(
+  find "$PROJECT_DIR/output" -maxdepth 1 -type f -name 'replay_portfolio_equity_*.csv' -newer "$META_MARKER" -printf '%T@ %p\n' \
+    | sort -nr \
+    | awk 'NR==1 {print $2}'
+)"
+
+if [[ -n "$LATEST_META_EQUITY" && -f "$LATEST_META_EQUITY" ]]; then
+  cp "$LATEST_META_EQUITY" "$SIM_F_META"
+  echo "Copied META F equity/decision log: $LATEST_META_EQUITY -> $SIM_F_META"
+else
+  echo "WARNING: Could not locate META F equity output after meta run."
+fi
+
 ###############################################################################
 # BUILD COMPARISON REPORT
 ###############################################################################
@@ -125,8 +149,10 @@ ARGS=(
   --out-dir "$RUN_DIR"
 )
 
-if [[ -n "$POSITIONS_CSV" ]]; then
+if [[ -n "$POSITIONS_CSV" && -f "$POSITIONS_CSV" ]]; then
   ARGS+=(--positions-csv "$POSITIONS_CSV")
+else
+  echo "WARNING: No valid positions CSV found. Owned/CurrentValue fields will be empty."
 fi
 
 if [[ "$SEND_EMAIL" == "1" ]]; then
