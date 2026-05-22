@@ -4,6 +4,14 @@ set -euo pipefail
 PROJECT_DIR="/home/luiscarlosht/WeinsteinAgent"
 cd "$PROJECT_DIR"
 
+LOCK_FILE="/tmp/weinstein_daily_parity.lock"
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+  echo "Another daily parity run is already active. Exiting."
+  exit 0
+fi
+
 START_DATE="${START_DATE:-$(date -d '30 days ago' +%F)}"
 END_DATE="${END_DATE:-$(date +%F)}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -138,4 +146,3 @@ echo "DONE daily parity run"
 echo "Output folder: $RUN_DIR"
 
 ls -lh "$RUN_DIR"
-```
