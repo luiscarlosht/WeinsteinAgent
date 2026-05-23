@@ -57,7 +57,8 @@ def normalize_debug(df: pd.DataFrame, source: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=[
             "Source", "Ticker", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct",
-            "VolPace", "ADX14", "cond_buy_price_ok", "cond_buy_vol_ok",
+            "VolPace", "ADX14", "WatchSignal", "WatchReason",
+            "cond_buy_price_ok", "cond_buy_vol_ok",
             "cond_near_pace_gate", "cond_near_now", "buy_confirm",
         ])
 
@@ -80,6 +81,8 @@ def normalize_debug(df: pd.DataFrame, source: str) -> pd.DataFrame:
     out["HeadroomPct"] = pd.to_numeric(df[headroom_col], errors="coerce") if headroom_col else pd.NA
     out["VolPace"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else pd.NA
     out["ADX14"] = pd.to_numeric(df[adx_col], errors="coerce") if adx_col else pd.NA
+    out["WatchSignal"] = df["WatchSignal"].astype(str).str.upper().str.strip() if "WatchSignal" in df.columns else ""
+    out["WatchReason"] = df["WatchReason"].astype(str).str.strip() if "WatchReason" in df.columns else ""
 
     for c in [
         "cond_weekly_stage_ok",
@@ -115,6 +118,19 @@ def signal_counts(df: pd.DataFrame, label: str) -> pd.DataFrame:
         if sig not in SIGNAL_ORDER:
             rows.append({"Source": label, "Signal": sig, "Count": int(cnt)})
     return pd.DataFrame(rows)
+
+
+def watch_counts(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    if df.empty or "WatchSignal" not in df.columns:
+        return pd.DataFrame({"Source": [label], "WatchSignal": ["NO_WATCH_DATA"], "Count": [0]})
+    s = df["WatchSignal"].fillna("").astype(str).str.upper().str.strip()
+    s = s[s.ne("")]
+    if s.empty:
+        return pd.DataFrame({"Source": [label], "WatchSignal": ["NO_WATCH_ROWS"], "Count": [0]})
+    return pd.DataFrame([
+        {"Source": label, "WatchSignal": sig, "Count": int(cnt)}
+        for sig, cnt in s.value_counts().items()
+    ])
 
 
 def gate_failure_summary(df: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -160,7 +176,7 @@ def top_candidates(df: pd.DataFrame, label: str, n: int = 40) -> pd.DataFrame:
     x["_sig_p"] = x["Signal"].map(sig_priority).fillna(9)
     x = x.sort_values(["_sig_p", "AbsHeadroomPct", "VolPace"], ascending=[True, True, False])
     cols = [
-        "Source", "Ticker", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct",
+        "Source", "Ticker", "Signal", "Reason", "WatchSignal", "WatchReason", "PriceNow", "Pivot", "HeadroomPct",
         "VolPace", "ADX14", "cond_buy_price_ok", "cond_buy_vol_ok",
         "cond_near_pace_gate", "cond_near_now", "buy_confirm",
     ]
@@ -171,16 +187,17 @@ def compare_strict_validation(strict: pd.DataFrame, validation: pd.DataFrame) ->
     if strict.empty and validation.empty:
         return pd.DataFrame()
 
-    s = strict[["Ticker", "Signal", "Reason", "HeadroomPct", "VolPace"]].copy()
-    s.columns = ["Ticker", "StrictSignal", "StrictReason", "StrictHeadroomPct", "StrictVolPace"]
+    s = strict[["Ticker", "Signal", "Reason", "WatchSignal", "HeadroomPct", "VolPace"]].copy()
+    s.columns = ["Ticker", "StrictSignal", "StrictReason", "StrictWatchSignal", "StrictHeadroomPct", "StrictVolPace"]
 
-    v = validation[["Ticker", "Signal", "Reason", "HeadroomPct", "VolPace"]].copy()
-    v.columns = ["Ticker", "ValidationSignal", "ValidationReason", "ValidationHeadroomPct", "ValidationVolPace"]
+    v = validation[["Ticker", "Signal", "Reason", "WatchSignal", "HeadroomPct", "VolPace"]].copy()
+    v.columns = ["Ticker", "ValidationSignal", "ValidationReason", "ValidationWatchSignal", "ValidationHeadroomPct", "ValidationVolPace"]
 
     out = pd.merge(s, v, on="Ticker", how="outer")
     out = out[
         (out["StrictSignal"].fillna("") != out["ValidationSignal"].fillna(""))
         | (out["ValidationSignal"].isin(["BUY", "NEAR"]))
+        | (out["ValidationWatchSignal"].fillna("").ne(""))
     ].copy()
 
     priority = {"BUY": 0, "NEAR": 1, "NONE": 2, "SKIP-STAGE": 3, "SKIP-MA": 4}
@@ -194,7 +211,7 @@ def html_table(df: pd.DataFrame, max_rows: int = 100) -> str:
     return df.head(max_rows).to_html(index=False, escape=True)
 
 
-def build_html(summary: Dict[str, object], counts: pd.DataFrame, gates: pd.DataFrame, diffs: pd.DataFrame, candidates: pd.DataFrame) -> str:
+def build_html(summary: Dict[str, object], counts: pd.DataFrame, watches: pd.DataFrame, gates: pd.DataFrame, diffs: pd.DataFrame, candidates: pd.DataFrame) -> str:
     parts = [
         "<html><body>",
         "<h2>PROD Validation Mode Summary</h2>",
@@ -208,6 +225,8 @@ def build_html(summary: Dict[str, object], counts: pd.DataFrame, gates: pd.DataF
         "</ul>",
         "<h3>Signal Counts</h3>",
         html_table(counts),
+        "<h3>Watch-Layer Counts</h3>",
+        html_table(watches),
         "<h3>Gate Failure Summary</h3>",
         html_table(gates),
         "<h3>Strict vs Validation Differences</h3>",
@@ -240,6 +259,11 @@ def main() -> None:
         signal_counts(validation, "VALIDATION_TEST_EASE"),
     ], ignore_index=True)
 
+    watches = pd.concat([
+        watch_counts(strict, "STRICT_PROD"),
+        watch_counts(validation, "VALIDATION_TEST_EASE"),
+    ], ignore_index=True)
+
     gates = pd.concat([
         gate_failure_summary(strict, "STRICT_PROD"),
         gate_failure_summary(validation, "VALIDATION_TEST_EASE"),
@@ -250,12 +274,14 @@ def main() -> None:
 
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     counts_path = os.path.join(args.out_dir, f"prod_validation_signal_counts_{stamp}.csv")
+    watches_path = os.path.join(args.out_dir, f"prod_validation_watch_counts_{stamp}.csv")
     gates_path = os.path.join(args.out_dir, f"prod_validation_gate_summary_{stamp}.csv")
     diffs_path = os.path.join(args.out_dir, f"prod_validation_differences_{stamp}.csv")
     cand_path = os.path.join(args.out_dir, f"prod_validation_candidates_{stamp}.csv")
     html_path = os.path.join(args.out_dir, f"prod_validation_summary_{stamp}.html")
 
     counts.to_csv(counts_path, index=False)
+    watches.to_csv(watches_path, index=False)
     gates.to_csv(gates_path, index=False)
     diffs.to_csv(diffs_path, index=False)
     candidates.to_csv(cand_path, index=False)
@@ -273,18 +299,20 @@ def main() -> None:
         "Validation BUY": cnt(validation, "BUY"),
         "Validation NEAR": cnt(validation, "NEAR"),
         "Validation NONE": cnt(validation, "NONE"),
+        "Validation WATCH rows": int(validation.get("WatchSignal", pd.Series(dtype=str)).fillna("").astype(str).str.len().gt(0).sum()) if not validation.empty else 0,
         "Differences": len(diffs),
         "Strict debug": args.strict_debug,
         "Validation debug": args.validation_debug,
     }
 
-    html_body = build_html(summary, counts, gates, diffs, candidates)
+    html_body = build_html(summary, counts, watches, gates, diffs, candidates)
     Path(html_path).write_text(html_body, encoding="utf-8")
 
     print("DONE")
     for k, v in summary.items():
         print(f"{k}: {v}")
     print(f"counts: {counts_path}")
+    print(f"watches: {watches_path}")
     print(f"gates: {gates_path}")
     print(f"differences: {diffs_path}")
     print(f"candidates: {cand_path}")

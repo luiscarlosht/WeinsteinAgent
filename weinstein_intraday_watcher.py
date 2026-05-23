@@ -770,6 +770,56 @@ def evaluate_intraday_signals(
         vol_pace = vol_now / vol_ma50
         headroom_pct = (price_now / pivot_window - 1.0) * 100.0
 
+        # ------------------------------------------------------------------
+        # WATCH LAYER VISIBILITY
+        # ------------------------------------------------------------------
+        # This is an observability layer only.  It does NOT convert rows into
+        # BUY/NEAR/SELL and it does NOT loosen production trade signals.
+        #
+        # Goal: expose why PROD is quiet during the day by labeling useful
+        # Stage-2/pivot contexts even when strict participation gates fail.
+        # Examples:
+        #   WATCH_BREAKOUT_PRICE  = price is over pivot, but strict BUY failed
+        #   WATCH_NEAR_PIVOT      = price is close to pivot, but not actionable
+        #   WATCH_LOW_VOLUME      = price context is interesting, but vol pace is weak
+        watch_signal = ""
+        watch_reason = ""
+        watch_price_ok = False
+        watch_volume_ok = False
+        watch_near_zone_pct = float(cfg.intraday.near_below_pivot_pct) / 100.0
+        watch_price_ok = bool(price_now >= float(pivot_window) * (1.0 - watch_near_zone_pct))
+        watch_volume_ok = bool((not np.isnan(vol_pace)) and vol_pace >= cfg.intraday.near_vol_pace_min)
+
+        if watch_price_ok:
+            if price_now >= float(pivot_window):
+                if watch_volume_ok:
+                    watch_signal = "WATCH_BREAKOUT_PRICE"
+                    watch_reason = (
+                        f"Watch: price is over pivot but strict BUY not confirmed yet; "
+                        f"headroom={headroom_pct:.2f}%, vol={vol_pace:.2f}x"
+                    )
+                else:
+                    watch_signal = "WATCH_LOW_VOLUME"
+                    watch_reason = (
+                        f"Watch: price is over pivot but volume pace is weak; "
+                        f"headroom={headroom_pct:.2f}%, vol={vol_pace:.2f}x "
+                        f"< near_req={cfg.intraday.near_vol_pace_min:.2f}x"
+                    )
+            else:
+                if watch_volume_ok:
+                    watch_signal = "WATCH_NEAR_PIVOT"
+                    watch_reason = (
+                        f"Watch: price is within {cfg.intraday.near_below_pivot_pct:.2f}% of pivot; "
+                        f"headroom={headroom_pct:.2f}%, vol={vol_pace:.2f}x"
+                    )
+                else:
+                    watch_signal = "WATCH_LOW_VOLUME"
+                    watch_reason = (
+                        f"Watch: price is near pivot but volume pace is weak; "
+                        f"headroom={headroom_pct:.2f}%, vol={vol_pace:.2f}x "
+                        f"< near_req={cfg.intraday.near_vol_pace_min:.2f}x"
+                    )
+
         # BUY vs NEAR logic is delegated to CORE so PROD and SIM stay aligned.
         core_params = LongEntryParams(
             min_break_pct=cfg.intraday.confirm_headroom_pct / 100.0,
@@ -885,6 +935,12 @@ def evaluate_intraday_signals(
                 cond_buy_price_ok=cond_buy_price_ok,
                 cond_near_now=cond_near_now,
                 buy_confirm=buy_confirm,
+                WatchSignal=watch_signal,
+                WatchReason=watch_reason,
+                WatchPriceOK=watch_price_ok,
+                WatchVolumeOK=watch_volume_ok,
+                watch_signal=watch_signal,
+                watch_reason=watch_reason,
             )
         )
 
@@ -1258,11 +1314,15 @@ def _sort_diag_for_report(diag: pd.DataFrame) -> pd.DataFrame:
 
     signal = df.get('Signal', pd.Series('', index=df.index)).astype(str).str.upper()
     structure = df.get('Structure', pd.Series('', index=df.index)).astype(str).str.lower()
+    watch_signal = df.get('WatchSignal', pd.Series('', index=df.index)).astype(str).str.upper()
 
     priority = pd.Series(50, index=df.index, dtype=float)
     priority.loc[signal.eq('BUY')] = 0
     priority.loc[signal.isin(['NEAR', 'NEAR_BUY', 'NEAR-TRIGGER'])] = 1
-    priority.loc[signal.eq('NONE') & structure.str.contains('stage 2', na=False)] = 2
+    priority.loc[watch_signal.eq('WATCH_BREAKOUT_PRICE')] = 2
+    priority.loc[watch_signal.eq('WATCH_NEAR_PIVOT')] = 3
+    priority.loc[watch_signal.eq('WATCH_LOW_VOLUME')] = 4
+    priority.loc[signal.eq('NONE') & structure.str.contains('stage 2', na=False)] = 5
     priority.loc[signal.eq('NONE')] = 3
     priority.loc[signal.eq('SKIP-ADX')] = 4
     priority.loc[signal.isin(['SKIP-DATA', 'SKIP-MA', 'SKIP-INTRADAY', 'SKIP-PIVOT'])] = 5
@@ -1613,6 +1673,7 @@ def build_intraday_report_html(
     buys = diag.loc[sig.eq("BUY")].copy() if not diag.empty else pd.DataFrame()
     nears = diag.loc[sig.isin(["NEAR", "NEAR_BUY", "NEAR-TRIGGER"])].copy() if not diag.empty else pd.DataFrame()
     sells = diag.loc[sig.isin(["SELL", "SELLTRIG", "SELL-TRIGGER"])].copy() if not diag.empty else pd.DataFrame()
+    watch = diag.loc[diag.get("WatchSignal", pd.Series("", index=diag.index)).fillna("").astype(str).str.len().gt(0)].copy() if not diag.empty else pd.DataFrame()
 
     skip_stage = int(sig.eq("SKIP-STAGE").sum()) if not sig.empty else 0
     skip_adx = int(sig.eq("SKIP-ADX").sum()) if not sig.empty else 0
@@ -1631,7 +1692,9 @@ def build_intraday_report_html(
       and ADX14 ≥ {cfg.intraday.adx_min_long:.1f} when available.<br><br>
       <b>NEAR-TRIGGER:</b> Structurally valid Stage 2 setup approaching pivot breakout,
       or initial pivot cross lacking full BUY confirmation. This is the early watchlist layer before confirmed BUY signals.<br><br>
-      <b>SELL-TRIGGER:</b> Confirmed breakdown below SMA150 by {cfg.intraday.crack_ma_pct:.1f}% with persistence and downside confirmation.
+      <b>SELL-TRIGGER:</b> Confirmed breakdown below SMA150 by {cfg.intraday.crack_ma_pct:.1f}% with persistence and downside confirmation.<br><br>
+      <b>WATCH:</b> Observational visibility for Stage 2 / pivot contexts that are close to actionable but fail strict BUY/NEAR gates,
+      usually because volume pace is too weak. WATCH rows do not trigger trade recommendations.
     </i></p>
     <p style="font-size:13px;color:#555;">
       <b>Market Regime (Chapter 8 filter):</b> {market_regime} — LONG allowed={bool(long_ok)}, SHORT allowed={short_allowed}.<br>
@@ -1674,6 +1737,8 @@ def build_intraday_report_html(
         "<hr>",
         _ordered_section("Near-Triggers (ranked)", nears, "NEAR", "No NEAR-TRIGGER setups at this scan."),
         "<hr>",
+        _watch_section(diag),
+        "<hr>",
         _ordered_section("Sell Triggers (ranked)", sells, "SELL", "No SELL-TRIGGER signals."),
         build_action_charts_section(buys, nears, sells, daily=daily, max_charts=15),
         build_portfolio_review_section(diag, holdings, holdings_source),
@@ -1682,6 +1747,7 @@ def build_intraday_report_html(
         "<table class=\"summary\"><thead><tr><th>Metric</th><th>Count</th></tr></thead><tbody>",
         f"<tr><td>Confirmed BUY</td><td>{len(buys)}</td></tr>",
         f"<tr><td>NEAR-TRIGGER</td><td>{len(nears)}</td></tr>",
+        f"<tr><td>WATCH rows</td><td>{len(watch)}</td></tr>",
         f"<tr><td>SELL-TRIGGER</td><td>{len(sells)}</td></tr>",
         f"<tr><td>Stage 1/2 structure, no trigger yet</td><td>{none_count}</td></tr>",
         f"<tr><td>SKIP-STAGE</td><td>{skip_stage}</td></tr>",
@@ -1694,6 +1760,7 @@ def build_intraday_report_html(
         "<li>NONE means the ticker has acceptable structure but has not produced a trigger yet.</li>",
         "<li>BUY remains strict: confirmed breakout plus participation confirmation.</li>",
         "<li>NEAR-TRIGGER is the early watchlist layer: structurally valid setups that may become actionable if volume expands.</li>",
+        "<li>WATCH rows are observational only: they reveal close-to-pivot or low-volume contexts without becoming trading signals.</li>",
         "<li>Signals are filtered through the Chapter 8 market/regime model and optional breadth health gate.</li>",
         "</ul>",
         "<hr>",
@@ -1703,7 +1770,7 @@ def build_intraday_report_html(
     if diag.empty:
         sections.append("<p>No diagnostics rows generated.</p>")
     else:
-        preferred_cols = ["Ticker", "Structure", "Signal", "Reason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "CloseDaily", "MA150", "ATR14"]
+        preferred_cols = ["Ticker", "Structure", "Signal", "Reason", "WatchSignal", "WatchReason", "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14", "CloseDaily", "MA150", "ATR14"]
         cols = [c for c in preferred_cols if c in diag.columns]
         # Sort before colorizing so the raw numeric values can still be ranked.
         diag_sorted = _sort_diag_for_report(diag)
