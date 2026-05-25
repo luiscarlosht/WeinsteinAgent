@@ -47,7 +47,7 @@ notifications:
       host: "smtp.gmail.com"
       port_ssl: 587
       username: "luiscarlosht@gmail.com"
-      app_password: "qnamoxtmakhnvlml"
+      app_password_env: "SMTP_APP_PASSWORD"
 
 reporting:
   # Files the job writes
