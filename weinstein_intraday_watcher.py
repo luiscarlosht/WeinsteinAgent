@@ -1654,6 +1654,78 @@ def build_action_charts_section(
         parts.append(f"<p class=\"note\">Chart section limited to top {max_charts} actionable tickers.</p>")
     return "\n".join(parts)
 
+
+def _watch_section(diag: pd.DataFrame, limit: int = 40) -> str:
+    """Render diagnostic-only WATCH rows in the intraday HTML report.
+
+    WATCH rows are intentionally NOT trading signals. They expose cases where
+    price is close to/over pivot but strict BUY/NEAR gates are not confirmed,
+    usually because volume pace or confirmation is weak.
+    """
+    parts = ["<h4>Watch-Layer Visibility (diagnostic only)</h4>"]
+
+    if diag is None or diag.empty or "WatchSignal" not in diag.columns:
+        parts.append("<p>No WATCH rows available in diagnostics.</p>")
+        return "\n".join(parts)
+
+    watch = diag.copy()
+    watch["WatchSignal"] = watch["WatchSignal"].fillna("").astype(str).str.strip()
+    watch = watch[watch["WatchSignal"].ne("")].copy()
+
+    if watch.empty:
+        parts.append("<p>No WATCH contexts at this scan.</p>")
+        parts.append("<p class=\"note\">WATCH is observational only and does not change BUY / NEAR / SELL recommendations.</p>")
+        return "\n".join(parts)
+
+    counts = watch["WatchSignal"].value_counts().reset_index()
+    counts.columns = ["WatchSignal", "Count"]
+    counts["WatchSignal"] = counts["WatchSignal"].map(lambda x: _badge(x, _badge_class_for_signal(x)))
+
+    parts.append("<p class=\"note\">WATCH rows are diagnostic-only. They show setups near/over pivot that failed strict confirmation, commonly because volume pace is weak.</p>")
+    parts.append(counts.to_html(index=False, escape=False, classes="summary"))
+
+    # Sort strongest watch contexts first: breakout price, near pivot, then low volume.
+    priority = {
+        "WATCH_BREAKOUT_PRICE": 0,
+        "WATCH_NEAR_PIVOT": 1,
+        "WATCH_LOW_VOLUME": 2,
+    }
+    watch["_watch_priority"] = watch["WatchSignal"].map(priority).fillna(9)
+    watch["_abs_headroom"] = pd.to_numeric(watch.get("HeadroomPct"), errors="coerce").abs()
+    watch["_volpace"] = pd.to_numeric(watch.get("VolPace"), errors="coerce")
+    watch = watch.sort_values(["_watch_priority", "_abs_headroom", "_volpace"], ascending=[True, True, False])
+
+    preferred_cols = [
+        "Ticker", "Structure", "Signal", "Reason", "WatchSignal", "WatchReason",
+        "PriceNow", "Pivot", "HeadroomPct", "VolPace", "ADX14",
+        "cond_buy_price_ok", "cond_buy_vol_ok", "cond_near_pace_gate", "cond_near_now", "buy_confirm",
+    ]
+    cols = [c for c in preferred_cols if c in watch.columns]
+    show = watch[cols].head(limit).copy()
+
+    if "WatchSignal" in show.columns:
+        show["WatchSignal"] = show["WatchSignal"].map(lambda x: _badge(x, _badge_class_for_signal(x)))
+    if "Signal" in show.columns:
+        show["Signal"] = show["Signal"].map(lambda x: _badge(x, _badge_class_for_signal(x)))
+    if "Structure" in show.columns:
+        show["Structure"] = show["Structure"].map(lambda x: _badge(x, _badge_class_for_structure(x)))
+
+    for col, digits, suffix in [
+        ("PriceNow", 2, ""),
+        ("Pivot", 2, ""),
+        ("HeadroomPct", 2, "%"),
+        ("VolPace", 2, "×"),
+        ("ADX14", 1, ""),
+    ]:
+        if col in show.columns:
+            show[col] = show[col].map(lambda x, d=digits, s=suffix: _fmt_table_num(x, d, s))
+
+    parts.append(show.to_html(index=False, escape=False, classes="diagnostics-table"))
+    if len(watch) > limit:
+        parts.append(f"<p class=\"note\">Showing top {limit} of {len(watch)} WATCH contexts.</p>")
+    parts.append("<p class=\"note\">WATCH rows are for visibility only. Confirmed BUY/NEAR/SELL rules remain unchanged.</p>")
+    return "\n".join(parts)
+
 def build_intraday_report_html(
     diag: pd.DataFrame,
     cfg: FullConfig,
