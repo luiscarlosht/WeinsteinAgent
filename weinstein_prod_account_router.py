@@ -32,6 +32,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from weinstein_prod_history import read_prod_history_for_date, summarize_prod_history
+
 from weinstein_account_profiles import (
     load_profiles,
     read_fidelity_positions,
@@ -324,11 +326,13 @@ def build_html(summary: dict, recs: pd.DataFrame, diffs: pd.DataFrame, meta: pd.
         "<ul>",
     ]
     for k, v in summary.items():
-        if k == "meta_state":
+        if k == "meta_state" or str(k).startswith("_"):
             continue
         parts.append(f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>")
     parts += [
         "</ul>",
+        "<h3>PROD Intraday Signals Seen Today</h3>",
+        _table(summary.get("_prod_history_df", pd.DataFrame()), 100),
         "<h3>Account-Routed Recommendations</h3>",
         _table(recs, 100),
         "<h3>D vs F Differences</h3>",
@@ -359,6 +363,8 @@ def write_outputs(out_dir: str, recs: pd.DataFrame, diffs: pd.DataFrame, html_bo
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--prod-debug", default="output/intraday_debug.csv")
+    ap.add_argument("--prod-history", default="output/prod_intraday_signal_history.csv")
+    ap.add_argument("--prod-history-date", default="", help="Central-time date YYYY-MM-DD; defaults to latest date in history")
     ap.add_argument("--positions-csv", default="")
     ap.add_argument("--profiles", default="account_strategy_profiles.yaml")
     ap.add_argument("--parity-dir", default="")
@@ -372,7 +378,11 @@ def main() -> None:
     parity_dir = args.parity_dir or latest_parity_dir()
     raw_sim_d, raw_sim_f, meta, parity_info = read_latest_parity(parity_dir)
 
-    prod = normalize_signal_df(_read_csv(args.prod_debug), "PROD")
+    prod_latest = normalize_signal_df(_read_csv(args.prod_debug), "PROD_LATEST")
+    prod_history_raw = read_prod_history_for_date(args.prod_history, args.prod_history_date or None)
+    prod_history = summarize_prod_history(prod_history_raw)
+    # For routing, prefer signals actually seen at any point intraday; fall back to latest snapshot.
+    prod = prod_history if not prod_history.empty else prod_latest
     sim_d = normalize_signal_df(raw_sim_d, "SIM_D")
     sim_f = normalize_signal_df(raw_sim_f, "SIM_F")
 
@@ -390,7 +400,9 @@ def main() -> None:
     meta_state = latest_meta_state(meta)
 
     summary = {
-        "PROD signals": len(prod),
+        "PROD latest snapshot signals": len(prod_latest),
+        "PROD intraday signals seen": len(prod_history),
+        "PROD routing signals used": len(prod),
         "SIM D signals available": len(sim_d),
         "SIM F signals available": len(sim_f),
         "Positions loaded": len(positions),
@@ -402,6 +414,7 @@ def main() -> None:
         "meta_state": meta_state,
     }
 
+    summary["_prod_history_df"] = prod_history
     html_body = build_html(summary, recs, diffs, meta, positions)
     paths = write_outputs(args.out_dir, recs, diffs, html_body)
 

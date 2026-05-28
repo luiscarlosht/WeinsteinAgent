@@ -33,6 +33,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from weinstein_prod_history import read_prod_history_for_date, summarize_prod_history
+
 from weinstein_account_profiles import (
     load_profiles,
     read_fidelity_positions,
@@ -139,21 +141,27 @@ def normalize_sim(sim: pd.DataFrame, source: str) -> pd.DataFrame:
     return out[["Ticker", "Signal", "Price", "Reason", "Source"]].drop_duplicates()
 
 
-def compare_signals(prod: pd.DataFrame, sim_d: pd.DataFrame, sim_f: pd.DataFrame) -> pd.DataFrame:
-    keys = sorted(set(prod["Ticker"]) | set(sim_d["Ticker"]) | set(sim_f["Ticker"]))
+def compare_signals(prod: pd.DataFrame, sim_d: pd.DataFrame, sim_f: pd.DataFrame, prod_history: pd.DataFrame | None = None) -> pd.DataFrame:
+    prod_history = prod_history if prod_history is not None else pd.DataFrame(columns=["Ticker", "Signal"])
+    keys = sorted(set(prod["Ticker"]) | set(prod_history["Ticker"]) | set(sim_d["Ticker"]) | set(sim_f["Ticker"]))
     rows = []
     for t in keys:
         p = ",".join(sorted(prod.loc[prod["Ticker"].eq(t), "Signal"].unique()))
+        ph = ",".join(sorted(prod_history.loc[prod_history["Ticker"].eq(t), "Signal"].unique())) if not prod_history.empty else ""
         d = ",".join(sorted(sim_d.loc[sim_d["Ticker"].eq(t), "Signal"].unique()))
         f = ",".join(sorted(sim_f.loc[sim_f["Ticker"].eq(t), "Signal"].unique()))
         rows.append({
             "Ticker": t,
-            "PROD_Signal": p,
+            "PROD_Latest_Signal": p,
+            "PROD_Intraday_Signal": ph,
             "SIM_D_Signal": d,
             "SIM_F_RawSignal": f,
-            "PROD_vs_D_Match": bool(p and d and p == d),
-            "PROD_vs_F_Match": bool(p and f and p == f),
-            "In_PROD": bool(p),
+            "PROD_Latest_vs_D_Match": bool(p and d and p == d),
+            "PROD_Latest_vs_F_Match": bool(p and f and p == f),
+            "PROD_Intraday_vs_D_Match": bool(ph and d and ph == d),
+            "PROD_Intraday_vs_F_Match": bool(ph and f and ph == f),
+            "In_PROD_Latest": bool(p),
+            "In_PROD_Intraday": bool(ph),
             "In_SIM_D": bool(d),
             "In_SIM_F": bool(f),
         })
@@ -258,11 +266,15 @@ def build_html(summary: dict, comparison: pd.DataFrame, recs: pd.DataFrame, meta
         "<ul>",
     ]
     for k, v in summary.items():
+        if str(k).startswith("_"):
+            continue
         parts.append(f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>")
     parts += [
         "</ul>",
         "<h3>Account Recommendations</h3>",
         table(recs, 100),
+        "<h3>PROD Intraday Signals Seen Today</h3>",
+        table(summary.get("_prod_history_df", pd.DataFrame()), 100),
         "<h3>PROD vs SIM Signal Comparison</h3>",
         table(comparison, 100),
         "<h3>META F Decisions</h3>",
@@ -306,6 +318,8 @@ def upload_to_sheets(profile_cfg: dict, comparison: pd.DataFrame, recs: pd.DataF
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prod-debug", default="output/intraday_debug.csv")
+    ap.add_argument("--prod-history", default="output/prod_intraday_signal_history.csv")
+    ap.add_argument("--prod-history-date", default="", help="Central-time date YYYY-MM-DD; defaults to latest date in history")
     ap.add_argument("--sim-d-events", required=True)
     ap.add_argument("--sim-f-events", required=True)
     ap.add_argument("--sim-f-meta", default="")
@@ -322,6 +336,8 @@ def main():
         profile_cfg.setdefault("google_sheets", {})["enabled"] = True
 
     prod = normalize_prod(_read_csv(args.prod_debug))
+    prod_history_raw = read_prod_history_for_date(args.prod_history, args.prod_history_date or None)
+    prod_history = summarize_prod_history(prod_history_raw)
     sim_d = normalize_sim(_read_csv(args.sim_d_events), "SIM_D")
     sim_f = normalize_sim(_read_csv(args.sim_f_events), "SIM_F")
     meta = read_meta_decisions(args.sim_f_meta)
@@ -334,30 +350,37 @@ def main():
             print(f"WARNING: positions CSV not found: {args.positions_csv}")
         pos = pd.DataFrame()
 
-    comparison = compare_signals(prod, sim_d, sim_f)
+    comparison = compare_signals(prod, sim_d, sim_f, prod_history)
     recs = account_recommendations(sim_d, sim_f, pos, profile_cfg)
 
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     comp_path = os.path.join(args.out_dir, f"daily_prod_sim_signal_comparison_{stamp}.csv")
     rec_path = os.path.join(args.out_dir, f"daily_account_recommendations_{stamp}.csv")
     meta_path = os.path.join(args.out_dir, f"daily_meta_f_decisions_{stamp}.csv")
+    prod_hist_path = os.path.join(args.out_dir, f"daily_prod_intraday_history_{stamp}.csv")
     html_path = os.path.join(args.out_dir, f"daily_prod_sim_summary_{stamp}.html")
 
     comparison.to_csv(comp_path, index=False)
     recs.to_csv(rec_path, index=False)
     if not meta.empty:
         meta.to_csv(meta_path, index=False)
+    if not prod_history.empty:
+        prod_history.to_csv(prod_hist_path, index=False)
 
     summary = {
-        "PROD signals": len(prod),
+        "PROD latest snapshot signals": len(prod),
+        "PROD intraday signals seen": len(prod_history),
         "SIM D signals": len(sim_d),
         "SIM F raw signals": len(sim_f),
         "Account recommendation rows": len(recs),
-        "PROD vs D exact ticker/signal matches": int(comparison["PROD_vs_D_Match"].sum()) if not comparison.empty else 0,
-        "PROD vs F exact ticker/signal matches": int(comparison["PROD_vs_F_Match"].sum()) if not comparison.empty else 0,
+        "PROD latest vs D exact ticker/signal matches": int(comparison["PROD_Latest_vs_D_Match"].sum()) if not comparison.empty else 0,
+        "PROD latest vs F exact ticker/signal matches": int(comparison["PROD_Latest_vs_F_Match"].sum()) if not comparison.empty else 0,
+        "PROD intraday vs D exact ticker/signal matches": int(comparison["PROD_Intraday_vs_D_Match"].sum()) if not comparison.empty else 0,
+        "PROD intraday vs F exact ticker/signal matches": int(comparison["PROD_Intraday_vs_F_Match"].sum()) if not comparison.empty else 0,
         "Positions loaded": len(pos),
     }
 
+    summary["_prod_history_df"] = prod_history
     html_body = build_html(summary, comparison, recs, meta)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_body)
@@ -383,6 +406,8 @@ def main():
     print(f"Account recommendations: {rec_path}")
     if not meta.empty:
         print(f"META F decisions: {meta_path}")
+    if not prod_history.empty:
+        print(f"PROD intraday history: {prod_hist_path}")
     print(f"HTML: {html_path}")
 
 

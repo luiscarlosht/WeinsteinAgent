@@ -35,6 +35,8 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+
+from weinstein_prod_history import append_prod_signal_history
 import yfinance as yf
 import yaml
 
@@ -2011,6 +2013,22 @@ def main() -> None:
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     diag.to_csv(out_csv, index=False)
     log(f"Wrote diagnostics CSV → {out_csv}")
+
+    # Preserve actionable PROD intraday signal history before the next scan overwrites
+    # output/intraday_debug.csv. Daily parity/routing reports use this file to avoid
+    # losing transient BUY/NEAR/SELL signals that appeared earlier in the session.
+    try:
+        history_path = os.environ.get(
+            "PROD_SIGNAL_HISTORY_CSV",
+            os.path.join(cfg.app.output_dir, "prod_intraday_signal_history.csv"),
+        )
+        appended = append_prod_signal_history(diag, history_path, source_file=out_csv)
+        if appended.empty:
+            log(f"PROD signal history unchanged → {history_path} (no BUY/NEAR/SELL/SHORT rows this scan)")
+        else:
+            log(f"Appended PROD signal history → {history_path} rows={len(appended)}")
+    except Exception as e:
+        log(f"⚠️ Failed to append PROD signal history: {e}")
 
     # Polished HTML/email-style report
     # Keep filenames/logs in the VM local timezone, but show report time in Dallas/Central time.
