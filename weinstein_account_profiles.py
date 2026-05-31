@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from weinstein_positions_source import is_google_positions_source, load_positions_dataframe
+
 
 def load_profiles(path: str = "account_strategy_profiles.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -47,6 +49,9 @@ def read_fidelity_positions(csv_path: str) -> pd.DataFrame:
     - trailing commas
     - occasional malformed footer text
     """
+    if is_google_positions_source(csv_path):
+        return load_positions_dataframe(csv_path)
+
     if not csv_path or not os.path.exists(csv_path):
         return pd.DataFrame()
 

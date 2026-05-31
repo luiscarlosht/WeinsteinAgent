@@ -69,7 +69,9 @@ def normalize_signal_frame(df: pd.DataFrame, source: str = "PROD") -> pd.DataFra
     # Preserve useful audit metadata when present.
     for c in [
         "RunUTC", "RunCT", "RunDateCT", "SourceFile", "Structure", "WatchSignal", "WatchReason",
-        "Pivot", "HeadroomPct", "VolPace", "ADX14", "PriceNow",
+        "Pivot", "HeadroomPct", "VolPace", "ADX14", "PriceNow", "RegimeLabel",
+        "LongExposureMult", "ShortExposureMult", "SuggestedLongSizePct", "Stage",
+        "MA30", "MA150", "ATR14", "Conditions",
     ]:
         actual = _first_existing_col(out, [c])
         if actual:
