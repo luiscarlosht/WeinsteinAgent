@@ -40,6 +40,7 @@ from weinstein_account_profiles import (
     normalize_positions,
     attach_profiles,
 )
+from weinstein_positions_source import is_google_positions_source
 
 
 SIGNALS = {"BUY", "NEAR", "NEAR_BUY", "NEAR-TRIGGER", "SELL", "SELLTRIG", "SELL-TRIGGER", "SELL-WATCH", "SHORT"}
@@ -146,7 +147,10 @@ def read_latest_parity(parity_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
 
     sim_d = _read_csv(os.path.join(parity_dir, "sim_D_replay_events.csv"))
-    sim_f = _read_csv(os.path.join(parity_dir, "sim_F_base_events.csv"))
+    effective_f_path = os.path.join(parity_dir, "sim_F_effective_events.csv")
+    if not Path(effective_f_path).exists():
+        effective_f_path = os.path.join(parity_dir, "sim_F_base_events.csv")
+    sim_f = _read_csv(effective_f_path)
 
     meta_path = latest_file(os.path.join(parity_dir, "daily_meta_f_decisions_*.csv")) or os.path.join(parity_dir, "sim_F_meta_equity.csv")
     meta = _read_csv(meta_path)
@@ -155,6 +159,7 @@ def read_latest_parity(parity_dir: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.
         "parity_dir": parity_dir,
         "sim_d_rows": len(sim_d),
         "sim_f_rows": len(sim_f),
+        "sim_f_path": effective_f_path if Path(effective_f_path).exists() else "",
         "meta_rows": len(meta),
         "meta_path": meta_path if meta_path and Path(meta_path).exists() else "",
     }
@@ -183,7 +188,7 @@ def latest_meta_state(meta: pd.DataFrame) -> dict:
 
 def load_positions(path: str, profiles_path: str) -> pd.DataFrame:
     cfg = load_profiles(profiles_path)
-    if not path or not os.path.exists(path):
+    if not path or (not is_google_positions_source(path) and not os.path.exists(path)):
         return pd.DataFrame()
     return attach_profiles(normalize_positions(read_fidelity_positions(path)), cfg)
 
@@ -225,7 +230,7 @@ def account_routed_recommendations(
                 source_label = "PROD_D" if not prod.empty else "SIM_D_FALLBACK"
         elif profile == "F":
             source_df = sim_f
-            source_label = "SIM_F_META"
+            source_label = "SIM_F_EFFECTIVE"
         else:
             continue
 

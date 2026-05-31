@@ -86,7 +86,7 @@ def _newest_weekly_csv() -> str:
     files = [
         f
         for f in os.listdir(LATEST_WEEKLY_DIR)
-        if f.startswith(LATEST_WEEKLY_PREFIX) and f.endswith(".csv")
+        if re.fullmatch(rf"{re.escape(LATEST_WEEKLY_PREFIX)}\d{{8}}(?:_\d{{4}})?\.csv", f)
     ]
     if not files:
         raise FileNotFoundError(

@@ -6,7 +6,7 @@ Daily PROD vs SIM parity report.
 Compares:
 - PROD intraday diagnostics: output/intraday_debug.csv
 - SIM D replay events
-- SIM F broad replay events + optional F meta decisions
+- SIM F effective replay events selected by the latest F meta decision
 - Fidelity account positions/profile map
 
 Outputs:
@@ -141,21 +141,50 @@ def normalize_sim(sim: pd.DataFrame, source: str) -> pd.DataFrame:
     return out[["Ticker", "Signal", "Price", "Reason", "Source"]].drop_duplicates()
 
 
-def compare_signals(prod: pd.DataFrame, sim_d: pd.DataFrame, sim_f: pd.DataFrame, prod_history: pd.DataFrame | None = None) -> pd.DataFrame:
+def latest_meta_profile(meta: pd.DataFrame) -> str:
+    if meta.empty or "meta_profile" not in meta.columns:
+        return ""
+    out = meta.copy()
+    if "date" in out.columns:
+        out["_dt"] = pd.to_datetime(out["date"], errors="coerce")
+        out = out.sort_values("_dt")
+    return str(out["meta_profile"].iloc[-1]).strip().upper()
+
+
+def effective_f_signals(sim_d: pd.DataFrame, sim_e: pd.DataFrame, sim_f_raw: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+    """Select the effective F shadow stream for the latest META profile."""
+    profile = latest_meta_profile(meta)
+    if profile == "A":
+        out = sim_f_raw[sim_f_raw["Signal"].ne("SHORT")].copy()
+    elif profile == "D":
+        out = sim_d.copy()
+    elif profile == "E":
+        out = sim_e.copy()
+    else:
+        # B and unknown profiles consume the broad both-sides stream.
+        out = sim_f_raw.copy()
+    out["F_MetaProfile"] = profile or "UNKNOWN"
+    return out
+
+
+def compare_signals(prod: pd.DataFrame, sim_d: pd.DataFrame, sim_f: pd.DataFrame, prod_history: pd.DataFrame | None = None, sim_f_raw: pd.DataFrame | None = None) -> pd.DataFrame:
     prod_history = prod_history if prod_history is not None else pd.DataFrame(columns=["Ticker", "Signal"])
-    keys = sorted(set(prod["Ticker"]) | set(prod_history["Ticker"]) | set(sim_d["Ticker"]) | set(sim_f["Ticker"]))
+    sim_f_raw = sim_f_raw if sim_f_raw is not None else sim_f
+    keys = sorted(set(prod["Ticker"]) | set(prod_history["Ticker"]) | set(sim_d["Ticker"]) | set(sim_f["Ticker"]) | set(sim_f_raw["Ticker"]))
     rows = []
     for t in keys:
         p = ",".join(sorted(prod.loc[prod["Ticker"].eq(t), "Signal"].unique()))
         ph = ",".join(sorted(prod_history.loc[prod_history["Ticker"].eq(t), "Signal"].unique())) if not prod_history.empty else ""
         d = ",".join(sorted(sim_d.loc[sim_d["Ticker"].eq(t), "Signal"].unique()))
         f = ",".join(sorted(sim_f.loc[sim_f["Ticker"].eq(t), "Signal"].unique()))
+        f_raw = ",".join(sorted(sim_f_raw.loc[sim_f_raw["Ticker"].eq(t), "Signal"].unique()))
         rows.append({
             "Ticker": t,
             "PROD_Latest_Signal": p,
             "PROD_Intraday_Signal": ph,
             "SIM_D_Signal": d,
-            "SIM_F_RawSignal": f,
+            "SIM_F_EffectiveSignal": f,
+            "SIM_F_RawSignal": f_raw,
             "PROD_Latest_vs_D_Match": bool(p and d and p == d),
             "PROD_Latest_vs_F_Match": bool(p and f and p == f),
             "PROD_Intraday_vs_D_Match": bool(ph and d and ph == d),
@@ -321,6 +350,7 @@ def main():
     ap.add_argument("--prod-history", default="output/prod_intraday_signal_history.csv")
     ap.add_argument("--prod-history-date", default="", help="Central-time date YYYY-MM-DD; defaults to latest date in history")
     ap.add_argument("--sim-d-events", required=True)
+    ap.add_argument("--sim-e-events", default="")
     ap.add_argument("--sim-f-events", required=True)
     ap.add_argument("--sim-f-meta", default="")
     ap.add_argument("--positions-csv", default="")
@@ -339,10 +369,12 @@ def main():
     prod_history_raw = read_prod_history_for_date(args.prod_history, args.prod_history_date or None)
     prod_history = summarize_prod_history(prod_history_raw)
     sim_d = normalize_sim(_read_csv(args.sim_d_events), "SIM_D")
-    sim_f = normalize_sim(_read_csv(args.sim_f_events), "SIM_F")
+    sim_e = normalize_sim(_read_csv(args.sim_e_events), "SIM_E")
+    sim_f_raw = normalize_sim(_read_csv(args.sim_f_events), "SIM_F_RAW")
     meta = read_meta_decisions(args.sim_f_meta)
+    sim_f = effective_f_signals(sim_d, sim_e, sim_f_raw, meta)
 
-    if args.positions_csv and os.path.exists(args.positions_csv):
+    if args.positions_csv:
         pos = attach_profiles(normalize_positions(read_fidelity_positions(args.positions_csv)), profile_cfg)
         print(f"Positions loaded from {args.positions_csv}: {len(pos)}")
     else:
@@ -350,18 +382,20 @@ def main():
             print(f"WARNING: positions CSV not found: {args.positions_csv}")
         pos = pd.DataFrame()
 
-    comparison = compare_signals(prod, sim_d, sim_f, prod_history)
+    comparison = compare_signals(prod, sim_d, sim_f, prod_history, sim_f_raw)
     recs = account_recommendations(sim_d, sim_f, pos, profile_cfg)
 
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     comp_path = os.path.join(args.out_dir, f"daily_prod_sim_signal_comparison_{stamp}.csv")
     rec_path = os.path.join(args.out_dir, f"daily_account_recommendations_{stamp}.csv")
     meta_path = os.path.join(args.out_dir, f"daily_meta_f_decisions_{stamp}.csv")
+    effective_f_path = os.path.join(args.out_dir, "sim_F_effective_events.csv")
     prod_hist_path = os.path.join(args.out_dir, f"daily_prod_intraday_history_{stamp}.csv")
     html_path = os.path.join(args.out_dir, f"daily_prod_sim_summary_{stamp}.html")
 
     comparison.to_csv(comp_path, index=False)
     recs.to_csv(rec_path, index=False)
+    sim_f.to_csv(effective_f_path, index=False)
     if not meta.empty:
         meta.to_csv(meta_path, index=False)
     if not prod_history.empty:
@@ -371,7 +405,10 @@ def main():
         "PROD latest snapshot signals": len(prod),
         "PROD intraday signals seen": len(prod_history),
         "SIM D signals": len(sim_d),
-        "SIM F raw signals": len(sim_f),
+        "SIM E signals": len(sim_e),
+        "SIM F raw signals": len(sim_f_raw),
+        "SIM F effective signals": len(sim_f),
+        "SIM F selected profile": latest_meta_profile(meta) or "UNKNOWN",
         "Account recommendation rows": len(recs),
         "PROD latest vs D exact ticker/signal matches": int(comparison["PROD_Latest_vs_D_Match"].sum()) if not comparison.empty else 0,
         "PROD latest vs F exact ticker/signal matches": int(comparison["PROD_Latest_vs_F_Match"].sum()) if not comparison.empty else 0,
@@ -404,6 +441,7 @@ def main():
     print("DONE")
     print(f"Comparison: {comp_path}")
     print(f"Account recommendations: {rec_path}")
+    print(f"SIM F effective events: {effective_f_path}")
     if not meta.empty:
         print(f"META F decisions: {meta_path}")
     if not prod_history.empty:

@@ -151,7 +151,7 @@ def load_sim_signals_from_comparison(parity_dir: str) -> pd.DataFrame:
 
     ticker_col = find_col(df, ["Ticker", "ticker"])
     d_col = find_col(df, ["SIM_D_Signal", "SIM_D_signal"])
-    f_col = find_col(df, ["SIM_F_RawSignal", "SIM_F_Signal", "SIM_F_signal"])
+    f_col = find_col(df, ["SIM_F_EffectiveSignal", "SIM_F_Signal", "SIM_F_signal", "SIM_F_RawSignal"])
 
     out = pd.DataFrame()
     out["Ticker"] = df[ticker_col].map(normalize_ticker) if ticker_col else ""
@@ -163,11 +163,12 @@ def load_sim_signals_from_comparison(parity_dir: str) -> pd.DataFrame:
 
 def infer_sim_first_dates_from_events(parity_dir: str) -> pd.DataFrame:
     candidates = []
+    # The effective F artifact is a latest-state snapshot. Keep the dated raw
+    # replay stream for lifecycle timing until META exports per-date decisions.
+    f_pattern = "sim_F_base_events.csv" if os.path.exists(os.path.join(parity_dir, "sim_F_base_events.csv")) else "sim_F_effective_events.csv"
     for pattern, label in [
         ("sim_D_replay_events.csv", "D"),
-        ("sim_F_base_events.csv", "F"),
-        ("*sim_D*events*.csv", "D"),
-        ("*sim_F*events*.csv", "F"),
+        (f_pattern, "F"),
     ]:
         for f in glob.glob(os.path.join(parity_dir, pattern)):
             candidates.append((f, label))

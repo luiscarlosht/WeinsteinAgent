@@ -12,7 +12,8 @@ if ! flock -n 9; then
   exit 0
 fi
 
-START_DATE="${START_DATE:-$(date -d '30 days ago' +%F)}"
+LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
+START_DATE="${START_DATE:-$(date -d "$LOOKBACK_DAYS days ago" +%F)}"
 END_DATE="${END_DATE:-$(date +%F)}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="$PROJECT_DIR/output/daily_parity/$STAMP"
@@ -24,7 +25,7 @@ SEND_EMAIL="${SEND_EMAIL:-1}"
 UPLOAD_SHEETS="${UPLOAD_SHEETS:-0}"
 
 # Auto-detect latest Fidelity positions export if not provided or if provided path is missing.
-if [[ -z "$POSITIONS_CSV" || ! -f "$POSITIONS_CSV" ]]; then
+if [[ "$POSITIONS_CSV" != "GOOGLE_SHEET" && ( -z "$POSITIONS_CSV" || ! -f "$POSITIONS_CSV" ) ]]; then
   if [[ -n "$POSITIONS_CSV" && ! -f "$POSITIONS_CSV" ]]; then
     echo "WARNING: Provided POSITIONS_CSV does not exist: $POSITIONS_CSV"
     echo "Attempting auto-detect instead..."
@@ -47,6 +48,7 @@ echo "PROD_DEBUG=$PROD_DEBUG"
 echo "POSITIONS_CSV=${POSITIONS_CSV:-NONE}"
 
 SIM_D_EVENTS="$RUN_DIR/sim_D_replay_events.csv"
+SIM_E_EVENTS="$RUN_DIR/sim_E_strict_events.csv"
 SIM_F_EVENTS="$RUN_DIR/sim_F_base_events.csv"
 SIM_F_META="$RUN_DIR/sim_F_meta_equity.csv"
 
@@ -70,6 +72,29 @@ python3 weinstein_replay_portfolio_backtest_fast.py \
   --min-equity-frac 0.25 \
   --replay-only \
   --replay-events-out "$SIM_D_EVENTS" \
+  --save-events
+
+###############################################################################
+# SIM E
+###############################################################################
+
+echo "Generating SIM E strict-quality replay events..."
+
+python3 weinstein_replay_portfolio_backtest_fast.py \
+  --start "$START_DATE" \
+  --end "$END_DATE" \
+  --mode both \
+  --snapshot-mode auto \
+  --config ./config.yaml \
+  --regime-mode prod \
+  --neutral-policy long \
+  --exposure-mode scaled \
+  --signal-quality-mode strict \
+  --max-leverage 1.0 \
+  --max-pos-frac 0.20 \
+  --min-equity-frac 0.25 \
+  --replay-only \
+  --replay-events-out "$SIM_E_EVENTS" \
   --save-events
 
 ###############################################################################
@@ -143,13 +168,14 @@ fi
 ARGS=(
   --prod-debug "$PROD_DEBUG"
   --sim-d-events "$SIM_D_EVENTS"
+  --sim-e-events "$SIM_E_EVENTS"
   --sim-f-events "$SIM_F_EVENTS"
   --sim-f-meta "$SIM_F_META"
   --profiles account_strategy_profiles.yaml
   --out-dir "$RUN_DIR"
 )
 
-if [[ -n "$POSITIONS_CSV" && -f "$POSITIONS_CSV" ]]; then
+if [[ "$POSITIONS_CSV" == "GOOGLE_SHEET" || ( -n "$POSITIONS_CSV" && -f "$POSITIONS_CSV" ) ]]; then
   ARGS+=(--positions-csv "$POSITIONS_CSV")
 else
   echo "WARNING: No valid positions CSV found. Owned/CurrentValue fields will be empty."
