@@ -300,8 +300,20 @@ def build_html(summary: dict, comparison: pd.DataFrame, recs: pd.DataFrame, meta
         parts.append(f"<li><b>{html.escape(str(k))}</b>: {html.escape(str(v))}</li>")
     parts += [
         "</ul>",
-        "<h3>Account Recommendations</h3>",
-        table(recs, 100),
+        "<h3>Action List — Large Fidelity Account (Profile D)</h3>",
+        table(
+            recs[recs["Profile"].astype(str).str.upper().eq("D")]
+            if not recs.empty and "Profile" in recs.columns
+            else recs,
+            100,
+        ),
+        "<h3>Action List — Small Fidelity Account (META F)</h3>",
+        table(
+            recs[recs["Profile"].astype(str).str.upper().eq("F")]
+            if not recs.empty and "Profile" in recs.columns
+            else pd.DataFrame(),
+            100,
+        ),
         "<h3>PROD Intraday Signals Seen Today</h3>",
         table(summary.get("_prod_history_df", pd.DataFrame()), 100),
         "<h3>PROD vs SIM Signal Comparison</h3>",
