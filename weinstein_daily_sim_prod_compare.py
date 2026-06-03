@@ -288,6 +288,16 @@ def build_html(summary: dict, comparison: pd.DataFrame, recs: pd.DataFrame, meta
             return "<p><i>No rows.</i></p>"
         return df.head(n).to_html(index=False, escape=True)
 
+    large_d_recs = pd.DataFrame()
+    small_meta_recs = pd.DataFrame()
+
+    if recs is not None and not recs.empty and "Profile" in recs.columns:
+        profile = recs["Profile"].astype(str).str.upper()
+        large_d_recs = recs[profile.eq("D")].copy()
+        small_meta_recs = recs[profile.eq("F")].copy()
+    elif recs is not None:
+        large_d_recs = recs
+
     parts = [
         "<html><body>",
         "<h2>Daily PROD vs SIM Parity Report</h2>",
@@ -301,19 +311,9 @@ def build_html(summary: dict, comparison: pd.DataFrame, recs: pd.DataFrame, meta
     parts += [
         "</ul>",
         "<h3>Action List — Large Fidelity Account (Profile D)</h3>",
-        table(
-            recs[recs["Profile"].astype(str).str.upper().eq("D")]
-            if not recs.empty and "Profile" in recs.columns
-            else recs,
-            100,
-        ),
+        table(large_d_recs, 100),
         "<h3>Action List — Small Fidelity Account (META F)</h3>",
-        table(
-            recs[recs["Profile"].astype(str).str.upper().eq("F")]
-            if not recs.empty and "Profile" in recs.columns
-            else pd.DataFrame(),
-            100,
-        ),
+        table(small_meta_recs, 100),
         "<h3>PROD Intraday Signals Seen Today</h3>",
         table(summary.get("_prod_history_df", pd.DataFrame()), 100),
         "<h3>PROD vs SIM Signal Comparison</h3>",
