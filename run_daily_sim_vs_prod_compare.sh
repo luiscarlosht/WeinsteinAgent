@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="/home/luiscarlosht/WeinsteinAgent"
+# Resolve project root dynamically from this script's location.
+# This allows the same script to run from:
+# - Google VM: /home/luiscarlosht/WeinsteinAgent
+# - DigitalOcean VM: /root/WeinsteinAgent
+# - Any future clone path
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
 cd "$PROJECT_DIR"
 
 LOCK_FILE="/tmp/weinstein_daily_parity.lock"
@@ -41,6 +47,7 @@ if [[ "$POSITIONS_CSV" != "GOOGLE_SHEET" && ( -z "$POSITIONS_CSV" || ! -f "$POSI
 fi
 
 echo "Daily SIM vs PROD parity"
+echo "PROJECT_DIR=$PROJECT_DIR"
 echo "START_DATE=$START_DATE"
 echo "END_DATE=$END_DATE"
 echo "RUN_DIR=$RUN_DIR"
