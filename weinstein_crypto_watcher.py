@@ -21,6 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from weinstein_mailer import send_email
+from weinstein_long_core import LongEntryParams, evaluate_long_signal
 
 # ---------------- Tunables (crypto) ----------------
 OUTPUT_DIR = "./output"
@@ -399,6 +400,18 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
     # State
     trig = _load_state()
 
+    # Crypto now consumes the shared Weinstein LONG CORE for BUY/NEAR
+    # signal classification.  The crypto watcher keeps its existing
+    # 24/7 data handling, state machine, SELL logic, reports, and email
+    # behavior; only the long-side BUY/NEAR eligibility calculation is
+    # delegated to the shared core.
+    crypto_long_params = LongEntryParams(
+        min_break_pct=MIN_BREAKOUT_PCT,
+        dist_above_ma_min=BUY_DIST_ABOVE_MA_MIN,
+        vol_min=VOL_PACE_MIN,
+        adx_min=0.0,
+    )
+
     buy_signals, near_signals, sell_triggers = [], [], []
     info_rows = []
 
@@ -439,46 +452,87 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma_crypto(t, daily)
 
-        # BUY confirm: close above pivot & SMA150 by +0.4% (no intrabar/elapsed checks)
+        # BUY / NEAR classification now comes from the shared LONG CORE.
+        #
+        # IMPORTANT: the legacy crypto watcher confirmed BUY using the most
+        # recent intraday close, while NEAR used the current intraday price.
+        # To preserve that behavior as closely as possible, we call CORE twice:
+        #   - core_buy_result: last intraday close, used for confirm
+        #   - core_near_result: current price, used for NEAR/ARMED state
+        #
+        # The legacy crypto watcher treated missing volume pace as allowed.
+        # The long CORE requires a non-NaN volume input, so when pace is missing
+        # we pass the required threshold to preserve the old permissive behavior.
         confirm = False
         vol_ok = True
         price_ok = False
+        last_c = np.nan
+        core_vol_mult = float(pace) if pd.notna(pace) else VOL_PACE_MIN
 
-        if pd.notna(ma30) and pd.notna(pivot):
-            def _price_ok(c):
-                return (
-                    c >= pivot * (1.0 + MIN_BREAKOUT_PCT)
-                    and c >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
-                )
+        core_buy_signal = "NONE"
+        core_buy_reason = "not_evaluated"
+        core_near_signal = "NONE"
+        core_near_reason = "not_evaluated"
 
-            closes_n = get_last_n_intraday_closes(intraday, t, n=2)
-            if closes_n:
-                last_c = closes_n[-1]
-                price_ok = _price_ok(last_c)
-                confirm = price_ok
+        closes_n = get_last_n_intraday_closes(intraday, t, n=2)
+        if closes_n:
+            last_c = closes_n[-1]
+
+        if (
+            stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
+            and pd.notna(ma30)
+            and pd.notna(pivot)
+            and pd.notna(last_c)
+        ):
+            core_buy_result = evaluate_long_signal(
+                price=float(last_c),
+                ma_val=float(ma30),
+                pivot=float(pivot),
+                rs_above_ma=rs_ok,
+                vol_mult=core_vol_mult,
+                adx_val=np.nan,
+                params=crypto_long_params,
+                near_below_pivot_pct=NEAR_BELOW_PIVOT_PCT,
+                near_vol_min=NEAR_VOL_PACE_MIN,
+            )
+            core_buy_signal = core_buy_result.signal
+            core_buy_reason = core_buy_result.reason
+            confirm = core_buy_result.signal == "BUY"
+            price_ok = core_buy_result.signal == "BUY"
 
         # volume gate (24h vs 50dma)
         pace_full_gate = (pd.isna(pace) or pace >= VOL_PACE_MIN)
         near_pace_gate = (pd.isna(pace) or pace >= NEAR_VOL_PACE_MIN)
 
-        # NEAR zone (only if we have valid pivot + ma + price)
+        # NEAR zone from shared LONG CORE, evaluated on current intraday price.
         near_now = False
         if (
             stage in ("Stage 1 (Basing)", "Stage 2 (Uptrend)")
-            and rs_ok
             and pd.notna(ma30)
             and pd.notna(pivot)
             and pd.notna(price)
         ):
-            above_ma = price >= ma30 * (1.0 + BUY_DIST_ABOVE_MA_MIN)
-            if above_ma:
-                # near pivot from below or just tiny breakout not yet fully "confirm"
-                if (price >= pivot * (1.0 - NEAR_BELOW_PIVOT_PCT)) and (
-                    price < pivot * (1.0 + MIN_BREAKOUT_PCT)
-                ):
-                    near_now = True
-                elif (price >= pivot * (1.0 + MIN_BREAKOUT_PCT)) and not confirm:
-                    near_now = True
+            core_near_result = evaluate_long_signal(
+                price=float(price),
+                ma_val=float(ma30),
+                pivot=float(pivot),
+                rs_above_ma=rs_ok,
+                vol_mult=core_vol_mult,
+                adx_val=np.nan,
+                params=crypto_long_params,
+                near_below_pivot_pct=NEAR_BELOW_PIVOT_PCT,
+                near_vol_min=NEAR_VOL_PACE_MIN,
+            )
+            core_near_signal = core_near_result.signal
+            core_near_reason = core_near_result.reason
+
+            # Preserve legacy behavior: if current price has broken out but
+            # the last-close BUY confirmation has not yet triggered, keep it
+            # in NEAR/ARMED territory.
+            near_now = (
+                core_near_result.signal == "NEAR"
+                or (core_near_result.signal == "BUY" and not confirm)
+            )
 
         # SELL near/confirm: crack below SMA150 by SELL_BREAK_PCT (no elapsed checks)
         sell_near_now = False
@@ -609,6 +663,10 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                 else round(float(pace), 2),
                 "two_bar_confirm": confirm,
                 "last_bar_vol_ok": True,  # kept for continuity; not used to gate
+                "core_buy_signal": core_buy_signal,
+                "core_buy_reason": core_buy_reason,
+                "core_near_signal": core_near_signal,
+                "core_near_reason": core_near_reason,
                 "buy_state": st["state"],
                 "sell_state": st["sell_state"],
             }
@@ -739,6 +797,10 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
             "vol_pace_vs50dma",
             "two_bar_confirm",
             "last_bar_vol_ok",
+            "core_buy_signal",
+            "core_buy_reason",
+            "core_near_signal",
+            "core_near_reason",
             "buy_state",
             "sell_state",
         ]
