@@ -221,11 +221,34 @@ def symbol_clean(value: Any) -> str:
 def is_cash_symbol(symbol: str, description: str = "") -> bool:
     s = symbol_clean(symbol)
     d = str(description or "").upper()
+
+    cash_symbols = {
+        "USD",
+        "USD***",
+        "CASH",
+        "CORE",
+        "SPAXX",
+        "SPAXX*",
+        "SPAXX**",
+    }
+
     return (
         not s
-        or s in {"USD", "USD***", "CASH", "SPAXX", "CORE"}
+        or s in cash_symbols
+        or "MONEY MARKET" in d
         or "US DOLLARS" in d
         or "FDIC INSURED DEPOSIT" in d
+        or d == "CASH"
+    )
+
+
+def is_pending_activity(symbol: str, description: str = "") -> bool:
+    s = symbol_clean(symbol)
+    d = str(description or "").upper()
+
+    return (
+        "PENDING ACTIVITY" in s
+        or "PENDING ACTIVITY" in d
     )
 
 
@@ -308,7 +331,14 @@ def normalize_positions(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     out["IsCash"] = [
         is_cash_symbol(s, d) for s, d in zip(symbol, description)
     ]
-    out["AssetClass"] = np.where(out["IsCrypto"], "Crypto", np.where(out["IsCash"], "Cash", "Equity"))
+    out["IsPending"] = [
+        is_pending_activity(s, d) for s, d in zip(symbol, description)
+    ]
+    out["AssetClass"] = np.where(
+        out["IsPending"],
+        "Pending",
+        np.where(out["IsCrypto"], "Crypto", np.where(out["IsCash"], "Cash", "Equity")),
+    )
     out["TradableForWeinstein"] = np.where(
         (out["AssetClass"] == "Equity") & (out["AccountGroup"] == "Brokerage"),
         True,
@@ -353,7 +383,14 @@ def normalize_history(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     out["IsCash"] = [
         is_cash_symbol(s, d) for s, d in zip(symbol, description)
     ]
-    out["AssetClass"] = np.where(out["IsCrypto"], "Crypto", np.where(out["IsCash"], "Cash", "Equity"))
+    out["IsPending"] = [
+        is_pending_activity(s, d) for s, d in zip(symbol, description)
+    ]
+    out["AssetClass"] = np.where(
+        out["IsPending"],
+        "Pending",
+        np.where(out["IsCrypto"], "Crypto", np.where(out["IsCash"], "Cash", "Equity")),
+    )
     out["NormalizedSymbol"] = [
         crypto_yfinance_symbol(s) if crypto else symbol_clean(s)
         for s, crypto in zip(symbol, out["IsCrypto"])

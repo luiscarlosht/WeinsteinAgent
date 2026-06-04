@@ -44,3 +44,22 @@ python3 sync_fidelity_exports_to_google_sheet.py \
 ```bash
 pip install pandas numpy pyyaml gspread google-auth
 ```
+
+
+## Classification fix
+
+This version classifies:
+
+- `SPAXX`, `SPAXX*`, `SPAXX**`
+- money market rows
+- `US DOLLARS`
+- `FDIC INSURED DEPOSIT`
+
+as `AssetClass = Cash`.
+
+It classifies `Pending activity` rows as:
+
+- `AssetClass = Pending`
+- `TradableForWeinstein = False`
+
+This prevents cash/pending balances from becoming false Weinstein equity positions.
