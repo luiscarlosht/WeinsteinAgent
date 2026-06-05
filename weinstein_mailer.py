@@ -112,7 +112,7 @@ def _normalize_addresses(email_cfg: dict):
     if not recipients:
         raise ValueError("No recipient emails specified. Set EMAIL_TO or notifications.email.recipients.")
 
-    from_name = _env("WEINSTEIN_EMAIL_FROM_NAME", "EMAIL_FROM_NAME") or email_cfg.get("from_name") or email_cfg.get("display_name") or sender
+    from_name = _env("WEINSTEIN_EMAIL_FROM_NAME", "EMAIL_FROM_NAME") or email_cfg.get("from_name") or email_cfg.get("display_name") or ""
     return sender, from_name, recipients
 
 
@@ -197,7 +197,10 @@ def send_email(subject: Optional[str] = None, html_body: str = "", text_body: Op
 
     msg = EmailMessage()
     msg["Subject"] = final_subject
-    msg["From"] = f"{from_name} <{sender}>"
+    if from_name and from_name.strip():
+        msg["From"] = f"{from_name} <{sender}>"
+    else:
+        msg["From"] = sender
     msg["To"] = ", ".join(recipients)
 
     if text_body is None:
