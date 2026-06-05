@@ -783,6 +783,39 @@ def run(
         level="info",
     )
 
+    # 11.7c audit: print detailed market-regime gates so we can distinguish
+    # Chapter 8 regime gates from VIX / fast-crash overlays.
+    try:
+        import market_regime as _mr_audit
+        _cfg = _mr_audit.MarketRegimeConfig(verbose=False)
+        _snap = _mr_audit.detect_market_regime(_cfg)
+        _long_regime, _short_regime_gate = _mr_audit._compute_long_short_flags(_snap.regime)
+        _fast_crash = bool(getattr(_snap, "fast_crash", False))
+        if _fast_crash:
+            _long_regime_effective = False
+        else:
+            _long_regime_effective = _long_regime
+        _vix_last, _long_vix, _short_vix = _mr_audit._compute_vix_gates(_cfg)
+        _combined_long = bool(_long_regime_effective and _long_vix)
+        _combined_short = bool(_short_regime_gate and _short_vix)
+        _vix_txt = "nan" if pd.isna(_vix_last) else f"{_vix_last:.2f}"
+        log(
+            "Regime gate audit: "
+            f"regime={getattr(_snap.regime, 'value', _snap.regime)} "
+            f"long_regime={_long_regime} "
+            f"long_regime_effective={_long_regime_effective} "
+            f"short_regime={_short_regime_gate} "
+            f"fast_crash={_fast_crash} "
+            f"vix={_vix_txt} "
+            f"long_vix={_long_vix} "
+            f"short_vix={_short_vix} "
+            f"combined_long={_combined_long} "
+            f"combined_short={_combined_short}",
+            level="info",
+        )
+    except Exception as e:
+        log(f"Regime gate audit unavailable: {e}", level="warn")
+
     # If regime says "no shorts", exit early (writing a header-only CSV if requested)
     if not short_ok:
         log(
