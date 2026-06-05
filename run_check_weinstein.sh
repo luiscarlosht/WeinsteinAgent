@@ -83,28 +83,42 @@ logfile = sys.argv[1]
 since_epoch = int(float(sys.argv[2] or "0"))
 
 error_re = re.compile(
-    r"Traceback|KeyError|ValueError|Exception|ERROR|failed|fatal|cannot|unrecognized arguments|SMTPAuthenticationError|Username and Password not accepted",
+    r"Traceback|KeyError|ValueError|Exception|ERROR|failed|fatal|cannot|unrecognized arguments|SMTPAuthenticationError|Username and Password not accepted|Failed download|Failed downloads|JSONDecodeError|YFPricesMissingError",
     re.I,
 )
+
 benign_re = re.compile(
     r"short_debug\.csv is empty|shorts disabled|Aborting: short_debug CSV is missing|FutureWarning",
     re.I,
 )
+
 email_error_re = re.compile(
-    r"SMTPAuthenticationError|Username and Password not accepted|BadCredentials|email failed",
+    r"SMTPAuthenticationError|Username and Password not accepted|BadCredentials|email failed|smtplib\.SMTPAuthenticationError",
     re.I,
 )
+
 email_success_re = re.compile(
     r"Email sent\.|DONE$|DONE daily parity run|Weekly report complete|Routing email sent",
     re.I,
 )
 
+# Yahoo can intermittently fail one ticker, often SPGI, due to a temporary JSON
+# decode / quote response issue. Treat small isolated download failures as WARN.
+yahoo_failure_re = re.compile(
+    r"Failed download|Failed downloads|JSONDecodeError|YFPricesMissingError|possibly delisted|No data found",
+    re.I,
+)
+
+# Log timestamps can appear as:
+# [15:40:23]
+# [2026-06-05 15:41:27]
 time_re_full = re.compile(r"\[(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})\]")
 time_re_hms = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
 
 today = dt.datetime.now().date()
 latest_ts = None
 events = []
+pending_traceback = []
 
 def parse_ts(line, latest):
     m = time_re_full.search(line)
@@ -118,16 +132,66 @@ def parse_ts(line, latest):
         return dt.datetime(today.year, today.month, today.day, int(m.group(1)), int(m.group(2)), int(m.group(3)))
     return latest
 
+def classify_yahoo_failure(line):
+    # If a single ticker failed, warn only. A broad failure remains an error.
+    m = re.search(r"(\d+)\s+Failed download", line, flags=re.I)
+    if m:
+        n = int(m.group(1))
+        return "WARN" if n <= 2 else "ERROR"
+    if "1 Failed download" in line:
+        return "WARN"
+    if "JSONDecodeError" in line and ("SPGI" in line or "Failed download" in line):
+        return "WARN"
+    return "ERROR"
+
+def flush_traceback():
+    global pending_traceback
+    if not pending_traceback:
+        return
+    block = "\n".join(x[2] for x in pending_traceback)
+    ts = pending_traceback[-1][1]
+
+    if email_error_re.search(block):
+        events.append(("EMAIL_ERROR_BLOCK", ts, block))
+    elif yahoo_failure_re.search(block):
+        events.append(("WARN", ts, block))
+    else:
+        events.append(("ERROR", ts, block))
+
+    pending_traceback = []
+
 with open(logfile, "r", errors="replace") as f:
-    for line in f:
-        ts = parse_ts(line, latest_ts)
+    for raw_line in f:
+        ts = parse_ts(raw_line, latest_ts)
         if ts is not None:
             latest_ts = ts
         use_ts = ts or latest_ts
+
         if use_ts is not None and use_ts.timestamp() < since_epoch:
             continue
 
-        line = line.rstrip()
+        line = raw_line.rstrip()
+
+        # Capture traceback blocks so stale SMTP tracebacks can be suppressed as
+        # one unit instead of leaving orphaned "Traceback" lines behind.
+        if line.startswith("Traceback (most recent call last):"):
+            flush_traceback()
+            pending_traceback = [("TRACEBACK", use_ts, line)]
+            continue
+
+        if pending_traceback:
+            pending_traceback.append(("TRACEBACK", use_ts, line))
+            # A blank line or a final exception-looking line usually ends a traceback.
+            if (
+                line == ""
+                or re.search(r"^[A-Za-z_][\w.]*Error:", line)
+                or "SMTPAuthenticationError" in line
+                or "KeyError:" in line
+                or "ValueError:" in line
+            ):
+                flush_traceback()
+            continue
+
         if email_success_re.search(line):
             events.append(("EMAIL_OK", use_ts, line))
         elif error_re.search(line):
@@ -135,8 +199,12 @@ with open(logfile, "r", errors="replace") as f:
                 events.append(("WARN", use_ts, line))
             elif email_error_re.search(line):
                 events.append(("EMAIL_ERROR", use_ts, line))
+            elif yahoo_failure_re.search(line):
+                events.append((classify_yahoo_failure(line), use_ts, line))
             else:
                 events.append(("ERROR", use_ts, line))
+
+flush_traceback()
 
 last_email_ok_idx = max([i for i, (kind, _, _) in enumerate(events) if kind == "EMAIL_OK"], default=-1)
 
@@ -144,18 +212,22 @@ current = []
 stale_email_errors = []
 for i, event in enumerate(events):
     kind, ts, line = event
-    if kind == "EMAIL_ERROR" and i < last_email_ok_idx:
+
+    # Suppress stale SMTP failures and entire SMTP traceback blocks when the same
+    # log later proves email recovered.
+    if kind in {"EMAIL_ERROR", "EMAIL_ERROR_BLOCK"} and i < last_email_ok_idx:
         stale_email_errors.append(event)
         continue
-    if kind in {"ERROR", "EMAIL_ERROR", "WARN"}:
+
+    if kind in {"ERROR", "EMAIL_ERROR", "EMAIL_ERROR_BLOCK", "WARN"}:
         current.append(event)
 
-errors = [x for x in current if x[0] in {"ERROR", "EMAIL_ERROR"}]
+errors = [x for x in current if x[0] in {"ERROR", "EMAIL_ERROR", "EMAIL_ERROR_BLOCK"}]
 warns = [x for x in current if x[0] == "WARN"]
 
 if errors:
     print("❌ Current errors found:")
-    for _, _, line in errors[-30:]:
+    for _, _, line in errors[-20:]:
         print(line)
 elif warns:
     print("⚠️  Only benign/current warnings found:")
@@ -165,7 +237,7 @@ else:
     print("✅ No current errors found.")
 
 if stale_email_errors:
-    print(f"ℹ️  Suppressed {len(stale_email_errors)} stale email/auth error line(s) because a later email success marker exists in this log.")
+    print(f"ℹ️  Suppressed {len(stale_email_errors)} stale email/auth traceback or error block(s) because a later email success marker exists in this log.")
 PY
 }
 
