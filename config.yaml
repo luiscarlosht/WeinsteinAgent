@@ -23,7 +23,7 @@ sheets:
 
 google:
   # Service account that the code uses to read the sheet
-  service_account_json: "/home/luiscarlosht/WeinsteinAgent/creds/gcp_service_account.json"
+  service_account_json: "/root/WeinsteinAgent/creds/gcp_service_account.json"
   client_email: "500633565449-compute@developer.gserviceaccount.com"
 
 notifications:
@@ -51,7 +51,7 @@ notifications:
 
 reporting:
   # Files the job writes
-  output_dir: "/home/luiscarlosht/WeinsteinAgent/output"
+  output_dir: "/root/WeinsteinAgent/output"
   include_pdf: true
   include_csv: true
   summary_lines: 10
