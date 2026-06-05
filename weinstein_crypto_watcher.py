@@ -6,7 +6,7 @@ Weinstein Crypto Watch — crypto-specific intraday scan (no intrabar/elapsed ga
 - Stage 1/2 + pivot + SMA150 confirmation
 - 24h volume pace vs 50d avg (projected for the current UTC day)
 - NEAR/ARMED/COOLDOWN state machine (like equities) but without 60m elapsed/pace checks
-- Snapshot table and optional CryptoHoldings section (from Google Sheet tab)
+- Ownership-aware snapshot/actions from CryptoHoldings Google Sheet tab
 - Tiny RS charts (RS vs BTC-USD), same mailer as equities
 """
 
@@ -325,13 +325,139 @@ def open_ws(gc, sheet_url: str, tab: str):
         return sh.add_worksheet(title=tab, rows=2000, cols=26)
 
 
-def read_tab(ws) -> pd.DataFrame:
-    vals = ws.get_all_values()
-    if not vals:
-        return pd.DataFrame()
-    header, rows = vals[0], vals[1:]
-    df = pd.DataFrame(rows, columns=[h.strip() for h in header])
-    return df
+def norm_crypto_symbol(value) -> str:
+    """Normalize Fidelity / sheet crypto symbols to yfinance format."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = str(value).strip().upper()
+    if not s:
+        return ""
+    mapping = {
+        "BTC": "BTC-USD",
+        "BTC/USD": "BTC-USD",
+        "BITCOIN": "BTC-USD",
+        "ETH": "ETH-USD",
+        "ETH/USD": "ETH-USD",
+        "ETHEREUM": "ETH-USD",
+        "SOL": "SOL-USD",
+        "SOL/USD": "SOL-USD",
+        "SOLANA": "SOL-USD",
+        "LTC": "LTC-USD",
+        "LTC/USD": "LTC-USD",
+        "LITECOIN": "LTC-USD",
+        "USD***": "USD***",
+        "USD": "USD",
+    }
+    if s in mapping:
+        return mapping[s]
+    if s.endswith("/USD"):
+        return s.replace("/USD", "-USD")
+    return s
+
+
+def to_float(value, default=0.0):
+    """Parse strings like '$1,234.56', '(12.3)', blanks, and numerics."""
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "--"}:
+        return default
+    neg = s.startswith("(") and s.endswith(")")
+    if neg:
+        s = s[1:-1]
+    s = s.replace("$", "").replace(",", "").replace("%", "").replace("+", "").strip()
+    try:
+        val = float(s)
+        return -val if neg else val
+    except Exception:
+        return default
+
+
+def first_present(row, names, default=""):
+    for name in names:
+        if name in row and str(row.get(name, "")).strip() != "":
+            return row.get(name)
+    return default
+
+
+def build_crypto_holdings_map(dfh: pd.DataFrame) -> dict:
+    """
+    Build a ticker -> holding dict from the CryptoHoldings tab.
+
+    Supports both the normalized importer columns:
+      NormalizedSymbol, QuantityNum, CurrentValueNum, CostBasisTotalNum
+
+    and raw Fidelity export columns:
+      Symbol, Quantity, Current Value, Cost Basis Total
+    """
+    holdings = {}
+    if dfh is None or dfh.empty:
+        return holdings
+
+    for _, row in dfh.iterrows():
+        raw_symbol = first_present(row, ["NormalizedSymbol", "Ticker", "Symbol", "ticker", "symbol"])
+        ticker = norm_crypto_symbol(raw_symbol)
+        if not ticker or ticker in {"USD", "USD***", "CASH"}:
+            continue
+
+        qty = to_float(first_present(row, ["QuantityNum", "Quantity", "Qty", "quantity", "qty"]), 0.0)
+        value = to_float(first_present(row, ["CurrentValueNum", "Current Value", "CurrentValue", "Market Value", "Value"]), 0.0)
+        cost_basis = to_float(first_present(row, ["CostBasisTotalNum", "Cost Basis Total", "CostBasis", "Cost Basis"]), 0.0)
+        avg_cost = to_float(first_present(row, ["AverageCostBasisNum", "Average Cost Basis", "AvgCost", "Average Cost"]), 0.0)
+        last_price = to_float(first_present(row, ["LastPriceNum", "Last Price", "Price"]), 0.0)
+        account_name = str(first_present(row, ["Account Name", "AccountName", "Account", "WalletOrExchange"], "")).strip()
+        account_number = str(first_present(row, ["Account Number", "AccountNumber"], "")).strip()
+
+        if ticker not in holdings:
+            holdings[ticker] = {
+                "ticker": ticker,
+                "owned_qty": 0.0,
+                "current_value": 0.0,
+                "cost_basis": 0.0,
+                "avg_cost": avg_cost,
+                "last_price": last_price,
+                "accounts": set(),
+                "account_numbers": set(),
+            }
+
+        h = holdings[ticker]
+        h["owned_qty"] += qty
+        h["current_value"] += value
+        h["cost_basis"] += cost_basis
+        if avg_cost:
+            h["avg_cost"] = avg_cost
+        if last_price:
+            h["last_price"] = last_price
+        if account_name:
+            h["accounts"].add(account_name)
+        if account_number:
+            h["account_numbers"].add(account_number)
+
+    for h in holdings.values():
+        h["owned"] = (abs(h.get("owned_qty", 0.0)) > 0) or (abs(h.get("current_value", 0.0)) > 0)
+        h["accounts"] = ", ".join(sorted(h["accounts"]))
+        h["account_numbers"] = ", ".join(sorted(h["account_numbers"]))
+    return holdings
+
+
+def ownership_action(signal_kind: str, owned: bool) -> str:
+    """Convert signal + ownership into an actionable report phrase."""
+    if signal_kind == "SELLTRIG":
+        return "SELL risk / review exit" if owned else "SELL signal but not owned"
+    if signal_kind == "BUY":
+        return "BUY / add-to-position candidate" if owned else "BUY candidate"
+    if signal_kind == "NEAR":
+        return "WATCH owned position" if owned else "WATCH candidate"
+    if owned:
+        return "HOLD / monitor"
+    return ""
 
 
 # ---------------- Core scan ----------------
@@ -386,6 +512,35 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
     intraday, daily = get_intraday(symbols)
     log("Price data downloaded.", level="ok")
 
+    # Optional CryptoHoldings snapshot and ownership map.
+    # This makes signals actionable: BUY candidate vs add-to-position,
+    # SELL risk only when the asset is actually owned, etc.
+    crypto_holdings_df = pd.DataFrame()
+    crypto_holdings_by_symbol = {}
+    holdings_html = ""
+    try:
+        if sheet_url and service_account_file and gspread:
+            gc = auth_gspread(service_account_file)
+            if gc:
+                ws = open_ws(gc, sheet_url, TAB_CRYPTO_HOLD)
+                crypto_holdings_df = read_tab(ws)
+                if not crypto_holdings_df.empty:
+                    crypto_holdings_by_symbol = build_crypto_holdings_map(crypto_holdings_df)
+                    keep_cols = [c for c in crypto_holdings_df.columns if c.strip()]
+                    holdings_html = (
+                        "<h4>Crypto Holdings (from Google Sheet)</h4>"
+                        + crypto_holdings_df[keep_cols].to_html(index=False)
+                    )
+                    log(
+                        f"Loaded CryptoHoldings: rows={len(crypto_holdings_df)} owned_symbols={len(crypto_holdings_by_symbol)}",
+                        level="ok",
+                    )
+    except Exception as e:
+        log(
+            f"Sheet load failure for crypto holdings: CryptoHoldings ({e})",
+            level="warn",
+        )
+
     # Determine which tickers actually have Close data in intraday
     if isinstance(intraday.columns, pd.MultiIndex):
         available_tickers = set(intraday["Close"].columns)
@@ -437,6 +592,14 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
         if np.isnan(price):
             # No real price → skip this symbol
             continue
+
+        holding = crypto_holdings_by_symbol.get(norm_crypto_symbol(t), {})
+        owned = bool(holding.get("owned", False))
+        owned_qty = holding.get("owned_qty", 0.0)
+        current_value = holding.get("current_value", 0.0)
+        cost_basis = holding.get("cost_basis", 0.0)
+        avg_cost = holding.get("avg_cost", 0.0)
+        holding_accounts = holding.get("accounts", "")
 
         stage = str(row.get("stage", ""))
         ma30 = row.get("ma30", np.nan)
@@ -631,6 +794,11 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                     "stage": stage,
                     "ma30": ma30,
                     "weekly_rank": weekly_rank,
+                    "owned": owned,
+                    "owned_qty": owned_qty,
+                    "current_value": current_value,
+                    "cost_basis": cost_basis,
+                    "action": ownership_action("BUY", owned),
                 }
             )
             trig[t]["state"] = "COOLDOWN"
@@ -646,6 +814,11 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                         "ma30": ma30,
                         "weekly_rank": weekly_rank,
                         "reason": "near/armed",
+                        "owned": owned,
+                        "owned_qty": owned_qty,
+                        "current_value": current_value,
+                        "cost_basis": cost_basis,
+                        "action": ownership_action("NEAR", owned),
                     }
                 )
 
@@ -658,6 +831,11 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                     "stage": stage,
                     "weekly_rank": weekly_rank,
                     "pace": None if pd.isna(pace) else float(pace),
+                    "owned": owned,
+                    "owned_qty": owned_qty,
+                    "current_value": current_value,
+                    "cost_basis": cost_basis,
+                    "action": ownership_action("SELLTRIG", owned),
                 }
             )
             trig[t]["sell_state"] = "COOLDOWN"
@@ -678,6 +856,21 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                 "core_buy_reason": core_buy_reason,
                 "core_near_signal": core_near_signal,
                 "core_near_reason": core_near_reason,
+                "owned": owned,
+                "owned_qty": owned_qty,
+                "current_value": current_value,
+                "cost_basis": cost_basis,
+                "avg_cost": avg_cost,
+                "holding_accounts": holding_accounts,
+                "ownership_action": (
+                    ownership_action("SELLTRIG", owned)
+                    if st["sell_state"] in ("TRIGGERED", "ARMED", "NEAR") and owned
+                    else ownership_action("BUY", owned)
+                    if confirm
+                    else ownership_action("NEAR", owned)
+                    if near_now
+                    else ownership_action("", owned)
+                ),
                 "buy_state": st["state"],
                 "sell_state": st["sell_state"],
             }
@@ -730,25 +923,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
 
     log(f"Charts prepared: {len(charts)}", level="debug")
 
-    # Optional CryptoHoldings snapshot (if present)
-    holdings_html = ""
-    try:
-        if sheet_url and service_account_file and gspread:
-            gc = auth_gspread(service_account_file)
-            if gc:
-                ws = open_ws(gc, sheet_url, TAB_CRYPTO_HOLD)
-                dfh = read_tab(ws)
-                if not dfh.empty:
-                    keep_cols = [c for c in dfh.columns if c.strip()]
-                    holdings_html = (
-                        "<h4>Crypto Holdings (from Google Sheet)</h4>"
-                        + dfh[keep_cols].to_html(index=False)
-                    )
-    except Exception:
-        log(
-            "Sheet load failure for crypto holdings: CryptoHoldings",
-            level="warn",
-        )
+    # CryptoHoldings were loaded before evaluation so ownership can be attached
+    # directly to snapshot rows and signal/action text.
 
     # HTML/text
     def bullets(items, kind):
@@ -767,9 +943,14 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                     if (pace_val is None or pd.isna(pace_val))
                     else f"{pace_val:.2f}x"
                 )
+                action = it.get("action") or ownership_action("SELLTRIG", bool(it.get("owned", False)))
+                owned_txt = "owned" if it.get("owned") else "not owned"
+                qty_txt = f", qty {float(it.get('owned_qty') or 0):.6g}" if it.get("owned") else ""
+                val_txt = f", value ${float(it.get('current_value') or 0):,.2f}" if it.get("owned") else ""
                 lis.append(
                     f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} "
-                    f"(↓ SMA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})</li>"
+                    f"— <b>{action}</b> ({owned_txt}{qty_txt}{val_txt}; "
+                    f"↓ SMA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})</li>"
                 )
             else:
                 pivot_val = it.get("pivot", np.nan)
@@ -780,9 +961,14 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                     if (pace_val is None or pd.isna(pace_val))
                     else f"{pace_val:.2f}x"
                 )
+                action = it.get("action") or ownership_action(kind, bool(it.get("owned", False)))
+                owned_txt = "owned" if it.get("owned") else "not owned"
+                qty_txt = f", qty {float(it.get('owned_qty') or 0):.6g}" if it.get("owned") else ""
+                val_txt = f", value ${float(it.get('current_value') or 0):,.2f}" if it.get("owned") else ""
                 lis.append(
                     f"<li><b>{i}.</b> <b>{it['ticker']}</b> @ {it['price']:.2f} "
-                    f"(pivot {pivot_str}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
+                    f"— <b>{action}</b> ({owned_txt}{qty_txt}{val_txt}; "
+                    f"pivot {pivot_str}, pace {pace_str}, {it['stage']}, weekly {wr_str})</li>"
                 )
         return "<ol>" + "\n".join(lis) + "</ol>"
 
@@ -812,6 +998,13 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
             "core_buy_reason",
             "core_near_signal",
             "core_near_reason",
+            "owned",
+            "owned_qty",
+            "current_value",
+            "cost_basis",
+            "avg_cost",
+            "holding_accounts",
+            "ownership_action",
             "buy_state",
             "sell_state",
         ]
@@ -871,9 +1064,11 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                     if (pace_val is None or pd.isna(pace_val))
                     else f"{pace_val:.2f}x"
                 )
+                action = it.get("action") or ownership_action("SELLTRIG", bool(it.get("owned", False)))
+                owned_txt = "owned" if it.get("owned") else "not owned"
                 out.append(
-                    f"{i}. {it['ticker']} @ {it['price']:.2f} "
-                    f"(below SMA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})"
+                    f"{i}. {it['ticker']} @ {it['price']:.2f} — {action} "
+                    f"({owned_txt}; below SMA150 {ma_str}, pace {pace_str}, {it.get('stage','')}, weekly {wr_str})"
                 )
             else:
                 pivot_val = it.get("pivot", np.nan)
@@ -884,9 +1079,11 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
                     if (pace_val is None or pd.isna(pace_val))
                     else f"{pace_val:.2f}x"
                 )
+                action = it.get("action") or ownership_action(kind, bool(it.get("owned", False)))
+                owned_txt = "owned" if it.get("owned") else "not owned"
                 out.append(
-                    f"{i}. {it['ticker']} @ {it['price']:.2f} "
-                    f"(pivot {pivot_str}, pace {pace_str}, {it['stage']}, weekly {wr_str})"
+                    f"{i}. {it['ticker']} @ {it['price']:.2f} — {action} "
+                    f"({owned_txt}; pivot {pivot_str}, pace {pace_str}, {it['stage']}, weekly {wr_str})"
                 )
         return "\n".join(out)
 
