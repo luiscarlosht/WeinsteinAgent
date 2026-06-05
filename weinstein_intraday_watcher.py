@@ -490,28 +490,78 @@ def fetch_price_data(tickers: List[str], daily_history_period: str = "18mo", ben
     )
 
     # Normalize into a consistent multi-index: (date/time, ticker)
-    def stack_yf(df_raw: pd.DataFrame) -> pd.DataFrame:
-        if df_raw.empty:
+    def stack_yf(df_raw: pd.DataFrame, label: str) -> pd.DataFrame:
+        if df_raw is None or df_raw.empty:
+            log(f"Yahoo {label} download returned empty frame.")
             return pd.DataFrame()
+
+        frames = []
+
         if isinstance(df_raw.columns, pd.MultiIndex):
-            frames = []
             for ticker in sorted(set(sym for sym, _ in df_raw.columns)):
-                sub = df_raw[ticker].copy()
+                try:
+                    sub = df_raw[ticker].copy()
+                except Exception as e:
+                    log(f"Skipping {ticker} {label}: cannot slice yfinance frame ({e})")
+                    continue
+
+                if sub is None or sub.empty:
+                    log(f"Skipping {ticker} {label}: empty yfinance subframe")
+                    continue
+
+                sub = sub.dropna(how="all")
+                if sub.empty:
+                    log(f"Skipping {ticker} {label}: all rows empty")
+                    continue
+
                 sub["Ticker"] = ticker
                 frames.append(sub)
-            out = pd.concat(frames)
         else:
-            # Single ticker
-            out = df_raw.copy()
+            out = df_raw.copy().dropna(how="all")
+            if out.empty:
+                log(f"Yahoo {label} single-ticker frame is empty after dropna.")
+                return pd.DataFrame()
             out["Ticker"] = download_tickers[0]
+            frames.append(out)
+
+        if not frames:
+            log(f"Yahoo {label}: no usable ticker frames after normalization.")
+            return pd.DataFrame()
+
+        out = pd.concat(frames, axis=0)
         out.reset_index(inplace=True)
-        date_col = "Date" if "Date" in out.columns else "Datetime"
+
+        if "Date" in out.columns:
+            date_col = "Date"
+        elif "Datetime" in out.columns:
+            date_col = "Datetime"
+        elif "index" in out.columns and pd.api.types.is_datetime64_any_dtype(out["index"]):
+            date_col = "index"
+        else:
+            log(f"Yahoo {label}: missing Date/Datetime column; columns={list(out.columns)[:12]}")
+            return pd.DataFrame()
+
         out = out.rename(columns={date_col: "Date"})
-        out = out.set_index(["Date", "Ticker"])
+        if "Ticker" not in out.columns:
+            log(f"Yahoo {label}: missing Ticker column after normalization.")
+            return pd.DataFrame()
+
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        missing = [c for c in required if c not in out.columns]
+        if missing:
+            log(f"Yahoo {label}: missing OHLCV columns {missing}; columns={list(out.columns)[:12]}")
+            return pd.DataFrame()
+
+        out = out.dropna(subset=["Date", "Ticker"])
+        if out.empty:
+            log(f"Yahoo {label}: no rows after Date/Ticker cleanup.")
+            return pd.DataFrame()
+
+        out = out.set_index(["Date", "Ticker"]).sort_index()
         return out
 
-    daily_stacked = stack_yf(daily)
-    intraday_stacked = stack_yf(intraday)
+    daily_stacked = stack_yf(daily, 'daily')
+    intraday_stacked = stack_yf(intraday, 'intraday')
 
     return daily_stacked, intraday_stacked
 
