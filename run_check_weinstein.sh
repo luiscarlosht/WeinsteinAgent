@@ -76,7 +76,6 @@ scan_errors_since_epoch() {
 
   python3 - "$logfile" "$since_epoch" <<'PY'
 import datetime as dt
-import os
 import re
 import sys
 
@@ -84,64 +83,89 @@ logfile = sys.argv[1]
 since_epoch = int(float(sys.argv[2] or "0"))
 
 error_re = re.compile(
-    r"Traceback|KeyError|ValueError|Exception|ERROR|failed|fatal|cannot|unrecognized arguments|SMTPAuthenticationError",
+    r"Traceback|KeyError|ValueError|Exception|ERROR|failed|fatal|cannot|unrecognized arguments|SMTPAuthenticationError|Username and Password not accepted",
     re.I,
 )
-
-# Treat these as warnings, not current system failures.
 benign_re = re.compile(
     r"short_debug\.csv is empty|shorts disabled|Aborting: short_debug CSV is missing|FutureWarning",
     re.I,
 )
+email_error_re = re.compile(
+    r"SMTPAuthenticationError|Username and Password not accepted|BadCredentials|email failed",
+    re.I,
+)
+email_success_re = re.compile(
+    r"Email sent\.|DONE$|DONE daily parity run|Weekly report complete|Routing email sent",
+    re.I,
+)
 
-# Log timestamps can appear as:
-# [15:40:23]
-# [2026-06-05 15:41:27]
 time_re_full = re.compile(r"\[(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})\]")
 time_re_hms = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
 
 today = dt.datetime.now().date()
 latest_ts = None
-rows = []
+events = []
+
+def parse_ts(line, latest):
+    m = time_re_full.search(line)
+    if m:
+        return dt.datetime(
+            int(m.group(1)[0:4]), int(m.group(1)[5:7]), int(m.group(1)[8:10]),
+            int(m.group(2)), int(m.group(3)), int(m.group(4))
+        )
+    m = time_re_hms.search(line)
+    if m:
+        return dt.datetime(today.year, today.month, today.day, int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return latest
 
 with open(logfile, "r", errors="replace") as f:
     for line in f:
-        ts = None
-        m = time_re_full.search(line)
-        if m:
-            ts = dt.datetime(
-                int(m.group(1)[0:4]), int(m.group(1)[5:7]), int(m.group(1)[8:10]),
-                int(m.group(2)), int(m.group(3)), int(m.group(4))
-            )
-        else:
-            m = time_re_hms.search(line)
-            if m:
-                ts = dt.datetime(today.year, today.month, today.day, int(m.group(1)), int(m.group(2)), int(m.group(3)))
-
+        ts = parse_ts(line, latest_ts)
         if ts is not None:
             latest_ts = ts
-
         use_ts = ts or latest_ts
         if use_ts is not None and use_ts.timestamp() < since_epoch:
             continue
 
-        if error_re.search(line):
-            kind = "WARN" if benign_re.search(line) else "ERROR"
-            rows.append((kind, line.rstrip()))
+        line = line.rstrip()
+        if email_success_re.search(line):
+            events.append(("EMAIL_OK", use_ts, line))
+        elif error_re.search(line):
+            if benign_re.search(line):
+                events.append(("WARN", use_ts, line))
+            elif email_error_re.search(line):
+                events.append(("EMAIL_ERROR", use_ts, line))
+            else:
+                events.append(("ERROR", use_ts, line))
 
-errors = [x for x in rows if x[0] == "ERROR"]
-warns = [x for x in rows if x[0] == "WARN"]
+last_email_ok_idx = max([i for i, (kind, _, _) in enumerate(events) if kind == "EMAIL_OK"], default=-1)
+
+current = []
+stale_email_errors = []
+for i, event in enumerate(events):
+    kind, ts, line = event
+    if kind == "EMAIL_ERROR" and i < last_email_ok_idx:
+        stale_email_errors.append(event)
+        continue
+    if kind in {"ERROR", "EMAIL_ERROR", "WARN"}:
+        current.append(event)
+
+errors = [x for x in current if x[0] in {"ERROR", "EMAIL_ERROR"}]
+warns = [x for x in current if x[0] == "WARN"]
 
 if errors:
     print("❌ Current errors found:")
-    for _, line in errors[-30:]:
+    for _, _, line in errors[-30:]:
         print(line)
 elif warns:
     print("⚠️  Only benign/current warnings found:")
-    for _, line in warns[-20:]:
+    for _, _, line in warns[-20:]:
         print(line)
 else:
     print("✅ No current errors found.")
+
+if stale_email_errors:
+    print(f"ℹ️  Suppressed {len(stale_email_errors)} stale email/auth error line(s) because a later email success marker exists in this log.")
 PY
 }
 
