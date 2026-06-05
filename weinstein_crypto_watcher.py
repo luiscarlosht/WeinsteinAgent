@@ -91,7 +91,11 @@ def load_config(path):
     sheets = cfg.get("sheets", {}) or {}
     google = cfg.get("google", {}) or {}
     sheet_url = sheets.get("url") or sheets.get("sheet_url")
-    svc_file = google.get("service_account_json")
+    svc_file = (
+        os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        or google.get("service_account_json")
+    )
 
     # optional crypto universe from YAML
     crypto = cfg.get("crypto", {}) or {}
@@ -113,7 +117,14 @@ def newest_weekly_csv():
         raise FileNotFoundError(
             "No weekly CSV found in ./output. Run your weekly report first."
         )
-    files.sort(reverse=True)
+
+    # Pick the newest generated weekly file by modified time, not filename.
+    # This avoids selecting placeholder/stale files such as:
+    #   weinstein_weekly_equities_YYYY.csv
+    files.sort(
+        key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)),
+        reverse=True,
+    )
     return os.path.join(OUTPUT_DIR, files[0])
 
 
