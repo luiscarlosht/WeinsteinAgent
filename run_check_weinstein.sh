@@ -17,6 +17,15 @@ latest_file() {
   ls -1t $pattern 2>/dev/null | head -1 || true
 }
 
+file_epoch() {
+  local f="$1"
+  if [[ -n "$f" && -e "$f" ]]; then
+    stat -c %Y "$f"
+  else
+    echo 0
+  fi
+}
+
 show_recent_files() {
   local title="$1"
   local pattern="$2"
@@ -53,22 +62,87 @@ show_log_tail() {
   fi
 }
 
-check_log_errors() {
+scan_errors_since_epoch() {
   local logfile="$1"
-  line "Error scan: $logfile"
+  local since_epoch="$2"
+  local title="$3"
+
+  line "Error scan: $logfile ($title)"
+
   if [[ ! -f "$logfile" ]]; then
     warn "$logfile missing"
     return 0
   fi
 
-  local errors
-  errors="$(grep -Ei "Traceback|KeyError|ValueError|Exception|ERROR|failed|fatal|aborting|cannot|unrecognized arguments" "$logfile" 2>/dev/null | tail -30 || true)"
-  if [[ -n "$errors" ]]; then
-    fail "Potential errors found in $logfile"
-    echo "$errors"
-  else
-    pass "No obvious errors found in $logfile"
-  fi
+  python3 - "$logfile" "$since_epoch" <<'PY'
+import datetime as dt
+import os
+import re
+import sys
+
+logfile = sys.argv[1]
+since_epoch = int(float(sys.argv[2] or "0"))
+
+error_re = re.compile(
+    r"Traceback|KeyError|ValueError|Exception|ERROR|failed|fatal|cannot|unrecognized arguments|SMTPAuthenticationError",
+    re.I,
+)
+
+# Treat these as warnings, not current system failures.
+benign_re = re.compile(
+    r"short_debug\.csv is empty|shorts disabled|Aborting: short_debug CSV is missing|FutureWarning",
+    re.I,
+)
+
+# Log timestamps can appear as:
+# [15:40:23]
+# [2026-06-05 15:41:27]
+time_re_full = re.compile(r"\[(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})\]")
+time_re_hms = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
+
+today = dt.datetime.now().date()
+latest_ts = None
+rows = []
+
+with open(logfile, "r", errors="replace") as f:
+    for line in f:
+        ts = None
+        m = time_re_full.search(line)
+        if m:
+            ts = dt.datetime(
+                int(m.group(1)[0:4]), int(m.group(1)[5:7]), int(m.group(1)[8:10]),
+                int(m.group(2)), int(m.group(3)), int(m.group(4))
+            )
+        else:
+            m = time_re_hms.search(line)
+            if m:
+                ts = dt.datetime(today.year, today.month, today.day, int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+        if ts is not None:
+            latest_ts = ts
+
+        use_ts = ts or latest_ts
+        if use_ts is not None and use_ts.timestamp() < since_epoch:
+            continue
+
+        if error_re.search(line):
+            kind = "WARN" if benign_re.search(line) else "ERROR"
+            rows.append((kind, line.rstrip()))
+
+errors = [x for x in rows if x[0] == "ERROR"]
+warns = [x for x in rows if x[0] == "WARN"]
+
+if errors:
+    print("❌ Current errors found:")
+    for _, line in errors[-30:]:
+        print(line)
+elif warns:
+    print("⚠️  Only benign/current warnings found:")
+    for _, line in warns[-20:]:
+        print(line)
+else:
+    print("✅ No current errors found.")
+PY
 }
 
 echo "=== Weinstein health check for ${today_iso} ==="
@@ -77,8 +151,11 @@ echo "Time: $(date)"
 echo
 
 line "Git"
-git status --short | head -60 || true
+git status --short | head -80 || true
 echo "Commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+latest_intraday="$(latest_file "output/intraday_watch_${today_ymd}_*.html")"
+latest_intraday_epoch="$(file_epoch "$latest_intraday")"
 
 show_recent_files "Intraday HTML today" "output/intraday_watch_${today_ymd}_"*.html
 show_recent_files "Crypto HTML today" "output/crypto_watch_${today_ymd}_"*.html
@@ -108,7 +185,6 @@ else
 fi
 
 line "Latest portfolio holdings in intraday report"
-latest_intraday="$(latest_file "output/intraday_watch_${today_ymd}_*.html")"
 if [[ -n "$latest_intraday" ]]; then
   pass "Latest intraday HTML: $latest_intraday"
   grep -E "Reviewed [0-9]+ owned tickers|Portfolio Holdings Review|Portfolio Action|Ticker not present" "$latest_intraday" | head -20 || true
@@ -116,17 +192,31 @@ else
   fail "No intraday HTML for today"
 fi
 
-show_log_tail "Cron short stack recent lines" "cron_short.log" "${today_iso}|Intraday watcher starting|Saved HTML|Traceback|KeyError|Aborting|Done"
-check_log_errors "cron_short.log"
+line "Bad holdings symbol check"
+bad_symbols="857480172|857480180|87283J616|58805T275|NON40TVFA|NON40TP8J"
+bad_hits="$(grep -E "$bad_symbols" output/intraday_debug.csv output/intraday_watch_${today_ymd}_*.html 2>/dev/null || true)"
+if [[ -n "$bad_hits" ]]; then
+  fail "Bad non-Yahoo holdings symbols are still present in current outputs:"
+  echo "$bad_hits" | tail -20
+else
+  pass "No known bad holdings symbols found in current intraday outputs."
+fi
+
+show_log_tail "Cron short stack recent lines" "cron_short.log" "${today_iso}|Intraday watcher starting|Saved HTML|Traceback|KeyError|Aborting|Done|Short tick complete|shorts disabled"
+if [[ "$latest_intraday_epoch" != "0" ]]; then
+  scan_errors_since_epoch "cron_short.log" "$latest_intraday_epoch" "since latest intraday HTML"
+else
+  scan_errors_since_epoch "cron_short.log" "$(date -d "${today_iso} 00:00:00" +%s)" "since start of today"
+fi
 
 show_log_tail "Daily parity recent lines" "cron_daily_parity.log" "${today_iso}|DONE|ERROR|Traceback|SIM F trade outcomes|HTML:"
-check_log_errors "cron_daily_parity.log"
+scan_errors_since_epoch "cron_daily_parity.log" "$(date -d "${today_iso} 00:00:00" +%s)" "since start of today"
 
-show_log_tail "Prod account routing recent lines" "cron_prod_account_routing.log" "${today_iso}|DONE|ERROR|Traceback|Email sent"
-check_log_errors "cron_prod_account_routing.log"
+show_log_tail "Prod account routing recent lines" "cron_prod_account_routing.log" "${today_iso}|DONE|ERROR|Traceback|Email sent|SMTPAuthenticationError"
+scan_errors_since_epoch "cron_prod_account_routing.log" "$(date -d "${today_iso} 00:00:00" +%s)" "since start of today"
 
 show_log_tail "Weekly recent lines" "cron_weekly.log" "${today_iso}|DONE|ERROR|Traceback|Email sent"
-check_log_errors "cron_weekly.log"
+scan_errors_since_epoch "cron_weekly.log" "$(date -d "${today_iso} 00:00:00" +%s)" "since start of today"
 
 line "Cron schedule"
 crontab -l | grep -v '^#' | grep -v '^$' || warn "No active crontab lines"
