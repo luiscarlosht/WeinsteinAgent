@@ -774,7 +774,10 @@ def _compute_vix_gates(cfg: MarketRegimeConfig) -> Tuple[float, bool, bool]:
         series = _download_vix_series(cfg)
         if series.empty:
             raise RuntimeError("Empty VIX series.")
-        vix_last = float(series.iloc[-1])
+        last_vix = series.iloc[-1]
+        if hasattr(last_vix, "iloc"):
+            last_vix = last_vix.iloc[0]
+        vix_last = float(last_vix)
     except Exception as e:
         if cfg.verbose:
             print(f"[VIX] Warning: could not compute VIX gates: {e}")
