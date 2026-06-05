@@ -468,6 +468,77 @@ def ownership_action(signal_kind: str, owned: bool) -> str:
     return ""
 
 
+def pct_change(numerator, denominator):
+    """Return percentage numerator / denominator * 100, or NaN when not meaningful."""
+    try:
+        denominator = float(denominator)
+        numerator = float(numerator)
+        if denominator == 0 or math.isclose(denominator, 0.0):
+            return np.nan
+        return (numerator / denominator) * 100.0
+    except Exception:
+        return np.nan
+
+
+def distance_pct(current_price, target_price):
+    """
+    Positive means the target is above current price and the asset still needs
+    to rise that much. Negative means current price is already above target.
+    """
+    try:
+        current_price = float(current_price)
+        target_price = float(target_price)
+        if current_price <= 0 or pd.isna(current_price) or pd.isna(target_price):
+            return np.nan
+        return ((target_price / current_price) - 1.0) * 100.0
+    except Exception:
+        return np.nan
+
+
+def portfolio_risk_label(owned, price, ma30, pivot, unrealized_gain_pct, sell_state):
+    """Simple risk label for owned crypto holdings."""
+    if not owned:
+        return "N/A"
+    if str(sell_state) in {"TRIGGERED", "ARMED"}:
+        return "HIGH"
+    below_ma = pd.notna(ma30) and pd.notna(price) and float(price) < float(ma30)
+    below_pivot = pd.notna(pivot) and pd.notna(price) and float(price) < float(pivot)
+    deep_loss = pd.notna(unrealized_gain_pct) and float(unrealized_gain_pct) <= -35.0
+    if below_ma and deep_loss:
+        return "HIGH"
+    if below_ma or below_pivot or deep_loss:
+        return "MEDIUM"
+    return "LOW"
+
+
+def portfolio_recommendation(owned, signal_kind, price, ma30, pivot, unrealized_gain_pct, sell_state):
+    """Human-readable portfolio action derived from signal state + ownership."""
+    if signal_kind == "SELLTRIG" and owned:
+        return "Review exit; sell trigger active."
+    if signal_kind == "BUY" and owned:
+        return "Add only if allocation target allows."
+    if signal_kind == "BUY" and not owned:
+        return "New BUY candidate."
+    if signal_kind == "NEAR" and owned:
+        return "Watch for recovery confirmation before adding."
+    if signal_kind == "NEAR" and not owned:
+        return "Watch candidate; wait for trigger."
+
+    below_ma = pd.notna(ma30) and pd.notna(price) and float(price) < float(ma30)
+    below_pivot = pd.notna(pivot) and pd.notna(price) and float(price) < float(pivot)
+    deep_loss = pd.notna(unrealized_gain_pct) and float(unrealized_gain_pct) <= -25.0
+
+    if owned and below_ma and deep_loss:
+        return "Hold; do not average down until MA recovery."
+    if owned and below_ma:
+        return "Hold / monitor; wait for MA recovery."
+    if owned and below_pivot:
+        return "Hold; wait for Stage 2 breakout."
+    if owned:
+        return "Hold / monitor."
+    return "No action."
+
+
 # ---------------- Core scan ----------------
 def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=False):
     log(f"Crypto watcher starting with config: {config_path}", level="step")
@@ -545,6 +616,12 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             f"Sheet load failure for crypto holdings: CryptoHoldings ({e})",
             level="warn",
         )
+
+    total_crypto_current_value = sum(
+        float(h.get("current_value", 0.0) or 0.0)
+        for h in crypto_holdings_by_symbol.values()
+        if h.get("owned")
+    )
 
     # Always include owned crypto assets in the scan/snapshot.
     owned_symbols = sorted(
@@ -643,6 +720,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
         cost_basis = holding.get("cost_basis", 0.0)
         avg_cost = holding.get("avg_cost", 0.0)
         holding_accounts = holding.get("accounts", "")
+        unrealized_gain_pct = pct_change(current_value - cost_basis, cost_basis) if cost_basis else np.nan
+        portfolio_weight_pct = pct_change(current_value, total_crypto_current_value) if total_crypto_current_value else np.nan
 
         stage = str(row.get("stage", ""))
         ma30 = row.get("ma30", np.nan)
@@ -668,6 +747,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
         pivot = last_weekly_pivot_high(t, daily, weeks=PIVOT_LOOKBACK_WEEKS)
         pace = volume_pace_today_vs_50dma_crypto(t, daily)
+        distance_to_ma30_pct = distance_pct(price, ma30)
+        distance_to_pivot_pct = distance_pct(price, pivot)
 
         # BUY / NEAR classification now comes from the shared LONG CORE.
         #
@@ -841,6 +922,10 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                     "owned_qty": owned_qty,
                     "current_value": current_value,
                     "cost_basis": cost_basis,
+                    "unrealized_gain_pct": unrealized_gain_pct,
+                    "portfolio_weight_pct": portfolio_weight_pct,
+                    "distance_to_ma30_pct": distance_to_ma30_pct,
+                    "distance_to_pivot_pct": distance_to_pivot_pct,
                     "action": ownership_action("BUY", owned),
                 }
             )
@@ -861,6 +946,10 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                         "owned_qty": owned_qty,
                         "current_value": current_value,
                         "cost_basis": cost_basis,
+                        "unrealized_gain_pct": unrealized_gain_pct,
+                        "portfolio_weight_pct": portfolio_weight_pct,
+                        "distance_to_ma30_pct": distance_to_ma30_pct,
+                        "distance_to_pivot_pct": distance_to_pivot_pct,
                         "action": ownership_action("NEAR", owned),
                     }
                 )
@@ -878,6 +967,10 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                     "owned_qty": owned_qty,
                     "current_value": current_value,
                     "cost_basis": cost_basis,
+                    "unrealized_gain_pct": unrealized_gain_pct,
+                    "portfolio_weight_pct": portfolio_weight_pct,
+                    "distance_to_ma30_pct": distance_to_ma30_pct,
+                    "distance_to_pivot_pct": distance_to_pivot_pct,
                     "action": ownership_action("SELLTRIG", owned),
                 }
             )
@@ -905,6 +998,11 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                 "cost_basis": cost_basis,
                 "avg_cost": avg_cost,
                 "holding_accounts": holding_accounts,
+                "unrealized_gain_pct": None if pd.isna(unrealized_gain_pct) else round(float(unrealized_gain_pct), 2),
+                "portfolio_weight_pct": None if pd.isna(portfolio_weight_pct) else round(float(portfolio_weight_pct), 2),
+                "distance_to_ma30_pct": None if pd.isna(distance_to_ma30_pct) else round(float(distance_to_ma30_pct), 2),
+                "distance_to_pivot_pct": None if pd.isna(distance_to_pivot_pct) else round(float(distance_to_pivot_pct), 2),
+                "risk_label": portfolio_risk_label(owned, price, ma30, pivot, unrealized_gain_pct, st["sell_state"]),
                 "ownership_action": (
                     ownership_action("SELLTRIG", owned)
                     if st["sell_state"] in ("TRIGGERED", "ARMED", "NEAR") and owned
@@ -913,6 +1011,15 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                     else ownership_action("NEAR", owned)
                     if near_now
                     else ownership_action("", owned)
+                ),
+                "portfolio_recommendation": portfolio_recommendation(
+                    owned,
+                    "SELLTRIG" if st["sell_state"] in ("TRIGGERED", "ARMED", "NEAR") and owned else "BUY" if confirm else "NEAR" if near_now else "",
+                    price,
+                    ma30,
+                    pivot,
+                    unrealized_gain_pct,
+                    st["sell_state"],
                 ),
                 "buy_state": st["state"],
                 "sell_state": st["sell_state"],
@@ -1047,7 +1154,13 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "cost_basis",
             "avg_cost",
             "holding_accounts",
+            "unrealized_gain_pct",
+            "portfolio_weight_pct",
+            "distance_to_ma30_pct",
+            "distance_to_pivot_pct",
+            "risk_label",
             "ownership_action",
+            "portfolio_recommendation",
             "buy_state",
             "sell_state",
         ]
@@ -1187,11 +1300,6 @@ if __name__ == "__main__":
         help="comma list of tickers to restrict evaluation (e.g. BTC-USD,ETH-USD)",
     )
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument(
-        "--force-email",
-        action="store_true",
-        help="Send the crypto report even when there are no BUY/SELL triggers.",
-    )
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
