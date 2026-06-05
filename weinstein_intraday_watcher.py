@@ -1077,6 +1077,15 @@ def _normalize_holdings_df(raw: pd.DataFrame) -> pd.DataFrame:
     out["Account"] = df[acct_col].astype(str) if acct_col else ""
     out = out[~out["Ticker"].isin(INVALID_HOLDING_SYMBOLS)].copy()
     out = out[out["Ticker"].map(_is_yahoo_equity_symbol)].copy()
+
+    # Final hard stop: never allow CUSIPs, Fidelity internal codes, crypto,
+    # cash/sweep codes, or numeric retirement identifiers into Yahoo downloads.
+    bad_mask = (
+        out["Ticker"].astype(str).str.match(r"^[0-9A-Z]{8,12}$", na=False)
+        & out["Ticker"].astype(str).str.contains(r"[0-9]", regex=True, na=False)
+    ) | out["Ticker"].astype(str).str.startswith("NON", na=False)       | out["Ticker"].astype(str).str.endswith("-USD", na=False)
+
+    out = out.loc[~bad_mask].copy()
     if out.empty:
         return out
     # Use min_count=1 so blank quantity/value columns remain blank instead of becoming 0.00.
