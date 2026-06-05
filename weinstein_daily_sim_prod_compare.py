@@ -13,6 +13,7 @@ Outputs:
 - daily_prod_sim_signal_comparison.csv
 - daily_account_recommendations.csv
 - daily_meta_f_decisions.csv when available
+- sim_F_effective_events.csv enriched for attribution
 - daily_prod_sim_summary.html
 - optional Google Sheet tabs
 - optional email summary
@@ -83,6 +84,28 @@ def _latest_date_filter(df: pd.DataFrame) -> pd.DataFrame:
     latest = dts.max().date()
     out = df.loc[dts.dt.date.eq(latest)].copy()
     return out if not out.empty else df
+
+
+def _first_existing_column(df: pd.DataFrame, names: list[str]) -> str | None:
+    lower = {c.lower(): c for c in df.columns}
+    for n in names:
+        if n.lower() in lower:
+            return lower[n.lower()]
+    return None
+
+
+def _safe_num(x) -> float:
+    if x is None:
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    s = str(x).strip().replace("$", "").replace(",", "").replace("%", "")
+    if not s:
+        return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
 
 
 def normalize_prod(prod: pd.DataFrame) -> pd.DataFrame:
@@ -165,6 +188,194 @@ def effective_f_signals(sim_d: pd.DataFrame, sim_e: pd.DataFrame, sim_f_raw: pd.
         out = sim_f_raw.copy()
     out["F_MetaProfile"] = profile or "UNKNOWN"
     return out
+
+
+def _prepare_raw_sim_for_attribution(raw: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Keep raw SIM columns and add normalized join columns for attribution enrichment."""
+    if raw.empty:
+        return pd.DataFrame(columns=["Ticker", "Signal", "Price", "Reason", "Source"])
+
+    out = _latest_date_filter(raw.copy())
+
+    tcol = _first_existing_column(out, ["Ticker", "ticker", "Symbol", "symbol"])
+    scol = _first_existing_column(out, ["Signal", "signal"])
+    pcol = _first_existing_column(out, ["Price", "price", "PriceNow", "close", "Close"])
+    rcol = _first_existing_column(out, ["Reason", "reason", "detail", "Details"])
+
+    out["Ticker"] = out[tcol].astype(str).str.upper().str.strip() if tcol else ""
+    out["Signal"] = out[scol].apply(_norm_signal) if scol else ""
+    out["Price"] = out[pcol] if pcol else ""
+    out["Reason"] = out[rcol] if rcol else ""
+    out["Source"] = source
+    out = out[out["Signal"].isin({"BUY", "NEAR", "SELL", "SHORT"})].copy()
+
+    # Add raw-source-prefixed columns for columns that would otherwise collide or be lost.
+    for col in list(out.columns):
+        if col in {"Ticker", "Signal", "Price", "Reason", "Source"}:
+            continue
+        new_col = f"Raw_{col}"
+        if new_col not in out.columns:
+            out[new_col] = out[col]
+
+    return out
+
+
+def _derive_attribution_columns(df: pd.DataFrame, meta: pd.DataFrame, selected_profile: str) -> pd.DataFrame:
+    """Add standard columns that the attribution engine can rely on, even when raw data is sparse."""
+    out = df.copy()
+
+    # Standard timestamp/profile columns.
+    out["AttributionGeneratedUTC"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    out["EffectiveMetaProfile"] = selected_profile or latest_meta_profile(meta) or "UNKNOWN"
+
+    # Date/EventDate.
+    date_col = _first_existing_column(out, ["date", "Date", "Raw_date", "Raw_Date", "TimestampUTC", "Raw_TimestampUTC", "timestamp", "Raw_timestamp"])
+    if date_col:
+        out["EventDate"] = pd.to_datetime(out[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+    elif not meta.empty and "date" in meta.columns:
+        m = meta.copy()
+        m["_dt"] = pd.to_datetime(m["date"], errors="coerce")
+        latest_date = m["_dt"].dropna().max()
+        out["EventDate"] = latest_date.strftime("%Y-%m-%d") if pd.notna(latest_date) else ""
+    else:
+        out["EventDate"] = ""
+
+    # Numeric price and important indicator columns if available.
+    out["PriceNum"] = out["Price"].map(_safe_num) if "Price" in out.columns else np.nan
+
+    ma_col = _first_existing_column(out, [
+        "MA150", "ma150", "SMA150", "sma150", "Raw_MA150", "Raw_ma150", "Raw_SMA150", "Raw_sma150",
+        "MA_150", "Raw_MA_150",
+    ])
+    pivot_col = _first_existing_column(out, [
+        "Pivot", "pivot", "PivotHigh", "pivot_high", "Raw_Pivot", "Raw_pivot", "Raw_PivotHigh", "Raw_pivot_high",
+    ])
+    adx_col = _first_existing_column(out, ["ADX", "adx", "Raw_ADX", "Raw_adx"])
+    vol_col = _first_existing_column(out, [
+        "VolumeRatio", "volume_ratio", "VolRatio", "vol_ratio", "VolumePace", "volume_pace",
+        "Raw_VolumeRatio", "Raw_volume_ratio", "Raw_VolRatio", "Raw_vol_ratio", "Raw_VolumePace", "Raw_volume_pace",
+    ])
+    rank_col = _first_existing_column(out, [
+        "WeeklyRank", "weekly_rank", "Rank", "rank", "Raw_WeeklyRank", "Raw_weekly_rank", "Raw_Rank", "Raw_rank",
+    ])
+    stage_col = _first_existing_column(out, ["Stage", "stage", "Raw_Stage", "Raw_stage"])
+    regime_col = _first_existing_column(out, ["Regime", "regime", "MarketRegime", "market_regime", "Raw_Regime", "Raw_regime"])
+
+    out["MA150"] = out[ma_col].map(_safe_num) if ma_col else np.nan
+    out["Pivot"] = out[pivot_col].map(_safe_num) if pivot_col else np.nan
+    out["ADX"] = out[adx_col].map(_safe_num) if adx_col else np.nan
+    out["VolumeRatio"] = out[vol_col].map(_safe_num) if vol_col else np.nan
+    out["WeeklyRank"] = out[rank_col].map(_safe_num) if rank_col else np.nan
+    out["Stage"] = out[stage_col] if stage_col else ""
+    out["MarketRegime"] = out[regime_col] if regime_col else ""
+
+    out["DistanceToMA150Pct"] = np.where(
+        out["PriceNum"].notna() & out["MA150"].notna() & (out["MA150"] != 0),
+        (out["PriceNum"] - out["MA150"]) / out["MA150"] * 100.0,
+        np.nan,
+    )
+    out["DistanceToPivotPct"] = np.where(
+        out["PriceNum"].notna() & out["Pivot"].notna() & (out["Pivot"] != 0),
+        (out["PriceNum"] - out["Pivot"]) / out["Pivot"] * 100.0,
+        np.nan,
+    )
+
+    # Reason term and filter flags.
+    out["ReasonTerm"] = out["Reason"].astype(str).str.lower().str.strip() if "Reason" in out.columns else ""
+    out["Filter_MA150_Crack"] = out["ReasonTerm"].str.contains("ma150|sma150|below_ma|crack", regex=True, na=False)
+    out["Filter_Breakout"] = out["ReasonTerm"].str.contains("breakout|pivot|break", regex=True, na=False)
+    out["Filter_ADX_Available"] = out["ADX"].notna()
+    out["Filter_Volume_Available"] = out["VolumeRatio"].notna()
+    out["Filter_Rank_Available"] = out["WeeklyRank"].notna()
+    out["Filter_Stage_Available"] = out["Stage"].astype(str).str.len().gt(0)
+    out["Filter_Regime_Available"] = out["MarketRegime"].astype(str).str.len().gt(0)
+
+    # PnL placeholders. If raw event files later add PnL/return columns, preserve them into these standards.
+    pnl_col = _first_existing_column(out, [
+        "PnL", "pnl", "Profit", "profit", "Gain", "gain", "Raw_PnL", "Raw_pnl", "Raw_Profit", "Raw_profit", "Raw_Gain", "Raw_gain",
+    ])
+    ret_col = _first_existing_column(out, [
+        "ReturnPct", "return_pct", "Return", "return", "Raw_ReturnPct", "Raw_return_pct", "Raw_Return", "Raw_return",
+    ])
+    equity_before_col = _first_existing_column(out, ["EquityBefore", "equity_before", "Raw_EquityBefore", "Raw_equity_before"])
+    equity_after_col = _first_existing_column(out, ["EquityAfter", "equity_after", "Raw_EquityAfter", "Raw_equity_after"])
+
+    out["PnL"] = out[pnl_col].map(_safe_num) if pnl_col else np.nan
+    out["ReturnPct"] = out[ret_col].map(_safe_num) if ret_col else np.nan
+    out["EquityBefore"] = out[equity_before_col].map(_safe_num) if equity_before_col else np.nan
+    out["EquityAfter"] = out[equity_after_col].map(_safe_num) if equity_after_col else np.nan
+
+    # Make key attribution columns appear first.
+    preferred = [
+        "EventDate", "Ticker", "Signal", "Reason", "Source", "F_MetaProfile", "EffectiveMetaProfile",
+        "Price", "PriceNum", "MA150", "DistanceToMA150Pct", "Pivot", "DistanceToPivotPct",
+        "Stage", "WeeklyRank", "ADX", "VolumeRatio", "MarketRegime",
+        "Filter_MA150_Crack", "Filter_Breakout", "Filter_ADX_Available", "Filter_Volume_Available",
+        "Filter_Rank_Available", "Filter_Stage_Available", "Filter_Regime_Available",
+        "EquityBefore", "EquityAfter", "PnL", "ReturnPct", "ReasonTerm", "AttributionGeneratedUTC",
+    ]
+    cols = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
+    return out[cols]
+
+
+def enrich_effective_f_events(
+    sim_f: pd.DataFrame,
+    sim_d_raw: pd.DataFrame,
+    sim_e_raw: pd.DataFrame,
+    sim_f_raw_raw: pd.DataFrame,
+    meta: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return attribution-ready SIM F effective events without changing parity logic."""
+    if sim_f.empty:
+        return sim_f.copy()
+
+    selected = latest_meta_profile(meta) or "UNKNOWN"
+
+    raw_sources = [
+        _prepare_raw_sim_for_attribution(sim_d_raw, "SIM_D_RAW_INPUT"),
+        _prepare_raw_sim_for_attribution(sim_e_raw, "SIM_E_RAW_INPUT"),
+        _prepare_raw_sim_for_attribution(sim_f_raw_raw, "SIM_F_RAW_INPUT"),
+    ]
+    raw_all = pd.concat([r for r in raw_sources if not r.empty], ignore_index=True) if any(not r.empty for r in raw_sources) else pd.DataFrame()
+
+    base = sim_f.copy()
+    base["_join_key"] = (
+        base["Ticker"].astype(str).str.upper().str.strip()
+        + "|" + base["Signal"].astype(str).str.upper().str.strip()
+        + "|" + base["Reason"].astype(str).str.strip()
+    )
+
+    if not raw_all.empty:
+        raw_all["_join_key"] = (
+            raw_all["Ticker"].astype(str).str.upper().str.strip()
+            + "|" + raw_all["Signal"].astype(str).str.upper().str.strip()
+            + "|" + raw_all["Reason"].astype(str).str.strip()
+        )
+
+        # Prefer raw rows from the selected stream when possible.
+        source_pref = {
+            "D": "SIM_D_RAW_INPUT",
+            "E": "SIM_E_RAW_INPUT",
+            "A": "SIM_F_RAW_INPUT",
+            "B": "SIM_F_RAW_INPUT",
+            "UNKNOWN": "SIM_F_RAW_INPUT",
+        }.get(selected, "SIM_F_RAW_INPUT")
+        raw_all["_source_priority"] = np.where(raw_all["Source"].eq(source_pref), 0, 1)
+        raw_all = raw_all.sort_values(["_join_key", "_source_priority"]).drop_duplicates("_join_key", keep="first")
+
+        raw_cols = [c for c in raw_all.columns if c not in {"_source_priority"}]
+        enriched = base.merge(raw_all[raw_cols], on="_join_key", how="left", suffixes=("", "_RawJoined"))
+
+        # Fill standard columns from raw joined columns when present.
+        for col in ["Ticker", "Signal", "Price", "Reason", "Source"]:
+            raw_col = f"{col}_RawJoined"
+            if raw_col in enriched.columns:
+                enriched[col] = enriched[col].where(enriched[col].astype(str).str.len().gt(0), enriched[raw_col])
+    else:
+        enriched = base
+
+    enriched = enriched.drop(columns=[c for c in ["_join_key", "Ticker_RawJoined", "Signal_RawJoined", "Price_RawJoined", "Reason_RawJoined", "Source_RawJoined"] if c in enriched.columns])
+    return _derive_attribution_columns(enriched, meta, selected)
 
 
 def compare_signals(prod: pd.DataFrame, sim_d: pd.DataFrame, sim_f: pd.DataFrame, prod_history: pd.DataFrame | None = None, sim_f_raw: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -273,6 +484,7 @@ def account_recommendations(sim_d: pd.DataFrame, sim_f: pd.DataFrame, positions:
     out["_p"] = out["Signal"].map(priority).fillna(9)
     return out.sort_values(["AccountNumber", "_p", "Ticker"]).drop(columns=["_p"])
 
+
 def read_meta_decisions(path: str) -> pd.DataFrame:
     df = _read_csv(path)
     if df.empty:
@@ -380,11 +592,18 @@ def main():
     prod = normalize_prod(_read_csv(args.prod_debug))
     prod_history_raw = read_prod_history_for_date(args.prod_history, args.prod_history_date or None)
     prod_history = summarize_prod_history(prod_history_raw)
-    sim_d = normalize_sim(_read_csv(args.sim_d_events), "SIM_D")
-    sim_e = normalize_sim(_read_csv(args.sim_e_events), "SIM_E")
-    sim_f_raw = normalize_sim(_read_csv(args.sim_f_events), "SIM_F_RAW")
+
+    sim_d_raw = _read_csv(args.sim_d_events)
+    sim_e_raw = _read_csv(args.sim_e_events)
+    sim_f_raw_input = _read_csv(args.sim_f_events)
+
+    sim_d = normalize_sim(sim_d_raw, "SIM_D")
+    sim_e = normalize_sim(sim_e_raw, "SIM_E")
+    sim_f_raw = normalize_sim(sim_f_raw_input, "SIM_F_RAW")
+
     meta = read_meta_decisions(args.sim_f_meta)
     sim_f = effective_f_signals(sim_d, sim_e, sim_f_raw, meta)
+    sim_f_enriched = enrich_effective_f_events(sim_f, sim_d_raw, sim_e_raw, sim_f_raw_input, meta)
 
     if args.positions_csv:
         pos = attach_profiles(normalize_positions(read_fidelity_positions(args.positions_csv)), profile_cfg)
@@ -407,7 +626,7 @@ def main():
 
     comparison.to_csv(comp_path, index=False)
     recs.to_csv(rec_path, index=False)
-    sim_f.to_csv(effective_f_path, index=False)
+    sim_f_enriched.to_csv(effective_f_path, index=False)
     if not meta.empty:
         meta.to_csv(meta_path, index=False)
     if not prod_history.empty:
@@ -421,6 +640,8 @@ def main():
         "SIM F raw signals": len(sim_f_raw),
         "SIM F effective signals": len(sim_f),
         "SIM F selected profile": latest_meta_profile(meta) or "UNKNOWN",
+        "SIM F effective enriched columns": len(sim_f_enriched.columns),
+        "SIM F effective enriched rows": len(sim_f_enriched),
         "Account recommendation rows": len(recs),
         "PROD latest vs D exact ticker/signal matches": int(comparison["PROD_Latest_vs_D_Match"].sum()) if not comparison.empty else 0,
         "PROD latest vs F exact ticker/signal matches": int(comparison["PROD_Latest_vs_F_Match"].sum()) if not comparison.empty else 0,
