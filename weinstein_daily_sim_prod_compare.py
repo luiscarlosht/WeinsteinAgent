@@ -243,31 +243,58 @@ def _derive_attribution_columns(df: pd.DataFrame, meta: pd.DataFrame, selected_p
     # Numeric price and important indicator columns if available.
     out["PriceNum"] = out["Price"].map(_safe_num) if "Price" in out.columns else np.nan
 
+    # Canonical attribution mapping.
+    #
+    # The replay engines use a few lower-level/raw names. The attribution engine
+    # expects stable canonical names. Keep both: preserve the original/raw columns,
+    # and populate these canonical columns for dashboards.
     ma_col = _first_existing_column(out, [
         "MA150", "ma150", "SMA150", "sma150", "Raw_MA150", "Raw_ma150", "Raw_SMA150", "Raw_sma150",
         "MA_150", "Raw_MA_150",
     ])
+    ma30_col = _first_existing_column(out, [
+        "MA30", "ma30", "SMA30", "sma30", "Raw_MA30", "Raw_ma30", "Raw_SMA30", "Raw_sma30",
+        "MA_30", "Raw_MA_30",
+    ])
     pivot_col = _first_existing_column(out, [
         "Pivot", "pivot", "PivotHigh", "pivot_high", "Raw_Pivot", "Raw_pivot", "Raw_PivotHigh", "Raw_pivot_high",
     ])
-    adx_col = _first_existing_column(out, ["ADX", "adx", "Raw_ADX", "Raw_adx"])
+    adx_col = _first_existing_column(out, [
+        "ADX", "adx", "ADX14", "adx14", "Raw_ADX", "Raw_adx", "Raw_ADX14", "Raw_adx14",
+    ])
+    atr_col = _first_existing_column(out, [
+        "ATR", "atr", "ATR14", "atr14", "Raw_ATR", "Raw_atr", "Raw_ATR14", "Raw_atr14",
+    ])
     vol_col = _first_existing_column(out, [
         "VolumeRatio", "volume_ratio", "VolRatio", "vol_ratio", "VolumePace", "volume_pace",
-        "Raw_VolumeRatio", "Raw_volume_ratio", "Raw_VolRatio", "Raw_vol_ratio", "Raw_VolumePace", "Raw_volume_pace",
+        "VolMult", "vol_mult", "Raw_VolumeRatio", "Raw_volume_ratio", "Raw_VolRatio", "Raw_vol_ratio",
+        "Raw_VolumePace", "Raw_volume_pace", "Raw_VolMult", "Raw_vol_mult",
     ])
     rank_col = _first_existing_column(out, [
         "WeeklyRank", "weekly_rank", "Rank", "rank", "Raw_WeeklyRank", "Raw_weekly_rank", "Raw_Rank", "Raw_rank",
     ])
+    quality_score_col = _first_existing_column(out, [
+        "QualityScore", "quality_score", "Raw_QualityScore", "Raw_quality_score",
+    ])
+    quality_mult_col = _first_existing_column(out, [
+        "QualityMult", "quality_mult", "Raw_QualityMult", "Raw_quality_mult",
+    ])
     stage_col = _first_existing_column(out, ["Stage", "stage", "Raw_Stage", "Raw_stage"])
     regime_col = _first_existing_column(out, ["Regime", "regime", "MarketRegime", "market_regime", "Raw_Regime", "Raw_regime"])
+    rs_col = _first_existing_column(out, ["RSAboveMA", "rs_above_ma", "Raw_RSAboveMA", "Raw_rs_above_ma"])
 
     out["MA150"] = out[ma_col].map(_safe_num) if ma_col else np.nan
+    out["MA30"] = out[ma30_col].map(_safe_num) if ma30_col else np.nan
     out["Pivot"] = out[pivot_col].map(_safe_num) if pivot_col else np.nan
     out["ADX"] = out[adx_col].map(_safe_num) if adx_col else np.nan
+    out["ATR"] = out[atr_col].map(_safe_num) if atr_col else np.nan
     out["VolumeRatio"] = out[vol_col].map(_safe_num) if vol_col else np.nan
     out["WeeklyRank"] = out[rank_col].map(_safe_num) if rank_col else np.nan
+    out["QualityScore"] = out[quality_score_col].map(_safe_num) if quality_score_col else np.nan
+    out["QualityMult"] = out[quality_mult_col].map(_safe_num) if quality_mult_col else np.nan
     out["Stage"] = out[stage_col] if stage_col else ""
     out["MarketRegime"] = out[regime_col] if regime_col else ""
+    out["RSAboveMA"] = out[rs_col] if rs_col else ""
 
     out["DistanceToMA150Pct"] = np.where(
         out["PriceNum"].notna() & out["MA150"].notna() & (out["MA150"] != 0),
@@ -287,6 +314,8 @@ def _derive_attribution_columns(df: pd.DataFrame, meta: pd.DataFrame, selected_p
     out["Filter_ADX_Available"] = out["ADX"].notna()
     out["Filter_Volume_Available"] = out["VolumeRatio"].notna()
     out["Filter_Rank_Available"] = out["WeeklyRank"].notna()
+    out["Filter_QualityScore_Available"] = out["QualityScore"].notna()
+    out["Filter_QualityMult_Available"] = out["QualityMult"].notna()
     out["Filter_Stage_Available"] = out["Stage"].astype(str).str.len().gt(0)
     out["Filter_Regime_Available"] = out["MarketRegime"].astype(str).str.len().gt(0)
 
@@ -308,10 +337,11 @@ def _derive_attribution_columns(df: pd.DataFrame, meta: pd.DataFrame, selected_p
     # Make key attribution columns appear first.
     preferred = [
         "EventDate", "Ticker", "Signal", "Reason", "Source", "F_MetaProfile", "EffectiveMetaProfile",
-        "Price", "PriceNum", "MA150", "DistanceToMA150Pct", "Pivot", "DistanceToPivotPct",
-        "Stage", "WeeklyRank", "ADX", "VolumeRatio", "MarketRegime",
+        "Price", "PriceNum", "MA30", "MA150", "DistanceToMA150Pct", "Pivot", "DistanceToPivotPct",
+        "Stage", "WeeklyRank", "ADX", "ATR", "VolumeRatio", "QualityScore", "QualityMult", "RSAboveMA", "MarketRegime",
         "Filter_MA150_Crack", "Filter_Breakout", "Filter_ADX_Available", "Filter_Volume_Available",
-        "Filter_Rank_Available", "Filter_Stage_Available", "Filter_Regime_Available",
+        "Filter_Rank_Available", "Filter_QualityScore_Available", "Filter_QualityMult_Available",
+        "Filter_Stage_Available", "Filter_Regime_Available",
         "EquityBefore", "EquityAfter", "PnL", "ReturnPct", "ReasonTerm", "AttributionGeneratedUTC",
     ]
     cols = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
@@ -642,6 +672,7 @@ def main():
         "SIM F selected profile": latest_meta_profile(meta) or "UNKNOWN",
         "SIM F effective enriched columns": len(sim_f_enriched.columns),
         "SIM F effective enriched rows": len(sim_f_enriched),
+        "SIM F attribution mapping": "11.4 canonical mapping",
         "Account recommendation rows": len(recs),
         "PROD latest vs D exact ticker/signal matches": int(comparison["PROD_Latest_vs_D_Match"].sum()) if not comparison.empty else 0,
         "PROD latest vs F exact ticker/signal matches": int(comparison["PROD_Latest_vs_F_Match"].sum()) if not comparison.empty else 0,
