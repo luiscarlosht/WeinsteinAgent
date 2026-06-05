@@ -3,9 +3,10 @@
 """
 weinstein_attribution_engine.py
 
-Attribution Intelligence for WeinsteinAgent.
+Build 11.2 — Attribution + Filter/Funnel Intelligence
 
 Reads the latest output/daily_parity/<run> folder and creates:
+
   output/attribution/<run>/
     attribution_dashboard.html
     attribution_summary.csv
@@ -15,6 +16,9 @@ Reads the latest output/daily_parity/<run> folder and creates:
     attribution_profile_contribution.csv
     attribution_action_recommendations.csv
     attribution_event_breakdown.csv
+    attribution_signal_funnel.csv
+    attribution_filter_columns.csv
+    attribution_reason_terms.csv
     attribution_inputs.json
 
 Usage:
@@ -27,6 +31,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +41,14 @@ import pandas as pd
 
 DEFAULT_PARITY_ROOT = Path("output/daily_parity")
 DEFAULT_OUTPUT_ROOT = Path("output/attribution")
+
+
+FILTER_KEYWORDS = [
+    "adx", "pivot", "volume", "vol", "rank", "stage", "regime", "ma",
+    "sma", "ema", "rs", "relative", "break", "breakout", "distance",
+    "quality", "score", "risk", "trend", "atr", "rsi", "macd",
+    "eligible", "passed", "fail", "reason", "filter", "bucket",
+]
 
 
 def latest_dir(root: Path) -> Path:
@@ -104,6 +117,10 @@ def fmt_pct(v) -> str:
     return "—" if pd.isna(v) else f"{v:,.2f}%"
 
 
+def fmt_num(v) -> str:
+    return "—" if pd.isna(v) else f"{v:,.2f}"
+
+
 def html_table(df: pd.DataFrame, max_rows: int = 80) -> str:
     if df is None or df.empty:
         return "<p><i>No rows.</i></p>"
@@ -118,20 +135,26 @@ def find_col(df: pd.DataFrame, *names: str) -> str | None:
     return None
 
 
+def signal_cols(comparison: pd.DataFrame) -> dict:
+    return {
+        "ticker": find_col(comparison, "Ticker", "Symbol"),
+        "prod_latest": find_col(comparison, "PROD_Latest_Signal", "PROD_Latest"),
+        "prod_intraday": find_col(comparison, "PROD_Intraday_Signal", "PROD_Intraday"),
+        "sim_d": find_col(comparison, "SIM_D_Signal", "SIM_D"),
+        "sim_f_eff": find_col(comparison, "SIM_F_EffectiveSignal", "SIM_F_Effective_Signal", "SIM_F_Effective"),
+        "sim_f_raw": find_col(comparison, "SIM_F_RawSignal", "SIM_F_Raw_Signal", "SIM_F_Raw"),
+    }
+
+
 def build_signal_attribution(comparison: pd.DataFrame):
     if comparison.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
 
-    ticker = find_col(comparison, "Ticker", "Symbol")
-    prod_latest = find_col(comparison, "PROD_Latest_Signal", "PROD_Latest")
-    prod_intraday = find_col(comparison, "PROD_Intraday_Signal", "PROD_Intraday")
-    sim_d = find_col(comparison, "SIM_D_Signal", "SIM_D")
-    sim_f_eff = find_col(comparison, "SIM_F_EffectiveSignal", "SIM_F_Effective_Signal", "SIM_F_Effective")
-    sim_f_raw = find_col(comparison, "SIM_F_RawSignal", "SIM_F_Raw_Signal", "SIM_F_Raw")
+    c = signal_cols(comparison)
+    cols = [x for x in [c["prod_latest"], c["prod_intraday"], c["sim_d"], c["sim_f_eff"], c["sim_f_raw"]] if x]
 
-    signal_cols = [c for c in [prod_latest, prod_intraday, sim_d, sim_f_eff, sim_f_raw] if c]
     rows = []
-    for col in signal_cols:
+    for col in cols:
         ser = comparison[col].map(clean_signal_value)
         rows.append({
             "SignalColumn": col,
@@ -141,27 +164,81 @@ def build_signal_attribution(comparison: pd.DataFrame):
             "SHORT": int(ser.map(lambda x: contains_token(x, "SHORT")).sum()),
             "OtherNonBlank": int(((ser != "") & ~ser.str.contains("BUY|SELL|SHORT", regex=True, na=False)).sum()),
         })
+
     counts = pd.DataFrame(rows)
 
     short_mask = pd.Series(False, index=comparison.index)
-    for col in [sim_d, sim_f_eff, sim_f_raw]:
+    for col in [c["sim_d"], c["sim_f_eff"], c["sim_f_raw"]]:
         if col:
             short_mask = short_mask | comparison[col].map(lambda x: contains_token(x, "SHORT"))
-    short_candidates = comparison.loc[short_mask].copy()
-    if ticker and not short_candidates.empty:
-        cols = [ticker] + [c for c in [prod_latest, prod_intraday, sim_d, sim_f_eff, sim_f_raw] if c]
-        short_candidates = short_candidates[cols]
+
+    shorts = comparison.loc[short_mask].copy()
+    if c["ticker"] and not shorts.empty:
+        keep = [c["ticker"]] + [x for x in [c["prod_latest"], c["prod_intraday"], c["sim_d"], c["sim_f_eff"], c["sim_f_raw"]] if x]
+        shorts = shorts[keep]
 
     summary = {
         "comparison_rows": int(len(comparison)),
-        "prod_latest_signals": int(comparison[prod_latest].map(clean_signal_value).ne("").sum()) if prod_latest else 0,
-        "prod_intraday_signals": int(comparison[prod_intraday].map(clean_signal_value).ne("").sum()) if prod_intraday else 0,
-        "sim_d_signals": int(comparison[sim_d].map(clean_signal_value).ne("").sum()) if sim_d else 0,
-        "sim_f_effective_signals": int(comparison[sim_f_eff].map(clean_signal_value).ne("").sum()) if sim_f_eff else 0,
-        "sim_f_raw_signals": int(comparison[sim_f_raw].map(clean_signal_value).ne("").sum()) if sim_f_raw else 0,
-        "short_candidate_rows": int(len(short_candidates)),
+        "prod_latest_signals": int(comparison[c["prod_latest"]].map(clean_signal_value).ne("").sum()) if c["prod_latest"] else 0,
+        "prod_intraday_signals": int(comparison[c["prod_intraday"]].map(clean_signal_value).ne("").sum()) if c["prod_intraday"] else 0,
+        "sim_d_signals": int(comparison[c["sim_d"]].map(clean_signal_value).ne("").sum()) if c["sim_d"] else 0,
+        "sim_f_effective_signals": int(comparison[c["sim_f_eff"]].map(clean_signal_value).ne("").sum()) if c["sim_f_eff"] else 0,
+        "sim_f_raw_signals": int(comparison[c["sim_f_raw"]].map(clean_signal_value).ne("").sum()) if c["sim_f_raw"] else 0,
+        "short_candidate_rows": int(len(shorts)),
     }
-    return counts, short_candidates, summary
+
+    return counts, shorts, summary
+
+
+def build_signal_funnel(comparison: pd.DataFrame, events: pd.DataFrame, meta: pd.DataFrame):
+    if comparison.empty and events.empty and meta.empty:
+        return pd.DataFrame(), {}
+
+    c = signal_cols(comparison) if not comparison.empty else {}
+    rows = []
+
+    if not events.empty:
+        rows.append({"Stage": "SIM F Effective Events", "Count": int(len(events)), "Notes": "Rows in sim_F_effective_events.csv"})
+
+    if not comparison.empty:
+        for label, key in [
+            ("PROD Latest Signals", "prod_latest"),
+            ("PROD Intraday Signals", "prod_intraday"),
+            ("SIM D Signals", "sim_d"),
+            ("SIM F Effective Signals", "sim_f_eff"),
+            ("SIM F Raw Signals", "sim_f_raw"),
+        ]:
+            col = c.get(key)
+            if col:
+                rows.append({
+                    "Stage": label,
+                    "Count": int(comparison[col].map(clean_signal_value).ne("").sum()),
+                    "Notes": col,
+                })
+
+    if not meta.empty:
+        last = meta.tail(1).copy()
+        if len(last):
+            positions = safe_num(last.iloc[0].get("positions")) if "positions" in meta.columns else np.nan
+            long_positions = safe_num(last.iloc[0].get("long_positions")) if "long_positions" in meta.columns else np.nan
+            short_positions = safe_num(last.iloc[0].get("short_positions")) if "short_positions" in meta.columns else np.nan
+            rows.extend([
+                {"Stage": "Latest META Positions", "Count": int(positions) if pd.notna(positions) else 0, "Notes": "positions"},
+                {"Stage": "Latest META Long Positions", "Count": int(long_positions) if pd.notna(long_positions) else 0, "Notes": "long_positions"},
+                {"Stage": "Latest META Short Positions", "Count": int(short_positions) if pd.notna(short_positions) else 0, "Notes": "short_positions"},
+            ])
+
+    funnel = pd.DataFrame(rows)
+
+    summary = {}
+    if not funnel.empty:
+        summary["funnel_rows"] = int(len(funnel))
+        if "SIM F Raw Signals" in set(funnel["Stage"]) and "SIM F Effective Signals" in set(funnel["Stage"]):
+            raw = safe_num(funnel.loc[funnel["Stage"] == "SIM F Raw Signals", "Count"].iloc[0])
+            eff = safe_num(funnel.loc[funnel["Stage"] == "SIM F Effective Signals", "Count"].iloc[0])
+            summary["raw_to_effective_retention_pct"] = (eff / raw * 100.0) if raw else np.nan
+
+    return funnel, summary
 
 
 def build_meta_attribution(meta: pd.DataFrame):
@@ -207,6 +284,7 @@ def build_meta_attribution(meta: pd.DataFrame):
         "latest_meta_profile": str(df["meta_profile"].iloc[-1]) if "meta_profile" in df.columns and len(df) else "",
         "latest_meta_reason": str(df["meta_reason"].iloc[-1]) if "meta_reason" in df.columns and len(df) else "",
     }
+
     return df.tail(25), profile, summary
 
 
@@ -250,6 +328,7 @@ def build_event_attribution(events: pd.DataFrame):
         "Signal", "signal", "Action", "action", "Stage", "stage",
         "Sector", "sector", "Industry", "industry", "meta_profile", "regime", "Regime",
     ]
+
     frames = []
     for g in group_candidates:
         if g in df.columns:
@@ -261,9 +340,80 @@ def build_event_attribution(events: pd.DataFrame):
             )
             tmp.insert(0, "AttributionType", g)
             frames.append(tmp)
+
     if not frames:
         return pd.DataFrame(), summary
+
     return pd.concat(frames, ignore_index=True).sort_values("total_pnl", ascending=False), summary
+
+
+def build_filter_column_inventory(events: pd.DataFrame, comparison: pd.DataFrame):
+    rows = []
+
+    def inspect_df(name: str, df: pd.DataFrame):
+        if df.empty:
+            return
+        for col in df.columns:
+            low = col.lower()
+            is_filter = any(k in low for k in FILTER_KEYWORDS)
+            if not is_filter:
+                continue
+            ser = df[col]
+            non_null = int(ser.notna().sum())
+            unique = int(ser.astype(str).nunique(dropna=True))
+            numeric_vals = ser.map(safe_num)
+            numeric_count = int(numeric_vals.notna().sum())
+            rows.append({
+                "Source": name,
+                "Column": col,
+                "NonNullRows": non_null,
+                "UniqueValues": unique,
+                "NumericRows": numeric_count,
+                "Min": numeric_vals.min() if numeric_count else np.nan,
+                "Max": numeric_vals.max() if numeric_count else np.nan,
+                "Mean": numeric_vals.mean() if numeric_count else np.nan,
+                "SampleValues": ", ".join(ser.dropna().astype(str).head(5).tolist()),
+            })
+
+    inspect_df("sim_F_effective_events", events)
+    inspect_df("daily_prod_sim_signal_comparison", comparison)
+
+    return pd.DataFrame(rows).sort_values(["Source", "Column"]) if rows else pd.DataFrame()
+
+
+def build_reason_terms(events: pd.DataFrame, comparison: pd.DataFrame):
+    text_cols = []
+
+    def collect(name: str, df: pd.DataFrame):
+        if df.empty:
+            return
+        for col in df.columns:
+            low = col.lower()
+            if any(k in low for k in ["reason", "signal", "state", "status", "filter"]):
+                text_cols.append((name, col, df[col].dropna().astype(str)))
+
+    collect("sim_F_effective_events", events)
+    collect("daily_prod_sim_signal_comparison", comparison)
+
+    terms = {}
+    for source, col, series in text_cols:
+        for value in series:
+            for token in re.split(r"[^A-Za-z0-9_]+", value):
+                t = token.strip().lower()
+                if len(t) < 3:
+                    continue
+                if t in {"sell", "buy", "nan", "none", "true", "false"}:
+                    continue
+                key = (source, col, t)
+                terms[key] = terms.get(key, 0) + 1
+
+    rows = [
+        {"Source": s, "Column": c, "Term": t, "Count": n}
+        for (s, c, t), n in terms.items()
+    ]
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("Count", ascending=False).head(100)
 
 
 def metric_card(label, value, klass=""):
@@ -275,9 +425,38 @@ def metric_card(label, value, klass=""):
     """
 
 
-def build_html(out_path: Path, run_dir: Path, files: dict, summary: dict, signal_counts, shorts, meta_recent, profile, actions, event_attr):
+def build_recommendations(summary: dict, profile: pd.DataFrame, filter_inventory: pd.DataFrame, event_attr: pd.DataFrame):
+    recs = []
+
+    short_count = safe_num(summary.get("short_candidate_rows", 0))
+    if short_count > 0:
+        recs.append(f"Keep short trading OFF for production; {int(short_count)} SHORT flags are research-only until explicitly enabled.")
+
+    prod_latest = safe_num(summary.get("prod_latest_signals", 0))
+    sim_f = safe_num(summary.get("sim_f_effective_signals", 0))
+    if prod_latest == 0 and sim_f > 0:
+        recs.append("Treat current SIM signals as validation/research, not live actions, because PROD latest signals are zero.")
+
+    if not profile.empty and "total_equity_delta" in profile.columns:
+        best = profile.sort_values("total_equity_delta", ascending=False).head(1).iloc[0]
+        prof = best.get("meta_profile", "")
+        reason = best.get("meta_reason", "")
+        delta = safe_num(best.get("total_equity_delta"))
+        recs.append(f"Profile {prof} / {reason} is currently the top contributor ({fmt_money(delta)} total equity delta).")
+
+    if filter_inventory.empty:
+        recs.append("Next data improvement: add explicit filter columns to sim_F_effective_events.csv so attribution can score ADX, volume, pivot, rank, and regime directly.")
+
+    if event_attr.empty:
+        recs.append("Next attribution improvement: add trade-level PnL/return columns to SIM event outputs so the engine can rank filters by profit contribution.")
+
+    return pd.DataFrame({"Recommendation": recs})
+
+
+def build_html(out_path: Path, run_dir: Path, files: dict, summary: dict, signal_counts, shorts, meta_recent, profile, actions, event_attr, funnel, filters, reason_terms, recs):
     equity_change = safe_num(summary.get("equity_change"))
     equity_change_pct = safe_num(summary.get("equity_change_pct"))
+    retention = safe_num(summary.get("raw_to_effective_retention_pct"))
 
     css = """
     <style>
@@ -303,7 +482,7 @@ def build_html(out_path: Path, run_dir: Path, files: dict, summary: dict, signal
 <html>
 <head><meta charset="utf-8"/><title>Weinstein Attribution Intelligence</title>{css}</head>
 <body>
-<h1>Weinstein Attribution Intelligence</h1>
+<h1>Weinstein Attribution Intelligence — Build 11.2</h1>
 <div class="subtle">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
 <div class="subtle">Source parity run: <code>{html.escape(str(run_dir))}</code></div>
 
@@ -317,15 +496,31 @@ def build_html(out_path: Path, run_dir: Path, files: dict, summary: dict, signal
   {metric_card("Latest META Profile", summary.get("latest_meta_profile", "—"))}
   {metric_card("Equity Change", fmt_money(equity_change), "good" if equity_change > 0 else "bad")}
   {metric_card("Equity Change %", fmt_pct(equity_change_pct), "good" if equity_change_pct > 0 else "bad")}
+  {metric_card("Raw → Effective", fmt_pct(retention))}
+  {metric_card("Event Rows", summary.get("event_rows", 0))}
+  {metric_card("Filter Columns", len(filters) if filters is not None else 0)}
+  {metric_card("Event PnL Column", summary.get("event_pnl_column", "") or "None")}
 </div>
 
-<h2>Interpretation</h2>
-<ul>
-  <li><b>Signal attribution:</b> counts SIM/PROD BUY/SELL/SHORT flags from the parity comparison.</li>
-  <li><b>Short flags:</b> treated as research/validation only until short trading is explicitly enabled.</li>
-  <li><b>META attribution:</b> groups equity changes by selected META profile and reason.</li>
-  <li><b>Event attribution:</b> uses event-level PnL/return columns when those columns exist in SIM event files.</li>
-</ul>
+<h2>System Recommendations</h2>{html_table(recs, 20)}
+
+<h2>Signal Funnel</h2>{html_table(funnel, 50)}
+
+<h2>Signal Counts</h2>{html_table(signal_counts, 100)}
+
+<h2>SHORT Candidate Flags</h2>{html_table(shorts, 50)}
+
+<h2>Filter Column Inventory</h2>{html_table(filters, 100)}
+
+<h2>Reason / Filter Terms</h2>{html_table(reason_terms, 100)}
+
+<h2>Action Recommendation Summary</h2>{html_table(actions, 100)}
+
+<h2>META Profile Contribution</h2>{html_table(profile, 100)}
+
+<h2>Recent META Decisions</h2>{html_table(meta_recent, 50)}
+
+<h2>Event Attribution</h2>{html_table(event_attr, 100)}
 
 <h2>Input Files</h2>
 <ul>
@@ -335,12 +530,6 @@ def build_html(out_path: Path, run_dir: Path, files: dict, summary: dict, signal
   <li>SIM F events: <code>{html.escape(str(files.get("events") or "NONE"))}</code></li>
 </ul>
 
-<h2>Signal Counts</h2>{html_table(signal_counts)}
-<h2>SHORT Candidate Flags</h2>{html_table(shorts)}
-<h2>Action Recommendation Summary</h2>{html_table(actions)}
-<h2>META Profile Contribution</h2>{html_table(profile)}
-<h2>Recent META Decisions</h2>{html_table(meta_recent)}
-<h2>Event Attribution</h2>{html_table(event_attr)}
 </body></html>"""
     out_path.write_text(body, encoding="utf-8")
 
@@ -372,12 +561,15 @@ def main():
     meta_recent, profile, s2 = build_meta_attribution(meta)
     action_summary, s3 = build_action_summary(actions_df)
     event_attr, s4 = build_event_attribution(events)
+    funnel, s5 = build_signal_funnel(comparison, events, meta)
+    filters = build_filter_column_inventory(events, comparison)
+    reason_terms = build_reason_terms(events, comparison)
 
     summary = {}
-    summary.update(s1)
-    summary.update(s2)
-    summary.update(s3)
-    summary.update(s4)
+    for s in [s1, s2, s3, s4, s5]:
+        summary.update(s)
+
+    recs = build_recommendations(summary, profile, filters, event_attr)
 
     pd.DataFrame([summary]).to_csv(out_dir / "attribution_summary.csv", index=False)
     signal_counts.to_csv(out_dir / "attribution_signal_counts.csv", index=False)
@@ -386,10 +578,14 @@ def main():
     profile.to_csv(out_dir / "attribution_profile_contribution.csv", index=False)
     action_summary.to_csv(out_dir / "attribution_action_recommendations.csv", index=False)
     event_attr.to_csv(out_dir / "attribution_event_breakdown.csv", index=False)
+    funnel.to_csv(out_dir / "attribution_signal_funnel.csv", index=False)
+    filters.to_csv(out_dir / "attribution_filter_columns.csv", index=False)
+    reason_terms.to_csv(out_dir / "attribution_reason_terms.csv", index=False)
+    recs.to_csv(out_dir / "attribution_recommendations.csv", index=False)
     (out_dir / "attribution_inputs.json").write_text(json.dumps({k: str(v) if v else None for k, v in files.items()}, indent=2))
 
     html_path = out_dir / "attribution_dashboard.html"
-    build_html(html_path, run_dir, files, summary, signal_counts, shorts, meta_recent, profile, action_summary, event_attr)
+    build_html(html_path, run_dir, files, summary, signal_counts, shorts, meta_recent, profile, action_summary, event_attr, funnel, filters, reason_terms, recs)
 
     print(f"DONE attribution: {html_path}")
     print(f"Output folder: {out_dir}")
