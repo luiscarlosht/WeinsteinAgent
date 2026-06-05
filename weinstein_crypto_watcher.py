@@ -325,6 +325,14 @@ def open_ws(gc, sheet_url: str, tab: str):
         return sh.add_worksheet(title=tab, rows=2000, cols=26)
 
 
+def read_tab(ws) -> pd.DataFrame:
+    vals = ws.get_all_values()
+    if not vals:
+        return pd.DataFrame()
+    header, rows = vals[0], vals[1:]
+    return pd.DataFrame(rows, columns=[h.strip() for h in header])
+
+
 def norm_crypto_symbol(value) -> str:
     """Normalize Fidelity / sheet crypto symbols to yfinance format."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
