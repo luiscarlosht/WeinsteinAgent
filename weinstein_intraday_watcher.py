@@ -1001,12 +1001,57 @@ def _first_present_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
     return None
 
 
+def _flag_col_truthy(df: pd.DataFrame, col_name: str, default: bool = True) -> pd.Series:
+    col = _first_present_col(df, [col_name])
+    if not col:
+        return pd.Series(default, index=df.index)
+    return df[col].astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
+
+def _flag_col_falsey(df: pd.DataFrame, col_name: str, default: bool = False) -> pd.Series:
+    col = _first_present_col(df, [col_name])
+    if not col:
+        return pd.Series(default, index=df.index)
+    return df[col].astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
+
+def _is_yahoo_equity_symbol(sym: str) -> bool:
+    s = _clean_symbol(sym)
+    if not s:
+        return False
+    if s in INVALID_HOLDING_SYMBOLS:
+        return False
+    if s.endswith("-USD"):
+        return False
+    if s.startswith("NON"):
+        return False
+    if re.fullmatch(r"[0-9A-Z]{8,12}", s) and any(ch.isdigit() for ch in s):
+        return False
+    return bool(re.fullmatch(r"[A-Z]{1,5}([.-][A-Z])?", s))
+
 def _normalize_holdings_df(raw: pd.DataFrame) -> pd.DataFrame:
-    """Return normalized holdings columns: Ticker, Quantity, Value, GainPct, Account."""
+    """Return normalized holdings columns: Ticker, Quantity, Value, GainPct, Account.
+
+    For Google Sheet Holdings exports, only rows explicitly enabled for Weinstein
+    are eligible for PROD intraday SELL/risk coverage.
+    """
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"])
     df = raw.copy()
-    sym_col = _first_present_col(df, ["Ticker", "Symbol", "symbol", "ticker"])
+
+    # Respect Trading Hub controls. This prevents 401k/CUSIP/cash/crypto rows
+    # from being injected into the Yahoo/yfinance equity download universe.
+    if _first_present_col(df, ["TradableForWeinstein"]) is not None:
+        df = df.loc[_flag_col_truthy(df, "TradableForWeinstein", default=False)].copy()
+    if _first_present_col(df, ["IsCash"]) is not None:
+        df = df.loc[~_flag_col_falsey(df, "IsCash", default=False)].copy()
+    if _first_present_col(df, ["IsPending"]) is not None:
+        df = df.loc[~_flag_col_falsey(df, "IsPending", default=False)].copy()
+    if _first_present_col(df, ["IsCrypto"]) is not None:
+        df = df.loc[~_flag_col_falsey(df, "IsCrypto", default=False)].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"])
+
+    sym_col = _first_present_col(df, ["Ticker", "NormalizedSymbol", "Symbol", "symbol", "ticker"])
     if not sym_col:
         return pd.DataFrame(columns=["Ticker", "Quantity", "Value", "GainPct", "Account"])
     # Support common Fidelity/Google-Sheet/export header variants.
@@ -1031,7 +1076,7 @@ def _normalize_holdings_df(raw: pd.DataFrame) -> pd.DataFrame:
     out["GainPct"] = df[gain_col].map(_parse_money_like) if gain_col else np.nan
     out["Account"] = df[acct_col].astype(str) if acct_col else ""
     out = out[~out["Ticker"].isin(INVALID_HOLDING_SYMBOLS)].copy()
-    out = out[out["Ticker"].str.match(r"^[A-Z0-9.\-]{1,12}$", na=False)].copy()
+    out = out[out["Ticker"].map(_is_yahoo_equity_symbol)].copy()
     if out.empty:
         return out
     # Use min_count=1 so blank quantity/value columns remain blank instead of becoming 0.00.
@@ -1110,7 +1155,7 @@ def _merge_holding_sources(sources: List[Tuple[pd.DataFrame, str]]) -> Tuple[pd.
             if col not in df.columns:
                 df[col] = np.nan if col not in ("Ticker", "Account") else ""
         df = df[~df["Ticker"].isin(INVALID_HOLDING_SYMBOLS)].copy()
-        df = df[df["Ticker"].astype(str).str.match(r"^[A-Z0-9.\-]{1,12}$", na=False)].copy()
+        df = df[df["Ticker"].map(_is_yahoo_equity_symbol)].copy()
         if not df.empty:
             normalized_sources.append(df[["Ticker", "Quantity", "Value", "GainPct", "Account"]])
             used_sources.append(src)
