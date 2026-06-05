@@ -513,16 +513,13 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
         filt = set([t.strip().upper() for t in only])
         focus = focus[focus["ticker"].isin(filt)].copy()
 
-    # Symbols needed (universe + benchmark)
-    symbols = sorted(set(focus["ticker"].tolist() + [BENCHMARK_DEFAULT]))
-
-    log("Downloading intraday + daily bars...", level="step")
-    intraday, daily = get_intraday(symbols)
-    log("Price data downloaded.", level="ok")
-
     # Optional CryptoHoldings snapshot and ownership map.
     # This makes signals actionable: BUY candidate vs add-to-position,
     # SELL risk only when the asset is actually owned, etc.
+    #
+    # IMPORTANT: load this before downloading price data so owned assets are
+    # always included in the scan snapshot, even if they are not in the weekly
+    # crypto focus list or if the asset is the benchmark itself (BTC-USD).
     crypto_holdings_df = pd.DataFrame()
     crypto_holdings_by_symbol = {}
     holdings_html = ""
@@ -548,6 +545,42 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
             f"Sheet load failure for crypto holdings: CryptoHoldings ({e})",
             level="warn",
         )
+
+    # Always include owned crypto assets in the scan/snapshot.
+    owned_symbols = sorted(
+        t for t, h in crypto_holdings_by_symbol.items()
+        if h.get("owned") and t not in {"USD", "USD***", "CASH"}
+    )
+    if owned_symbols:
+        existing = set(focus["ticker"].astype(str).str.upper()) if not focus.empty else set()
+        missing_owned = [t for t in owned_symbols if t not in existing]
+        if missing_owned:
+            focus = pd.concat(
+                [
+                    focus,
+                    pd.DataFrame(
+                        {
+                            "ticker": missing_owned,
+                            "stage": "Stage 1 (Basing)",
+                            "ma30": np.nan,
+                            "rs_above_ma": True,
+                            "rank": 999999,
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+            log(
+                f"Added owned crypto to snapshot universe: {', '.join(missing_owned)}",
+                level="debug",
+            )
+
+    # Symbols needed (focus + owned symbols + benchmark)
+    symbols = sorted(set(focus["ticker"].tolist() + owned_symbols + [BENCHMARK_DEFAULT]))
+
+    log("Downloading intraday + daily bars...", level="step")
+    intraday, daily = get_intraday(symbols)
+    log("Price data downloaded.", level="ok")
 
     # Determine which tickers actually have Close data in intraday
     if isinstance(intraday.columns, pd.MultiIndex):
@@ -593,7 +626,9 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False):
 
     for _, row in focus.iterrows():
         t = row["ticker"]
-        if t == BENCHMARK_DEFAULT:  # skip benchmark itself
+        # Normally the benchmark is only used for RS comparison, but include it
+        # in the snapshot when it is an owned crypto holding (for example BTC-USD).
+        if t == BENCHMARK_DEFAULT and norm_crypto_symbol(t) not in crypto_holdings_by_symbol:
             continue
 
         price = px_now(t)
