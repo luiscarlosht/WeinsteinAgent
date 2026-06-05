@@ -408,6 +408,173 @@ def enrich_effective_f_events(
     return _derive_attribution_columns(enriched, meta, selected)
 
 
+
+def _prepare_raw_sim_all_for_attribution(raw: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Keep the full replay stream, not just latest date, for trade outcome attribution."""
+    if raw.empty:
+        return pd.DataFrame(columns=["Ticker", "Signal", "Price", "Reason", "Source"])
+
+    out = raw.copy()
+
+    tcol = _first_existing_column(out, ["Ticker", "ticker", "Symbol", "symbol"])
+    scol = _first_existing_column(out, ["Signal", "signal"])
+    pcol = _first_existing_column(out, ["Price", "price", "PriceNow", "close", "Close"])
+    rcol = _first_existing_column(out, ["Reason", "reason", "detail", "Details"])
+
+    out["Ticker"] = out[tcol].astype(str).str.upper().str.strip() if tcol else ""
+    out["Signal"] = out[scol].apply(_norm_signal) if scol else ""
+    out["Price"] = out[pcol] if pcol else ""
+    out["Reason"] = out[rcol] if rcol else ""
+    out["Source"] = source
+    out = out[out["Signal"].isin({"BUY", "NEAR", "SELL", "SHORT"})].copy()
+
+    for col in list(out.columns):
+        if col in {"Ticker", "Signal", "Price", "Reason", "Source"}:
+            continue
+        new_col = f"Raw_{col}"
+        if new_col not in out.columns:
+            out[new_col] = out[col]
+
+    return out
+
+
+def _nearest_future_return_for_group(group: pd.DataFrame, horizon_days: int) -> pd.Series:
+    """Return percent move to the first event row on/after EventDate + horizon_days.
+
+    This uses the replay event stream as the available price series. If no future
+    row exists for the ticker/horizon, the return is blank.
+    """
+    g = group.sort_values("EventDateDT").reset_index()
+    dates = g["EventDateDT"].to_numpy()
+    prices = g["PriceNum"].to_numpy(dtype=float)
+    out = np.full(len(g), np.nan)
+
+    for i in range(len(g)):
+        if pd.isna(g.loc[i, "EventDateDT"]) or pd.isna(prices[i]) or prices[i] == 0:
+            continue
+        target = g.loc[i, "EventDateDT"] + pd.Timedelta(days=horizon_days)
+        j = int(np.searchsorted(dates, np.datetime64(target), side="left"))
+        if j < len(g) and not pd.isna(prices[j]):
+            out[i] = (prices[j] - prices[i]) / prices[i] * 100.0
+
+    return pd.Series(out, index=g["index"])
+
+
+def _future_extremes_for_group(group: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+    """Compute max gain and max drawdown percent through the horizon using available event rows."""
+    g = group.sort_values("EventDateDT").reset_index()
+    out_gain = np.full(len(g), np.nan)
+    out_dd = np.full(len(g), np.nan)
+
+    for i in range(len(g)):
+        start_date = g.loc[i, "EventDateDT"]
+        start_price = g.loc[i, "PriceNum"]
+        if pd.isna(start_date) or pd.isna(start_price) or start_price == 0:
+            continue
+        end_date = start_date + pd.Timedelta(days=horizon_days)
+        window = g[(g["EventDateDT"] > start_date) & (g["EventDateDT"] <= end_date)]
+        if window.empty:
+            continue
+        rets = (window["PriceNum"].astype(float) - float(start_price)) / float(start_price) * 100.0
+        out_gain[i] = rets.max()
+        out_dd[i] = rets.min()
+
+    return pd.DataFrame({
+        f"MaxGain{horizon_days}D": pd.Series(out_gain, index=g["index"]),
+        f"MaxDrawdown{horizon_days}D": pd.Series(out_dd, index=g["index"]),
+    })
+
+
+def build_trade_outcome_events(
+    sim_d_raw: pd.DataFrame,
+    sim_e_raw: pd.DataFrame,
+    sim_f_raw_raw: pd.DataFrame,
+    meta: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build historical trade outcome rows from the selected META F replay stream.
+
+    Daily effective events are latest-date only, so forward outcomes are usually blank there.
+    This historical artifact uses the full replay stream and adds:
+    - Forward5DReturnPct
+    - Forward10DReturnPct
+    - Forward20DReturnPct
+    - MaxGain20D
+    - MaxDrawdown20D
+    - TradeOutcome20D
+    """
+    selected = latest_meta_profile(meta) or "UNKNOWN"
+
+    if selected == "D":
+        raw = sim_d_raw
+        source = "SIM_D_OUTCOME_STREAM"
+    elif selected == "E":
+        raw = sim_e_raw
+        source = "SIM_E_OUTCOME_STREAM"
+    elif selected == "A":
+        raw = sim_f_raw_raw
+        source = "SIM_F_RAW_OUTCOME_STREAM"
+    else:
+        raw = sim_f_raw_raw
+        source = "SIM_F_RAW_OUTCOME_STREAM"
+
+    prepared = _prepare_raw_sim_all_for_attribution(raw, source)
+    if prepared.empty:
+        return pd.DataFrame()
+
+    enriched = _derive_attribution_columns(prepared, meta, selected)
+
+    # Keep only rows with usable ticker, date, price.
+    enriched["EventDateDT"] = pd.to_datetime(enriched["EventDate"], errors="coerce")
+    enriched["PriceNum"] = enriched["PriceNum"].map(_safe_num)
+    enriched = enriched[
+        enriched["Ticker"].astype(str).str.len().gt(0)
+        & enriched["EventDateDT"].notna()
+        & enriched["PriceNum"].notna()
+    ].copy()
+
+    if enriched.empty:
+        return enriched
+
+    for h in [5, 10, 20]:
+        enriched[f"Forward{h}DReturnPct"] = np.nan
+        for _, group in enriched.groupby("Ticker", sort=False):
+            vals = _nearest_future_return_for_group(group, h)
+            enriched.loc[vals.index, f"Forward{h}DReturnPct"] = vals
+
+    enriched["MaxGain20D"] = np.nan
+    enriched["MaxDrawdown20D"] = np.nan
+    for _, group in enriched.groupby("Ticker", sort=False):
+        ext = _future_extremes_for_group(group, 20)
+        for col in ext.columns:
+            enriched.loc[ext.index, col] = ext[col]
+
+    # For SELL/SHORT, a negative forward return is favorable. For BUY/NEAR, positive is favorable.
+    def outcome(row):
+        ret = row.get("Forward20DReturnPct", np.nan)
+        sig = _norm_signal(row.get("Signal"))
+        if pd.isna(ret):
+            return "PENDING"
+        if sig in {"SELL", "SHORT"}:
+            return "WIN" if ret < 0 else "LOSS"
+        if sig in {"BUY", "NEAR"}:
+            return "WIN" if ret > 0 else "LOSS"
+        return "UNKNOWN"
+
+    enriched["TradeOutcome20D"] = enriched.apply(outcome, axis=1)
+    enriched["OutcomeAttributionMethod"] = "nearest future replay event on/after horizon date"
+
+    # Place outcome fields near the front.
+    preferred = [
+        "EventDate", "Ticker", "Signal", "Reason", "Source", "EffectiveMetaProfile",
+        "Price", "PriceNum", "Forward5DReturnPct", "Forward10DReturnPct", "Forward20DReturnPct",
+        "MaxGain20D", "MaxDrawdown20D", "TradeOutcome20D", "OutcomeAttributionMethod",
+        "MA30", "MA150", "DistanceToMA150Pct", "Pivot", "DistanceToPivotPct",
+        "Stage", "WeeklyRank", "ADX", "ATR", "VolumeRatio", "QualityScore", "QualityMult", "MarketRegime",
+    ]
+    cols = [c for c in preferred if c in enriched.columns] + [c for c in enriched.columns if c not in preferred and c != "EventDateDT"]
+    return enriched[cols]
+
+
 def compare_signals(prod: pd.DataFrame, sim_d: pd.DataFrame, sim_f: pd.DataFrame, prod_history: pd.DataFrame | None = None, sim_f_raw: pd.DataFrame | None = None) -> pd.DataFrame:
     prod_history = prod_history if prod_history is not None else pd.DataFrame(columns=["Ticker", "Signal"])
     sim_f_raw = sim_f_raw if sim_f_raw is not None else sim_f
@@ -634,6 +801,7 @@ def main():
     meta = read_meta_decisions(args.sim_f_meta)
     sim_f = effective_f_signals(sim_d, sim_e, sim_f_raw, meta)
     sim_f_enriched = enrich_effective_f_events(sim_f, sim_d_raw, sim_e_raw, sim_f_raw_input, meta)
+    sim_f_trade_outcomes = build_trade_outcome_events(sim_d_raw, sim_e_raw, sim_f_raw_input, meta)
 
     if args.positions_csv:
         pos = attach_profiles(normalize_positions(read_fidelity_positions(args.positions_csv)), profile_cfg)
@@ -651,12 +819,15 @@ def main():
     rec_path = os.path.join(args.out_dir, f"daily_account_recommendations_{stamp}.csv")
     meta_path = os.path.join(args.out_dir, f"daily_meta_f_decisions_{stamp}.csv")
     effective_f_path = os.path.join(args.out_dir, "sim_F_effective_events.csv")
+    trade_outcomes_path = os.path.join(args.out_dir, "sim_F_trade_outcomes.csv")
     prod_hist_path = os.path.join(args.out_dir, f"daily_prod_intraday_history_{stamp}.csv")
     html_path = os.path.join(args.out_dir, f"daily_prod_sim_summary_{stamp}.html")
 
     comparison.to_csv(comp_path, index=False)
     recs.to_csv(rec_path, index=False)
     sim_f_enriched.to_csv(effective_f_path, index=False)
+    if not sim_f_trade_outcomes.empty:
+        sim_f_trade_outcomes.to_csv(trade_outcomes_path, index=False)
     if not meta.empty:
         meta.to_csv(meta_path, index=False)
     if not prod_history.empty:
@@ -673,6 +844,8 @@ def main():
         "SIM F effective enriched columns": len(sim_f_enriched.columns),
         "SIM F effective enriched rows": len(sim_f_enriched),
         "SIM F attribution mapping": "11.4 canonical mapping",
+        "SIM F trade outcome rows": len(sim_f_trade_outcomes),
+        "SIM F trade outcome mapping": "11.5 forward replay outcome attribution",
         "Account recommendation rows": len(recs),
         "PROD latest vs D exact ticker/signal matches": int(comparison["PROD_Latest_vs_D_Match"].sum()) if not comparison.empty else 0,
         "PROD latest vs F exact ticker/signal matches": int(comparison["PROD_Latest_vs_F_Match"].sum()) if not comparison.empty else 0,
@@ -706,6 +879,8 @@ def main():
     print(f"Comparison: {comp_path}")
     print(f"Account recommendations: {rec_path}")
     print(f"SIM F effective events: {effective_f_path}")
+    if not sim_f_trade_outcomes.empty:
+        print(f"SIM F trade outcomes: {trade_outcomes_path}")
     if not meta.empty:
         print(f"META F decisions: {meta_path}")
     if not prod_history.empty:
