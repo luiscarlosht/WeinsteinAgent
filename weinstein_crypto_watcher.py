@@ -1300,6 +1300,11 @@ if __name__ == "__main__":
         help="comma list of tickers to restrict evaluation (e.g. BTC-USD,ETH-USD)",
     )
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--force-email",
+        action="store_true",
+        help="Send the crypto report even when there are no BUY/SELL triggers.",
+    )
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
