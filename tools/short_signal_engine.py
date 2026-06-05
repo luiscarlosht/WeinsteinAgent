@@ -48,6 +48,10 @@ def log_warn(msg: str) -> None:
     print(f"⚠️ [{_now_str()}] {msg}")
 
 
+def log_skip(msg: str) -> None:
+    print(f"✅ [{_now_str()}] {msg}")
+
+
 # ----------------------------
 # Short-exit tunables
 # ----------------------------
@@ -112,7 +116,7 @@ def load_csv(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
     if df.empty:
-        log_warn(f"CSV {path} is empty (no rows).")
+        log_skip(f"Short side disabled or no short candidates this scan; {path} has no rows.")
     return df
 
 
@@ -468,15 +472,16 @@ def main(argv=None) -> int:
     log_info(f"Loading short debug CSV: {csv_path}")
     df_all = load_csv(csv_path)
 
-    # If missing / empty / unreadable, we just exit gracefully.
+    # If missing / empty / unreadable, exit gracefully.
+    # This is expected when Chapter 8/VIX disables the short side.
     if df_all.empty:
-        log_warn("Aborting: short_debug CSV is missing, empty, or unreadable. Nothing to do.")
+        log_skip("No short rows to process. This is normal when shorts are disabled by regime.")
         return 0
 
     df_win = apply_window(df_all, args.window_min)
     if df_win.empty:
         # Nothing in the time window; not an error.
-        log_warn("No rows within the requested window; nothing to summarize.")
+        log_skip("No short rows within the requested window; nothing to summarize.")
         return 0
 
     df_sum = summarize(df_win, outdir, args.window_min)
