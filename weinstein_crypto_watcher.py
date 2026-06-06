@@ -1105,6 +1105,20 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             exit_review_tier = "UNKNOWN"
             exit_review_reason = "Tier unavailable"
 
+        # 12.11b Align ActionPriority with ExitReviewTier
+        if exit_review_tier == "TIER1":
+            action_priority = 1
+            action_priority_reason = "TIER1 immediate exit review"
+        elif exit_review_tier == "TIER2":
+            action_priority = 2
+            action_priority_reason = "TIER2 reduce/trim review"
+        elif exit_review_tier == "TIER3":
+            action_priority = 4
+            action_priority_reason = "TIER3 recovery watch"
+        elif exit_review_tier == "TIER4" and owned:
+            action_priority = 5
+            action_priority_reason = "TIER4 healthy/normal hold"
+
         debug_rows.append({
             "ExitReviewTier": exit_review_tier,
             "ExitReviewReason": exit_review_reason,
