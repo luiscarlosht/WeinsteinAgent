@@ -1076,7 +1076,38 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             action_priority = 50
             action_priority_reason = "Priority unavailable"
 
+        # 12.11 Exit Review Tier
+        exit_review_tier = "TIER4"
+        exit_review_reason = "Healthy hold"
+
+        try:
+            _below_sma150 = pd.notna(ma30) and pd.notna(price) and float(price) < float(ma30)
+            _deep_loss = pd.notna(unrealized_gain_pct) and float(unrealized_gain_pct) <= -25.0
+            _severe_loss = pd.notna(unrealized_gain_pct) and float(unrealized_gain_pct) <= -35.0
+            _far_below_sma = pd.notna(distance_to_ma30_pct) and float(distance_to_ma30_pct) >= 30.0
+
+            if owned and st.get("sell_state") == "TRIGGERED":
+                exit_review_tier = "TIER1"
+                exit_review_reason = "SELLTRIG active"
+            elif owned and sell_confirm and _severe_loss and _far_below_sma:
+                exit_review_tier = "TIER1"
+                exit_review_reason = "Confirmed below SMA150, severe loss, far below trend"
+            elif owned and _sell_risk_watch_calc and _deep_loss:
+                exit_review_tier = "TIER2"
+                exit_review_reason = "SELL risk watch with deep unrealized loss"
+            elif owned and recovery_watch and _below_sma150:
+                exit_review_tier = "TIER3"
+                exit_review_reason = "Recovery watch only; do not average down"
+            elif owned and not _below_sma150:
+                exit_review_tier = "TIER4"
+                exit_review_reason = "Healthy hold"
+        except Exception:
+            exit_review_tier = "UNKNOWN"
+            exit_review_reason = "Tier unavailable"
+
         debug_rows.append({
+            "ExitReviewTier": exit_review_tier,
+            "ExitReviewReason": exit_review_reason,
             "ActionPriority": action_priority,
             "ActionPriorityReason": action_priority_reason,
             "Ticker": t,
@@ -1131,6 +1162,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
         info_rows.append(
             {
+                "exit_review_tier": exit_review_tier,
+                "exit_review_reason": exit_review_reason,
                 "action_priority": action_priority,
                 "action_priority_reason": action_priority_reason,
                 "ticker": t,
@@ -1342,6 +1375,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
     if not snapshot_df.empty:
         cols_order = [
+            "exit_review_tier",
+            "exit_review_reason",
             "action_priority",
             "action_priority_reason",
             "ticker",
@@ -1397,6 +1432,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
     if not recovery_watch_rows.empty:
         recovery_cols = [
+            "exit_review_tier",
+            "exit_review_reason",
             "action_priority",
             "action_priority_reason",
             "ticker",
