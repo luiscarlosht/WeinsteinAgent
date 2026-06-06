@@ -1025,7 +1025,60 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             )
             trig[t]["sell_state"] = "COOLDOWN"
 
+        # 12.10 Action Priority Ranking
+        # Lower number = higher urgency. Visibility/ranking only; no trade execution.
+        action_priority = 50
+        action_priority_reason = "Hold/watch"
+        try:
+            if owned and st.get("sell_state") == "TRIGGERED":
+                action_priority = 1
+                action_priority_reason = "SELLTRIG active"
+            elif owned and sell_risk_watch if False else False:
+                pass
+        except Exception:
+            pass
+
+        try:
+            _sell_risk_watch_calc = bool(
+                owned and (
+                    sell_confirm
+                    or sell_near_now
+                    or st.get("sell_state") in ("NEAR", "ARMED", "TRIGGERED")
+                )
+            )
+            _deep_loss_calc = pd.notna(unrealized_gain_pct) and float(unrealized_gain_pct) <= -25.0
+
+            if owned and st.get("sell_state") == "TRIGGERED":
+                action_priority = 1
+                action_priority_reason = "SELLTRIG active"
+            elif owned and _sell_risk_watch_calc and _deep_loss_calc:
+                action_priority = 2
+                action_priority_reason = "SELL risk + deep loss"
+            elif owned and _sell_risk_watch_calc:
+                action_priority = 3
+                action_priority_reason = "SELL risk watch"
+            elif owned and recovery_watch:
+                action_priority = 4
+                action_priority_reason = "Recovery watch"
+            elif owned:
+                action_priority = 5
+                action_priority_reason = "Owned hold/watch"
+            elif st.get("state") == "TRIGGERED":
+                action_priority = 6
+                action_priority_reason = "BUY trigger"
+            elif st.get("state") in ("NEAR", "ARMED"):
+                action_priority = 7
+                action_priority_reason = "NEAR/ARMED watch"
+            else:
+                action_priority = 50
+                action_priority_reason = "No action"
+        except Exception:
+            action_priority = 50
+            action_priority_reason = "Priority unavailable"
+
         debug_rows.append({
+            "ActionPriority": action_priority,
+            "ActionPriorityReason": action_priority_reason,
             "Ticker": t,
             "Owned": owned,
             "Price": price,
@@ -1078,6 +1131,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
         info_rows.append(
             {
+                "action_priority": action_priority,
+                "action_priority_reason": action_priority_reason,
                 "ticker": t,
                 "stage": stage,
                 "price": price,
@@ -1287,6 +1342,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
     if not snapshot_df.empty:
         cols_order = [
+            "action_priority",
+            "action_priority_reason",
             "ticker",
             "stage",
             "price",
@@ -1325,9 +1382,12 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                 snapshot_df[c] = ""
 
         snapshot_df["__stage_rank"] = snapshot_df["stage"].apply(stage_order)
+        snapshot_df["__action_priority_sort"] = pd.to_numeric(
+            snapshot_df.get("action_priority", 50), errors="coerce"
+        ).fillna(50)
         snapshot_df = snapshot_df.sort_values(
-            ["__stage_rank", "ticker"]
-        ).drop(columns="__stage_rank")
+            ["__action_priority_sort", "__stage_rank", "ticker"]
+        ).drop(columns=["__action_priority_sort", "__stage_rank"])
         snapshot_html = (
             "<h4>Snapshot (ordered by stage)</h4>"
             + snapshot_df[cols_order].to_html(index=False)
@@ -1337,6 +1397,10 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
     if not recovery_watch_rows.empty:
         recovery_cols = [
+            "action_priority",
+            "action_priority_reason",
+            "action_priority",
+            "action_priority_reason",
             "ticker",
             "price",
             "ma30",
