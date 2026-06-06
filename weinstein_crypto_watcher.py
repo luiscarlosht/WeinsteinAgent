@@ -1244,6 +1244,21 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
         except Exception:
             recovery_watch_rows = pd.DataFrame()
 
+    sell_risk_rows = pd.DataFrame()
+    if not snapshot_df.empty and "sell_state" in snapshot_df.columns:
+        try:
+            sell_risk_rows = snapshot_df[
+                snapshot_df["owned"].astype(bool)
+                & snapshot_df["sell_state"].astype(str).isin(["NEAR", "ARMED"])
+            ].copy()
+            if not sell_risk_rows.empty:
+                sell_risk_rows = sell_risk_rows.sort_values(
+                    ["sell_state", "distance_to_ma30_pct", "ticker"],
+                    ascending=[True, True, True],
+                )
+        except Exception:
+            sell_risk_rows = pd.DataFrame()
+
     if not snapshot_df.empty:
         cols_order = [
             "ticker",
@@ -1315,6 +1330,28 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
     else:
         recovery_watch_html = "<h4>Recovery Watch — owned crypto below SMA150</h4><p>No recovery-watch rows.</p>"
 
+    if not sell_risk_rows.empty:
+        sell_risk_cols = [
+            "ticker",
+            "price",
+            "ma30",
+            "distance_to_ma30_pct",
+            "vol_pace_vs50dma",
+            "sell_state",
+            "risk_label",
+            "portfolio_recommendation",
+        ]
+        for c in sell_risk_cols:
+            if c not in sell_risk_rows.columns:
+                sell_risk_rows[c] = ""
+        sell_risk_html = (
+            "<h4>SELL Risk Watch — owned crypto near SMA150 failure</h4>"
+            "<p><i>Visibility only unless SELL-TRIGGER appears. NEAR/ARMED means watch downside risk closely.</i></p>"
+            + sell_risk_rows[sell_risk_cols].to_html(index=False)
+        )
+    else:
+        sell_risk_html = "<h4>SELL Risk Watch — owned crypto near SMA150 failure</h4><p>No SELL risk watch rows.</p>"
+
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     header_html = f"""
     <h3>Weinstein Crypto Watch — {now}</h3>
@@ -1336,6 +1373,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
         + bullets(sell_triggers, "SELLTRIG")
         + charts_html
         + recovery_watch_html
+        + sell_risk_html
         + snapshot_html
         + (("<hr/>" + holdings_html) if holdings_html else "")
     )
@@ -1391,12 +1429,25 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             )
         return "\n".join(out)
 
+    def _sell_risk_lines(df):
+        if df is None or df.empty:
+            return "No SELL risk watch rows."
+        out = []
+        for i, (_, r) in enumerate(df.iterrows(), 1):
+            out.append(
+                f"{i}. {r.get('ticker')} @ {float(r.get('price') or 0):.2f} — "
+                f"sell_state={r.get('sell_state')} risk={r.get('risk_label')} "
+                f"distance_to_SMA150={r.get('distance_to_ma30_pct')}%"
+            )
+        return "\n".join(out)
+
     text = (
         f"Weinstein Crypto Watch — {now}\n\n"
         f"BUY (ranked):\n{_lines(buy_signals, 'BUY')}\n\n"
         f"NEAR-TRIGGER (ranked):\n{_lines(near_signals, 'NEAR')}\n\n"
         f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers, 'SELLTRIG')}\n\n"
-        f"RECOVERY WATCH (visibility only):\n{_recovery_lines(recovery_watch_rows)}\n"
+        f"RECOVERY WATCH (visibility only):\n{_recovery_lines(recovery_watch_rows)}\n\n"
+        f"SELL RISK WATCH (visibility only):\n{_sell_risk_lines(sell_risk_rows)}\n"
     )
 
     # persist state & write html
