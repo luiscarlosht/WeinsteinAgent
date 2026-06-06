@@ -1218,6 +1218,18 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
         log(f"Failed to write crypto debug CSV: {e}", level="warn")
 
     snapshot_df = pd.DataFrame(info_rows)
+    recovery_watch_rows = pd.DataFrame()
+    if not snapshot_df.empty and "recovery_watch" in snapshot_df.columns:
+        try:
+            recovery_watch_rows = snapshot_df[snapshot_df["recovery_watch"].astype(bool)].copy()
+            if not recovery_watch_rows.empty:
+                recovery_watch_rows = recovery_watch_rows.sort_values(
+                    ["distance_to_ma30_pct", "ticker"],
+                    ascending=[True, True],
+                )
+        except Exception:
+            recovery_watch_rows = pd.DataFrame()
+
     if not snapshot_df.empty:
         cols_order = [
             "ticker",
@@ -1265,6 +1277,28 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
     else:
         snapshot_html = ""
 
+    if not recovery_watch_rows.empty:
+        recovery_cols = [
+            "ticker",
+            "price",
+            "ma30",
+            "distance_to_ma30_pct",
+            "vol_pace_vs50dma",
+            "risk_label",
+            "recovery_reason",
+            "portfolio_recommendation",
+        ]
+        for c in recovery_cols:
+            if c not in recovery_watch_rows.columns:
+                recovery_watch_rows[c] = ""
+        recovery_watch_html = (
+            "<h4>Recovery Watch — owned crypto below SMA150</h4>"
+            "<p><i>Visibility only. This is not a BUY signal. Wait for SMA150 reclaim / Stage 2 confirmation before adding.</i></p>"
+            + recovery_watch_rows[recovery_cols].to_html(index=False)
+        )
+    else:
+        recovery_watch_html = "<h4>Recovery Watch — owned crypto below SMA150</h4><p>No recovery-watch rows.</p>"
+
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     header_html = f"""
     <h3>Weinstein Crypto Watch — {now}</h3>
@@ -1285,6 +1319,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
         + "<h4>Sell Triggers (ranked)</h4>"
         + bullets(sell_triggers, "SELLTRIG")
         + charts_html
+        + recovery_watch_html
         + snapshot_html
         + (("<hr/>" + holdings_html) if holdings_html else "")
     )
@@ -1329,11 +1364,23 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                 )
         return "\n".join(out)
 
+    def _recovery_lines(df):
+        if df is None or df.empty:
+            return "No recovery-watch rows."
+        out = []
+        for i, (_, r) in enumerate(df.iterrows(), 1):
+            out.append(
+                f"{i}. {r.get('ticker')} @ {float(r.get('price') or 0):.2f} — "
+                f"{r.get('recovery_reason', '')}"
+            )
+        return "\n".join(out)
+
     text = (
         f"Weinstein Crypto Watch — {now}\n\n"
         f"BUY (ranked):\n{_lines(buy_signals, 'BUY')}\n\n"
         f"NEAR-TRIGGER (ranked):\n{_lines(near_signals, 'NEAR')}\n\n"
-        f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers, 'SELLTRIG')}\n"
+        f"SELL TRIGGERS (ranked):\n{_lines(sell_triggers, 'SELLTRIG')}\n\n"
+        f"RECOVERY WATCH (visibility only):\n{_recovery_lines(recovery_watch_rows)}\n"
     )
 
     # persist state & write html
