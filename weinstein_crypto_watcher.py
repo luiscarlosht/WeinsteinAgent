@@ -698,6 +698,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
     buy_signals, near_signals, sell_triggers = [], [], []
     info_rows = []
+    debug_rows = []
 
     log("Evaluating candidates...", level="step")
 
@@ -976,6 +977,47 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             )
             trig[t]["sell_state"] = "COOLDOWN"
 
+        debug_rows.append({
+            "Ticker": t,
+            "Owned": owned,
+            "Price": price,
+            "Stage": stage,
+            "SMA150": ma30,
+            "Pivot": pivot,
+            "DistanceToSMA150Pct": distance_to_ma30_pct,
+            "DistanceToPivotPct": distance_to_pivot_pct,
+            "VolPace": pace,
+            "RS_OK": rs_ok,
+            "WeeklyRank": weekly_rank,
+            "CoreBuySignal": core_buy_signal,
+            "CoreBuyReason": core_buy_reason,
+            "CoreNearSignal": core_near_signal,
+            "CoreNearReason": core_near_reason,
+            "NearNow": near_now,
+            "Confirm": confirm,
+            "SellNearNow": sell_near_now,
+            "SellConfirm": sell_confirm,
+            "State": st.get("state"),
+            "SellState": st.get("sell_state"),
+            "OwnedQty": owned_qty,
+            "CurrentValue": current_value,
+            "CostBasis": cost_basis,
+            "UnrealizedGainPct": unrealized_gain_pct,
+            "PortfolioWeightPct": portfolio_weight_pct,
+            "PortfolioRisk": portfolio_risk_label(
+                owned, price, ma30, pivot, unrealized_gain_pct, st.get("sell_state")
+            ),
+            "PortfolioRecommendation": portfolio_recommendation(
+                owned,
+                "SELLTRIG" if st.get("sell_state") == "TRIGGERED" else "BUY" if st.get("state") == "TRIGGERED" else "NEAR" if st.get("state") in ("NEAR", "ARMED") else "",
+                price,
+                ma30,
+                pivot,
+                unrealized_gain_pct,
+                st.get("sell_state"),
+            ),
+        })
+
         info_rows.append(
             {
                 "ticker": t,
@@ -1132,6 +1174,16 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
               <div style="font-size:12px;color:#555;margin-top:3px;">{t}</div>
             </div>
             """
+
+    # 12.1 Crypto explainability snapshot
+    try:
+        debug_df = pd.DataFrame(debug_rows)
+        debug_path = os.path.join(OUTPUT_DIR, "crypto_debug.csv")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        debug_df.to_csv(debug_path, index=False)
+        log(f"Wrote crypto debug CSV → {debug_path} rows={len(debug_df)}", level="ok")
+    except Exception as e:
+        log(f"Failed to write crypto debug CSV: {e}", level="warn")
 
     snapshot_df = pd.DataFrame(info_rows)
     if not snapshot_df.empty:
