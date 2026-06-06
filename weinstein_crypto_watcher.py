@@ -513,8 +513,16 @@ def portfolio_risk_label(owned, price, ma30, pivot, unrealized_gain_pct, sell_st
 
 def portfolio_recommendation(owned, signal_kind, price, ma30, pivot, unrealized_gain_pct, sell_state):
     """Human-readable portfolio action derived from signal state + ownership."""
+    below_ma = pd.notna(ma30) and pd.notna(price) and float(price) < float(ma30)
+    below_pivot = pd.notna(pivot) and pd.notna(price) and float(price) < float(pivot)
+    deep_loss = pd.notna(unrealized_gain_pct) and float(unrealized_gain_pct) <= -25.0
+
     if signal_kind == "SELLTRIG" and owned:
-        return "Review exit; sell trigger active."
+        return "Review reduce/exit now; SELL trigger active. Do not add."
+    if owned and below_ma and deep_loss:
+        return "Review reduce/exit; confirmed below SMA150 with deep loss. Do not average down."
+    if owned and below_ma:
+        return "Review reduce/trim; below SMA150. Wait for reclaim before adding."
     if signal_kind == "BUY" and owned:
         return "Add only if allocation target allows."
     if signal_kind == "BUY" and not owned:
@@ -523,15 +531,6 @@ def portfolio_recommendation(owned, signal_kind, price, ma30, pivot, unrealized_
         return "Watch for recovery confirmation before adding."
     if signal_kind == "NEAR" and not owned:
         return "Watch candidate; wait for trigger."
-
-    below_ma = pd.notna(ma30) and pd.notna(price) and float(price) < float(ma30)
-    below_pivot = pd.notna(pivot) and pd.notna(price) and float(price) < float(pivot)
-    deep_loss = pd.notna(unrealized_gain_pct) and float(unrealized_gain_pct) <= -25.0
-
-    if owned and below_ma and deep_loss:
-        return "Hold; do not average down until MA recovery."
-    if owned and below_ma:
-        return "Hold / monitor; wait for MA recovery."
     if owned and below_pivot:
         return "Hold; wait for Stage 2 breakout."
     if owned:
