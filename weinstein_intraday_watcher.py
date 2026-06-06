@@ -1842,6 +1842,7 @@ def build_intraday_report_html(
     holdings: Optional[pd.DataFrame] = None,
     holdings_source: str = "",
     daily: Optional[pd.DataFrame] = None,
+    vix_audit: Optional[dict] = None,
 ) -> str:
     """Build the polished intraday HTML/email-style report."""
     if diag is None:
@@ -1862,6 +1863,16 @@ def build_intraday_report_html(
     short_allowed = bool(cfg.regime.use_short and not long_ok)
     env_ok = bool(long_ok and breadth_long_ok)
 
+    if vix_audit:
+        vix_status = (
+            f"<br><b>VIX Overlay:</b> enforcement={'ON' if vix_audit.get('enforce_vix_for_longs') else 'OFF / visibility-only'}, "
+            f"VIX={vix_audit.get('vix', 'nan')}, "
+            f"long_vix_ok={bool(vix_audit.get('long_vix', True))}, "
+            f"would_block_new_longs={'YES' if vix_audit.get('would_block_longs') else 'NO'}."
+        )
+    else:
+        vix_status = "<br><b>VIX Overlay:</b> unavailable."
+
     rules = f"""
     <h3>Weinstein Intraday Watch — {ts_display}</h3>
     <p><i>
@@ -1878,7 +1889,7 @@ def build_intraday_report_html(
       <b>Market Regime (Chapter 8 filter):</b> {market_regime} — LONG allowed={bool(long_ok)}, SHORT allowed={short_allowed}.<br>
       <b>Breadth Health:</b> {breadth_pct:.1f}% of breadth universe above MA{cfg.intraday.breadth_ma_window}
       (breadth filter enabled={cfg.intraday.breadth_enabled}, LONG breadth_ok={bool(breadth_long_ok)}).<br>
-      <b>Effective LONG gate:</b> env_long_ok = market_long_ok AND breadth_long_ok → {env_ok}.
+      <b>Effective LONG gate:</b> env_long_ok = market_long_ok AND breadth_long_ok → {env_ok}.{vix_status}
     </p>
     """
 
@@ -2058,6 +2069,7 @@ def main() -> None:
     # Shared D Regime + Exposure CORE gate. This is the PROD side of the same
     # architecture tested in SIM as Test D. It is opt-in via intraday.regime_exposure.enabled.
     regime_decision = None
+    vix_audit = None
     long_ok = True
     if not cfg.regime.use_long:
         long_ok = False
@@ -2109,6 +2121,13 @@ def main() -> None:
                         "enforce_vix_for_longs", False
                     )
                 )
+                vix_audit = {
+                    "vix": _vix_txt,
+                    "long_vix": bool(_long_vix),
+                    "short_vix": bool(_short_vix),
+                    "would_block_longs": bool(not _combined_long),
+                    "enforce_vix_for_longs": bool(enforce_vix_for_longs),
+                }
                 log(
                     "Long-side VIX visibility audit: "
                     f"regime={getattr(_snap.regime, 'value', _snap.regime)} "
@@ -2206,6 +2225,7 @@ def main() -> None:
             holdings=holdings_df,
             holdings_source=holdings_source,
             daily=daily,
+            vix_audit=vix_audit,
         )
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html)
