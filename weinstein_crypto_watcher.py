@@ -955,6 +955,34 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                     }
                 )
 
+        # 12.2 Recovery Watch Layer
+        # Non-trading visibility only: owned crypto is still below SMA150,
+        # but may be improving enough to monitor for recovery.
+        recovery_watch = False
+        recovery_reason = ""
+        try:
+            below_sma150 = pd.notna(ma30) and pd.notna(price) and float(price) < float(ma30)
+            dist_to_sma = float(distance_to_ma30_pct) if pd.notna(distance_to_ma30_pct) else np.nan
+            strong_volume = pd.notna(pace) and float(pace) >= VOL_PACE_MIN
+            near_sma_recovery = pd.notna(dist_to_sma) and 0 <= dist_to_sma <= 15.0
+            deep_below_but_active = pd.notna(dist_to_sma) and dist_to_sma > 15.0 and strong_volume
+
+            if owned and below_sma150 and (near_sma_recovery or deep_below_but_active):
+                recovery_watch = True
+                if near_sma_recovery:
+                    recovery_reason = (
+                        f"RECOVERY-WATCH: owned crypto is {dist_to_sma:.2f}% below SMA150; "
+                        "watch for SMA150 reclaim before adding."
+                    )
+                else:
+                    recovery_reason = (
+                        f"RECOVERY-WATCH: owned crypto is still {dist_to_sma:.2f}% below SMA150, "
+                        f"but volume pace is strong at {float(pace):.2f}x; monitor recovery attempt."
+                    )
+        except Exception:
+            recovery_watch = False
+            recovery_reason = ""
+
         if st["sell_state"] == "TRIGGERED":
             sell_triggers.append(
                 {
@@ -1004,6 +1032,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "CostBasis": cost_basis,
             "UnrealizedGainPct": unrealized_gain_pct,
             "PortfolioWeightPct": portfolio_weight_pct,
+            "RecoveryWatch": recovery_watch,
+            "RecoveryReason": recovery_reason,
             "PortfolioRisk": portfolio_risk_label(
                 owned, price, ma30, pivot, unrealized_gain_pct, st.get("sell_state")
             ),
@@ -1044,6 +1074,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                 "portfolio_weight_pct": None if pd.isna(portfolio_weight_pct) else round(float(portfolio_weight_pct), 2),
                 "distance_to_ma30_pct": None if pd.isna(distance_to_ma30_pct) else round(float(distance_to_ma30_pct), 2),
                 "distance_to_pivot_pct": None if pd.isna(distance_to_pivot_pct) else round(float(distance_to_pivot_pct), 2),
+                "recovery_watch": recovery_watch,
+                "recovery_reason": recovery_reason,
                 "risk_label": portfolio_risk_label(owned, price, ma30, pivot, unrealized_gain_pct, st["sell_state"]),
                 "ownership_action": (
                     ownership_action("SELLTRIG", owned)
@@ -1210,6 +1242,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "portfolio_weight_pct",
             "distance_to_ma30_pct",
             "distance_to_pivot_pct",
+            "recovery_watch",
+            "recovery_reason",
             "risk_label",
             "ownership_action",
             "portfolio_recommendation",
