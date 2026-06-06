@@ -329,3 +329,12 @@ fi
 
 echo
 echo "Done."
+
+echo
+echo "---- VIX Overlay Status ----"
+latest_intraday_html=$(ls -1t output/intraday_watch_*.html 2>/dev/null | head -1)
+if [ -n "$latest_intraday_html" ]; then
+    grep -h "VIX Overlay" "$latest_intraday_html" | sed 's/<[^>]*>//g'
+else
+    echo "⚠️ No intraday HTML found"
+fi
