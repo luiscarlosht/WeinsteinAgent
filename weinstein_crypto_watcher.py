@@ -1046,6 +1046,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "Confirm": confirm,
             "SellNearNow": sell_near_now,
             "SellConfirm": sell_confirm,
+            "SellRiskWatch": bool(owned and (sell_confirm or sell_near_now or st.get("sell_state") in ("NEAR", "ARMED", "TRIGGERED"))),
             "SellRiskReason": sell_risk_reason,
             "State": st.get("state"),
             "SellState": st.get("sell_state"),
@@ -1102,6 +1103,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                 "portfolio_weight_pct": None if pd.isna(portfolio_weight_pct) else round(float(portfolio_weight_pct), 2),
                 "distance_to_ma30_pct": None if pd.isna(distance_to_ma30_pct) else round(float(distance_to_ma30_pct), 2),
                 "distance_to_pivot_pct": None if pd.isna(distance_to_pivot_pct) else round(float(distance_to_pivot_pct), 2),
+                "sell_risk_watch": bool(owned and (sell_confirm or sell_near_now or st["sell_state"] in ("NEAR", "ARMED", "TRIGGERED"))),
                 "sell_risk_reason": sell_risk_reason,
                 "recovery_watch": recovery_watch,
                 "recovery_score": (
@@ -1268,11 +1270,13 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             recovery_watch_rows = pd.DataFrame()
 
     sell_risk_rows = pd.DataFrame()
-    if not snapshot_df.empty and "sell_state" in snapshot_df.columns:
+    if not snapshot_df.empty:
         try:
+            if "sell_risk_watch" not in snapshot_df.columns:
+                snapshot_df["sell_risk_watch"] = False
             sell_risk_rows = snapshot_df[
                 snapshot_df["owned"].astype(bool)
-                & snapshot_df["sell_state"].astype(str).isin(["NEAR", "ARMED"])
+                & snapshot_df["sell_risk_watch"].astype(bool)
             ].copy()
             if not sell_risk_rows.empty:
                 sell_risk_rows = sell_risk_rows.sort_values(
@@ -1306,6 +1310,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "portfolio_weight_pct",
             "distance_to_ma30_pct",
             "distance_to_pivot_pct",
+            "sell_risk_watch",
             "sell_risk_reason",
             "recovery_watch",
             "recovery_score",
@@ -1361,6 +1366,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "ma30",
             "distance_to_ma30_pct",
             "vol_pace_vs50dma",
+            "sell_risk_watch",
             "sell_state",
             "sell_risk_reason",
             "risk_label",
