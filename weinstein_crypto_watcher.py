@@ -847,6 +847,27 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                     (c <= ma30 * (1.0 - SELL_BREAK_PCT)) for c in closes2[-1:]
                 )
 
+        # 12.7 SELL risk reason visibility
+        sell_risk_reason = ""
+        try:
+            if owned and pd.notna(ma30) and pd.notna(price):
+                pct_vs_sma150 = ((float(price) / float(ma30)) - 1.0) * 100.0
+                if sell_confirm:
+                    sell_risk_reason = (
+                        f"SELL-RISK: confirmed close below SMA150 by {abs(pct_vs_sma150):.2f}%."
+                    )
+                elif sell_near_now:
+                    sell_risk_reason = (
+                        f"SELL-RISK WATCH: price is near SMA150 ({pct_vs_sma150:.2f}% vs SMA150); "
+                        "watch for confirmed breakdown."
+                    )
+                elif float(price) < float(ma30):
+                    sell_risk_reason = (
+                        f"Below SMA150 by {abs(pct_vs_sma150):.2f}%, but not in SELL near-zone."
+                    )
+        except Exception:
+            sell_risk_reason = ""
+
         # promotion state
         st = trig.get(
             t,
@@ -1025,6 +1046,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "Confirm": confirm,
             "SellNearNow": sell_near_now,
             "SellConfirm": sell_confirm,
+            "SellRiskReason": sell_risk_reason,
             "State": st.get("state"),
             "SellState": st.get("sell_state"),
             "OwnedQty": owned_qty,
@@ -1080,6 +1102,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                 "portfolio_weight_pct": None if pd.isna(portfolio_weight_pct) else round(float(portfolio_weight_pct), 2),
                 "distance_to_ma30_pct": None if pd.isna(distance_to_ma30_pct) else round(float(distance_to_ma30_pct), 2),
                 "distance_to_pivot_pct": None if pd.isna(distance_to_pivot_pct) else round(float(distance_to_pivot_pct), 2),
+                "sell_risk_reason": sell_risk_reason,
                 "recovery_watch": recovery_watch,
                 "recovery_score": (
                     (100.0 - min(float(distance_to_ma30_pct), 100.0))
@@ -1283,6 +1306,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "portfolio_weight_pct",
             "distance_to_ma30_pct",
             "distance_to_pivot_pct",
+            "sell_risk_reason",
             "recovery_watch",
             "recovery_score",
             "recovery_reason",
@@ -1338,6 +1362,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "distance_to_ma30_pct",
             "vol_pace_vs50dma",
             "sell_state",
+            "sell_risk_reason",
             "risk_label",
             "portfolio_recommendation",
         ]
@@ -1437,7 +1462,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             out.append(
                 f"{i}. {r.get('ticker')} @ {float(r.get('price') or 0):.2f} — "
                 f"sell_state={r.get('sell_state')} risk={r.get('risk_label')} "
-                f"distance_to_SMA150={r.get('distance_to_ma30_pct')}%"
+                f"distance_to_SMA150={r.get('distance_to_ma30_pct')}% — "
+                f"{r.get('sell_risk_reason', '')}"
             )
         return "\n".join(out)
 
