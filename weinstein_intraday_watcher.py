@@ -2098,8 +2098,14 @@ def main() -> None:
                 _combined_long = bool(_long_regime_effective and _long_vix)
                 _combined_short = bool(_short_regime_gate and _short_vix)
                 _vix_txt = "nan" if pd.isna(_vix_last) else f"{_vix_last:.2f}"
+                import yaml as _yaml_audit
+                try:
+                    with open(args.config, "r") as _f:
+                        _raw_cfg = _yaml_audit.safe_load(_f) or {}
+                except Exception:
+                    _raw_cfg = {}
                 enforce_vix_for_longs = bool(
-                    (((cfg.raw or {}).get("intraday") or {}).get("regime_exposure") or {}).get(
+                    (((_raw_cfg or {}).get("intraday") or {}).get("regime_exposure") or {}).get(
                         "enforce_vix_for_longs", False
                     )
                 )
