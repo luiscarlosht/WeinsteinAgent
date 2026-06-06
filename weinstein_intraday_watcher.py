@@ -2085,6 +2085,35 @@ def main() -> None:
                 f"allow_long={regime_decision.allow_new_longs} allow_short={regime_decision.allow_new_shorts} "
                 f"long_mult={regime_decision.long_size_mult:.2f} short_mult={regime_decision.short_size_mult:.2f}"
             )
+
+            # 11.7d visibility audit only. This does not change long-side behavior.
+            try:
+                import market_regime as _mr_audit
+                _cfg = _mr_audit.MarketRegimeConfig(verbose=False)
+                _snap = _mr_audit.detect_market_regime(_cfg)
+                _long_regime, _short_regime_gate = _mr_audit._compute_long_short_flags(_snap.regime)
+                _fast_crash = bool(getattr(_snap, "fast_crash", False))
+                _long_regime_effective = False if _fast_crash else _long_regime
+                _vix_last, _long_vix, _short_vix = _mr_audit._compute_vix_gates(_cfg)
+                _combined_long = bool(_long_regime_effective and _long_vix)
+                _combined_short = bool(_short_regime_gate and _short_vix)
+                _vix_txt = "nan" if pd.isna(_vix_last) else f"{_vix_last:.2f}"
+                log(
+                    "Long-side VIX visibility audit: "
+                    f"regime={getattr(_snap.regime, 'value', _snap.regime)} "
+                    f"long_regime={_long_regime} "
+                    f"long_regime_effective={_long_regime_effective} "
+                    f"short_regime={_short_regime_gate} "
+                    f"fast_crash={_fast_crash} "
+                    f"vix={_vix_txt} "
+                    f"long_vix={_long_vix} "
+                    f"short_vix={_short_vix} "
+                    f"combined_long_if_vix_enforced={_combined_long} "
+                    f"combined_short_if_vix_enforced={_combined_short} "
+                    f"current_core_allow_long={regime_decision.allow_new_longs}"
+                )
+            except Exception as _audit_e:
+                log(f"Long-side VIX visibility audit unavailable: {_audit_e}")
         except Exception as e:
             log(f"D Regime/Exposure CORE failed; falling back to legacy long gate: {e}")
             regime_decision = None
