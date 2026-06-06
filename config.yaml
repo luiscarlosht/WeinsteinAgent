@@ -146,6 +146,7 @@ intraday:
   # This is opt-in. Set enabled=true only after you are ready to shadow/live-test.
   regime_exposure:
     enabled: true          # SAFE DEFAULT: do not change PROD behavior until intentionally enabled
+    enforce_vix_for_longs: false  # 11.7e: optional VIX overlay for new long entries
     benchmark: "SPY"
     regime_mode: "prod"     # BULL=longs, BEAR=shorts, NEUTRAL follows neutral_policy
     exposure_mode: "scaled"

@@ -2098,6 +2098,11 @@ def main() -> None:
                 _combined_long = bool(_long_regime_effective and _long_vix)
                 _combined_short = bool(_short_regime_gate and _short_vix)
                 _vix_txt = "nan" if pd.isna(_vix_last) else f"{_vix_last:.2f}"
+                enforce_vix_for_longs = bool(
+                    (((cfg.raw or {}).get("intraday") or {}).get("regime_exposure") or {}).get(
+                        "enforce_vix_for_longs", False
+                    )
+                )
                 log(
                     "Long-side VIX visibility audit: "
                     f"regime={getattr(_snap.regime, 'value', _snap.regime)} "
@@ -2110,8 +2115,15 @@ def main() -> None:
                     f"short_vix={_short_vix} "
                     f"combined_long_if_vix_enforced={_combined_long} "
                     f"combined_short_if_vix_enforced={_combined_short} "
-                    f"current_core_allow_long={regime_decision.allow_new_longs}"
+                    f"current_core_allow_long={regime_decision.allow_new_longs} "
+                    f"enforce_vix_for_longs={enforce_vix_for_longs}"
                 )
+                if enforce_vix_for_longs and not _combined_long:
+                    long_ok = False
+                    log(
+                        "Optional VIX long-entry overlay is ENABLED and VIX gate blocks new longs. "
+                        "Diagnostics and portfolio SELL/risk monitoring will still run."
+                    )
             except Exception as _audit_e:
                 log(f"Long-side VIX visibility audit unavailable: {_audit_e}")
         except Exception as e:
