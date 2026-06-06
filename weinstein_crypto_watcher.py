@@ -1399,8 +1399,6 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
         recovery_cols = [
             "action_priority",
             "action_priority_reason",
-            "action_priority",
-            "action_priority_reason",
             "ticker",
             "price",
             "ma30",
