@@ -1033,6 +1033,12 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "UnrealizedGainPct": unrealized_gain_pct,
             "PortfolioWeightPct": portfolio_weight_pct,
             "RecoveryWatch": recovery_watch,
+            "RecoveryScore": (
+                (100.0 - min(float(distance_to_ma30_pct), 100.0))
+                + (min(float(pace), 20.0) * 2.0 if pd.notna(pace) else 0.0)
+                if recovery_watch and pd.notna(distance_to_ma30_pct)
+                else 0.0
+            ),
             "RecoveryReason": recovery_reason,
             "PortfolioRisk": portfolio_risk_label(
                 owned, price, ma30, pivot, unrealized_gain_pct, st.get("sell_state")
@@ -1075,6 +1081,12 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
                 "distance_to_ma30_pct": None if pd.isna(distance_to_ma30_pct) else round(float(distance_to_ma30_pct), 2),
                 "distance_to_pivot_pct": None if pd.isna(distance_to_pivot_pct) else round(float(distance_to_pivot_pct), 2),
                 "recovery_watch": recovery_watch,
+                "recovery_score": (
+                    (100.0 - min(float(distance_to_ma30_pct), 100.0))
+                    + (min(float(pace), 20.0) * 2.0 if pd.notna(pace) else 0.0)
+                    if recovery_watch and pd.notna(distance_to_ma30_pct)
+                    else 0.0
+                ),
                 "recovery_reason": recovery_reason,
                 "risk_label": portfolio_risk_label(owned, price, ma30, pivot, unrealized_gain_pct, st["sell_state"]),
                 "ownership_action": (
@@ -1223,9 +1235,11 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
         try:
             recovery_watch_rows = snapshot_df[snapshot_df["recovery_watch"].astype(bool)].copy()
             if not recovery_watch_rows.empty:
+                if "recovery_score" not in recovery_watch_rows.columns:
+                    recovery_watch_rows["recovery_score"] = 0.0
                 recovery_watch_rows = recovery_watch_rows.sort_values(
-                    ["distance_to_ma30_pct", "ticker"],
-                    ascending=[True, True],
+                    ["recovery_score", "distance_to_ma30_pct", "ticker"],
+                    ascending=[False, True, True],
                 )
         except Exception:
             recovery_watch_rows = pd.DataFrame()
@@ -1255,6 +1269,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "distance_to_ma30_pct",
             "distance_to_pivot_pct",
             "recovery_watch",
+            "recovery_score",
             "recovery_reason",
             "risk_label",
             "ownership_action",
@@ -1284,6 +1299,7 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             "ma30",
             "distance_to_ma30_pct",
             "vol_pace_vs50dma",
+            "recovery_score",
             "risk_label",
             "recovery_reason",
             "portfolio_recommendation",
