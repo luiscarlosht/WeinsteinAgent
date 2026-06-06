@@ -191,7 +191,7 @@ def volume_pace_today_vs_50dma_crypto(ticker, daily_df):
         return np.nan
     v50 = v.rolling(50).mean().iloc[-2] if len(v) > 50 else np.nan
     today_vol = v.iloc[-1]
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     elapsed = max(0.0, (now - day_start).total_seconds())
     fraction = min(1.0, max(0.05, elapsed / (24 * 3600.0)))
