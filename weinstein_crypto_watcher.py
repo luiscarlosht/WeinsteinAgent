@@ -111,7 +111,9 @@ def load_config(path):
 def newest_weekly_csv():
     files = [
         f for f in os.listdir(OUTPUT_DIR)
-        if f.startswith("weinstein_weekly_") and f.endswith(".csv")
+        if f.startswith("weinstein_weekly_equities_")
+        and f.endswith(".csv")
+        and "YYYY" not in f
     ]
     if not files:
         raise FileNotFoundError(
