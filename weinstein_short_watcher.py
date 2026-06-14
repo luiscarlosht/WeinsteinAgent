@@ -177,14 +177,21 @@ def newest_weekly_csv():
     files = [
         f
         for f in os.listdir(WEEKLY_OUTPUT_DIR)
-        if f.startswith(WEEKLY_FILE_PREFIX) and f.endswith(".csv")
+        if f.startswith(WEEKLY_FILE_PREFIX)
+        and f.endswith(".csv")
+        and "YYYY" not in f
     ]
     if not files:
         raise FileNotFoundError(
             f"No weekly CSV found in {WEEKLY_OUTPUT_DIR}. "
             f"Run weinstein_report_weekly.py first."
         )
-    files.sort(reverse=True)
+
+    # Pick newest generated weekly file by modified time, not filename.
+    files.sort(
+        key=lambda f: os.path.getmtime(os.path.join(WEEKLY_OUTPUT_DIR, f)),
+        reverse=True,
+    )
     return os.path.join(WEEKLY_OUTPUT_DIR, files[0])
 
 
