@@ -541,8 +541,12 @@ def portfolio_recommendation(owned, signal_kind, price, ma30, pivot, unrealized_
 
 
 # ---------------- Core scan ----------------
-def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=False):
-    log(f"Crypto watcher starting with config: {config_path}", level="step")
+def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=False, profile="B", sim=False):
+    profile = str(profile or "B").upper().strip()
+    if profile not in {"A", "B", "C", "D", "E", "F"}:
+        raise ValueError(f"Unsupported crypto profile: {profile}")
+    run_mode = "SIM" if sim else "PROD"
+    log(f"Crypto watcher starting with config: {config_path} profile={profile} mode={run_mode}", level="step")
     cfg, sheet_url, service_account_file, universe = load_config(config_path)
 
     weekly_df, weekly_csv_path = load_weekly()
@@ -1122,6 +1126,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
             action_priority_reason = "TIER4 healthy/normal hold"
 
         debug_rows.append({
+            "CryptoProfile": profile,
+            "RunMode": run_mode,
             "ExitReviewTier": exit_review_tier,
             "ExitReviewReason": exit_review_reason,
             "ActionPriority": action_priority,
@@ -1178,6 +1184,8 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
 
         info_rows.append(
             {
+                "crypto_profile": profile,
+                "run_mode": run_mode,
                 "exit_review_tier": exit_review_tier,
                 "exit_review_reason": exit_review_reason,
                 "action_priority": action_priority,
@@ -1652,6 +1660,8 @@ if __name__ == "__main__":
         help="Send the crypto report even when there are no BUY/SELL triggers.",
     )
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--profile", choices=["A", "B", "C", "D", "E", "F"], default="B")
+    ap.add_argument("--sim", action="store_true")
     args = ap.parse_args()
 
     VERBOSE = not args.quiet
@@ -1662,7 +1672,14 @@ if __name__ == "__main__":
     )
 
     try:
-        run(config_path=args.config, only=only, dry_run=args.dry_run, force_email=args.force_email)
+        run(
+            config_path=args.config,
+            only=only,
+            dry_run=args.dry_run,
+            force_email=args.force_email,
+            profile=args.profile,
+            sim=args.sim,
+        )
         log("Crypto tick complete.", level="ok")
     except Exception as e:
         log(f"Error: {e}", level="err")

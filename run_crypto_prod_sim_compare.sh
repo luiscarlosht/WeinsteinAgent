@@ -21,7 +21,6 @@ run_case () {
 
   python3 weinstein_crypto_watcher.py \
     --config ./config.yaml \
-    --force-email false \
     "$@" \
     2>&1 | tee "$OUTDIR/${name}.log"
 
@@ -36,19 +35,13 @@ run_case () {
 run_case PROD_B \
   --profile B
 
-# SIM same profile B: should match PROD_B
-run_case SIM_B \
-  --profile B \
-  --sim
-
-# SIM challengers
-run_case SIM_D \
-  --profile D \
-  --sim
-
-run_case SIM_F \
-  --profile F \
-  --sim
+# SIM all profiles
+run_case SIM_A --profile A --sim
+run_case SIM_B --profile B --sim
+run_case SIM_C --profile C --sim
+run_case SIM_D --profile D --sim
+run_case SIM_E --profile E --sim
+run_case SIM_F --profile F --sim
 
 python3 - <<'PY' "$OUTDIR"
 import sys
@@ -56,7 +49,7 @@ from pathlib import Path
 import pandas as pd
 
 out = Path(sys.argv[1])
-cases = ["PROD_B", "SIM_B", "SIM_D", "SIM_F"]
+cases = ["PROD_B", "SIM_A", "SIM_B", "SIM_C", "SIM_D", "SIM_E", "SIM_F"]
 
 rows = []
 dfs = {}
