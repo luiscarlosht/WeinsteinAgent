@@ -513,6 +513,59 @@ def portfolio_risk_label(owned, price, ma30, pivot, unrealized_gain_pct, sell_st
     return "LOW"
 
 
+def crypto_profile_long_params(profile):
+    """
+    Crypto A/B/C/D/E/F profile behavior.
+
+    Initial behavior release:
+    - A/B use current production thresholds.
+    - C/D/E/F progressively tighten breakout distance and volume requirements.
+    - F is a meta placeholder and currently maps to D-like behavior.
+    """
+    profile = str(profile or "B").upper().strip()
+
+    base = {
+        "min_break_pct": MIN_BREAKOUT_PCT,
+        "dist_above_ma_min": BUY_DIST_ABOVE_MA_MIN,
+        "vol_min": VOL_PACE_MIN,
+        "adx_min": 0.0,
+    }
+
+    profiles = {
+        "A": base,
+        "B": base,
+        "C": {
+            **base,
+            "min_break_pct": max(MIN_BREAKOUT_PCT, 0.006),
+            "vol_min": max(VOL_PACE_MIN, 1.20),
+        },
+        "D": {
+            **base,
+            "min_break_pct": max(MIN_BREAKOUT_PCT, 0.008),
+            "dist_above_ma_min": max(BUY_DIST_ABOVE_MA_MIN, 0.015),
+            "vol_min": max(VOL_PACE_MIN, 1.30),
+        },
+        "E": {
+            **base,
+            "min_break_pct": max(MIN_BREAKOUT_PCT, 0.012),
+            "dist_above_ma_min": max(BUY_DIST_ABOVE_MA_MIN, 0.025),
+            "vol_min": max(VOL_PACE_MIN, 1.50),
+        },
+        "F": {
+            **base,
+            "min_break_pct": max(MIN_BREAKOUT_PCT, 0.008),
+            "dist_above_ma_min": max(BUY_DIST_ABOVE_MA_MIN, 0.015),
+            "vol_min": max(VOL_PACE_MIN, 1.30),
+        },
+    }
+
+    selected = profiles.get(profile)
+    if selected is None:
+        raise ValueError(f"Unsupported crypto profile: {profile}")
+
+    return LongEntryParams(**selected)
+
+
 def portfolio_recommendation(owned, signal_kind, price, ma30, pivot, unrealized_gain_pct, sell_state):
     """Human-readable portfolio action derived from signal state + ownership."""
     below_ma = pd.notna(ma30) and pd.notna(price) and float(price) < float(ma30)
@@ -694,11 +747,14 @@ def run(config_path="./config.yaml", *, only=None, dry_run=False, force_email=Fa
     # 24/7 data handling, state machine, SELL logic, reports, and email
     # behavior; only the long-side BUY/NEAR eligibility calculation is
     # delegated to the shared core.
-    crypto_long_params = LongEntryParams(
-        min_break_pct=MIN_BREAKOUT_PCT,
-        dist_above_ma_min=BUY_DIST_ABOVE_MA_MIN,
-        vol_min=VOL_PACE_MIN,
-        adx_min=0.0,
+    crypto_long_params = crypto_profile_long_params(profile)
+    log(
+        "Crypto profile params: "
+        f"profile={profile} mode={run_mode} "
+        f"min_break_pct={crypto_long_params.min_break_pct} "
+        f"dist_above_ma_min={crypto_long_params.dist_above_ma_min} "
+        f"vol_min={crypto_long_params.vol_min}",
+        level="debug",
     )
 
     buy_signals, near_signals, sell_triggers = [], [], []
