@@ -109,7 +109,7 @@ def prepare_features(df):
     return df
 
 
-def run_profile(data_by_ticker, profile, start, end, capital, max_pos_frac):
+def run_profile(data_by_ticker, profile, start, end, capital, max_pos_frac, max_exposure_frac):
     params = profile_params(profile)
 
     cash = float(capital)
@@ -196,7 +196,16 @@ def run_profile(data_by_ticker, profile, start, end, capital, max_pos_frac):
                 for x in positions
                 if dt in data_by_ticker[x].index
             )
-            invest = min(cash, equity_now * max_pos_frac)
+
+            current_exposure = sum(
+                positions[x]["qty"] * float(data_by_ticker[x].loc[dt, "Close"])
+                for x in positions
+                if dt in data_by_ticker[x].index
+            )
+            max_total_exposure = equity_now * max_exposure_frac
+            remaining_exposure = max(0.0, max_total_exposure - current_exposure)
+
+            invest = min(cash, equity_now * max_pos_frac, remaining_exposure)
             if invest <= 100:
                 continue
 
@@ -273,6 +282,7 @@ def main():
     ap.add_argument("--end", default=datetime.utcnow().strftime("%Y-%m-%d"))
     ap.add_argument("--capital", type=float, default=20000)
     ap.add_argument("--max-pos-frac", type=float, default=0.10)
+    ap.add_argument("--max-exposure-frac", type=float, default=0.50)
     ap.add_argument("--profiles", default="A,B,C,D,E,F")
     ap.add_argument("--universe", default=",".join(UNIVERSE))
     args = ap.parse_args()
@@ -306,6 +316,7 @@ def main():
             end=args.end,
             capital=args.capital,
             max_pos_frac=args.max_pos_frac,
+            max_exposure_frac=args.max_exposure_frac,
         )
         summaries.append(summary)
         all_eq.append(eq)
