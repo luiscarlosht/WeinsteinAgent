@@ -276,6 +276,65 @@ def run_profile(data_by_ticker, profile, start, end, capital, max_pos_frac, max_
     return summary, eq, tr
 
 
+
+def build_yearly_returns(equity_df):
+    if equity_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    eq = equity_df.copy()
+    eq["date"] = pd.to_datetime(eq["date"])
+    eq["year"] = eq["date"].dt.year
+
+    rows = []
+    for profile, g in eq.groupby("profile"):
+        g = g.sort_values("date")
+        for year, yg in g.groupby("year"):
+            start_equity = float(yg["equity"].iloc[0])
+            end_equity = float(yg["equity"].iloc[-1])
+            ret = (end_equity / start_equity - 1.0) * 100 if start_equity else float("nan")
+            rows.append({
+                "profile": profile,
+                "year": int(year),
+                "start_equity": start_equity,
+                "end_equity": end_equity,
+                "return_pct": ret,
+                "max_drawdown_pct": max_drawdown(yg["equity"].values) * 100,
+                "days": len(yg),
+            })
+
+    yearly = pd.DataFrame(rows)
+
+    winners = (
+        yearly.sort_values(["year", "return_pct"], ascending=[True, False])
+        .groupby("year")
+        .head(1)
+        .rename(columns={"profile": "winner_profile", "return_pct": "winner_return_pct"})
+        [["year", "winner_profile", "winner_return_pct"]]
+    )
+
+    # Consistency vs B
+    b = yearly[yearly["profile"] == "B"][["year", "return_pct"]].rename(columns={"return_pct": "B_return_pct"})
+    consistency = yearly.merge(b, on="year", how="left")
+    consistency["beat_B"] = consistency["return_pct"] > consistency["B_return_pct"]
+    consistency["return_gap_vs_B_pct_points"] = consistency["return_pct"] - consistency["B_return_pct"]
+
+    summary = (
+        consistency.groupby("profile")
+        .agg(
+            years=("year", "count"),
+            years_beating_B=("beat_B", "sum"),
+            avg_return_pct=("return_pct", "mean"),
+            median_return_pct=("return_pct", "median"),
+            avg_gap_vs_B_pct_points=("return_gap_vs_B_pct_points", "mean"),
+            worst_year_return_pct=("return_pct", "min"),
+            best_year_return_pct=("return_pct", "max"),
+        )
+        .reset_index()
+    )
+
+    return yearly, winners, summary
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2018-01-01")
@@ -334,8 +393,19 @@ def main():
     equity_df.to_csv(equity_path, index=False)
     trades_df.to_csv(trades_path, index=False)
 
+    yearly_df, yearly_winners_df, consistency_df = build_yearly_returns(equity_df)
+    yearly_df.to_csv(os.path.join(outdir, "crypto_profile_yearly_returns.csv"), index=False)
+    yearly_winners_df.to_csv(os.path.join(outdir, "crypto_profile_yearly_winners.csv"), index=False)
+    consistency_df.to_csv(os.path.join(outdir, "crypto_profile_consistency_vs_B.csv"), index=False)
+
     print()
     print(summary_df.to_string(index=False))
+    print()
+    print("Yearly winners")
+    print(yearly_winners_df.to_string(index=False))
+    print()
+    print("Consistency vs B")
+    print(consistency_df.to_string(index=False))
     print()
     print(f"Done. Results in: {outdir}")
 
